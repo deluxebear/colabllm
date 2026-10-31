@@ -155,9 +155,10 @@ def start_cloudflared():
     subprocess.run(["pkill", "-f", "cloudflared tunnel"], check=False)
     open(f"{WORK}/cloudflared.log", "w").close()
     if TUNNEL_TOKEN:   # ingress (hostname -> localhost:PUBLIC_PORT) lives in the Cloudflare config
-        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "run", "--token", TUNNEL_TOKEN]
+        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token", TUNNEL_TOKEN]
     else:
-        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{PUBLIC_PORT}"]
+        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "--protocol", "http2",
+                "--url", f"http://127.0.0.1:{PUBLIC_PORT}"]
     return ct_spawn("cloudflared", args)
 
 def wait_public_url(timeout=90):
