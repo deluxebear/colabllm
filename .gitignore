@@ -1,0 +1,4 @@
+.state/
+.cloudflare/
+__pycache__/
+*.pyc
