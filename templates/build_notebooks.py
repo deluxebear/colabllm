@@ -101,6 +101,7 @@ def start_caddy():
     hashed = subprocess.check_output(["caddy", "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
     upstream = f"""reverse_proxy 127.0.0.1:{SERVICE_PORT} {{
             {"header_up Host {upstream_hostport}" if REWRITE_HOST else ""}
+            {"header_up Origin http://{upstream_hostport}" if REWRITE_HOST else ""}
             header_up -Authorization
             flush_interval -1
         }}"""
