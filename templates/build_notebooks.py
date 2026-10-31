@@ -109,14 +109,20 @@ def start_caddy():
     auto_https off
 }}
 :{PUBLIC_PORT} {{
+    encode zstd gzip
     @bearer header Authorization "Bearer {API_TOKEN}"
     handle @bearer {{
+        {upstream}
+    }}
+    @cookie header Cookie *ct_session={API_TOKEN}*
+    handle @cookie {{
         {upstream}
     }}
     handle {{
         basic_auth {{
             {AUTH_USER} {hashed}
         }}
+        header +Set-Cookie "ct_session={API_TOKEN}; Path=/; HttpOnly; SameSite=Lax"
         {upstream}
     }}
 }}
@@ -822,6 +828,29 @@ if not os.path.exists(req_marker):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/manager_requirements.txt"],
                        check=True)
     open(req_marker, "w").write("ok\n")
+
+# Patch ComfyUI frontend so <script type="module">, <link rel="modulepreload">, and Vite's preload helper
+# use crossorigin="use-credentials" (otherwise browsers omit Basic Auth / cookies and get 401 behind Caddy)
+import glob, site
+for sp in site.getsitepackages():
+    fe_dir = f"{sp}/comfyui_frontend_package/static"
+    if not os.path.isdir(fe_dir):
+        continue
+    idx = f"{fe_dir}/index.html"
+    if os.path.isfile(idx):
+        html = open(idx, encoding="utf-8").read()
+        patched = re.sub(r'\bcrossorigin(?:="")?(?!="use-credentials")(?=[\s>/])',
+                         'crossorigin="use-credentials"', html)
+        if patched != html:
+            open(idx, "w", encoding="utf-8").write(patched)
+            print("Patched crossorigin=use-credentials in", idx)
+    for js_path in glob.glob(f"{fe_dir}/assets/*.js"):
+        js = open(js_path, encoding="utf-8", errors="ignore").read()
+        patched_js = js.replace('crossOrigin=``', 'crossOrigin=`use-credentials`').replace(
+            'crossOrigin=""', 'crossOrigin="use-credentials"')
+        if patched_js != js:
+            open(js_path, "w", encoding="utf-8").write(patched_js)
+            print("Patched crossOrigin in", js_path)
 
 if UI_MODE in ("legacy", "both"):
     mgr_dir = f"{COMFY_DIR}/custom_nodes/ComfyUI-Manager"
