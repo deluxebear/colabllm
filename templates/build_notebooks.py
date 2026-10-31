@@ -856,10 +856,8 @@ for sp in site.getsitepackages():
 
 if UI_MODE in ("legacy", "both"):
     mgr_dir = f"{COMFY_DIR}/custom_nodes/ComfyUI-Manager"
-    if not os.path.isdir(f"{mgr_dir}/.git"):
+    if not os.path.isdir(mgr_dir) or not os.listdir(mgr_dir):
         subprocess.run(["git", "clone", "--depth", "1", MANAGER_REPO, mgr_dir], check=True)
-    else:
-        subprocess.run(["git", "-C", mgr_dir, "pull", "--ff-only"], check=False)
     if os.path.exists(f"{mgr_dir}/requirements.txt"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{mgr_dir}/requirements.txt"], check=True)
 
