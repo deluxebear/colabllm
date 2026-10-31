@@ -832,8 +832,12 @@ if not os.path.exists(req_marker):
     open(req_marker, "w").write("ok\n")
 
 # Patch ComfyUI frontend so <script type="module">, <link rel="modulepreload">, and Vite's preload helper
-# use crossorigin="use-credentials" (otherwise browsers omit Basic Auth / cookies and get 401 behind Caddy)
+# use crossorigin="use-credentials", and strip embedded URL credentials (https://user:pass@host) before
+# Vue Router calls history.replaceState() (which throws SecurityError when user:pass@ is in location.href)
 import glob, site
+_URL_CRED_GUARD = ("<script>;(function(){if(location.username||location.password){"
+                   "location.replace(location.origin+location.pathname+location.search+location.hash);"
+                   "}})()</script>")
 for sp in site.getsitepackages():
     fe_dir = f"{sp}/comfyui_frontend_package/static"
     if not os.path.isdir(fe_dir):
@@ -843,9 +847,11 @@ for sp in site.getsitepackages():
         html = open(idx, encoding="utf-8").read()
         patched = re.sub(r'\bcrossorigin(?:="")?(?!="use-credentials")(?=[\s>/])',
                          'crossorigin="use-credentials"', html)
+        if _URL_CRED_GUARD not in patched:
+            patched = patched.replace("<head>", "<head>" + _URL_CRED_GUARD, 1)
         if patched != html:
             open(idx, "w", encoding="utf-8").write(patched)
-            print("Patched crossorigin=use-credentials in", idx)
+            print("Patched crossorigin=use-credentials and URL credential guard in", idx)
     for js_path in glob.glob(f"{fe_dir}/assets/*.js"):
         js = open(js_path, encoding="utf-8", errors="ignore").read()
         patched_js = js.replace('crossOrigin=``', 'crossOrigin=`use-credentials`').replace(
