@@ -794,8 +794,11 @@ while True:
 
 # --------------------------------------------------------------------------- comfyui (Caddy auth + ComfyUI-Manager)
 COMFYUI_CFG = dict(name="comfyui", service_port=8188, auth="caddy", public_port=18080,
-                   health_path="/system_stats", ready_timeout=900)
-COMFYUI_SETUP = r'''# @title 1. Setup -- install ComfyUI + ComfyUI-Manager once per VM (idempotent) + link Drive dirs
+                   health_path="/system_stats", ready_timeout=2400)
+COMFYUI_SETUP = r'''# @title 1. Setup -- install ComfyUI + ComfyUI-Manager (models on fast local SSD, outputs/workflows on Drive)
+from pathlib import Path
+from urllib.parse import unquote
+
 COMFY_DIR = "/content/ComfyUI"
 COMFY_REPO = os.environ.get("CT_COMFY_REPO", "https://github.com/comfyanonymous/ComfyUI.git")
 MANAGER_REPO = os.environ.get("CT_COMFY_MANAGER_REPO", "https://github.com/Comfy-Org/ComfyUI-Manager.git")
@@ -806,8 +809,15 @@ if not os.path.isdir(f"{COMFY_DIR}/.git"):
 else:
     subprocess.run(["git", "-C", COMFY_DIR, "pull", "--ff-only"], check=False)
 
-# Persist models, custom_nodes, user, input, and output in DATA_DIR (Google Drive when mounted)
-for sub in ("models", "custom_nodes", "output", "input", "user"):
+# Remove any legacy models stored on Google Drive so Drive is never bloated by multi-GB weights
+if os.path.isdir(f"{DATA_DIR}/models") and not os.path.islink(f"{DATA_DIR}/models"):
+    shutil.rmtree(f"{DATA_DIR}/models", ignore_errors=True)
+if os.path.islink(f"{COMFY_DIR}/models"):
+    os.unlink(f"{COMFY_DIR}/models")
+os.makedirs(f"{COMFY_DIR}/models", exist_ok=True)
+
+# Persist only lightweight user data (custom_nodes, output, input, user) on Google Drive
+for sub in ("custom_nodes", "output", "input", "user"):
     drive_sub = f"{DATA_DIR}/{sub}"
     local_sub = f"{COMFY_DIR}/{sub}"
     os.makedirs(drive_sub, exist_ok=True)
@@ -822,9 +832,10 @@ for sub in ("models", "custom_nodes", "output", "input", "user"):
     else:
         os.symlink(drive_sub, local_sub)
 
-# Install ComfyUI core requirements + ComfyUI-Manager (core v4 package + custom_nodes for full compatibility)
+# Install ComfyUI core requirements + ComfyUI-Manager + hf_xet for fast local SSD model downloads
 req_marker = f"{WORK}/comfyui_deps.ok"
 if not os.path.exists(req_marker):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/requirements.txt"], check=True)
     if os.path.exists(f"{COMFY_DIR}/manager_requirements.txt"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{COMFY_DIR}/manager_requirements.txt"],
@@ -873,9 +884,193 @@ for entry in sorted(os.listdir(f"{COMFY_DIR}/custom_nodes")):
     if entry != "ComfyUI-Manager" and os.path.isfile(req):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req], check=False)
 
-print("ComfyUI + ComfyUI-Manager setup complete; data_dir =", DATA_DIR)
+# --- On-demand workflow model downloader (downloads directly to local NVMe SSD /content/ComfyUI/models) ---
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+from huggingface_hub import hf_hub_download
+
+HF_URL_RE = re.compile(r"^https?://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+?)(?:\?.*)?$")
+
+def normalize_workflow_url(url):
+    url = url.strip()
+    m = re.match(r"^https?://github\.com/([^/]+/[^/]+)/blob/(.+)$", url)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
+    if not url.startswith(("http://", "https://", "/")):
+        name = url if url.endswith(".json") else f"{url}.json"
+        return f"https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}"
+    return url
+
+def extract_workflow_models(obj, found=None):
+    if found is None:
+        found = {}
+    if isinstance(obj, dict):
+        props = obj.get("properties")
+        if isinstance(props, dict) and isinstance(props.get("models"), list):
+            for m in props["models"]:
+                if isinstance(m, dict) and m.get("url") and m.get("directory") and m.get("name"):
+                    key = f"{m['directory'].strip('/')}/{m['name'].lstrip('/')}"
+                    found[key] = {"directory": m["directory"].strip("/"),
+                                  "name": m["name"].lstrip("/"),
+                                  "url": m["url"].strip()}
+        for v in obj.values():
+            extract_workflow_models(v, found)
+    elif isinstance(obj, list):
+        for item in obj:
+            extract_workflow_models(item, found)
+    return found
+
+def ensure_model_on_ssd(item):
+    dest = Path(COMFY_DIR) / "models" / item["directory"] / item["name"]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file() and dest.stat().st_size > 0:
+        print(f"[workflow-dl] SKIP (already on local SSD, {dest.stat().st_size/1e9:.2f} GB): {dest.relative_to(COMFY_DIR)}",
+              flush=True)
+        return str(dest)
+    url = item["url"]
+    m = HF_URL_RE.match(url)
+    t0 = time.monotonic()
+    if m:
+        repo_id, revision, filename = m.group(1), m.group(2), unquote(m.group(3))
+        print(f"[workflow-dl] HF Xet -> local SSD: {repo_id}/{filename} -> models/{item['directory']}/{item['name']}",
+              flush=True)
+        stage = Path("/content/hf-stage")
+        stage.mkdir(parents=True, exist_ok=True)
+        downloaded = Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, local_dir=stage))
+        shutil.move(str(downloaded), str(dest))
+    else:
+        print(f"[workflow-dl] HTTP -> local SSD: {url} -> models/{item['directory']}/{item['name']}", flush=True)
+        partial = dest.with_name(dest.name + ".partial")
+        urllib.request.urlretrieve(url, partial)
+        partial.replace(dest)
+    dt = time.monotonic() - t0
+    sz = dest.stat().st_size
+    print(f"[workflow-dl] DONE ({sz/1e9:.2f} GB in {dt:.1f}s, {sz/1e6/max(dt,1):.1f} MB/s): {dest.name}", flush=True)
+    return str(dest)
+
+def sync_workflow_models(wf_source):
+    src = normalize_workflow_url(wf_source)
+    print(f"[workflow-dl] Parsing workflow: {src}", flush=True)
+    if src.startswith(("http://", "https://")):
+        req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+        wf_name = Path(src.split("?")[0]).name
+    else:
+        raw = Path(src).read_text(encoding="utf-8")
+        wf_name = Path(src).name
+    wf_json = json.loads(raw)
+    # Save workflow into user/default/workflows so it is immediately available in the ComfyUI sidebar
+    wf_dir = Path(COMFY_DIR) / "user" / "default" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    if wf_name.endswith(".json"):
+        (wf_dir / wf_name).write_text(raw, encoding="utf-8")
+    models = list(extract_workflow_models(wf_json).values())
+    print(f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
+          ", ".join(f"{m['directory']}/{m['name']}" for m in models), flush=True)
+    results = []
+    for idx, m in enumerate(models, 1):
+        print(f"[workflow-dl] [{idx}/{len(models)}] Ensuring {m['directory']}/{m['name']} ...", flush=True)
+        results.append(ensure_model_on_ssd(m))
+    return {"workflow": wf_name, "models": [f"{m['directory']}/{m['name']}" for m in models], "paths": results}
+
+for wf_spec in [x.strip() for x in os.environ.get("CT_WORKFLOW", "").split(",") if x.strip()]:
+    sync_workflow_models(wf_spec)
+
+print("ComfyUI + ComfyUI-Manager setup complete; local SSD models =", f"{COMFY_DIR}/models", "drive data =", DATA_DIR)
 '''
-COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (Caddy auth in front)
+COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with live /api/ct/pull-workflow endpoint)
+# Install a small custom node that exposes POST /api/ct/pull-workflow {"workflow": "<url-or-template>"}
+# so you can trigger on-demand SSD model downloads for any workflow while ComfyUI is already running.
+os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
+open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write("""import json, os, re, shutil, time, urllib.request
+from pathlib import Path
+from urllib.parse import unquote
+from aiohttp import web
+from server import PromptServer
+import folder_paths
+
+COMFY_DIR = Path(folder_paths.base_path)
+HF_URL_RE = re.compile(r"^https?://huggingface\\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+?)(?:\\?.*)?$")
+
+def _normalize(url):
+    url = url.strip()
+    m = re.match(r"^https?://github\\.com/([^/]+/[^/]+)/blob/(.+)$", url)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
+    if not url.startswith(("http://", "https://", "/")):
+        name = url if url.endswith(".json") else f"{url}.json"
+        return f"https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}"
+    return url
+
+def _extract(obj, found=None):
+    if found is None:
+        found = {}
+    if isinstance(obj, dict):
+        props = obj.get("properties")
+        if isinstance(props, dict) and isinstance(props.get("models"), list):
+            for m in props["models"]:
+                if isinstance(m, dict) and m.get("url") and m.get("directory") and m.get("name"):
+                    key = f"{m['directory'].strip('/')}/{m['name'].lstrip('/')}"
+                    found[key] = {"directory": m["directory"].strip("/"),
+                                  "name": m["name"].lstrip("/"),
+                                  "url": m["url"].strip()}
+        for v in obj.values():
+            _extract(v, found)
+    elif isinstance(obj, list):
+        for item in obj:
+            _extract(item, found)
+    return found
+
+def _pull_sync(wf_source):
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    from huggingface_hub import hf_hub_download
+    src = _normalize(wf_source)
+    if src.startswith(("http://", "https://")):
+        req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+        wf_name = Path(src.split("?")[0]).name
+    else:
+        raw = Path(src).read_text(encoding="utf-8")
+        wf_name = Path(src).name
+    wf_json = json.loads(raw)
+    wf_dir = COMFY_DIR / "user" / "default" / "workflows"
+    wf_dir.mkdir(parents=True, exist_ok=True)
+    if wf_name.endswith(".json"):
+        (wf_dir / wf_name).write_text(raw, encoding="utf-8")
+    models = list(_extract(wf_json).values())
+    out = []
+    for m in models:
+        dest = COMFY_DIR / "models" / m["directory"] / m["name"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.is_file() and dest.stat().st_size > 0:
+            out.append({"model": f"{m['directory']}/{m['name']}", "status": "cached", "size": dest.stat().st_size})
+            continue
+        hm = HF_URL_RE.match(m["url"])
+        if hm:
+            stage = Path("/content/hf-stage")
+            stage.mkdir(parents=True, exist_ok=True)
+            dl = Path(hf_hub_download(repo_id=hm.group(1), filename=unquote(hm.group(3)),
+                                      revision=hm.group(2), local_dir=stage))
+            shutil.move(str(dl), str(dest))
+        else:
+            partial = dest.with_name(dest.name + ".partial")
+            urllib.request.urlretrieve(m["url"], partial)
+            partial.replace(dest)
+        out.append({"model": f"{m['directory']}/{m['name']}", "status": "downloaded", "size": dest.stat().st_size})
+    return {"workflow": wf_name, "models": out}
+
+@PromptServer.instance.routes.post("/api/ct/pull-workflow")
+async def ct_pull_workflow(request):
+    import asyncio
+    body = await request.json()
+    wf = body.get("workflow", "")
+    if not wf:
+        return web.json_response({"error": "missing 'workflow'"}, status=400)
+    res = await asyncio.to_thread(_pull_sync, wf)
+    return web.json_response(res)
+
+NODE_CLASS_MAPPINGS = {}
+""")
+
 EXTRA_ARGS = os.environ.get("CT_COMFY_ARGS", "").split()
 
 def start_service():
@@ -892,231 +1087,6 @@ ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/system_stats", timeout=300)
 print(f"ComfyUI listening on 127.0.0.1:{SERVICE_PORT}")
 '''
 
-# --------------------------------------------------------------------------- comfyui-models (dedicated incremental model downloader for ComfyUI)
-COMFYUI_MODELS_CFG = dict(name="comfyui-models", service_port=8189, auth="caddy", public_port=18080,
-                          health_path="/status.json", ready_timeout=3600)
-COMFYUI_MODELS_SETUP = r'''# @title 1. Setup -- incremental ComfyUI model downloader (saves directly to /content/drive/MyDrive/colab-llm/comfyui)
-import hashlib
-from pathlib import Path
-
-COMFY_DATA = Path(os.environ.get("CT_COMFY_DATA_DIR", "/content/drive/MyDrive/colab-llm/comfyui"))
-if not Path("/content/drive/MyDrive").is_dir():
-    raise RuntimeError("Google Drive is not mounted. Run via `./services/comfyui-models.py up`.")
-COMFY_DATA.mkdir(parents=True, exist_ok=True)
-
-os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
-from huggingface_hub import HfApi, hf_hub_download
-
-# Built-in model packs (each item: repo / filename / dest_rel OR url / dest_rel)
-PACKS = {
-    "minimax-h3-native": [
-        # Diffusion models (T2V / I2V / FL2VA + R2V / Ref2VA)
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
-         "dest": "models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-         "dest": "models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"},
-        # Text encoder
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-         "dest": "models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"},
-        # Video & Audio VAEs
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "vae/minimax_h3_video_vae_int8_convrot.safetensors",
-         "dest": "models/vae/minimax_h3_video_vae_int8_convrot.safetensors"},
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
-         "dest": "models/vae/minimax_h3_audio_vae_fp32.safetensors"},
-        # Lightning Turbo LoRAs (8-step for FL2V, 4-step for Ref2V)
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
-         "dest": "models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
-         "dest": "models/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"},
-        # Embeddings
-        {"repo": "Comfy-Org/MiniMax-H3",
-         "filename": "embeddings/minimaxh3_art_is_explosion.safetensors",
-         "dest": "models/embeddings/minimaxh3_art_is_explosion.safetensors"},
-        # Official workflow templates -> user/default/workflows/
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_t2v.json",
-         "dest": "user/default/workflows/video_minimax_h3_t2v.json"},
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_i2v.json",
-         "dest": "user/default/workflows/video_minimax_h3_i2v.json"},
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_r2v.json",
-         "dest": "user/default/workflows/video_minimax_h3_r2v.json"},
-        # Official example input images -> input/
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/transparent_rgb_gaming_mouse.png",
-         "dest": "input/transparent_rgb_gaming_mouse.png"},
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/red_superboy_on_city_roof.png",
-         "dest": "input/red_superboy_on_city_roof.png"},
-        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/mecha_dragon_lightning.png",
-         "dest": "input/mecha_dragon_lightning.png"},
-    ],
-}
-
-MANIFEST_PATH = COMFY_DATA / "models" / ".download-manifest.json"
-STATUS_PATH = Path(WORK) / "status.json"
-STAGE_DIR = Path("/content/hf-stage")
-STAGE_DIR.mkdir(parents=True, exist_ok=True)
-
-def mlog(msg):
-    print(time.strftime("[%F %T] ") + msg, flush=True)
-
-def load_manifest():
-    if MANIFEST_PATH.is_file():
-        try:
-            return json.loads(MANIFEST_PATH.read_text())
-        except Exception:
-            pass
-    return {"files": {}}
-
-def save_manifest(manifest):
-    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MANIFEST_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(MANIFEST_PATH)
-
-def write_status(state_dict):
-    tmp = STATUS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state_dict, indent=2, ensure_ascii=False) + "\n")
-    tmp.replace(STATUS_PATH)
-
-# Build incremental queue from CT_MODEL_PACKS + persistent queue file + CT_EXTRA_MODELS
-active_packs = [p.strip() for p in os.environ.get("CT_MODEL_PACKS", "minimax-h3-native").split(",") if p.strip()]
-items = []
-for p in active_packs:
-    if p not in PACKS:
-        raise ValueError(f"Unknown model pack '{p}' (available: {list(PACKS)})")
-    items.extend(PACKS[p])
-
-queue_file = COMFY_DATA / "models" / "download-queue.json"
-if queue_file.is_file():
-    try:
-        items.extend(json.loads(queue_file.read_text()))
-    except Exception as e:
-        mlog(f"Warning: could not parse {queue_file}: {e}")
-
-extra_json = os.environ.get("CT_EXTRA_MODELS", "").strip()
-if extra_json:
-    items.extend(json.loads(extra_json))
-
-# Resolve remote metadata (size & sha256) per HF repo once
-repo_meta = {}
-api = HfApi()
-for it in items:
-    repo = it.get("repo")
-    if repo and repo not in repo_meta:
-        info = api.model_info(repo, files_metadata=True)
-        repo_meta[repo] = {
-            s.rfilename: {"size": s.size, "sha256": (s.lfs or {}).get("sha256") if isinstance(s.lfs, dict) else getattr(s.lfs, "sha256", None)}
-            for s in info.siblings
-        }
-
-manifest = load_manifest()
-summary = {"packs": active_packs, "total": len(items), "completed": 0, "skipped": 0, "current": None, "files": []}
-write_status(summary)
-
-for idx, it in enumerate(items, 1):
-    dest_rel = it["dest"]
-    target = COMFY_DATA / dest_rel
-    target.parent.mkdir(parents=True, exist_ok=True)
-    rec = manifest["files"].get(dest_rel, {})
-
-    if "repo" in it:
-        repo, fn = it["repo"], it["filename"]
-        meta = repo_meta.get(repo, {}).get(fn, {})
-        exp_size = it.get("size") or meta.get("size")
-        exp_sha = it.get("sha256") or meta.get("sha256")
-        if target.is_file() and exp_size and target.stat().st_size == exp_size:
-            if not exp_sha or rec.get("sha256") == exp_sha or rec.get("size") == exp_size:
-                mlog(f"[{idx}/{len(items)}] SKIP (already on Drive, {exp_size/1e9:.2f} GB): {dest_rel}")
-                manifest["files"][dest_rel] = {"repo": repo, "filename": fn, "size": exp_size, "sha256": exp_sha}
-                save_manifest(manifest)
-                summary["skipped"] += 1
-                summary["completed"] += 1
-                summary["files"].append({"dest": dest_rel, "size": exp_size, "status": "cached"})
-                write_status(summary)
-                continue
-
-        summary["current"] = {"index": idx, "dest": dest_rel, "size": exp_size, "source": f"{repo}/{fn}"}
-        write_status(summary)
-        mlog(f"[{idx}/{len(items)}] DOWNLOADING ({ (exp_size or 0)/1e9:.2f} GB): {repo}/{fn} -> {dest_rel}")
-        t0 = time.monotonic()
-        staged = Path(hf_hub_download(repo_id=repo, filename=fn, local_dir=STAGE_DIR))
-        actual_size = staged.stat().st_size
-        if exp_size and actual_size != exp_size:
-            staged.unlink(missing_ok=True)
-            raise RuntimeError(f"Size mismatch for {fn}: got {actual_size}, expected {exp_size}")
-
-        mlog(f"[{idx}/{len(items)}] Moving {actual_size/1e9:.2f} GB from local SSD -> Drive: {target}")
-        partial = target.with_name(target.name + ".partial")
-        h = hashlib.sha256()
-        copied, last_log = 0, time.monotonic()
-        with staged.open("rb") as src, partial.open("wb") as dst:
-            while chunk := src.read(16 * 1024 * 1024):
-                dst.write(chunk)
-                if exp_sha:
-                    h.update(chunk)
-                copied += len(chunk)
-                if time.monotonic() - last_log >= 20:
-                    mlog(f"  copy progress {target.name}: {copied/1e9:.2f}/{(exp_size or actual_size)/1e9:.2f} GB")
-                    last_log = time.monotonic()
-        if exp_sha and h.hexdigest() != exp_sha:
-            partial.unlink(missing_ok=True)
-            staged.unlink(missing_ok=True)
-            raise RuntimeError(f"SHA256 mismatch for {fn}: got {h.hexdigest()}, expected {exp_sha}")
-        partial.replace(target)
-        staged.unlink(missing_ok=True)
-        dt = time.monotonic() - t0
-        mlog(f"[{idx}/{len(items)}] DONE in {dt:.1f}s ({actual_size/1e6/max(dt,1):.1f} MB/s): {dest_rel}")
-        manifest["files"][dest_rel] = {"repo": repo, "filename": fn, "size": actual_size, "sha256": exp_sha,
-                                        "updated_at": time.strftime("%FT%T%z")}
-        save_manifest(manifest)
-        summary["completed"] += 1
-        summary["files"].append({"dest": dest_rel, "size": actual_size, "status": "downloaded"})
-        write_status(summary)
-    else:
-        url = it["url"]
-        if target.is_file() and target.stat().st_size > 0:
-            mlog(f"[{idx}/{len(items)}] SKIP (already on Drive): {dest_rel}")
-            summary["skipped"] += 1
-            summary["completed"] += 1
-            summary["files"].append({"dest": dest_rel, "size": target.stat().st_size, "status": "cached"})
-            write_status(summary)
-            continue
-        summary["current"] = {"index": idx, "dest": dest_rel, "source": url}
-        write_status(summary)
-        mlog(f"[{idx}/{len(items)}] FETCHING {url} -> {dest_rel}")
-        partial = target.with_name(target.name + ".partial")
-        urllib.request.urlretrieve(url, partial)
-        partial.replace(target)
-        sz = target.stat().st_size
-        manifest["files"][dest_rel] = {"url": url, "size": sz, "updated_at": time.strftime("%FT%T%z")}
-        save_manifest(manifest)
-        summary["completed"] += 1
-        summary["files"].append({"dest": dest_rel, "size": sz, "status": "downloaded"})
-        write_status(summary)
-
-summary["current"] = None
-summary["finished_at"] = time.strftime("%FT%T%z")
-write_status(summary)
-shutil.copyfile(STATUS_PATH, COMFY_DATA / "models" / ".last-download-status.json")
-mlog(f"All {summary['total']} items ready on Drive ({summary['skipped']} cached, {summary['total'] - summary['skipped']} newly downloaded).")
-'''
-COMFYUI_MODELS_SERVICE = r'''# @title 2. Service -- lightweight status & manifest HTTP server on 127.0.0.1:8189
-def start_service():
-    subprocess.run(["pkill", "-f", f"http.server {SERVICE_PORT}"], check=False)
-    return ct_spawn("service", [sys.executable, "-m", "http.server", str(SERVICE_PORT), "--bind", "127.0.0.1"],
-                    cwd=WORK)
-
-PROCS["service"] = (start_service(), start_service)
-ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/status.json", timeout=60)
-print(f"comfyui-models status server listening on 127.0.0.1:{SERVICE_PORT}")
-'''
-
 if __name__ == "__main__":
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
@@ -1124,14 +1094,10 @@ if __name__ == "__main__":
     write(ROOT / "services/comfyui.ipynb",
           notebook("ComfyUI + ComfyUI-Manager",
                    "ComfyUI with ComfyUI-Manager enabled behind Caddy auth (basic auth for browser UI, "
-                   "Bearer token for API clients). Models, custom_nodes, user settings, input, and output "
-                   "persist in `CT_DATA_DIR` (`/content/drive/MyDrive/colab-llm/comfyui`).",
+                   "Bearer token for API clients). Models live on fast local NVMe SSD (`/content/ComfyUI/models`) "
+                   "and are downloaded on demand per workflow (`--workflow <url-or-template>` or `pull-workflow`); "
+                   "custom_nodes, user settings, input, and output persist on Google Drive.",
                    COMFYUI_CFG, COMFYUI_SETUP, COMFYUI_SERVICE))
-    write(ROOT / "services/comfyui-models.ipynb",
-          notebook("ComfyUI Model Downloader (Incremental)",
-                   "Dedicated Colab session to incrementally download and verify ComfyUI models, workflow templates, "
-                   "and input assets directly into `/content/drive/MyDrive/colab-llm/comfyui/`.",
-                   COMFYUI_MODELS_CFG, COMFYUI_MODELS_SETUP, COMFYUI_MODELS_SERVICE))
     write(ROOT / "services/ollama.ipynb",
           notebook("Ollama", "Ollama API behind Caddy auth (Ollama has no auth of its own). "
                    "Models: `CT_MODELS` (comma separated, default `qwen2.5:0.5b`).",
