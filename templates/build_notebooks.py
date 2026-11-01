@@ -892,6 +892,231 @@ ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/system_stats", timeout=300)
 print(f"ComfyUI listening on 127.0.0.1:{SERVICE_PORT}")
 '''
 
+# --------------------------------------------------------------------------- comfyui-models (dedicated incremental model downloader for ComfyUI)
+COMFYUI_MODELS_CFG = dict(name="comfyui-models", service_port=8189, auth="caddy", public_port=18080,
+                          health_path="/status.json", ready_timeout=3600)
+COMFYUI_MODELS_SETUP = r'''# @title 1. Setup -- incremental ComfyUI model downloader (saves directly to /content/drive/MyDrive/colab-llm/comfyui)
+import hashlib
+from pathlib import Path
+
+COMFY_DATA = Path(os.environ.get("CT_COMFY_DATA_DIR", "/content/drive/MyDrive/colab-llm/comfyui"))
+if not Path("/content/drive/MyDrive").is_dir():
+    raise RuntimeError("Google Drive is not mounted. Run via `./services/comfyui-models.py up`.")
+COMFY_DATA.mkdir(parents=True, exist_ok=True)
+
+os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+from huggingface_hub import HfApi, hf_hub_download
+
+# Built-in model packs (each item: repo / filename / dest_rel OR url / dest_rel)
+PACKS = {
+    "minimax-h3-native": [
+        # Diffusion models (T2V / I2V / FL2VA + R2V / Ref2VA)
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+         "dest": "models/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"},
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+         "dest": "models/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"},
+        # Text encoder
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+         "dest": "models/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"},
+        # Video & Audio VAEs
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "vae/minimax_h3_video_vae_int8_convrot.safetensors",
+         "dest": "models/vae/minimax_h3_video_vae_int8_convrot.safetensors"},
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "vae/minimax_h3_audio_vae_fp32.safetensors",
+         "dest": "models/vae/minimax_h3_audio_vae_fp32.safetensors"},
+        # Lightning Turbo LoRAs (8-step for FL2V, 4-step for Ref2V)
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+         "dest": "models/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+         "dest": "models/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"},
+        # Embeddings
+        {"repo": "Comfy-Org/MiniMax-H3",
+         "filename": "embeddings/minimaxh3_art_is_explosion.safetensors",
+         "dest": "models/embeddings/minimaxh3_art_is_explosion.safetensors"},
+        # Official workflow templates -> user/default/workflows/
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_t2v.json",
+         "dest": "user/default/workflows/video_minimax_h3_t2v.json"},
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_i2v.json",
+         "dest": "user/default/workflows/video_minimax_h3_i2v.json"},
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/video_minimax_h3_r2v.json",
+         "dest": "user/default/workflows/video_minimax_h3_r2v.json"},
+        # Official example input images -> input/
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/transparent_rgb_gaming_mouse.png",
+         "dest": "input/transparent_rgb_gaming_mouse.png"},
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/red_superboy_on_city_roof.png",
+         "dest": "input/red_superboy_on_city_roof.png"},
+        {"url": "https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/input/mecha_dragon_lightning.png",
+         "dest": "input/mecha_dragon_lightning.png"},
+    ],
+}
+
+MANIFEST_PATH = COMFY_DATA / "models" / ".download-manifest.json"
+STATUS_PATH = Path(WORK) / "status.json"
+STAGE_DIR = Path("/content/hf-stage")
+STAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+def mlog(msg):
+    print(time.strftime("[%F %T] ") + msg, flush=True)
+
+def load_manifest():
+    if MANIFEST_PATH.is_file():
+        try:
+            return json.loads(MANIFEST_PATH.read_text())
+        except Exception:
+            pass
+    return {"files": {}}
+
+def save_manifest(manifest):
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MANIFEST_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(MANIFEST_PATH)
+
+def write_status(state_dict):
+    tmp = STATUS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state_dict, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(STATUS_PATH)
+
+# Build incremental queue from CT_MODEL_PACKS + persistent queue file + CT_EXTRA_MODELS
+active_packs = [p.strip() for p in os.environ.get("CT_MODEL_PACKS", "minimax-h3-native").split(",") if p.strip()]
+items = []
+for p in active_packs:
+    if p not in PACKS:
+        raise ValueError(f"Unknown model pack '{p}' (available: {list(PACKS)})")
+    items.extend(PACKS[p])
+
+queue_file = COMFY_DATA / "models" / "download-queue.json"
+if queue_file.is_file():
+    try:
+        items.extend(json.loads(queue_file.read_text()))
+    except Exception as e:
+        mlog(f"Warning: could not parse {queue_file}: {e}")
+
+extra_json = os.environ.get("CT_EXTRA_MODELS", "").strip()
+if extra_json:
+    items.extend(json.loads(extra_json))
+
+# Resolve remote metadata (size & sha256) per HF repo once
+repo_meta = {}
+api = HfApi()
+for it in items:
+    repo = it.get("repo")
+    if repo and repo not in repo_meta:
+        info = api.model_info(repo, files_metadata=True)
+        repo_meta[repo] = {
+            s.rfilename: {"size": s.size, "sha256": (s.lfs or {}).get("sha256") if isinstance(s.lfs, dict) else getattr(s.lfs, "sha256", None)}
+            for s in info.siblings
+        }
+
+manifest = load_manifest()
+summary = {"packs": active_packs, "total": len(items), "completed": 0, "skipped": 0, "current": None, "files": []}
+write_status(summary)
+
+for idx, it in enumerate(items, 1):
+    dest_rel = it["dest"]
+    target = COMFY_DATA / dest_rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rec = manifest["files"].get(dest_rel, {})
+
+    if "repo" in it:
+        repo, fn = it["repo"], it["filename"]
+        meta = repo_meta.get(repo, {}).get(fn, {})
+        exp_size = it.get("size") or meta.get("size")
+        exp_sha = it.get("sha256") or meta.get("sha256")
+        if target.is_file() and exp_size and target.stat().st_size == exp_size:
+            if not exp_sha or rec.get("sha256") == exp_sha or rec.get("size") == exp_size:
+                mlog(f"[{idx}/{len(items)}] SKIP (already on Drive, {exp_size/1e9:.2f} GB): {dest_rel}")
+                manifest["files"][dest_rel] = {"repo": repo, "filename": fn, "size": exp_size, "sha256": exp_sha}
+                save_manifest(manifest)
+                summary["skipped"] += 1
+                summary["completed"] += 1
+                summary["files"].append({"dest": dest_rel, "size": exp_size, "status": "cached"})
+                write_status(summary)
+                continue
+
+        summary["current"] = {"index": idx, "dest": dest_rel, "size": exp_size, "source": f"{repo}/{fn}"}
+        write_status(summary)
+        mlog(f"[{idx}/{len(items)}] DOWNLOADING ({ (exp_size or 0)/1e9:.2f} GB): {repo}/{fn} -> {dest_rel}")
+        t0 = time.monotonic()
+        staged = Path(hf_hub_download(repo_id=repo, filename=fn, local_dir=STAGE_DIR))
+        actual_size = staged.stat().st_size
+        if exp_size and actual_size != exp_size:
+            staged.unlink(missing_ok=True)
+            raise RuntimeError(f"Size mismatch for {fn}: got {actual_size}, expected {exp_size}")
+
+        mlog(f"[{idx}/{len(items)}] Moving {actual_size/1e9:.2f} GB from local SSD -> Drive: {target}")
+        partial = target.with_name(target.name + ".partial")
+        h = hashlib.sha256()
+        copied, last_log = 0, time.monotonic()
+        with staged.open("rb") as src, partial.open("wb") as dst:
+            while chunk := src.read(16 * 1024 * 1024):
+                dst.write(chunk)
+                if exp_sha:
+                    h.update(chunk)
+                copied += len(chunk)
+                if time.monotonic() - last_log >= 20:
+                    mlog(f"  copy progress {target.name}: {copied/1e9:.2f}/{(exp_size or actual_size)/1e9:.2f} GB")
+                    last_log = time.monotonic()
+        if exp_sha and h.hexdigest() != exp_sha:
+            partial.unlink(missing_ok=True)
+            staged.unlink(missing_ok=True)
+            raise RuntimeError(f"SHA256 mismatch for {fn}: got {h.hexdigest()}, expected {exp_sha}")
+        partial.replace(target)
+        staged.unlink(missing_ok=True)
+        dt = time.monotonic() - t0
+        mlog(f"[{idx}/{len(items)}] DONE in {dt:.1f}s ({actual_size/1e6/max(dt,1):.1f} MB/s): {dest_rel}")
+        manifest["files"][dest_rel] = {"repo": repo, "filename": fn, "size": actual_size, "sha256": exp_sha,
+                                        "updated_at": time.strftime("%FT%T%z")}
+        save_manifest(manifest)
+        summary["completed"] += 1
+        summary["files"].append({"dest": dest_rel, "size": actual_size, "status": "downloaded"})
+        write_status(summary)
+    else:
+        url = it["url"]
+        if target.is_file() and target.stat().st_size > 0:
+            mlog(f"[{idx}/{len(items)}] SKIP (already on Drive): {dest_rel}")
+            summary["skipped"] += 1
+            summary["completed"] += 1
+            summary["files"].append({"dest": dest_rel, "size": target.stat().st_size, "status": "cached"})
+            write_status(summary)
+            continue
+        summary["current"] = {"index": idx, "dest": dest_rel, "source": url}
+        write_status(summary)
+        mlog(f"[{idx}/{len(items)}] FETCHING {url} -> {dest_rel}")
+        partial = target.with_name(target.name + ".partial")
+        urllib.request.urlretrieve(url, partial)
+        partial.replace(target)
+        sz = target.stat().st_size
+        manifest["files"][dest_rel] = {"url": url, "size": sz, "updated_at": time.strftime("%FT%T%z")}
+        save_manifest(manifest)
+        summary["completed"] += 1
+        summary["files"].append({"dest": dest_rel, "size": sz, "status": "downloaded"})
+        write_status(summary)
+
+summary["current"] = None
+summary["finished_at"] = time.strftime("%FT%T%z")
+write_status(summary)
+shutil.copyfile(STATUS_PATH, COMFY_DATA / "models" / ".last-download-status.json")
+mlog(f"All {summary['total']} items ready on Drive ({summary['skipped']} cached, {summary['total'] - summary['skipped']} newly downloaded).")
+'''
+COMFYUI_MODELS_SERVICE = r'''# @title 2. Service -- lightweight status & manifest HTTP server on 127.0.0.1:8189
+def start_service():
+    subprocess.run(["pkill", "-f", f"http.server {SERVICE_PORT}"], check=False)
+    return ct_spawn("service", [sys.executable, "-m", "http.server", str(SERVICE_PORT), "--bind", "127.0.0.1"],
+                    cwd=WORK)
+
+PROCS["service"] = (start_service(), start_service)
+ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/status.json", timeout=60)
+print(f"comfyui-models status server listening on 127.0.0.1:{SERVICE_PORT}")
+'''
+
 if __name__ == "__main__":
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
@@ -902,6 +1127,11 @@ if __name__ == "__main__":
                    "Bearer token for API clients). Models, custom_nodes, user settings, input, and output "
                    "persist in `CT_DATA_DIR` (`/content/drive/MyDrive/colab-llm/comfyui`).",
                    COMFYUI_CFG, COMFYUI_SETUP, COMFYUI_SERVICE))
+    write(ROOT / "services/comfyui-models.ipynb",
+          notebook("ComfyUI Model Downloader (Incremental)",
+                   "Dedicated Colab session to incrementally download and verify ComfyUI models, workflow templates, "
+                   "and input assets directly into `/content/drive/MyDrive/colab-llm/comfyui/`.",
+                   COMFYUI_MODELS_CFG, COMFYUI_MODELS_SETUP, COMFYUI_MODELS_SERVICE))
     write(ROOT / "services/ollama.ipynb",
           notebook("Ollama", "Ollama API behind Caddy auth (Ollama has no auth of its own). "
                    "Models: `CT_MODELS` (comma separated, default `qwen2.5:0.5b`).",

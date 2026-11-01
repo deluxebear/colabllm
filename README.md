@@ -23,6 +23,8 @@
 ├── services/
 │   ├── comfyui.py                      # ComfyUI + ComfyUI-Manager 执行脚本（Caddy 认证 auth="caddy"，默认 L4）
 │   ├── comfyui.ipynb                   # ComfyUI + ComfyUI-Manager notebook（模型/插件/输出持久化到 Google Drive）
+│   ├── comfyui-models.py               # ComfyUI 专用增量模型下载会话脚本（默认下载 MiniMax H3 全套模型与工作流，L4）
+│   ├── comfyui-models.ipynb            # ComfyUI 专用增量模型下载 notebook（HF Xet 高速下载 + SHA256 校验 + Drive 落盘）
 │   ├── unsloth-studio.py               # Unsloth Studio 执行脚本（自带登录 auth="builtin"，默认 L4）
 │   ├── unsloth-studio.ipynb            # Unsloth Studio notebook
 │   ├── ollama.py                       # Ollama 执行脚本（Caddy 认证 auth="caddy"，默认 T4）
