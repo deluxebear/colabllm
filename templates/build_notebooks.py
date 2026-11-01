@@ -387,7 +387,7 @@ def qlog(msg):
 def write_json_atomic(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(f"{path.name}.{SERVICE}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(value, indent=2) + "\n")
     tmp.replace(path)
 
@@ -481,7 +481,7 @@ def prepare_runtime(config, service, work):
         with tarfile.open(local_tar, "w", dereference=True) as bundle:
             bundle.add(bin_dir, arcname="bin")
         checksum_value = digest_file(local_tar)
-        partial = cache / "runtime.tar.partial"
+        partial = cache / f"runtime.tar.{SERVICE}.{os.getpid()}.partial"
         shutil.copyfile(local_tar, partial)
         partial.replace(archive)
         checksum.write_text(checksum_value + "\n")
@@ -619,7 +619,7 @@ def prepare_projector(config, service, work):
     backup = Path(config["model_root"]) / config["repo"] / item["name"]
     if not valid_shard(backup, item):
         backup.parent.mkdir(parents=True, exist_ok=True)
-        partial = backup.with_suffix(".gguf.partial")
+        partial = backup.with_suffix(f".gguf.{SERVICE}.{os.getpid()}.partial")
         shutil.copyfile(target, partial)
         if not valid_shard(partial, item):
             partial.unlink(missing_ok=True)
@@ -747,10 +747,14 @@ while time.monotonic() < pub_deadline:
             }, timeout=180)
             reply = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
             qlog(f"PUBLIC VERIFIED: {PUBLIC_URL}/v1 | reply={reply[:60]}")
-            write_json_atomic(SERVICE_DIR / "last-verification.json", {
+            ver_rec = {
+                "service": SERVICE,
                 "verified_at": time.strftime("%FT%T%z"), "base_url": PUBLIC_URL + "/v1",
                 "context_allocated": allocated, "vision_enabled": vision_enabled, "reply": reply,
-            })
+            }
+            write_json_atomic(SERVICE_DIR / "last-verification.json", ver_rec)
+            if SERVICE != "qwen-flash":
+                write_json_atomic(SERVICE_DIR / f"last-verification-{SERVICE}.json", ver_rec)
             break
     except Exception as err:
         qlog(f"Public probe pending ({type(err).__name__}: {err})")
@@ -779,6 +783,7 @@ while True:
         failures = 0
     gpu_mem = cmd_out(["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader"])
     status_rec = {
+        "service": SERVICE,
         "kernel_pid": os.getpid(), "server_pid": PROCS["service"][0].pid,
         "tunnel_pid": PROCS["cloudflared"][0].pid, "context": CFG["context"],
         "alias": CFG["alias"], "url": PUBLIC_URL + "/v1",
@@ -787,6 +792,8 @@ while True:
     }
     try:
         write_json_atomic(SERVICE_DIR / "last-status.json", status_rec)
+        if SERVICE != "qwen-flash":
+            write_json_atomic(SERVICE_DIR / f"last-status-{SERVICE}.json", status_rec)
     except OSError:
         pass
     qlog("heartbeat | " + gpu_mem)
@@ -1647,6 +1654,933 @@ ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/system_stats", timeout=300)
 print(f"ComfyUI listening on 127.0.0.1:{SERVICE_PORT}")
 '''
 
+# --------------------------------------------------------------------------- nemotron-transcribe (G4, vLLM + NeMo Speech SALM)
+NEMOTRON_TRANSCRIBE_CFG = dict(
+    name="nemotron-transcribe",
+    service_port=8000,
+    auth="builtin",
+    public_port=8000,
+    health_path="/health",
+    ready_timeout=3600,
+)
+
+NEMOTRON_TRANSCRIBE_SETUP = r'''# @title 1. Setup -- parallel NeMo Speech + vLLM 0.32 env & local SSD model download (67.5 GB BF16 / FP8 / NVFP4)
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import hashlib, platform
+
+PRECISION_REPOS = {
+    "bf16": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B",
+    "fp8": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-FP8",
+    "nvfp4": "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4",
+}
+PRECISION = os.environ.get("CT_NEMOTRON_PRECISION", "bf16").strip().lower()
+MODEL_REPO = os.environ.get("CT_NEMOTRON_REPO", "").strip() or PRECISION_REPOS.get(PRECISION, PRECISION_REPOS["bf16"])
+MODEL_ALIAS = os.environ.get("CT_NEMOTRON_ALIAS", "nemotron-transcribe").strip()
+NEMO_REPO = os.environ.get("CT_NEMO_SPEECH_REPO", "https://github.com/NVIDIA-NeMo/Speech.git").strip()
+
+NT_WORK = Path("/content/nemotron-transcribe")
+NEMO_DIR = Path("/content/nemo-speech")
+VENV_DIR = NEMO_DIR / ".venv"
+MODEL_DIR = NT_WORK / "model" / MODEL_REPO.split("/")[-1]
+DRIVE_AUDIO_DIR = Path(DATA_DIR) / "audio"
+DRIVE_OUTPUT_DIR = Path(DATA_DIR) / "outputs"
+FLASHINFER_DRIVE_DIR = Path(DATA_DIR) / "flashinfer-cache"
+FLASHINFER_CACHE_DIR = NT_WORK / "flashinfer-cache"
+
+for d in (NT_WORK, MODEL_DIR.parent, DRIVE_AUDIO_DIR, DRIVE_OUTPUT_DIR, FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+if any(FLASHINFER_DRIVE_DIR.iterdir()):
+    subprocess.run(["cp", "-rn", f"{FLASHINFER_DRIVE_DIR}/.", f"{FLASHINFER_CACHE_DIR}/"], check=False)
+
+def nlog(msg):
+    print(time.strftime("[%F %T] [nemotron] ") + msg, flush=True)
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-40:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+gpu_info = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader"], text=True
+).strip()
+nlog(f"GPU detected: {gpu_info} | repo={MODEL_REPO} precision={PRECISION}")
+
+if not shutil.which("ffmpeg"):
+    subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1", shell=True, check=False)
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def prepare_env():
+    env_log = NT_WORK / "env-setup.log"
+    marker = VENV_DIR / ".ct_env_ready"
+    vllm_bin = VENV_DIR / "bin" / "vllm"
+    py_bin = VENV_DIR / "bin" / "python"
+    if marker.is_file() and vllm_bin.is_file() and py_bin.is_file():
+        nlog("Reusing existing NeMo Speech + vLLM 0.32 virtualenv")
+        return VENV_DIR
+
+    nlog(f"Setting up NeMo Speech + vLLM 0.32 environment (log: {env_log})...")
+    if not (NEMO_DIR / ".git").is_dir():
+        run_logged(["git", "clone", "--depth", "1", NEMO_REPO, str(NEMO_DIR)], env_log)
+    else:
+        run_logged(["git", "-C", str(NEMO_DIR), "pull", "--ff-only"], env_log, check=False)
+
+    uv_bin = shutil.which("uv") or "uv"
+    run_logged([uv_bin, "venv", "--python", "3.13", str(VENV_DIR), "--clear"], env_log, cwd=str(NEMO_DIR))
+    sync_env = {**os.environ, "UV_PROJECT_ENVIRONMENT": str(VENV_DIR)}
+    res = run_logged(
+        [uv_bin, "sync", "--extra", "asr", "--extra", "vllm", "--locked", "--no-install-project"],
+        env_log, env=sync_env, cwd=str(NEMO_DIR), check=False
+    )
+    if res.returncode != 0:
+        nlog("`uv sync --locked` exited non-zero; retrying without `--locked`...")
+        run_logged(
+            [uv_bin, "sync", "--extra", "asr", "--extra", "vllm", "--no-install-project"],
+            env_log, env=sync_env, cwd=str(NEMO_DIR)
+        )
+    run_logged([uv_bin, "pip", "install", "--python", str(py_bin), "--no-deps", "-e", str(NEMO_DIR)], env_log)
+    run_logged(
+        [uv_bin, "pip", "install", "--python", str(py_bin), "--no-deps", "av==19.0.2", "opencv-python-headless==5.0.0.93"],
+        env_log,
+    )
+
+    # Apply official NVIDIA DFlash2 safety patch to vLLM 0.32 if applicable
+    patch_code = r"""
+from pathlib import Path
+import vllm
+path = Path(vllm.__file__).parent / "model_executor/models/qwen3_dflash2.py"
+if path.is_file():
+    source = path.read_text()
+    old = "    successors = successor_table[candidate_ids]\n"
+    anchor = "            anchor_token_ids[:, None, None].expand(-1, 1, top_k),"
+    if "safe_anchor_token_ids" not in source and source.count(old) == 1 and source.count(anchor) == 1:
+        source = source.replace(old, (
+            "    safe_anchor_token_ids = anchor_token_ids.clamp(\n"
+            "        min=0, max=predecessor_table.shape[0] - 1\n"
+            "    )\n" + old
+        )).replace(anchor, "            safe_anchor_token_ids[:, None, None].expand(-1, 1, top_k),")
+        path.write_text(source)
+"""
+    run_logged([str(py_bin), "-c", patch_code], env_log, check=False)
+    run_logged([str(vllm_bin), "download-kernels"], env_log, env=sync_env, check=False)
+    marker.write_text("ok\n", encoding="utf-8")
+    nlog("NeMo Speech + vLLM 0.32 environment ready")
+    return VENV_DIR
+
+def _cleanup_hf_temp():
+    for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub", str(MODEL_DIR / ".cache")):
+        shutil.rmtree(p, ignore_errors=True)
+
+def prepare_model():
+    dl_log = NT_WORK / "model-download.log"
+    marker = MODEL_DIR / ".ct_model_ready"
+    has_weights = any(MODEL_DIR.glob("*.safetensors")) if MODEL_DIR.is_dir() else False
+    if marker.is_file() and (MODEL_DIR / "config.json").is_file() and has_weights:
+        nlog(f"Reusing local SSD model at {MODEL_DIR}")
+        return MODEL_DIR
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+    _cleanup_hf_temp()
+    free_gb = shutil.disk_usage("/content").free / 1e9
+    nlog(f"Downloading {MODEL_REPO} -> local SSD {MODEL_DIR} (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+    dl_code = (
+        "import sys; from huggingface_hub import snapshot_download; "
+        "snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])"
+    )
+    try:
+        run_logged([sys.executable, "-c", dl_code, MODEL_REPO, str(MODEL_DIR)], dl_log, env=dl_env)
+    finally:
+        _cleanup_hf_temp()
+
+    if not (MODEL_DIR / "config.json").is_file() or not any(MODEL_DIR.glob("*.safetensors")):
+        raise RuntimeError(f"Model download incomplete in {MODEL_DIR}")
+    marker.write_text(MODEL_REPO + "\n", encoding="utf-8")
+    total_gb = sum(p.stat().st_size for p in MODEL_DIR.rglob("*") if p.is_file()) / 1e9
+    nlog(f"Model ready on local SSD: {MODEL_DIR} ({total_gb:.2f} GB)")
+    return MODEL_DIR
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    f_env = pool.submit(prepare_env)
+    f_mod = pool.submit(prepare_model)
+    while not (f_env.done() and f_mod.done()):
+        for fut in (f_env, f_mod):
+            if fut.done() and fut.exception():
+                raise fut.exception()
+        free_gb = shutil.disk_usage("/content").free / 1e9
+        nlog(f"Setup heartbeat | env={'done' if f_env.done() else 'running'} "
+             f"model={'done' if f_mod.done() else 'running'} | free_ssd={free_gb:.1f} GB")
+        time.sleep(30)
+    VENV_DIR = f_env.result()
+    MODEL_DIR = f_mod.result()
+
+nlog(f"Setup complete: venv={VENV_DIR} model={MODEL_DIR} drive_data={DATA_DIR}")
+'''
+
+NEMOTRON_TRANSCRIBE_SERVICE = r'''# @title 2. Service -- vLLM + NeMo Speech SALM on 127.0.0.1:8000 with Bearer Auth + Google Drive Audio API
+(NT_WORK / "ct_nemotron_middleware.py").write_text(r"""from __future__ import annotations
+
+import asyncio
+import base64
+import glob as glob_mod
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any
+
+from starlette.responses import JSONResponse
+from nemo.collections.speechlm2.vllm.salm.ctc_serving import ctc_timestamp_middleware
+
+API_TOKEN = os.environ.get("CT_API_TOKEN", "")
+SERVICE_PORT = int(os.environ.get("CT_SERVICE_PORT", "8000"))
+DATA_DIR = Path(os.environ.get("CT_DATA_DIR", "/content/drive/MyDrive/colab-llm/nemotron-transcribe"))
+DRIVE_ROOT = Path("/content/drive")
+MYDRIVE_ROOT = Path("/content/drive/MyDrive")
+MODEL_REPO = os.environ.get("CT_NEMOTRON_REPO", "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B")
+
+AUDIO_EXTS = (
+    ".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".webm", ".mp4", ".mkv", ".wma", ".mpga", ".mpeg",
+)
+DIRECT_MIMES = {
+    ".wav": "audio/wav",
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+}
+
+PRESETS: dict[str, dict[str, Any]] = {
+    "verbatim": {
+        "description": "逐字转写（保留语气词、重复、标点与大小写，多语种通用默认推荐）",
+        "user_prompt": (
+            "Audio transcription. Language: as spoken. Wording: verbatim, including fillers and repetitions. "
+            "Formatting: punctuation and capitalization. Output: transcript only."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "clean": {
+        "description": "整洁书面转写（去除口头禅与无意重复，保留原意与标点大小写）",
+        "user_prompt": (
+            "Audio transcription. Language: as spoken. Wording: omit fillers and accidental repetitions; "
+            "keep the remaining spoken wording unchanged. Formatting: punctuation and capitalization. "
+            "Output: transcript only."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "speaker": {
+        "description": "说话人分离转写 + 词级时间戳（带 <spk:0> <spk:1> 标签，配合 timestamps=True）",
+        "user_prompt": (
+            "Transcribe this audio with punctuation and capitalization. Include all spoken words and verbal fillers. "
+            "Write numbers in their standard written form. Put speaker tags <spk:0> <spk:1> <spk:2> <spk:3> on the transcription."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": True,
+    },
+    "multispeaker": {
+        "description": "多说话人纯文本转写（无标点小写，每轮讲话前标注 <spk:N>）",
+        "user_prompt": (
+            "Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. "
+            "Use no punctuation and no capitalization. Start every speaker turn with a speaker tag such as "
+            "<spk:0>, <spk:1>, <spk:2>, etc.; assign one stable tag per speaker and keep speaker identities "
+            "consistent. Output only the speaker-tagged transcript."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "rich": {
+        "description": "富文本转写（包含非语音事件 <ev:*> 与说话风格 <sty:*> 标签）",
+        "user_prompt": (
+            "Transcribe this audio with punctuation and capitalization. Include all spoken words and verbal fillers. "
+            "Write numbers in their standard written form. Use <ev:*> and <sty:*> special tokens to recognize all "
+            "non-speech verbatims and speaking style."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "near-field": {
+        "description": "仅转写距离麦克风最近的主讲人（过滤远场背景人声）",
+        "user_prompt": (
+            "Transcribe this audio. Include all spoken words and verbal fillers. Write numbers as spoken. "
+            "No punctuation or capitalization. Transcribe only the speaker nearest to the microphone. "
+            "Do not transcribe any other voices."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "structured": {
+        "description": "结构化内容转写（精确保留邮箱、URL、文件路径、命令、编号与标点分隔符）",
+        "user_prompt": (
+            "Transcribe as a clean written transcript. Preserve exact values and punctuation/separators in emails, "
+            "URLs, file paths, commands, and identifiers. Use conventional written forms."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "context": {
+        "description": "带领域词汇/专有名词提示的上下文偏置转写（配合 context 参数）",
+        "user_prompt": "Transcribe with punctuation and capitalization. Context terms: {context}.",
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "translate": {
+        "description": "语音直接翻译为目标语言文本（配合 lang 参数，如 Chinese / English / Japanese）",
+        "user_prompt": "Please translate the given speech to {lang}.",
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "lid": {
+        "description": "语种识别（输出录音对应的语言标签）",
+        "user_prompt": (
+            "Identify the language spoken in this audio. Respond with exactly one of the following locale labels "
+            "and nothing else: ar_eg, bg_bg, cmn_hans_cn, hr_hr, cs_cz, da_dk, nl_nl, en_us, et_ee, fil_ph, fi_fi, "
+            "fr_fr, de_de, el_gr, he_il, hi_in, hu_hu, id_id, it_it, ja_jp, ko_kr, lv_lv, lt_lt, mt_mt, pl_pl, "
+            "pt_br, ro_ro, ru_ru, sk_sk, sl_si, es_419, sv_se, th_th, tr_tr, uk_ua, vi_vn."
+        ),
+        "system_prompt": "",
+        "reasoning": False,
+        "timestamps": False,
+    },
+    "qa": {
+        "description": "音频理解与问答（开启推理模式 enable_thinking=True，根据录音内容回答问题）",
+        "user_prompt": "What is happening in this audio?",
+        "system_prompt": (
+            "Answer the question directly using evidence from every provided audio clip in order. "
+            "Answer every requested part, preserve exact names and numbers, and give a concise, specific answer first. "
+            "Do not invent details."
+        ),
+        "reasoning": True,
+        "timestamps": False,
+    },
+}
+
+CHAR_RUN = re.compile(r"(.)\1{20,}", re.DOTALL)
+BLOCK_RUN = re.compile(r"(.{1,4096}?)\1{19,}", re.DOTALL)
+
+def cleanup_generation_loops(text: str) -> str:
+    if not text:
+        return text
+    text = CHAR_RUN.sub(lambda m: m.group(1), text)
+    return BLOCK_RUN.sub(lambda m: m.group(1), text)
+
+def _check_auth(request: Any) -> bool:
+    if not API_TOKEN:
+        return True
+    auth = request.headers.get("authorization") or ""
+    if auth == f"Bearer {API_TOKEN}":
+        return True
+    xkey = request.headers.get("x-api-key") or ""
+    if xkey == API_TOKEN:
+        return True
+    return False
+
+def _resolve_drive_path(raw_spec: str) -> Path:
+    spec = (raw_spec or "").strip()
+    for prefix in ("drive://", "gdrive://", "file://"):
+        if spec.startswith(prefix):
+            spec = spec[len(prefix):]
+    spec = spec.lstrip("/")
+    if not spec:
+        return MYDRIVE_ROOT if MYDRIVE_ROOT.is_dir() else DATA_DIR
+
+    candidates = []
+    if spec.startswith("content/drive/"):
+        candidates.append(Path("/") / spec)
+    elif spec.startswith("drive/"):
+        candidates.append(Path("/content") / spec)
+    elif spec.startswith("MyDrive/"):
+        candidates.append(DRIVE_ROOT / spec)
+    elif spec == "MyDrive":
+        candidates.append(MYDRIVE_ROOT)
+    else:
+        candidates.append(MYDRIVE_ROOT / spec)
+        candidates.append(DATA_DIR / spec)
+        candidates.append(DATA_DIR / "audio" / spec)
+        candidates.append(Path("/") / spec)
+
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return candidates[0].resolve()
+
+def _rel_to_mydrive(p: Path) -> str:
+    try:
+        return str(p.resolve().relative_to(MYDRIVE_ROOT.resolve()))
+    except Exception:
+        return str(p)
+
+SKIP_DRIVE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "custom_nodes",
+    "models", ".runtimes", "Takeout", ".Trash", ".ipynb_checkpoints",
+}
+
+def _list_drive_audio_files(spec: str, recursive: bool = False) -> list[dict[str, Any]]:
+    raw = (spec or "").strip()
+    for prefix in ("drive://", "gdrive://", "file://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+
+    has_glob = any(ch in raw for ch in ("*", "?", "["))
+    matched_paths: list[Path] = []
+
+    if has_glob:
+        clean = raw.lstrip("/")
+        bases = []
+        if clean.startswith("content/drive/"):
+            bases.append(Path("/") / clean)
+        elif clean.startswith("MyDrive/"):
+            bases.append(DRIVE_ROOT / clean)
+        else:
+            bases.append(MYDRIVE_ROOT / clean)
+            bases.append(DATA_DIR / clean)
+            bases.append(DATA_DIR / "audio" / clean)
+        seen = set()
+        for pattern_path in bases:
+            for hit in sorted(glob_mod.glob(str(pattern_path), recursive=True)):
+                hp = Path(hit).resolve()
+                if hp.is_file() and hp.suffix.lower() in AUDIO_EXTS and str(hp) not in seen:
+                    seen.add(str(hp))
+                    matched_paths.append(hp)
+    else:
+        target = _resolve_drive_path(raw)
+        if target.is_file():
+            matched_paths.append(target)
+        elif target.is_dir():
+            if not recursive:
+                for hp in sorted(target.iterdir()):
+                    if hp.is_file() and hp.suffix.lower() in AUDIO_EXTS:
+                        matched_paths.append(hp.resolve())
+            else:
+                for root_dir, dirnames, filenames in os.walk(target):
+                    dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DRIVE_DIRS and not d.startswith("."))
+                    for fn in sorted(filenames):
+                        hp = Path(root_dir) / fn
+                        if hp.suffix.lower() in AUDIO_EXTS:
+                            matched_paths.append(hp.resolve())
+
+    items = []
+    for p in matched_paths:
+        st = p.stat()
+        items.append({
+            "drive_path": str(p),
+            "rel_path": _rel_to_mydrive(p),
+            "name": p.name,
+            "size_bytes": st.st_size,
+            "size_mb": round(st.st_size / 1e6, 2),
+            "mtime": int(st.st_mtime),
+        })
+    return items
+
+def _load_audio_as_data_url(audio_path: Path, force_ffmpeg_16k: bool = False) -> str:
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Audio file not found on Google Drive: {audio_path}")
+    ext = audio_path.suffix.lower()
+    sz = audio_path.stat().st_size
+    if not force_ffmpeg_16k and ext in DIRECT_MIMES and sz <= 140 * 1024 * 1024:
+        b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+        return f"data:{DIRECT_MIMES[ext]};base64,{b64}"
+    # Convert video containers or large files to 16kHz mono PCM16 WAV in memory via ffmpeg
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error", "-i", str(audio_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if res.returncode != 0 or not res.stdout:
+        err = res.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed decoding {audio_path.name}: {err}")
+    b64 = base64.b64encode(res.stdout).decode("ascii")
+    return f"data:audio/wav;base64,{b64}"
+
+def _fmt_srt_time(seconds: float) -> str:
+    ms = max(0, int(round(seconds * 1000)))
+    h, rem = divmod(ms, 3600_000)
+    m, rem = divmod(rem, 60_000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+def _words_to_srt(words: list[dict[str, Any]]) -> str:
+    if not words:
+        return ""
+    segments = []
+    cur_words: list[str] = []
+    cur_start = 0.0
+    cur_end = 0.0
+    cur_spk = None
+
+    def flush():
+        nonlocal cur_words, cur_start, cur_end, cur_spk
+        if not cur_words:
+            return
+        prefix = f"[{cur_spk}] " if cur_spk else ""
+        text = prefix + " ".join(cur_words).strip()
+        segments.append((cur_start, max(cur_end, cur_start + 0.2), text))
+        cur_words = []
+
+    for w in words:
+        w_text = str(w.get("word") or "").strip()
+        if not w_text:
+            continue
+        w_start = float(w.get("start") or 0.0)
+        w_end = float(w.get("end") or w_start)
+        w_spk = w.get("speaker")
+        if not cur_words:
+            cur_start = w_start
+            cur_end = w_end
+            cur_spk = w_spk
+            cur_words.append(w_text)
+            continue
+        gap = w_start - cur_end
+        spk_changed = (w_spk != cur_spk)
+        if spk_changed or gap > 1.2 or len(cur_words) >= 14 or (len(cur_words) >= 6 and cur_words[-1].endswith((".", "?", "!", "。", "？", "！"))):
+            flush()
+            cur_start = w_start
+            cur_end = w_end
+            cur_spk = w_spk
+            cur_words.append(w_text)
+        else:
+            cur_end = max(cur_end, w_end)
+            cur_words.append(w_text)
+    flush()
+
+    lines = []
+    for idx, (st_t, ed_t, txt) in enumerate(segments, 1):
+        lines.append(f"{idx}\n{_fmt_srt_time(st_t)} --> {_fmt_srt_time(ed_t)}\n{txt}\n")
+    return "\n".join(lines)
+
+def _build_prompt_and_settings(body: dict[str, Any]) -> tuple[str, str, bool, bool]:
+    preset_name = (body.get("preset") or "").strip().lower()
+    preset = PRESETS.get(preset_name) if preset_name else None
+
+    user_prompt = body.get("prompt")
+    if user_prompt is None or str(user_prompt).strip() == "":
+        user_prompt = preset["user_prompt"] if preset else PRESETS["verbatim"]["user_prompt"]
+    user_prompt = str(user_prompt)
+
+    context_terms = (body.get("context") or "").strip()
+    target_lang = (body.get("lang") or body.get("language") or "Chinese").strip()
+    if "{context}" in user_prompt:
+        user_prompt = user_prompt.replace("{context}", context_terms or "general")
+    elif context_terms and "Context terms:" not in user_prompt:
+        user_prompt = f"{user_prompt.rstrip()} Context terms: {context_terms}."
+    if "{lang}" in user_prompt:
+        user_prompt = user_prompt.replace("{lang}", target_lang)
+
+    sys_prompt = body.get("system_prompt")
+    if sys_prompt is None:
+        sys_prompt = preset["system_prompt"] if preset else ""
+    sys_prompt = str(sys_prompt)
+
+    reasoning = body.get("reasoning")
+    if reasoning is None:
+        reasoning = bool(preset["reasoning"]) if preset else False
+    else:
+        reasoning = bool(reasoning)
+
+    timestamps = body.get("timestamps")
+    if timestamps is None:
+        timestamps = bool(preset["timestamps"]) if preset else False
+    else:
+        timestamps = bool(timestamps)
+
+    return user_prompt, sys_prompt, reasoning, timestamps
+
+def _call_local_chat_completions(payload: dict[str, Any], timeout: int = 1800) -> tuple[int, dict[str, Any]]:
+    headers = {"Content-Type": "application/json"}
+    if API_TOKEN:
+        headers["Authorization"] = f"Bearer {API_TOKEN}"
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{SERVICE_PORT}/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", errors="replace")
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, {"error": {"message": raw, "code": e.code}}
+
+def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    t0 = time.monotonic()
+    raw_path = (body.get("drive_path") or body.get("audio") or body.get("path") or "").strip()
+    if not raw_path:
+        return 400, {"error": "Missing 'drive_path' (Google Drive audio file path)"}
+
+    audio_path = _resolve_drive_path(raw_path)
+    if not audio_path.is_file():
+        return 404, {
+            "error": f"Audio file not found on Google Drive: '{raw_path}' (resolved to '{audio_path}')",
+            "resolved_path": str(audio_path),
+            "drive_mounted": MYDRIVE_ROOT.is_dir(),
+        }
+
+    user_prompt, sys_prompt, reasoning, timestamps = _build_prompt_and_settings(body)
+    force_ffmpeg = bool(body.get("normalize_audio", False))
+    data_url = _load_audio_as_data_url(audio_path, force_ffmpeg_16k=force_ffmpeg)
+
+    messages: list[dict[str, Any]] = []
+    if sys_prompt:
+        messages.append({"role": "system", "content": sys_prompt})
+    messages.append({
+        "role": "user",
+        "content": [
+            {"type": "text", "text": user_prompt},
+            {"type": "audio_url", "audio_url": {"url": data_url}},
+        ],
+    })
+
+    extra_body: dict[str, Any] = {
+        "chat_template_kwargs": {"enable_thinking": reasoning},
+        "skip_special_tokens": bool(body.get("skip_special_tokens", False)),
+        "spaces_between_special_tokens": False,
+        "seed": int(body.get("seed", 0)),
+    }
+    if reasoning:
+        extra_body.update(top_k=-1, thinking_token_budget=int(body.get("thinking_token_budget", 17408)))
+        extra_body["chat_template_kwargs"]["reasoning_budget"] = int(body.get("reasoning_budget", 16384))
+    if timestamps:
+        extra_body["mm_processor_kwargs"] = {"capture_ctc_timestamps": True}
+
+    temp = body.get("temperature")
+    if temp is None:
+        temp = 0.6 if reasoning else 0.0
+    top_p = body.get("top_p")
+    if top_p is None:
+        top_p = 0.95 if reasoning else 1.0
+    max_tokens = body.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = 20480 if reasoning else 16384
+
+    chat_payload = {
+        "model": body.get("model") or MODEL_REPO,
+        "messages": messages,
+        "temperature": float(temp),
+        "top_p": float(top_p),
+        "max_tokens": int(max_tokens),
+        **extra_body,
+    }
+
+    status_code, completion = _call_local_chat_completions(chat_payload)
+    if status_code != 200:
+        return status_code, completion
+
+    choice = (completion.get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    text = msg.get("content") or ""
+    reasoning_content = msg.get("reasoning_content") or msg.get("reasoning") or None
+    if not reasoning and body.get("cleanup_loops", True):
+        text = cleanup_generation_loops(text)
+
+    ctc_ts = completion.get("ctc_timestamps")
+    words = (ctc_ts or {}).get("words") or [] if isinstance(ctc_ts, dict) else []
+    srt_text = _words_to_srt(words) if words else ""
+
+    elapsed = round(time.monotonic() - t0, 2)
+    result: dict[str, Any] = {
+        "drive_path": str(audio_path),
+        "rel_path": _rel_to_mydrive(audio_path),
+        "prompt": user_prompt,
+        "system_prompt": sys_prompt,
+        "preset": body.get("preset") or None,
+        "reasoning": reasoning,
+        "timestamps": timestamps,
+        "text": text,
+        "reasoning_content": reasoning_content,
+        "ctc_timestamps": ctc_ts,
+        "srt": srt_text or None,
+        "elapsed_sec": elapsed,
+        "usage": completion.get("usage"),
+        "saved_drive_files": [],
+    }
+
+    save_to_drive = bool(body.get("save_to_drive", False))
+    save_drive_dir = (body.get("save_drive_dir") or "").strip()
+    if save_to_drive or save_drive_dir:
+        out_dir = _resolve_drive_path(save_drive_dir) if save_drive_dir else audio_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = audio_path.stem
+        txt_file = out_dir / f"{stem}.txt"
+        txt_file.write_text(text + ("\n" if not text.endswith("\n") else ""), encoding="utf-8")
+        result["saved_drive_files"].append(str(txt_file))
+
+        json_file = out_dir / f"{stem}.nemotron.json"
+        json_file.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        result["saved_drive_files"].append(str(json_file))
+
+        if srt_text:
+            srt_file = out_dir / f"{stem}.srt"
+            srt_file.write_text(srt_text, encoding="utf-8")
+            result["saved_drive_files"].append(str(srt_file))
+
+    return 200, result
+
+def _rewrite_drive_urls_in_chat_body(raw_body: bytes) -> bytes | None:
+    if b"drive://" not in raw_body and b"gdrive://" not in raw_body and b"/content/drive/" not in raw_body:
+        return None
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    changed = False
+    for msg in payload.get("messages") or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "audio_url":
+                continue
+            aurl = item.get("audio_url")
+            url_val = aurl.get("url") if isinstance(aurl, dict) else None
+            if isinstance(url_val, str) and url_val.startswith(("drive://", "gdrive://", "/content/drive/", "file:///content/drive/")):
+                ap = _resolve_drive_path(url_val)
+                aurl["url"] = _load_audio_as_data_url(ap)
+                changed = True
+    if not changed:
+        return None
+    return json.dumps(payload).encode("utf-8")
+
+async def nemotron_middleware(request: Any, call_next: Any) -> Any:
+    path = request.scope["path"].removeprefix(request.scope.get("root_path", ""))
+    client_host = (request.client.host if request.client else "") or ""
+
+    # Allow local watchdog health probe without auth
+    if path == "/health" and client_host in ("127.0.0.1", "::1", "localhost") and not request.headers.get("authorization"):
+        return await call_next(request)
+
+    if not _check_auth(request):
+        return JSONResponse(
+            {"error": {"message": "Unauthorized: invalid or missing Bearer token", "type": "AuthenticationError", "code": 401}},
+            status_code=HTTPStatus.UNAUTHORIZED,
+        )
+
+    if request.method == "GET" and path == "/api/ct/prompts":
+        return JSONResponse({"presets": PRESETS, "default_preset": "verbatim"})
+
+    if request.method == "GET" and path == "/api/ct/drive-list":
+        spec = request.query_params.get("path", "")
+        recursive = request.query_params.get("recursive", "1") not in ("0", "false", "False")
+        try:
+            files = await asyncio.to_thread(_list_drive_audio_files, spec, recursive)
+            return JSONResponse({
+                "drive_mounted": MYDRIVE_ROOT.is_dir(),
+                "query": spec,
+                "count": len(files),
+                "files": files,
+            })
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+    if request.method == "POST" and path == "/api/ct/drive-transcribe":
+        try:
+            body = json.loads(await request.body())
+            code, res = await asyncio.to_thread(_run_drive_transcribe_sync, body)
+            return JSONResponse(res, status_code=code)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    if request.method == "POST" and path == "/v1/chat/completions":
+        raw_body = await request.body()
+        rewritten = await asyncio.to_thread(_rewrite_drive_urls_in_chat_body, raw_body)
+        if rewritten is not None:
+            code, res = await asyncio.to_thread(_call_local_chat_completions, json.loads(rewritten))
+            return JSONResponse(res, status_code=code)
+        return await ctc_timestamp_middleware(request, call_next)
+
+    return await call_next(request)
+""", encoding="utf-8")
+
+GPU_MEM_UTIL = os.environ.get("CT_NEMOTRON_GPU_MEM", "0.92" if PRECISION == "bf16" else "0.85")
+MAX_MODEL_LEN = int(os.environ.get("CT_NEMOTRON_MAX_MODEL_LEN", "65536"))
+MAX_NUM_SEQS = int(os.environ.get("CT_NEMOTRON_MAX_SEQS", "64"))
+MTP_TOKENS = int(os.environ.get("CT_NEMOTRON_MTP", "8"))
+LIMIT_MM = os.environ.get(
+    "CT_NEMOTRON_LIMIT_MM",
+    '{"audio":{"count":6,"length":120000000}}' if PRECISION == "bf16" else '{"audio":{"count":1,"length":57600000}}',
+)
+
+VLLM_ENV = {
+    "PATH": f"{VENV_DIR}/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
+    "PYTHONPATH": f"{NT_WORK}:{os.environ.get('PYTHONPATH', '')}",
+    "VIRTUAL_ENV": str(VENV_DIR),
+    "VLLM_PLUGINS": "nemo_speechlm",
+    "VLLM_MAX_AUDIO_DECODE_DURATION_S": "3600",
+    "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": "180",
+    "VLLM_USE_V2_MODEL_RUNNER": "0",
+    "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "CT_API_TOKEN": API_TOKEN,
+    "CT_SERVICE_PORT": str(SERVICE_PORT),
+    "CT_DATA_DIR": str(DATA_DIR),
+    "CT_NEMOTRON_REPO": MODEL_REPO,
+}
+if PRECISION in ("fp8", "nvfp4"):
+    VLLM_ENV["VLLM_DISABLED_KERNELS"] = "FlashInferFP8ScaledMMLinearKernel"
+
+SERVER_ARGS = [
+    str(VENV_DIR / "bin" / "vllm"), "serve", str(MODEL_DIR),
+    "--served-model-name", MODEL_REPO, MODEL_ALIAS,
+    "--host", "127.0.0.1",
+    "--port", str(SERVICE_PORT),
+    "--api-key", API_TOKEN,
+    "--trust-remote-code",
+    "--dtype", "bfloat16",
+    "--gpu-memory-utilization", str(GPU_MEM_UTIL),
+    "--max-model-len", str(MAX_MODEL_LEN),
+    "--max-num-batched-tokens", "4096",
+    "--max-num-seqs", str(MAX_NUM_SEQS),
+    "--enable-chunked-prefill",
+    "--no-enable-prefix-caching",
+    "--use-replayssm",
+    "--mamba-backend", "flashinfer",
+    "--mamba-cache-mode", "none",
+    "--mm-processor-cache-gb", "0",
+    "--no-async-scheduling",
+    "--limit-mm-per-prompt", LIMIT_MM,
+    "--reasoning-parser", "nemotron_v3",
+    "--trust-request-mm-kwargs",
+    "--middleware", "ct_nemotron_middleware.nemotron_middleware",
+]
+if PRECISION in ("fp8", "nvfp4"):
+    SERVER_ARGS += ["--kv-cache-dtype", "auto"]
+if MTP_TOKENS > 0:
+    SERVER_ARGS += [
+        "--speculative-config",
+        json.dumps({"method": "mtp", "num_speculative_tokens": MTP_TOKENS}),
+    ]
+
+def start_service():
+    subprocess.run(["pkill", "-f", "vllm serve"], check=False)
+    nlog(f"Starting vLLM server on 127.0.0.1:{SERVICE_PORT} (model={MODEL_REPO}, mtp={MTP_TOKENS}, ctx={MAX_MODEL_LEN})")
+    return ct_spawn("service", SERVER_ARGS, env=VLLM_ENV, cwd=str(NT_WORK))
+
+PROCS["service"] = (start_service(), start_service)
+'''
+
+NEMOTRON_TRANSCRIBE_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- wait for model load/FlashInfer warmup, verify Bearer auth, supervise
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=20):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url, headers=headers, data=None if payload is None else json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {})
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-token-probe", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 2400
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        raise RuntimeError("vLLM exited during startup:\n" + ct_tail("service", 60))
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 30:
+        gpu_stat = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader"],
+            text=True,
+        ).strip()
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["starting..."])[-1]
+        nlog(f"Waiting for vLLM load / FlashInfer kernel warmup | GPU: {gpu_stat} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    raise RuntimeError("Timed out waiting for vLLM server to become ready:\n" + ct_tail("service", 60))
+
+auth_check(LOCAL_BASE, API_TOKEN)
+if FLASHINFER_CACHE_DIR.is_dir() and FLASHINFER_DRIVE_DIR.is_dir():
+    subprocess.run(["cp", "-ru", f"{FLASHINFER_CACHE_DIR}/.", f"{FLASHINFER_DRIVE_DIR}/"], check=False)
+code, presets_info = http_json(LOCAL_BASE + "/api/ct/prompts", API_TOKEN)
+if code != 200:
+    raise RuntimeError(f"Local /api/ct/prompts check failed: HTTP {code}")
+nlog(f"Local endpoint verified: /v1/models (401/401/200) & /api/ct/prompts ({ len(presets_info.get('presets', {})) } presets)")
+
+pub_deadline = time.monotonic() + 120
+while time.monotonic() < pub_deadline:
+    try:
+        code, _ = http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)
+        if code == 200:
+            auth_check(PUBLIC_URL, API_TOKEN)
+            nlog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+            break
+    except Exception as err:
+        nlog(f"Public probe pending ({type(err).__name__}: {err})")
+    time.sleep(8)
+
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+started = time.monotonic()
+failures = 0
+while True:
+    time.sleep(60)
+    for name, (proc, restart) in list(PROCS.items()):
+        if proc.poll() is not None:
+            nlog(f"[watchdog] {name} exited with {proc.returncode}; restarting\n{ct_tail(name, 20)}")
+            PROCS[name] = (restart(), restart)
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        failures = 0 if code == 200 else failures + 1
+    except Exception:
+        failures += 1
+    if failures >= 6:
+        nlog("[watchdog] 6 failed health checks; restarting vLLM service")
+        PROCS["service"][0].terminate()
+        PROCS["service"] = (start_service(), start_service)
+        failures = 0
+    gpu_mem = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader"],
+        text=True,
+    ).strip()
+    nlog(f"heartbeat | up={int(time.monotonic() - started)}s | GPU: {gpu_mem}")
+'''
+
 if __name__ == "__main__":
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
@@ -1673,3 +2607,11 @@ if __name__ == "__main__":
                    "`--load-mode none --lazy-mode off`) on a Colab G4 (RTX PRO 6000 Blackwell sm_120) with "
                    "`llama-server --api-key-file` authentication.",
                    QWEN_FLASH_CFG, QWEN_FLASH_SETUP, QWEN_FLASH_SERVICE, keepalive=QWEN_FLASH_KEEPALIVE))
+    write(ROOT / "services/nemotron-transcribe.ipynb",
+          notebook("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech)",
+                   "Serves `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` (BF16 / FP8 / NVFP4, 65536 context, "
+                   "up to 1-hour audio, 40 languages, MTP8 speculative decoding, CTC word timestamps & speaker "
+                   "diarization) on a Colab G4 GPU via `vllm serve` + `nemo_speechlm`, with Bearer token auth "
+                   "and direct Google Drive audio batch/single transcription endpoints.",
+                   NEMOTRON_TRANSCRIBE_CFG, NEMOTRON_TRANSCRIBE_SETUP, NEMOTRON_TRANSCRIBE_SERVICE,
+                   keepalive=NEMOTRON_TRANSCRIBE_KEEPALIVE))

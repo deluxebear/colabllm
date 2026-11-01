@@ -45,6 +45,28 @@
 ./services/comfyui.py down
 ```
 
+### 2.1 多实例（多会话）并发运行
+
+支持通过 `-i <ID>` / `--instance <ID>` 同时启动多个独立的 ComfyUI GPU 实例（共享网盘中的 `user` 工作流、`custom_nodes`、`input` 和 `output`，各自拥有独立的本地高速 SSD `/content/ComfyUI/models`）：
+
+```bash
+# 启动第 1、第 2 个实例（分别绑定 comfyui-1.example.com 与 comfyui-2.example.com）
+./services/comfyui.py up -i 1 --domain --workflow video_minimax_h3_t2v
+./services/comfyui.py up -i 2 --domain --workflow video_minimax_h3_i2v
+
+# 查看所有 ComfyUI 实例状态与 URL
+./services/comfyui.py ps
+
+# 向指定实例（-i 2）或所有运行中实例（-A / --all-instances）同步拉取工作流/模型到本地 SSD
+./services/comfyui.py pull-workflow -i 2 video_minimax_h3_r2v
+./services/comfyui.py pull-workflow -A video_minimax_h3_r2v
+./services/comfyui.py pull-model -A https://huggingface.co/.../model.safetensors --dir loras
+
+# 停止单个实例或全部实例
+./services/comfyui.py down -i 2
+./services/comfyui.py down --all
+```
+
 ---
 
 ## 3. 按需下载模型到本地 SSD（三种方式）

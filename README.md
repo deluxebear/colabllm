@@ -19,6 +19,7 @@
 
 | 服务名称 | 默认 GPU | 认证方式 | 默认固定域名 (`--domain`) | 详细使用说明 |
 | --- | --- | --- | --- | --- |
+| **NVIDIA-Nemotron-3.5-Transcribe-30B-A4B** | `G4` | `vLLM` Bearer API Key (`builtin`) | `https://transcribe.example.com` | [docs/nemotron-transcribe.md](docs/nemotron-transcribe.md) |
 | **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](docs/comfyui.md) |
 | **Qwen3.8-Flash-Next (800K + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](docs/qwen-flash.md) |
 | **Ollama** | `T4` | Caddy (Basic Auth + Bearer) | `https://ollama.example.com` | [docs/ollama.md](docs/ollama.md) |
@@ -29,12 +30,15 @@
 ```
 ├── .agents/skills/colab-llm-service/   # 本项目 Agent Skill（最佳实践、排错、认证与隧道参考）
 ├── docs/                               # 各运行时详细使用文档
+│   ├── nemotron-transcribe.md          # NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / 远端 API + 网盘批量音频转写)
 │   ├── comfyui.md                      # ComfyUI + ComfyUI-Manager 使用说明（含本地 SSD 模型按需下载）
 │   ├── qwen-flash.md                   # Qwen3.8-Flash-Next (G4 / 800K / Vision) 使用说明
 │   ├── ollama.md                       # Ollama 使用说明
 │   └── unsloth-studio.md               # Unsloth Studio 使用说明
 ├── lib/colabsvc.py                     # 共享运行库（Service 定义与 CLI 实现）
 ├── services/
+│   ├── nemotron-transcribe.py          # Nemotron-3.5-Transcribe-30B-A4B 执行脚本（G4，支持 transcribe 单文件/批量调用网盘音频）
+│   ├── nemotron-transcribe.ipynb       # Nemotron-3.5-Transcribe-30B-A4B notebook（vLLM 0.32 + NeMo Speech SALM + MTP8 + CTC 时间戳）
 │   ├── comfyui.py                      # ComfyUI + ComfyUI-Manager 执行脚本（Caddy 认证，默认 L4，支持 --workflow / pull-workflow / pull-model）
 │   ├── comfyui.ipynb                   # ComfyUI + ComfyUI-Manager notebook（模型存本地高速 SSD，插件/工作流/输出持久化到 Google Drive）
 │   ├── unsloth-studio.py               # Unsloth Studio 执行脚本（自带登录 auth="builtin"，默认 L4）
@@ -80,6 +84,38 @@ cf auth login            # 使用 --domain 固定域名时需登录 Cloudflare C
 # 5. 停止服务并释放 Colab VM（加 --delete-tunnel 同时删除 Cloudflare 隧道和 DNS 记录）
 ./services/ollama.py down
 ./services/ollama.py down --delete-tunnel
+```
+
+## 多实例（多会话）并发支持（所有运行时通用）
+
+所有运行时脚本（`nemotron-transcribe.py`、`comfyui.py`、`qwen-flash.py`、`ollama.py`、`unsloth-studio.py` 以及 `templates/service.py`）均原生支持通过 **`-i <ID>` / `--instance <ID>`**（或环境变量 `CT_INSTANCE=<ID>`）创建和管理多个独立的 Colab GPU 会话与隧道：
+
+| 实例参数 | Colab 会话名 (`-s`) | 状态目录 (`.state/`) | 隧道名 (`--domain`) | 默认域名 (`--domain`) | 网盘共享目录 (`CT_DATA_DIR`) |
+| --- | --- | --- | --- | --- | --- |
+| 默认（不传 `-i`） | `<name>` | `.state/<name>/` | `colab-<name>` | `<host>.example.com` | `/content/drive/MyDrive/colab-llm/<name>` |
+| `-i 1` | `<name>-1` | `.state/<name>-1/` | `colab-<name>-1` | `<host>-1.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
+| `-i 2` | `<name>-2` | `.state/<name>-2/` | `colab-<name>-2` | `<host>-2.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
+
+```bash
+# 启动任意运行时的多个并发实例（各自拥有独立的 Colab GPU VM、Cloudflare 隧道与域名）
+./services/comfyui.py up -i 1 --domain               # -> https://comfyui-1.example.com
+./services/comfyui.py up -i 2 --domain               # -> https://comfyui-2.example.com
+./services/qwen-flash.py up -i 2 --domain            # -> https://qwen-2.example.com
+./services/ollama.py up -i 2 --domain                # -> https://ollama-2.example.com
+./services/unsloth-studio.py up -i 2 --domain        # -> https://unsloth-studio-2.example.com
+./services/nemotron-transcribe.py up -i 2 --domain   # -> https://transcribe-2.example.com
+
+# 列出某个服务的所有实例状态、URL 与 API Token
+./services/<name>.py ps
+
+# 查看指定实例的详情 / 日志 / 状态
+./services/<name>.py info -i 2
+./services/<name>.py logs -i 2 -f
+./services/<name>.py status -i 2
+
+# 停止指定实例，或使用 --all 一键停止该服务的所有实例
+./services/<name>.py down -i 2
+./services/<name>.py down --all
 ```
 
 ## 新增一个大模型服务

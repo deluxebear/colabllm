@@ -43,6 +43,24 @@
 ./services/unsloth-studio.py down
 ```
 
+### 2.1 多实例（多会话）并发运行
+
+当需要同时进行多个微调任务或对比实验时，可通过 `-i <ID>` / `--instance <ID>` 启动多个独立的 Unsloth Studio 会话：
+
+```bash
+# 启动第 2 个实例（会话 unsloth-studio-2，绑定 https://unsloth-studio-2.example.com）
+./services/unsloth-studio.py up -i 2 --domain --gpu A100
+
+# 查看所有 Unsloth Studio 实例状态、URL 与登录凭据
+./services/unsloth-studio.py ps
+./services/unsloth-studio.py info -i 2
+
+# 查看第 2 个实例日志 / 停止指定或全部实例
+./services/unsloth-studio.py logs -i 2 -f
+./services/unsloth-studio.py down -i 2
+./services/unsloth-studio.py down --all
+```
+
 ---
 
 ## 3. Web 界面登录与使用

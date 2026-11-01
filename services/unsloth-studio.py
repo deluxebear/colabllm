@@ -3,8 +3,9 @@
 
   ./services/unsloth-studio.py up                      # quick tunnel (*.trycloudflare.com)
   ./services/unsloth-studio.py up --domain             # https://unsloth-studio.example.com
+  ./services/unsloth-studio.py up -i 2 --domain        # 2nd instance -> https://unsloth-studio-2.example.com
   ./services/unsloth-studio.py up --domain ai.example.com --gpu A100
-  ./services/unsloth-studio.py info | logs -f | status | down [--delete-tunnel]
+  ./services/unsloth-studio.py ps | info [-i ID] | logs [-i ID] -f | status [-i ID] | down [-i ID | --all] [--delete-tunnel]
 """
 import sys
 from pathlib import Path

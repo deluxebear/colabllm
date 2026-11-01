@@ -19,14 +19,15 @@ Key properties preserved from the original deployment:
 
 Usage:
   ./services/qwen-flash.py up --domain          # https://qwen.example.com (recommended)
+  ./services/qwen-flash.py up -i 2 --domain     # 2nd instance -> https://qwen-2.example.com
   ./services/qwen-flash.py up                   # quick tunnel (*.trycloudflare.com)
-  ./services/qwen-flash.py info | logs -f | status | down [--delete-tunnel]
+  ./services/qwen-flash.py ps | info [-i ID] | logs [-i ID] -f | status [-i ID] | down [-i ID | --all] [--delete-tunnel]
 """
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from colabsvc import Service, State, main  # noqa: E402
+from colabsvc import Service, State, apply_instance, extract_instance_arg, main  # noqa: E402
 
 SERVICE = Service(
     name="qwen-flash",
@@ -64,5 +65,9 @@ def _seed_legacy_api_key(svc: Service) -> None:
 
 
 if __name__ == "__main__":
-    _seed_legacy_api_key(SERVICE)
+    _inst_id, _rem = extract_instance_arg(sys.argv[1:])
+    if _inst_id:
+        apply_instance(SERVICE, _inst_id)
+    if _rem and _rem[0] == "up" and "--dry-run" not in _rem:
+        _seed_legacy_api_key(SERVICE)
     main(SERVICE)

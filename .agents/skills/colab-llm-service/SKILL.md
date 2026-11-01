@@ -23,7 +23,9 @@ templates/               service.py + service.ipynb to copy; build_notebooks.py 
 Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, T4),
 `comfyui` (ComfyUI + ComfyUI-Manager, Caddy auth, L4, on-demand workflow model download to local SSD via `--workflow` / `pull-workflow`),
 `qwen-flash` (`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF` IQ3_S, 800K YaRN 3.125x + BF16 vision,
-`llama-server --api-key-file` built-in auth, G4 GPU, default domain `qwen.example.com`).
+`llama-server --api-key-file` built-in auth, G4 GPU, default domain `qwen.example.com`),
+`nemotron-transcribe` (`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` via `vllm serve` + `nemo_speechlm`,
+Bearer API key auth, G4 GPU, default domain `transcribe.example.com`, single & batch Drive audio CLI `transcribe`).
 
 ## Daily use
 

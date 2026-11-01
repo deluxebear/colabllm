@@ -46,6 +46,26 @@
 ./services/qwen-flash.py down
 ```
 
+### 2.1 多实例（多会话）并发运行
+
+支持通过 `-i <ID>` / `--instance <ID>` 同时启动多个 Qwen3.8-Flash-Next G4 实例（共享 Google Drive 上的 `sm_120` 编译缓存与模型分片备份，无需重复编译）：
+
+```bash
+# 启动第 2 个实例（自动分配会话 qwen-flash-2，绑定 https://qwen-2.example.com）
+./services/qwen-flash.py up -i 2 --domain
+
+# 查看所有实例状态、URL 与 API Token
+./services/qwen-flash.py ps
+
+# 查看第 2 个实例的日志或状态
+./services/qwen-flash.py logs -i 2 -f
+./services/qwen-flash.py status -i 2
+
+# 停止第 2 个实例，或停止所有实例
+./services/qwen-flash.py down -i 2
+./services/qwen-flash.py down --all
+```
+
 > **提示**：首次启动时需将 ~85 GB 模型分片下载到本地 SSD 并加载进显存/内存，耗时约 5~15 分钟，可通过 `./services/qwen-flash.py logs -f` 查看实时进度。
 
 ---

@@ -39,6 +39,24 @@
 ./services/ollama.py down
 ```
 
+### 2.1 多实例（多会话）并发运行与启动时指定模型
+
+```bash
+# 启动时通过 --models 指定要预拉取的模型列表
+./services/ollama.py up --domain --models qwen2.5:7b,llama3.2:3b
+
+# 启动第 2 个独立实例（会话 ollama-2，绑定 https://ollama-2.example.com）
+./services/ollama.py up -i 2 --domain --gpu L4 --models deepseek-r1:14b
+
+# 查看所有 Ollama 实例列表与状态
+./services/ollama.py ps
+
+# 查看指定实例详情 / 日志 / 停止全部实例
+./services/ollama.py info -i 2
+./services/ollama.py logs -i 2 -f
+./services/ollama.py down --all
+```
+
 ---
 
 ## 3. API 调用与在线拉取新模型

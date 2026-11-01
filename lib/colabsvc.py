@@ -68,10 +68,104 @@ class Service:
     auth_user: str = "admin"
     env: dict = dataclasses.field(default_factory=dict)   # extra env for the notebook
     ready_timeout: int = 3600       # seconds `up` waits for CT_READY
+    base_name: str = ""             # base service name before --instance suffix
+    base_default_hostname: str | None = None
+    instance: str | None = None     # optional instance id (-i / --instance)
+
+    def __post_init__(self) -> None:
+        if not self.base_name:
+            self.base_name = self.name
+        if self.base_default_hostname is None:
+            self.base_default_hostname = self.default_hostname
 
     @property
     def tunnel_port(self) -> int:
         return self.public_port if self.auth == "caddy" else self.service_port
+
+
+def extract_instance_arg(argv: list[str] | None = None) -> tuple[str | None, list[str]]:
+    """Extract `-i <id>` / `--instance <id>` from anywhere in argv so it works before or after the subcommand."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    inst: str | None = os.environ.get("CT_INSTANCE") or None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-i", "--instance") and i + 1 < len(args):
+            inst = args[i + 1].strip()
+            i += 2
+        elif a.startswith("--instance="):
+            inst = a.split("=", 1)[1].strip()
+            i += 1
+        else:
+            cleaned.append(a)
+            i += 1
+    if inst:
+        inst = re.sub(r"[^a-zA-Z0-9_-]+", "-", inst).strip("-") or None
+    return inst, cleaned
+
+
+def apply_instance(svc: Service, inst: str | None) -> Service:
+    """Apply an instance suffix (`-i 2` -> `<base>-2`, domain `<host>-2.<zone>`) to `svc` in place."""
+    base = svc.base_name or svc.name
+    svc.base_name = base
+    base_host = svc.base_default_hostname
+    if base_host is None:
+        base_host = svc.default_hostname
+        svc.base_default_hostname = base_host
+    svc.instance = inst
+    if not inst:
+        svc.name = base
+        svc.default_hostname = base_host
+        return svc
+    suffix = f"-{inst}"
+    svc.name = base if base.endswith(suffix) else f"{base}{suffix}"
+    if base_host:
+        if "." in base_host:
+            sub, rest = base_host.split(".", 1)
+            svc.default_hostname = f"{sub}{suffix}.{rest}" if not sub.endswith(suffix) else base_host
+        else:
+            svc.default_hostname = f"{base_host}{suffix}" if not base_host.endswith(suffix) else base_host
+    return svc
+
+
+def list_service_instances(base_name: str) -> list[dict]:
+    """Return status dicts for the default instance and all `<base_name>-<id>` instances found in `.state/`."""
+    if not STATE_ROOT.is_dir():
+        return []
+    items: list[dict] = []
+    for d in sorted(STATE_ROOT.iterdir()):
+        if not d.is_dir():
+            continue
+        if d.name == base_name:
+            inst_id = ""
+        elif d.name.startswith(base_name + "-"):
+            inst_id = d.name[len(base_name) + 1:]
+        else:
+            continue
+        sp = d / "state.json"
+        if not sp.is_file():
+            continue
+        try:
+            st = json.loads(sp.read_text())
+        except Exception:
+            continue
+        alive = pid_alive(st.get("runner_pid"))
+        items.append({
+            "instance": inst_id or "default",
+            "instance_arg": inst_id,
+            "name": d.name,
+            "alive": alive,
+            "running": alive,
+            "ready": bool(st.get("ready") and alive),
+            "runner_pid": st.get("runner_pid"),
+            "url": st.get("url"),
+            "api_token": st.get("api_token"),
+            "auth_user": st.get("auth_user"),
+            "auth_pass": st.get("auth_pass"),
+            "started": st.get("started"),
+        })
+    return items
 
 
 # --------------------------------------------------------------------------- utils
@@ -358,7 +452,7 @@ def cmd_up(svc: Service, script: Path, a) -> None:
     env = {"CT_SERVICE": svc.name, "CT_SERVICE_PORT": str(svc.service_port),
            "CT_PUBLIC_PORT": str(svc.tunnel_port), "CT_AUTH": svc.auth,
            "CT_API_TOKEN": st["api_token"],
-           "CT_DATA_DIR": f"/content/drive/MyDrive/colab-llm/{svc.name}", **svc.env}
+           "CT_DATA_DIR": f"/content/drive/MyDrive/colab-llm/{svc.base_name or svc.name}", **svc.env}
     hf_tok = a.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or st.get("hf_token")
     if not hf_tok:
         for p in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
@@ -390,8 +484,8 @@ def cmd_up(svc: Service, script: Path, a) -> None:
         rc = exec_runner(svc, nb_path)
         sys.exit(rc)
     state.log_path.write_bytes(b"")
-    proc = subprocess.Popen([sys.executable, str(script), "_exec", str(nb_path)],
-                            stdin=subprocess.DEVNULL, stdout=open(state.log_path, "ab"),
+    exec_cmd = [sys.executable, str(script), *(["-i", svc.instance] if svc.instance else []), "_exec", str(nb_path)]
+    proc = subprocess.Popen(exec_cmd, stdin=subprocess.DEVNULL, stdout=open(state.log_path, "ab"),
                             stderr=subprocess.STDOUT, start_new_session=True)
     state.save(runner_pid=proc.pid)
     log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path.relative_to(ROOT)}")
@@ -459,7 +553,31 @@ def show_info(svc: Service, do_probe: bool = False) -> None:
     banner(lines)
 
 
+def show_instances(svc: Service) -> None:
+    items = list_service_instances(svc.base_name or svc.name)
+    if not items:
+        log(f"no instances found in .state/ for '{svc.base_name or svc.name}'")
+        return
+    print(f"\nInstances of {svc.base_name or svc.name}:")
+    print(f"  {'INSTANCE':<12} {'SESSION':<28} {'STATE':<14} {'URL':<42} {'API TOKEN'}")
+    print("  " + "-" * 116)
+    for it in items:
+        state_str = "READY" if it["ready"] else ("STARTING" if it["alive"] else "STOPPED")
+        url_str = it.get("url") or "-"
+        tok = it.get("api_token") or "-"
+        print(f"  {it['instance']:<12} {it['name']:<28} {state_str:<14} {url_str:<42} {tok}")
+    print()
+
+
 def cmd_down(svc: Service, a) -> None:
+    if getattr(a, "all", False):
+        items = list_service_instances(svc.base_name or svc.name)
+        for it in items:
+            sub_svc = dataclasses.replace(svc)
+            apply_instance(sub_svc, it["instance_arg"] or None)
+            sub_a = argparse.Namespace(delete_tunnel=a.delete_tunnel, all=False)
+            cmd_down(sub_svc, sub_a)
+        return
     state = State(svc)
     st = state.load()
     if pid_alive(st.get("runner_pid")):
@@ -475,14 +593,20 @@ def cmd_down(svc: Service, a) -> None:
         st = {k: v for k, v in st.items() if k not in ("tunnel_id", "tunnel_name", "zone_id", "hostname")}
     keep = {k: st[k] for k in ("auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
                                "zone_id", "hostname") if k in st}
+    state.dir.mkdir(parents=True, exist_ok=True)
     state.path.write_text(json.dumps(keep, indent=2))
     os.chmod(state.path, 0o600)
 
 
 def main(svc: Service) -> None:
     script = Path(sys.argv[0]).resolve()
+    inst, cleaned_argv = extract_instance_arg(sys.argv[1:])
+    apply_instance(svc, inst)
+
     p = argparse.ArgumentParser(prog=script.name, description=(sys.modules["__main__"].__doc__ or "").strip(),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-i", "--instance", metavar="ID",
+                   help="instance ID to create/manage multiple parallel instances (e.g. -i 1, -i 2)")
     sub = p.add_subparsers(dest="cmd", required=True)
     u = sub.add_parser("up", help="session -> Drive -> (cf tunnel) -> run notebook, keep it alive")
     default_host = svc.default_hostname or f"{svc.name}.{svc.zone}"
@@ -498,14 +622,17 @@ def main(svc: Service) -> None:
     u.add_argument("--dry-run", action="store_true", help="only show the cell plan")
     d = sub.add_parser("down", help="stop runner + Colab session")
     d.add_argument("--delete-tunnel", action="store_true", help="also delete the named tunnel and its DNS record")
+    d.add_argument("--all", action="store_true", help="stop all instances of this service")
     sub.add_parser("info", help="URL and credentials")
+    sub.add_parser("ps", help="list all instances of this service and their URLs / states")
+    sub.add_parser("list", help="alias for `ps`")
     lg = sub.add_parser("logs", help="notebook output")
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("-n", "--lines", type=int, default=80)
     sub.add_parser("status", help="colab status + public URL probe")
     ex = sub.add_parser("_exec")          # internal: detached runner
     ex.add_argument("nb")
-    a = p.parse_args()
+    a = p.parse_args(cleaned_argv)
 
     if a.cmd == "up":
         cmd_up(svc, script, a)
@@ -515,6 +642,8 @@ def main(svc: Service) -> None:
         cmd_down(svc, a)
     elif a.cmd == "info":
         show_info(svc)
+    elif a.cmd in ("ps", "list"):
+        show_instances(svc)
     elif a.cmd == "status":
         run(["colab", "status", "-s", svc.name], check=False)
         show_info(svc, do_probe=True)
