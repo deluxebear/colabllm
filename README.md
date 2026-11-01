@@ -15,13 +15,27 @@
 | 安全认证层 (Caddy) | 远端 `services/<name>.ipynb` | 对无自带认证的服务（如 Ollama）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
 | 启动 `cloudflared` 与保活 | 远端 `services/<name>.ipynb` | 最后一个 cell 持续阻塞并监控子进程；本地后台进程保持 `colab exec` 连接以防 Colab 回收会话 |
 
+## 各运行时使用文档
+
+| 服务名称 | 默认 GPU | 认证方式 | 默认固定域名 (`--domain`) | 详细使用说明 |
+| --- | --- | --- | --- | --- |
+| **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](docs/comfyui.md) |
+| **Qwen3.8-Flash-Next (800K + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](docs/qwen-flash.md) |
+| **Ollama** | `T4` | Caddy (Basic Auth + Bearer) | `https://ollama.example.com` | [docs/ollama.md](docs/ollama.md) |
+| **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](docs/unsloth-studio.md) |
+
 ## 目录结构
 
 ```
 ├── .agents/skills/colab-llm-service/   # 本项目 Agent Skill（最佳实践、排错、认证与隧道参考）
+├── docs/                               # 各运行时详细使用文档
+│   ├── comfyui.md                      # ComfyUI + ComfyUI-Manager 使用说明（含本地 SSD 模型按需下载）
+│   ├── qwen-flash.md                   # Qwen3.8-Flash-Next (G4 / 800K / Vision) 使用说明
+│   ├── ollama.md                       # Ollama 使用说明
+│   └── unsloth-studio.md               # Unsloth Studio 使用说明
 ├── lib/colabsvc.py                     # 共享运行库（Service 定义与 CLI 实现）
 ├── services/
-│   ├── comfyui.py                      # ComfyUI + ComfyUI-Manager 执行脚本（Caddy 认证，默认 L4，支持 --workflow / pull-workflow 按工作流即时下载模型到本地 SSD）
+│   ├── comfyui.py                      # ComfyUI + ComfyUI-Manager 执行脚本（Caddy 认证，默认 L4，支持 --workflow / pull-workflow / pull-model）
 │   ├── comfyui.ipynb                   # ComfyUI + ComfyUI-Manager notebook（模型存本地高速 SSD，插件/工作流/输出持久化到 Google Drive）
 │   ├── unsloth-studio.py               # Unsloth Studio 执行脚本（自带登录 auth="builtin"，默认 L4）
 │   ├── unsloth-studio.ipynb            # Unsloth Studio notebook
