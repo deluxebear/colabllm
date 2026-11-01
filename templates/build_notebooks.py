@@ -885,8 +885,7 @@ for entry in sorted(os.listdir(f"{COMFY_DIR}/custom_nodes")):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req], check=False)
 
 # --- On-demand workflow model downloader (downloads directly to local NVMe SSD /content/ComfyUI/models) ---
-os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-open("/content/ComfyUI/ct_workflow_helper.py", "w", encoding="utf-8").write(r"""import glob, json, os, re, shutil, site, time, urllib.error, urllib.request
+open("/content/ComfyUI/ct_workflow_helper.py", "w", encoding="utf-8").write(r"""import glob, json, os, re, shutil, site, subprocess, sys, time, urllib.error, urllib.request
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -911,6 +910,10 @@ TYPE_SAVE_DIR = {
     "embedding": "embeddings", "gligen": "gligen", "photomaker": "photomaker", "model_patch": "model_patches",
 }
 _MANAGER_INDEX = None
+
+def _cleanup_dl_cache():
+    for p in ("/content/hf-stage", "/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(p, ignore_errors=True)
 
 def _get_manager_index():
     global _MANAGER_INDEX
@@ -1059,40 +1062,87 @@ def extract_workflow_models(wf_json):
 
     return found
 
-def ensure_model_on_ssd(item):
-    from huggingface_hub import hf_hub_download
+def _stream_http_download(url, dest, emit):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_tok and "huggingface.co" in url:
+        headers["Authorization"] = f"Bearer {hf_tok}"
+    req = urllib.request.Request(url, headers=headers)
+    partial = dest.with_name(dest.name + ".partial")
+    partial.unlink(missing_ok=True)
+    with urllib.request.urlopen(req, timeout=120) as resp, open(partial, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        copied = 0
+        t_start = last_log = time.monotonic()
+        while True:
+            chunk = resp.read(16 * 1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            copied += len(chunk)
+            now = time.monotonic()
+            if now - last_log >= 10:
+                speed = copied / 1e6 / max(now - t_start, 0.1)
+                if total > 0:
+                    emit(f"[workflow-dl]   ↳ {copied/1e9:.2f} / {total/1e9:.2f} GB ({copied*100/total:.1f}%) @ {speed:.1f} MB/s")
+                else:
+                    emit(f"[workflow-dl]   ↳ {copied/1e9:.2f} GB @ {speed:.1f} MB/s")
+                last_log = now
+    partial.replace(dest)
+
+def ensure_model_on_ssd(item, log_cb=None):
+    def _emit(msg):
+        print(msg, flush=True)
+        if log_cb:
+            log_cb(msg)
     dest = COMFY_DIR / "models" / item["directory"] / item["name"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
-        print(f"[workflow-dl] SKIP (already on local SSD, {dest.stat().st_size/1e9:.2f} GB): {dest.relative_to(COMFY_DIR)}",
-              flush=True)
+        _emit(f"[workflow-dl] SKIP (already on local SSD, {dest.stat().st_size/1e9:.2f} GB): {dest.relative_to(COMFY_DIR)}")
         return {"model": f"{item['directory']}/{item['name']}", "status": "cached",
                 "size": dest.stat().st_size, "source": item.get("source", "")}
+    _cleanup_dl_cache()
+    free_gb = shutil.disk_usage("/content").free / 1e9
     url = item["url"].replace("/blob/", "/resolve/")
     m = HF_URL_RE.match(url)
     t0 = time.monotonic()
-    if m:
-        repo_id, revision, filename = m.group(1), m.group(2), unquote(m.group(3))
-        print(f"[workflow-dl] HF Xet -> local SSD: {repo_id}/{filename} -> models/{item['directory']}/{item['name']}",
-              flush=True)
-        stage = Path("/content/hf-stage")
-        stage.mkdir(parents=True, exist_ok=True)
-        downloaded = Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, local_dir=stage))
-        shutil.move(str(downloaded), str(dest))
-    else:
-        print(f"[workflow-dl] HTTP -> local SSD: {url} -> models/{item['directory']}/{item['name']}", flush=True)
-        partial = dest.with_name(dest.name + ".partial")
-        urllib.request.urlretrieve(url, partial)
-        partial.replace(dest)
+    try:
+        # Use isolated subprocess for hf_hub_download when plenty of SSD headroom (>45 GB) exists;
+        # otherwise (or if subprocess fails), stream directly to dest.partial with zero staging duplication.
+        if m and free_gb > 45.0:
+            repo_id, revision, filename = m.group(1), m.group(2), unquote(m.group(3))
+            _emit(f"[workflow-dl] HF Xet -> local SSD (free: {free_gb:.1f} GB): {repo_id}/{filename} -> models/{item['directory']}/{item['name']}")
+            dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0"}
+            dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            code = (
+                "import shutil, sys; from pathlib import Path; from huggingface_hub import hf_hub_download; "
+                "stage = Path('/content/hf-stage'); stage.mkdir(parents=True, exist_ok=True); "
+                "p = Path(hf_hub_download(repo_id=sys.argv[1], filename=sys.argv[2], revision=sys.argv[3], local_dir=stage)); "
+                "shutil.move(str(p), sys.argv[4])"
+            )
+            proc = subprocess.run([sys.executable, "-c", code, repo_id, filename, revision, str(dest)], env=dl_env)
+            if proc.returncode != 0 or not (dest.is_file() and dest.stat().st_size > 0):
+                _cleanup_dl_cache()
+                _emit(f"[workflow-dl] HF Xet subprocess exited with {proc.returncode}; falling back to direct HTTP stream...")
+                _stream_http_download(url, dest, _emit)
+        else:
+            _emit(f"[workflow-dl] Direct HTTP stream -> local SSD (free: {free_gb:.1f} GB): {url} -> models/{item['directory']}/{item['name']}")
+            _stream_http_download(url, dest, _emit)
+    finally:
+        _cleanup_dl_cache()
     dt = time.monotonic() - t0
     sz = dest.stat().st_size
-    print(f"[workflow-dl] DONE ({sz/1e9:.2f} GB in {dt:.1f}s, {sz/1e6/max(dt,1):.1f} MB/s): {dest.name}", flush=True)
+    _emit(f"[workflow-dl] DONE ({sz/1e9:.2f} GB in {dt:.1f}s, {sz/1e6/max(dt,1):.1f} MB/s): {dest.name}")
     return {"model": f"{item['directory']}/{item['name']}", "status": "downloaded",
             "size": sz, "source": item.get("source", "")}
 
-def sync_workflow_models(wf_source, data_dir=None):
+def sync_workflow_models(wf_source, data_dir=None, job=None):
+    def _emit(msg):
+        if job is not None:
+            job["logs"].append(msg)
     wf_name, raw, resolved_from = resolve_workflow(wf_source, data_dir=data_dir)
-    print(f"[workflow-dl] Resolved workflow '{wf_source}' -> {resolved_from}", flush=True)
+    msg = f"[workflow-dl] Resolved workflow '{wf_source}' -> {resolved_from}"
+    print(msg, flush=True); _emit(msg)
     wf_json = json.loads(raw)
     wf_dir = COMFY_DIR / "user" / "default" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
@@ -1101,13 +1151,28 @@ def sync_workflow_models(wf_source, data_dir=None):
         if not target_wf.is_file() or target_wf.read_text(encoding="utf-8", errors="ignore") != raw:
             target_wf.write_text(raw, encoding="utf-8")
     models = list(extract_workflow_models(wf_json).values())
-    print(f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
-          ", ".join(f"{m['directory']}/{m['name']} ({m.get('source')})" for m in models), flush=True)
+    msg = (f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
+           ", ".join(f"{m['directory']}/{m['name']} ({m.get('source')})" for m in models))
+    print(msg, flush=True); _emit(msg)
+    if job is not None:
+        job["workflow"] = wf_name
+        job["resolved_from"] = resolved_from
+        job["total"] = len(models)
     results = []
     for idx, m in enumerate(models, 1):
-        print(f"[workflow-dl] [{idx}/{len(models)}] Ensuring {m['directory']}/{m['name']} ...", flush=True)
-        results.append(ensure_model_on_ssd(m))
-    return {"workflow": wf_name, "resolved_from": resolved_from, "models": results}
+        step_msg = f"[workflow-dl] [{idx}/{len(models)}] Ensuring {m['directory']}/{m['name']} ..."
+        print(step_msg, flush=True); _emit(step_msg)
+        if job is not None:
+            job["current"] = f"[{idx}/{len(models)}] {m['directory']}/{m['name']}"
+        res = ensure_model_on_ssd(m, log_cb=_emit)
+        results.append(res)
+        if job is not None:
+            job["completed"] = idx
+            job["models"] = list(results)
+    if job is not None:
+        job["current"] = None
+    free_ssd_gb = round(shutil.disk_usage("/content").free / 1e9, 2)
+    return {"workflow": wf_name, "resolved_from": resolved_from, "free_ssd_gb": free_ssd_gb, "models": results}
 """)
 
 sys.path.insert(0, "/content/ComfyUI")
@@ -1118,13 +1183,29 @@ for wf_spec in [x.strip() for x in os.environ.get("CT_WORKFLOW", "").split(",") 
 
 print("ComfyUI + ComfyUI-Manager setup complete; local SSD models =", f"{COMFY_DIR}/models", "drive data =", DATA_DIR)
 '''
-COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with live /api/ct/pull-workflow endpoint)
+COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with async /api/ct/pull-workflow endpoints)
 os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
-open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write("""import asyncio, sys
+open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write(r"""import secrets, sys, threading, time
 from aiohttp import web
 from server import PromptServer
 sys.path.insert(0, "/content/ComfyUI")
 from ct_workflow_helper import sync_workflow_models
+
+JOBS = {}
+_DL_LOCK = threading.Lock()
+
+def _run_job(job_id, wf):
+    job = JOBS[job_id]
+    with _DL_LOCK:
+        try:
+            res = sync_workflow_models(wf, job=job)
+            job["result"] = res
+            job["status"] = "done"
+        except Exception as e:
+            job["error"] = str(e)
+            job["logs"].append(f"[workflow-dl] ERROR: {e}")
+            job["status"] = "error"
+        job["finished_at"] = time.time()
 
 @PromptServer.instance.routes.post("/api/ct/pull-workflow")
 async def ct_pull_workflow(request):
@@ -1132,11 +1213,21 @@ async def ct_pull_workflow(request):
     wf = body.get("workflow", "")
     if not wf:
         return web.json_response({"error": "missing 'workflow'"}, status=400)
-    try:
-        res = await asyncio.to_thread(sync_workflow_models, wf)
-        return web.json_response(res)
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=400)
+    job_id = secrets.token_hex(8)
+    JOBS[job_id] = {
+        "job_id": job_id, "workflow_spec": wf, "status": "running",
+        "total": 0, "completed": 0, "current": None, "models": [], "logs": [],
+        "started_at": time.time(),
+    }
+    threading.Thread(target=_run_job, args=(job_id, wf), daemon=True).start()
+    return web.json_response(JOBS[job_id], status=202)
+
+@PromptServer.instance.routes.get("/api/ct/pull-workflow/{job_id}")
+async def ct_pull_workflow_status(request):
+    job_id = request.match_info["job_id"]
+    if job_id not in JOBS:
+        return web.json_response({"error": "unknown job_id"}, status=404)
+    return web.json_response(JOBS[job_id])
 
 NODE_CLASS_MAPPINGS = {}
 """)
