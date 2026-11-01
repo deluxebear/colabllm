@@ -1209,6 +1209,21 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
   if (window.__ctSsdDownloaderLoaded) return;
   window.__ctSsdDownloaderLoaded = true;
 
+  const MODEL_DIRS = [
+    ["diffusion_models", "diffusion_models (UNET / 扩散模型)"],
+    ["loras", "loras (LoRA 模型)"],
+    ["vae", "vae (VAE 模型)"],
+    ["text_encoders", "text_encoders (CLIP / T5 / Qwen 文本编码器)"],
+    ["checkpoints", "checkpoints (Checkpoints 大模型)"],
+    ["clip_vision", "clip_vision (CLIP Vision 视觉编码器)"],
+    ["controlnet", "controlnet (ControlNet 模型)"],
+    ["upscale_models", "upscale_models (放大模型)"],
+    ["audio_encoders", "audio_encoders (音频编码器)"],
+    ["model_patches", "model_patches (Model Patches)"],
+    ["embeddings", "embeddings (Embeddings)"],
+    ["__custom__", "✏️ 自定义目录..."]
+  ];
+
   const css = `
     #ct-ssd-btn {
       display: inline-flex; align-items: center; gap: 6px;
@@ -1226,35 +1241,42 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
       font-family: system-ui, -apple-system, sans-serif;
     }
     #ct-ssd-modal {
-      background: #18181b; color: #f4f4f5; width: 680px; max-width: 94vw;
-      max-height: 86vh; border-radius: 10px; border: 1px solid #3f3f46;
+      background: #18181b; color: #f4f4f5; width: 720px; max-width: 95vw;
+      max-height: 90vh; border-radius: 10px; border: 1px solid #3f3f46;
       box-shadow: 0 20px 50px rgba(0,0,0,0.6); display: flex; flex-direction: column;
       overflow: hidden;
     }
     .ct-ssd-hdr {
       display: flex; align-items: center; justify-content: space-between;
-      padding: 14px 18px; background: #27272a; border-bottom: 1px solid #3f3f46;
+      padding: 13px 18px; background: #27272a; border-bottom: 1px solid #3f3f46;
     }
     .ct-ssd-hdr h3 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 8px; }
     .ct-ssd-badge {
       background: #065f46; color: #a7f3d0; padding: 2px 8px; border-radius: 999px;
       font-size: 11px; font-weight: 600;
     }
-    .ct-ssd-body { padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
-    .ct-ssd-row { display: flex; gap: 8px; align-items: center; }
-    .ct-ssd-input {
-      flex: 1; background: #09090b; color: #f4f4f5; border: 1px solid #3f3f46;
-      border-radius: 6px; padding: 8px 10px; font-size: 13px;
+    .ct-ssd-body { padding: 14px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; }
+    .ct-ssd-section {
+      background: #202024; border: 1px solid #323238; border-radius: 8px;
+      padding: 10px 12px; display: flex; flex-direction: column; gap: 8px;
     }
+    .ct-ssd-sec-title { font-size: 12px; font-weight: 600; color: #a1a1aa; }
+    .ct-ssd-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .ct-ssd-input, .ct-ssd-select {
+      background: #09090b; color: #f4f4f5; border: 1px solid #3f3f46;
+      border-radius: 6px; padding: 7px 10px; font-size: 12.5px;
+    }
+    .ct-ssd-input { flex: 1; min-width: 180px; }
     .ct-ssd-action {
       background: #2563eb; color: #fff; border: none; border-radius: 6px;
-      padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+      padding: 7px 13px; font-size: 12.5px; font-weight: 600; cursor: pointer;
       white-space: nowrap;
     }
     .ct-ssd-action.canvas-btn {
       background: linear-gradient(135deg, #059669 0%, #0284c7 100%);
-      width: 100%; padding: 10px 14px; font-size: 13.5px;
+      width: 100%; padding: 9px 14px; font-size: 13px;
     }
+    .ct-ssd-action.model-btn { background: #0d9488; }
     .ct-ssd-action:disabled { opacity: 0.5; cursor: not-allowed; }
     .ct-ssd-progress-wrap {
       background: #27272a; border-radius: 6px; height: 8px; overflow: hidden; display: none;
@@ -1265,12 +1287,12 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
     }
     #ct-ssd-logs {
       background: #09090b; color: #d4d4d8; border: 1px solid #27272a; border-radius: 6px;
-      padding: 10px; font-family: ui-monospace, monospace; font-size: 11.5px;
-      height: 170px; overflow-y: auto; white-space: pre-wrap; line-height: 1.45;
+      padding: 9px 10px; font-family: ui-monospace, monospace; font-size: 11.5px;
+      height: 145px; overflow-y: auto; white-space: pre-wrap; line-height: 1.45;
     }
     .ct-ssd-models {
       background: #121215; border: 1px solid #27272a; border-radius: 6px;
-      padding: 8px 10px; max-height: 130px; overflow-y: auto; font-size: 12px;
+      padding: 7px 10px; max-height: 115px; overflow-y: auto; font-size: 11.5px;
     }
     .ct-ssd-model-item {
       display: flex; justify-content: space-between; padding: 3px 0;
@@ -1284,6 +1306,8 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
   styleEl.textContent = css;
   document.head.appendChild(styleEl);
 
+  const dirOptionsHtml = MODEL_DIRS.map(([v, label]) => `<option value="${v}">${label}</option>`).join("");
+
   const backdrop = document.createElement("div");
   backdrop.id = "ct-ssd-modal-backdrop";
   backdrop.innerHTML = `
@@ -1293,14 +1317,33 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
         <button class="ct-ssd-close" id="ct-ssd-close-btn">✕</button>
       </div>
       <div class="ct-ssd-body">
-        <button class="ct-ssd-action canvas-btn" id="ct-ssd-canvas-btn">
-          ⚡ 一键解析并下载【当前画布工作流】所需模型到本地 SSD
-        </button>
-        <div class="ct-ssd-row">
-          <input class="ct-ssd-input" id="ct-ssd-spec-input"
-            placeholder="或输入工作流 GitHub URL / 官方模板名 / 网盘文件名 (如 video_minimax_h3_r2v.json)" />
-          <button class="ct-ssd-action" id="ct-ssd-url-btn">📥 下载指定工作流</button>
+        <div class="ct-ssd-section">
+          <div class="ct-ssd-sec-title">1️⃣ 按工作流批量下载所需模型（自动识别工作流内全部模型并去重）</div>
+          <button class="ct-ssd-action canvas-btn" id="ct-ssd-canvas-btn">
+            ⚡ 一键解析并下载【当前画布工作流】所需模型到本地 SSD
+          </button>
+          <div class="ct-ssd-row">
+            <input class="ct-ssd-input" id="ct-ssd-spec-input"
+              placeholder="或输入工作流 GitHub URL / 官方模板名 / 网盘文件名 (如 video_minimax_h3_r2v.json)" />
+            <button class="ct-ssd-action" id="ct-ssd-url-btn">📥 下载工作流模型</button>
+          </div>
         </div>
+
+        <div class="ct-ssd-section">
+          <div class="ct-ssd-sec-title">2️⃣ 指定单个模型 URL 下载到对应目录 (/content/ComfyUI/models/&lt;目录&gt;)</div>
+          <div class="ct-ssd-row">
+            <input class="ct-ssd-input" id="ct-ssd-model-url"
+              placeholder="粘贴模型下载 URL (HuggingFace blob/resolve 链接或直链，粘贴后自动识别目录和文件名)" />
+          </div>
+          <div class="ct-ssd-row">
+            <span style="font-size:12px;color:#a1a1aa;">目标目录:</span>
+            <select class="ct-ssd-select" id="ct-ssd-dir-select">${dirOptionsHtml}</select>
+            <input class="ct-ssd-input" id="ct-ssd-custom-dir" placeholder="输入自定义子目录名 (如 xlabs/ipadapters)" style="display:none;max-width:190px;" />
+            <input class="ct-ssd-input" id="ct-ssd-model-name" placeholder="保存文件名 (留空则从 URL 自动提取)" style="max-width:220px;" />
+            <button class="ct-ssd-action model-btn" id="ct-ssd-model-btn">🎯 下载到该目录</button>
+          </div>
+        </div>
+
         <div class="ct-ssd-progress-wrap" id="ct-ssd-prog-wrap">
           <div class="ct-ssd-progress-bar" id="ct-ssd-prog-bar"></div>
         </div>
@@ -1319,7 +1362,7 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
   const btn = document.createElement("button");
   btn.id = "ct-ssd-btn";
   btn.innerHTML = "⬇️ SSD 模型下载";
-  btn.title = "按工作流一键下载所需模型到 Colab 本地高速 SSD (已存在的模型自动跳过)";
+  btn.title = "按工作流或模型 URL 下载到 Colab 本地高速 SSD (已存在的模型自动跳过)";
 
   function mountButton() {
     const rightMenu = document.querySelector(".comfyui-menu-right") ||
@@ -1344,7 +1387,38 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
   const canvasBtn = document.getElementById("ct-ssd-canvas-btn");
   const urlBtn = document.getElementById("ct-ssd-url-btn");
   const specInput = document.getElementById("ct-ssd-spec-input");
+  const modelUrlInput = document.getElementById("ct-ssd-model-url");
+  const dirSelect = document.getElementById("ct-ssd-dir-select");
+  const customDirInput = document.getElementById("ct-ssd-custom-dir");
+  const modelNameInput = document.getElementById("ct-ssd-model-name");
+  const modelBtn = document.getElementById("ct-ssd-model-btn");
   let pollTimer = null;
+
+  dirSelect.onchange = () => {
+    customDirInput.style.display = dirSelect.value === "__custom__" ? "inline-block" : "none";
+  };
+
+  // Auto-detect target directory and filename when user pastes/inputs a model URL
+  modelUrlInput.oninput = () => {
+    const raw = modelUrlInput.value.trim();
+    if (!raw) return;
+    try {
+      const clean = decodeURIComponent(raw.split("?")[0]);
+      const parts = clean.split("/").filter(Boolean);
+      const last = parts[parts.length - 1] || "";
+      if (last && /\.(safetensors|ckpt|pt|pth|bin|gguf|sft)$/i.test(last)) {
+        modelNameInput.value = last;
+      }
+      const knownDirs = MODEL_DIRS.map(d => d[0]).filter(d => d !== "__custom__");
+      for (const seg of parts) {
+        if (knownDirs.includes(seg)) {
+          dirSelect.value = seg;
+          customDirInput.style.display = "none";
+          break;
+        }
+      }
+    } catch (e) {}
+  };
 
   async function refreshStatus() {
     try {
@@ -1367,6 +1441,7 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
   function setBusy(busy) {
     canvasBtn.disabled = busy;
     urlBtn.disabled = busy;
+    modelBtn.disabled = busy;
     btn.innerHTML = busy ? "⏳ SSD 下载中..." : "⬇️ SSD 模型下载";
   }
 
@@ -1451,11 +1526,45 @@ open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(
     }
     startJob({ workflow: spec });
   };
+  modelBtn.onclick = () => {
+    const mUrl = modelUrlInput.value.trim();
+    if (!mUrl || !/^https?:\/\//i.test(mUrl)) {
+      logBox.textContent = "⚠️ 请输入有效的模型下载 URL (http:// 或 https://)。";
+      return;
+    }
+    const targetDir = (dirSelect.value === "__custom__" ? customDirInput.value : dirSelect.value).trim().replace(/^\/+|\/+$/g, "");
+    if (!targetDir) {
+      logBox.textContent = "⚠️ 请选择或输入目标模型子目录（如 loras, diffusion_models, vae）。";
+      return;
+    }
+    let mName = modelNameInput.value.trim().replace(/^\/+/, "");
+    if (!mName) {
+      try {
+        mName = decodeURIComponent(mUrl.split("?")[0]).split("/").filter(Boolean).pop() || "";
+      } catch (e) {}
+    }
+    if (!mName) {
+      logBox.textContent = "⚠️ 无法从 URL 自动提取文件名，请在「保存文件名」输入框中指定文件名（如 model.safetensors）。";
+      return;
+    }
+    startJob({
+      model_url: mUrl,
+      directory: targetDir,
+      filename: mName,
+      workflow_name: `direct_model:${targetDir}/${mName}`,
+      workflow_json: {
+        properties: {
+          models: [{ url: mUrl, directory: targetDir, name: mName }]
+        }
+      }
+    });
+  };
 })();""")
 
 os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
 open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write(r"""import secrets, sys, threading, time
 from pathlib import Path
+from urllib.parse import unquote
 from aiohttp import web
 from server import PromptServer
 sys.path.insert(0, "/content/ComfyUI")
@@ -1483,8 +1592,14 @@ async def ct_pull_workflow(request):
     wf = (body.get("workflow") or "").strip()
     wf_json_obj = body.get("workflow_json")
     wf_label = body.get("workflow_name") or "current_canvas.json"
+    model_url = (body.get("model_url") or "").strip()
+    if model_url and not isinstance(wf_json_obj, dict):
+        d = (body.get("directory") or "diffusion_models").strip().strip("/")
+        fn = (body.get("filename") or unquote(model_url.split("?")[0]).rstrip("/").split("/")[-1]).strip().lstrip("/")
+        wf_label = f"direct_model:{d}/{fn}"
+        wf_json_obj = {"properties": {"models": [{"url": model_url, "directory": d, "name": fn}]}}
     if not wf and not isinstance(wf_json_obj, dict):
-        return web.json_response({"error": "missing 'workflow' or 'workflow_json'"}, status=400)
+        return web.json_response({"error": "missing 'workflow', 'workflow_json', or 'model_url'"}, status=400)
     job_id = secrets.token_hex(8)
     JOBS[job_id] = {
         "job_id": job_id, "workflow_spec": wf or wf_label, "status": "running",
