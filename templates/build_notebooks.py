@@ -886,47 +886,189 @@ for entry in sorted(os.listdir(f"{COMFY_DIR}/custom_nodes")):
 
 # --- On-demand workflow model downloader (downloads directly to local NVMe SSD /content/ComfyUI/models) ---
 os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-from huggingface_hub import hf_hub_download
+open("/content/ComfyUI/ct_workflow_helper.py", "w", encoding="utf-8").write(r"""import glob, json, os, re, shutil, site, time, urllib.error, urllib.request
+from pathlib import Path
+from urllib.parse import unquote
 
+COMFY_DIR = Path("/content/ComfyUI")
 HF_URL_RE = re.compile(r"^https?://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+?)(?:\?.*)?$")
+MD_LINK_RE = re.compile(r"\[([^\]]+\.(?:safetensors|ckpt|pt|pth|bin|gguf|sft))\]\((https?://[^)\s]+)\)", re.I)
+MODEL_EXTS = (".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf", ".sft")
+NODE_TYPE_DIR = {
+    "CheckpointLoaderSimple": "checkpoints", "CheckpointLoader": "checkpoints", "unCLIPCheckpointLoader": "checkpoints",
+    "ImageOnlyCheckpointLoader": "checkpoints", "UNETLoader": "diffusion_models",
+    "DiffusionModelLoader": "diffusion_models", "CLIPLoader": "text_encoders", "DualCLIPLoader": "text_encoders",
+    "TripleCLIPLoader": "text_encoders", "QuadrupleCLIPLoader": "text_encoders", "VAELoader": "vae",
+    "LoraLoader": "loras", "LoraLoaderModelOnly": "loras", "ControlNetLoader": "controlnet",
+    "DiffControlNetLoader": "controlnet", "CLIPVisionLoader": "clip_vision", "StyleModelLoader": "style_models",
+    "UpscaleModelLoader": "upscale_models", "HypernetworkLoader": "hypernetworks", "GLIGENLoader": "gligen",
+    "ModelPatchLoader": "model_patches", "AudioEncoderLoader": "audio_encoders",
+}
+TYPE_SAVE_DIR = {
+    "checkpoint": "checkpoints", "unclip": "checkpoints", "diffusion_model": "diffusion_models",
+    "clip": "text_encoders", "vae": "vae", "VAE": "vae", "lora": "loras", "controlnet": "controlnet",
+    "T2I-Adapter": "controlnet", "clip_vision": "clip_vision", "upscale": "upscale_models",
+    "embedding": "embeddings", "gligen": "gligen", "photomaker": "photomaker", "model_patch": "model_patches",
+}
+_MANAGER_INDEX = None
 
-def normalize_workflow_url(url):
-    url = url.strip()
-    m = re.match(r"^https?://github\.com/([^/]+/[^/]+)/blob/(.+)$", url)
+def _get_manager_index():
+    global _MANAGER_INDEX
+    if _MANAGER_INDEX is not None:
+        return _MANAGER_INDEX
+    _MANAGER_INDEX = {}
+    candidates = [
+        COMFY_DIR / "custom_nodes" / "ComfyUI-Manager" / "model-list.json",
+        *[Path(sp) / "comfyui_manager" / "model-list.json" for sp in site.getsitepackages()],
+    ]
+    data = None
+    for p in candidates:
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                break
+            except Exception:
+                pass
+    if data is None:
+        try:
+            req = urllib.request.Request(
+                "https://raw.githubusercontent.com/Comfy-Org/ComfyUI-Manager/main/model-list.json",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            data = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+        except Exception:
+            data = {}
+    for m in data.get("models", []):
+        fn = m.get("filename")
+        url = m.get("url")
+        if not fn or not url:
+            continue
+        sp = m.get("save_path") or ""
+        if not sp or sp == "default":
+            sp = TYPE_SAVE_DIR.get(m.get("type", ""), "checkpoints")
+        _MANAGER_INDEX[fn] = {"directory": sp.strip("/"), "name": fn, "url": url}
+    return _MANAGER_INDEX
+
+def resolve_workflow(wf_source, data_dir=None):
+    spec = wf_source.strip()
+    m = re.match(r"^https?://github\.com/([^/]+/[^/]+)/blob/(.+)$", spec)
     if m:
-        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
-    if not url.startswith(("http://", "https://", "/")):
-        name = url if url.endswith(".json") else f"{url}.json"
-        return f"https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}"
-    return url
+        spec = f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
+    if spec.startswith(("http://", "https://")):
+        req = urllib.request.Request(spec, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
+        return Path(spec.split("?")[0]).name, raw, spec
+    if os.path.isfile(spec):
+        p = Path(spec)
+        return p.name, p.read_text(encoding="utf-8"), str(p)
 
-def extract_workflow_models(obj, found=None):
-    if found is None:
-        found = {}
-    if isinstance(obj, dict):
-        props = obj.get("properties")
-        if isinstance(props, dict) and isinstance(props.get("models"), list):
-            for m in props["models"]:
-                if isinstance(m, dict) and m.get("url") and m.get("directory") and m.get("name"):
-                    key = f"{m['directory'].strip('/')}/{m['name'].lstrip('/')}"
-                    found[key] = {"directory": m["directory"].strip("/"),
-                                  "name": m["name"].lstrip("/"),
-                                  "url": m["url"].strip()}
-        for v in obj.values():
-            extract_workflow_models(v, found)
-    elif isinstance(obj, list):
-        for item in obj:
-            extract_workflow_models(item, found)
+    # Bare filename / template name:
+    # 1) Try official Comfy-Org/workflow_templates online
+    name = spec if spec.endswith(".json") else f"{spec}.json"
+    gh_url = f"https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}"
+    try:
+        req = urllib.request.Request(gh_url, headers={"User-Agent": "Mozilla/5.0"})
+        raw = urllib.request.urlopen(req, timeout=20).read().decode("utf-8")
+        return Path(name).name, raw, gh_url
+    except Exception as net_err:
+        print(f"[workflow-dl] Online lookup ({gh_url}) failed ({net_err}); searching Drive & local workflow dirs...",
+              flush=True)
+
+    # 2) Fallback: search Google Drive workflow directories & local installed templates
+    d_root = Path(data_dir) if data_dir else Path(os.environ.get("CT_DATA_DIR", "/content/drive/MyDrive/colab-llm/comfyui"))
+    search_dirs = [
+        COMFY_DIR / "user" / "default" / "workflows",
+        d_root / "user" / "default" / "workflows",
+        d_root / "workflows",
+        COMFY_DIR / "user",
+        d_root / "user",
+    ]
+    for sp in site.getsitepackages():
+        for pkg_dir in glob.glob(f"{sp}/comfyui_workflow_templates*/templates"):
+            search_dirs.append(Path(pkg_dir))
+    for sdir in search_dirs:
+        if not sdir.is_dir():
+            continue
+        direct = sdir / name
+        if direct.is_file():
+            return direct.name, direct.read_text(encoding="utf-8"), str(direct)
+        for hit in sdir.rglob(Path(name).name):
+            if hit.is_file():
+                return hit.name, hit.read_text(encoding="utf-8"), str(hit)
+    raise FileNotFoundError(f"Workflow '{wf_source}' not found online ({gh_url}) or in Drive workflow directories")
+
+def extract_workflow_models(wf_json):
+    found = {}
+    md_urls = {}
+    missing_widgets = []
+
+    def _walk(obj):
+        if isinstance(obj, dict):
+            ntype = obj.get("type", "")
+            props = obj.get("properties")
+            if isinstance(props, dict) and isinstance(props.get("models"), list):
+                for m in props["models"]:
+                    if isinstance(m, dict) and m.get("url") and m.get("directory") and m.get("name"):
+                        d, n = m["directory"].strip("/"), m["name"].lstrip("/")
+                        found[f"{d}/{n}"] = {"directory": d, "name": n, "url": m["url"].strip(), "source": "properties.models"}
+            wvals = obj.get("widgets_values")
+            if isinstance(wvals, list):
+                for v in wvals:
+                    if isinstance(v, str):
+                        for fn, link in MD_LINK_RE.findall(v):
+                            clean_link = link.replace("/blob/", "/resolve/")
+                            md_urls[Path(fn).name] = clean_link
+                        if v.lower().endswith(MODEL_EXTS) and "\n" not in v and " " not in v and len(v) < 200:
+                            missing_widgets.append((ntype, v.strip()))
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+
+    _walk(wf_json)
+    by_name = {Path(m["name"]).name: m for m in found.values()}
+
+    for ntype, raw_val in missing_widgets:
+        fname = Path(raw_val).name
+        if fname in by_name:
+            continue
+        # Tier 2: match filename against MarkdownNote links in the same workflow
+        if fname in md_urls:
+            url = md_urls[fname]
+            d = NODE_TYPE_DIR.get(ntype)
+            if not d:
+                hm = HF_URL_RE.match(url)
+                if hm:
+                    parts = unquote(hm.group(3)).split("/")
+                    if len(parts) > 1:
+                        d = parts[0]
+            d = d or "diffusion_models"
+            item = {"directory": d, "name": raw_val, "url": url, "source": "markdown_link"}
+            found[f"{d}/{raw_val}"] = item
+            by_name[fname] = item
+            continue
+        # Tier 3: match filename against ComfyUI-Manager model-list.json
+        mgr_idx = _get_manager_index()
+        if fname in mgr_idx:
+            info = mgr_idx[fname]
+            d = NODE_TYPE_DIR.get(ntype) or info["directory"]
+            item = {"directory": d, "name": raw_val, "url": info["url"], "source": "model-list.json"}
+            found[f"{d}/{raw_val}"] = item
+            by_name[fname] = item
+
     return found
 
 def ensure_model_on_ssd(item):
-    dest = Path(COMFY_DIR) / "models" / item["directory"] / item["name"]
+    from huggingface_hub import hf_hub_download
+    dest = COMFY_DIR / "models" / item["directory"] / item["name"]
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
         print(f"[workflow-dl] SKIP (already on local SSD, {dest.stat().st_size/1e9:.2f} GB): {dest.relative_to(COMFY_DIR)}",
               flush=True)
-        return str(dest)
-    url = item["url"]
+        return {"model": f"{item['directory']}/{item['name']}", "status": "cached",
+                "size": dest.stat().st_size, "source": item.get("source", "")}
+    url = item["url"].replace("/blob/", "/resolve/")
     m = HF_URL_RE.match(url)
     t0 = time.monotonic()
     if m:
@@ -945,128 +1087,56 @@ def ensure_model_on_ssd(item):
     dt = time.monotonic() - t0
     sz = dest.stat().st_size
     print(f"[workflow-dl] DONE ({sz/1e9:.2f} GB in {dt:.1f}s, {sz/1e6/max(dt,1):.1f} MB/s): {dest.name}", flush=True)
-    return str(dest)
+    return {"model": f"{item['directory']}/{item['name']}", "status": "downloaded",
+            "size": sz, "source": item.get("source", "")}
 
-def sync_workflow_models(wf_source):
-    src = normalize_workflow_url(wf_source)
-    print(f"[workflow-dl] Parsing workflow: {src}", flush=True)
-    if src.startswith(("http://", "https://")):
-        req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-        raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
-        wf_name = Path(src.split("?")[0]).name
-    else:
-        raw = Path(src).read_text(encoding="utf-8")
-        wf_name = Path(src).name
-    wf_json = json.loads(raw)
-    # Save workflow into user/default/workflows so it is immediately available in the ComfyUI sidebar
-    wf_dir = Path(COMFY_DIR) / "user" / "default" / "workflows"
-    wf_dir.mkdir(parents=True, exist_ok=True)
-    if wf_name.endswith(".json"):
-        (wf_dir / wf_name).write_text(raw, encoding="utf-8")
-    models = list(extract_workflow_models(wf_json).values())
-    print(f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
-          ", ".join(f"{m['directory']}/{m['name']}" for m in models), flush=True)
-    results = []
-    for idx, m in enumerate(models, 1):
-        print(f"[workflow-dl] [{idx}/{len(models)}] Ensuring {m['directory']}/{m['name']} ...", flush=True)
-        results.append(ensure_model_on_ssd(m))
-    return {"workflow": wf_name, "models": [f"{m['directory']}/{m['name']}" for m in models], "paths": results}
-
-for wf_spec in [x.strip() for x in os.environ.get("CT_WORKFLOW", "").split(",") if x.strip()]:
-    sync_workflow_models(wf_spec)
-
-print("ComfyUI + ComfyUI-Manager setup complete; local SSD models =", f"{COMFY_DIR}/models", "drive data =", DATA_DIR)
-'''
-COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with live /api/ct/pull-workflow endpoint)
-# Install a small custom node that exposes POST /api/ct/pull-workflow {"workflow": "<url-or-template>"}
-# so you can trigger on-demand SSD model downloads for any workflow while ComfyUI is already running.
-os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
-open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write("""import json, os, re, shutil, time, urllib.request
-from pathlib import Path
-from urllib.parse import unquote
-from aiohttp import web
-from server import PromptServer
-import folder_paths
-
-COMFY_DIR = Path(folder_paths.base_path)
-HF_URL_RE = re.compile(r"^https?://huggingface\\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+?)(?:\\?.*)?$")
-
-def _normalize(url):
-    url = url.strip()
-    m = re.match(r"^https?://github\\.com/([^/]+/[^/]+)/blob/(.+)$", url)
-    if m:
-        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}"
-    if not url.startswith(("http://", "https://", "/")):
-        name = url if url.endswith(".json") else f"{url}.json"
-        return f"https://raw.githubusercontent.com/Comfy-Org/workflow_templates/main/templates/{name}"
-    return url
-
-def _extract(obj, found=None):
-    if found is None:
-        found = {}
-    if isinstance(obj, dict):
-        props = obj.get("properties")
-        if isinstance(props, dict) and isinstance(props.get("models"), list):
-            for m in props["models"]:
-                if isinstance(m, dict) and m.get("url") and m.get("directory") and m.get("name"):
-                    key = f"{m['directory'].strip('/')}/{m['name'].lstrip('/')}"
-                    found[key] = {"directory": m["directory"].strip("/"),
-                                  "name": m["name"].lstrip("/"),
-                                  "url": m["url"].strip()}
-        for v in obj.values():
-            _extract(v, found)
-    elif isinstance(obj, list):
-        for item in obj:
-            _extract(item, found)
-    return found
-
-def _pull_sync(wf_source):
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    from huggingface_hub import hf_hub_download
-    src = _normalize(wf_source)
-    if src.startswith(("http://", "https://")):
-        req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-        raw = urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
-        wf_name = Path(src.split("?")[0]).name
-    else:
-        raw = Path(src).read_text(encoding="utf-8")
-        wf_name = Path(src).name
+def sync_workflow_models(wf_source, data_dir=None):
+    wf_name, raw, resolved_from = resolve_workflow(wf_source, data_dir=data_dir)
+    print(f"[workflow-dl] Resolved workflow '{wf_source}' -> {resolved_from}", flush=True)
     wf_json = json.loads(raw)
     wf_dir = COMFY_DIR / "user" / "default" / "workflows"
     wf_dir.mkdir(parents=True, exist_ok=True)
     if wf_name.endswith(".json"):
-        (wf_dir / wf_name).write_text(raw, encoding="utf-8")
-    models = list(_extract(wf_json).values())
-    out = []
-    for m in models:
-        dest = COMFY_DIR / "models" / m["directory"] / m["name"]
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.is_file() and dest.stat().st_size > 0:
-            out.append({"model": f"{m['directory']}/{m['name']}", "status": "cached", "size": dest.stat().st_size})
-            continue
-        hm = HF_URL_RE.match(m["url"])
-        if hm:
-            stage = Path("/content/hf-stage")
-            stage.mkdir(parents=True, exist_ok=True)
-            dl = Path(hf_hub_download(repo_id=hm.group(1), filename=unquote(hm.group(3)),
-                                      revision=hm.group(2), local_dir=stage))
-            shutil.move(str(dl), str(dest))
-        else:
-            partial = dest.with_name(dest.name + ".partial")
-            urllib.request.urlretrieve(m["url"], partial)
-            partial.replace(dest)
-        out.append({"model": f"{m['directory']}/{m['name']}", "status": "downloaded", "size": dest.stat().st_size})
-    return {"workflow": wf_name, "models": out}
+        target_wf = wf_dir / wf_name
+        if not target_wf.is_file() or target_wf.read_text(encoding="utf-8", errors="ignore") != raw:
+            target_wf.write_text(raw, encoding="utf-8")
+    models = list(extract_workflow_models(wf_json).values())
+    print(f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
+          ", ".join(f"{m['directory']}/{m['name']} ({m.get('source')})" for m in models), flush=True)
+    results = []
+    for idx, m in enumerate(models, 1):
+        print(f"[workflow-dl] [{idx}/{len(models)}] Ensuring {m['directory']}/{m['name']} ...", flush=True)
+        results.append(ensure_model_on_ssd(m))
+    return {"workflow": wf_name, "resolved_from": resolved_from, "models": results}
+""")
+
+sys.path.insert(0, "/content/ComfyUI")
+from ct_workflow_helper import sync_workflow_models
+
+for wf_spec in [x.strip() for x in os.environ.get("CT_WORKFLOW", "").split(",") if x.strip()]:
+    sync_workflow_models(wf_spec, data_dir=DATA_DIR)
+
+print("ComfyUI + ComfyUI-Manager setup complete; local SSD models =", f"{COMFY_DIR}/models", "drive data =", DATA_DIR)
+'''
+COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with live /api/ct/pull-workflow endpoint)
+os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
+open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write("""import asyncio, sys
+from aiohttp import web
+from server import PromptServer
+sys.path.insert(0, "/content/ComfyUI")
+from ct_workflow_helper import sync_workflow_models
 
 @PromptServer.instance.routes.post("/api/ct/pull-workflow")
 async def ct_pull_workflow(request):
-    import asyncio
     body = await request.json()
     wf = body.get("workflow", "")
     if not wf:
         return web.json_response({"error": "missing 'workflow'"}, status=400)
-    res = await asyncio.to_thread(_pull_sync, wf)
-    return web.json_response(res)
+    try:
+        res = await asyncio.to_thread(sync_workflow_models, wf)
+        return web.json_response(res)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
 
 NODE_CLASS_MAPPINGS = {}
 """)
