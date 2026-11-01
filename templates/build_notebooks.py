@@ -849,6 +849,7 @@ import glob, site
 _URL_CRED_GUARD = ("<script>;(function(){if(location.username||location.password){"
                    "location.replace(location.origin+location.pathname+location.search+location.hash);"
                    "}})()</script>")
+_SSD_UI_SCRIPT = '<script defer src="/api/ct/ssd-downloader.js"></script>'
 for sp in site.getsitepackages():
     fe_dir = f"{sp}/comfyui_frontend_package/static"
     if not os.path.isdir(fe_dir):
@@ -860,9 +861,11 @@ for sp in site.getsitepackages():
                          'crossorigin="use-credentials"', html)
         if _URL_CRED_GUARD not in patched:
             patched = patched.replace("<head>", "<head>" + _URL_CRED_GUARD, 1)
+        if _SSD_UI_SCRIPT not in patched:
+            patched = patched.replace("</body>", _SSD_UI_SCRIPT + "</body>", 1)
         if patched != html:
             open(idx, "w", encoding="utf-8").write(patched)
-            print("Patched crossorigin=use-credentials and URL credential guard in", idx)
+            print("Patched crossorigin, URL credential guard, and SSD UI button in", idx)
     for js_path in glob.glob(f"{fe_dir}/assets/*.js"):
         js = open(js_path, encoding="utf-8", errors="ignore").read()
         patched_js = js.replace('crossOrigin=``', 'crossOrigin=`use-credentials`').replace(
@@ -1136,23 +1139,41 @@ def ensure_model_on_ssd(item, log_cb=None):
     return {"model": f"{item['directory']}/{item['name']}", "status": "downloaded",
             "size": sz, "source": item.get("source", "")}
 
-def sync_workflow_models(wf_source, data_dir=None, job=None):
+def list_ssd_models():
+    models_root = COMFY_DIR / "models"
+    items = []
+    if models_root.is_dir():
+        for p in sorted(models_root.rglob("*")):
+            if p.is_file() and p.name.lower().endswith(MODEL_EXTS):
+                rel = p.relative_to(models_root)
+                items.append({"path": str(rel), "size_gb": round(p.stat().st_size / 1e9, 2)})
+    free_ssd_gb = round(shutil.disk_usage("/content").free / 1e9, 2)
+    return {"free_ssd_gb": free_ssd_gb, "models": items}
+
+def sync_workflow_models(wf_source="", data_dir=None, job=None, wf_json_obj=None, wf_label=None):
     def _emit(msg):
         if job is not None:
             job["logs"].append(msg)
-    wf_name, raw, resolved_from = resolve_workflow(wf_source, data_dir=data_dir)
-    msg = f"[workflow-dl] Resolved workflow '{wf_source}' -> {resolved_from}"
-    print(msg, flush=True); _emit(msg)
-    wf_json = json.loads(raw)
-    wf_dir = COMFY_DIR / "user" / "default" / "workflows"
-    wf_dir.mkdir(parents=True, exist_ok=True)
-    if wf_name.endswith(".json"):
-        target_wf = wf_dir / wf_name
-        if not target_wf.is_file() or target_wf.read_text(encoding="utf-8", errors="ignore") != raw:
-            target_wf.write_text(raw, encoding="utf-8")
+    if wf_json_obj is not None:
+        wf_name = wf_label or "current_canvas.json"
+        resolved_from = "browser_canvas"
+        wf_json = wf_json_obj
+        msg = f"[workflow-dl] Using active browser canvas workflow ({wf_name})"
+        print(msg, flush=True); _emit(msg)
+    else:
+        wf_name, raw, resolved_from = resolve_workflow(wf_source, data_dir=data_dir)
+        msg = f"[workflow-dl] Resolved workflow '{wf_source}' -> {resolved_from}"
+        print(msg, flush=True); _emit(msg)
+        wf_json = json.loads(raw)
+        wf_dir = COMFY_DIR / "user" / "default" / "workflows"
+        wf_dir.mkdir(parents=True, exist_ok=True)
+        if wf_name.endswith(".json"):
+            target_wf = wf_dir / wf_name
+            if not target_wf.is_file() or target_wf.read_text(encoding="utf-8", errors="ignore") != raw:
+                target_wf.write_text(raw, encoding="utf-8")
     models = list(extract_workflow_models(wf_json).values())
     msg = (f"[workflow-dl] Found {len(models)} required model(s) in {wf_name}: " +
-           ", ".join(f"{m['directory']}/{m['name']} ({m.get('source')})" for m in models))
+           (", ".join(f"{m['directory']}/{m['name']} ({m.get('source')})" for m in models) if models else "none"))
     print(msg, flush=True); _emit(msg)
     if job is not None:
         job["workflow"] = wf_name
@@ -1183,22 +1204,271 @@ for wf_spec in [x.strip() for x in os.environ.get("CT_WORKFLOW", "").split(",") 
 
 print("ComfyUI + ComfyUI-Manager setup complete; local SSD models =", f"{COMFY_DIR}/models", "drive data =", DATA_DIR)
 '''
-COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with async /api/ct/pull-workflow endpoints)
+COMFYUI_SERVICE = r'''# @title 2. Service -- ComfyUI + ComfyUI-Manager on 127.0.0.1:8188 (with async /api/ct/pull-workflow + UI toolbar button)
+open("/content/ComfyUI/ct_ssd_downloader.js", "w", encoding="utf-8").write(r"""(function() {
+  if (window.__ctSsdDownloaderLoaded) return;
+  window.__ctSsdDownloaderLoaded = true;
+
+  const css = `
+    #ct-ssd-btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: linear-gradient(135deg, #2563eb 0%, #0d9488 100%);
+      color: #fff; border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px; padding: 5px 11px; font-size: 12px; font-weight: 600;
+      cursor: pointer; box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+      margin: 0 6px; white-space: nowrap; z-index: 9999;
+    }
+    #ct-ssd-btn:hover { filter: brightness(1.12); }
+    #ct-ssd-btn.ct-floating { position: fixed; top: 8px; right: 240px; }
+    #ct-ssd-modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.65);
+      display: none; align-items: center; justify-content: center; z-index: 100000;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    #ct-ssd-modal {
+      background: #18181b; color: #f4f4f5; width: 680px; max-width: 94vw;
+      max-height: 86vh; border-radius: 10px; border: 1px solid #3f3f46;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.6); display: flex; flex-direction: column;
+      overflow: hidden;
+    }
+    .ct-ssd-hdr {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 18px; background: #27272a; border-bottom: 1px solid #3f3f46;
+    }
+    .ct-ssd-hdr h3 { margin: 0; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .ct-ssd-badge {
+      background: #065f46; color: #a7f3d0; padding: 2px 8px; border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+    }
+    .ct-ssd-body { padding: 16px 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+    .ct-ssd-row { display: flex; gap: 8px; align-items: center; }
+    .ct-ssd-input {
+      flex: 1; background: #09090b; color: #f4f4f5; border: 1px solid #3f3f46;
+      border-radius: 6px; padding: 8px 10px; font-size: 13px;
+    }
+    .ct-ssd-action {
+      background: #2563eb; color: #fff; border: none; border-radius: 6px;
+      padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+      white-space: nowrap;
+    }
+    .ct-ssd-action.canvas-btn {
+      background: linear-gradient(135deg, #059669 0%, #0284c7 100%);
+      width: 100%; padding: 10px 14px; font-size: 13.5px;
+    }
+    .ct-ssd-action:disabled { opacity: 0.5; cursor: not-allowed; }
+    .ct-ssd-progress-wrap {
+      background: #27272a; border-radius: 6px; height: 8px; overflow: hidden; display: none;
+    }
+    .ct-ssd-progress-bar {
+      background: linear-gradient(90deg, #10b981, #3b82f6); height: 100%; width: 0%;
+      transition: width 0.3s ease;
+    }
+    #ct-ssd-logs {
+      background: #09090b; color: #d4d4d8; border: 1px solid #27272a; border-radius: 6px;
+      padding: 10px; font-family: ui-monospace, monospace; font-size: 11.5px;
+      height: 170px; overflow-y: auto; white-space: pre-wrap; line-height: 1.45;
+    }
+    .ct-ssd-models {
+      background: #121215; border: 1px solid #27272a; border-radius: 6px;
+      padding: 8px 10px; max-height: 130px; overflow-y: auto; font-size: 12px;
+    }
+    .ct-ssd-model-item {
+      display: flex; justify-content: space-between; padding: 3px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05); color: #a1a1aa;
+    }
+    .ct-ssd-close {
+      background: transparent; color: #a1a1aa; border: none; font-size: 18px; cursor: pointer;
+    }
+  `;
+  const styleEl = document.createElement("style");
+  styleEl.textContent = css;
+  document.head.appendChild(styleEl);
+
+  const backdrop = document.createElement("div");
+  backdrop.id = "ct-ssd-modal-backdrop";
+  backdrop.innerHTML = `
+    <div id="ct-ssd-modal">
+      <div class="ct-ssd-hdr">
+        <h3>⚡ Colab 本地 SSD 模型按需下载 <span id="ct-ssd-free" class="ct-ssd-badge">SSD 检测中...</span></h3>
+        <button class="ct-ssd-close" id="ct-ssd-close-btn">✕</button>
+      </div>
+      <div class="ct-ssd-body">
+        <button class="ct-ssd-action canvas-btn" id="ct-ssd-canvas-btn">
+          ⚡ 一键解析并下载【当前画布工作流】所需模型到本地 SSD
+        </button>
+        <div class="ct-ssd-row">
+          <input class="ct-ssd-input" id="ct-ssd-spec-input"
+            placeholder="或输入工作流 GitHub URL / 官方模板名 / 网盘文件名 (如 video_minimax_h3_r2v.json)" />
+          <button class="ct-ssd-action" id="ct-ssd-url-btn">📥 下载指定工作流</button>
+        </div>
+        <div class="ct-ssd-progress-wrap" id="ct-ssd-prog-wrap">
+          <div class="ct-ssd-progress-bar" id="ct-ssd-prog-bar"></div>
+        </div>
+        <div id="ct-ssd-logs">等待指令...（已存在于本地 SSD 的模型会自动跳过，下载完成后自动刷新节点列表）</div>
+        <div>
+          <div style="font-size:12px;color:#a1a1aa;margin-bottom:4px;font-weight:600;">
+            📦 当前本地 SSD 已缓存模型 (/content/ComfyUI/models)：
+          </div>
+          <div class="ct-ssd-models" id="ct-ssd-model-list">加载中...</div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  const btn = document.createElement("button");
+  btn.id = "ct-ssd-btn";
+  btn.innerHTML = "⬇️ SSD 模型下载";
+  btn.title = "按工作流一键下载所需模型到 Colab 本地高速 SSD (已存在的模型自动跳过)";
+
+  function mountButton() {
+    const rightMenu = document.querySelector(".comfyui-menu-right") ||
+                      document.querySelector(".actionbar-container") ||
+                      document.querySelector(".comfyui-menu");
+    if (rightMenu && btn.parentElement !== rightMenu) {
+      btn.classList.remove("ct-floating");
+      rightMenu.prepend(btn);
+    } else if (!btn.parentElement) {
+      btn.classList.add("ct-floating");
+      document.body.appendChild(btn);
+    }
+  }
+  mountButton();
+  setInterval(mountButton, 2000);
+
+  const logBox = document.getElementById("ct-ssd-logs");
+  const progWrap = document.getElementById("ct-ssd-prog-wrap");
+  const progBar = document.getElementById("ct-ssd-prog-bar");
+  const freeBadge = document.getElementById("ct-ssd-free");
+  const modelListEl = document.getElementById("ct-ssd-model-list");
+  const canvasBtn = document.getElementById("ct-ssd-canvas-btn");
+  const urlBtn = document.getElementById("ct-ssd-url-btn");
+  const specInput = document.getElementById("ct-ssd-spec-input");
+  let pollTimer = null;
+
+  async function refreshStatus() {
+    try {
+      const r = await fetch("/api/ct/ssd-status", { credentials: "include" });
+      const d = await r.json();
+      freeBadge.textContent = `SSD 剩余: ${d.free_ssd_gb} GB`;
+      if (!d.models || d.models.length === 0) {
+        modelListEl.innerHTML = '<div style="color:#71717a;">暂无已下载模型</div>';
+      } else {
+        modelListEl.innerHTML = d.models.map(m =>
+          `<div class="ct-ssd-model-item"><span>${m.path}</span><span>${m.size_gb} GB</span></div>`
+        ).join("");
+      }
+      if (d.active_job && !pollTimer) {
+        watchJob(d.active_job.job_id);
+      }
+    } catch (e) {}
+  }
+
+  function setBusy(busy) {
+    canvasBtn.disabled = busy;
+    urlBtn.disabled = busy;
+    btn.innerHTML = busy ? "⏳ SSD 下载中..." : "⬇️ SSD 模型下载";
+  }
+
+  function watchJob(jobId) {
+    if (pollTimer) clearInterval(pollTimer);
+    setBusy(true);
+    progWrap.style.display = "block";
+    pollTimer = setInterval(async () => {
+      try {
+        const r = await fetch(`/api/ct/pull-workflow/${jobId}`, { credentials: "include" });
+        const job = await r.json();
+        if (job.logs && job.logs.length) {
+          logBox.textContent = job.logs.join("\n");
+          logBox.scrollTop = logBox.scrollHeight;
+        }
+        const pct = job.total > 0 ? Math.round((job.completed / job.total) * 100) : 15;
+        progBar.style.width = `${pct}%`;
+        if (job.status === "done" || job.status === "error") {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          setBusy(false);
+          progBar.style.width = job.status === "done" ? "100%" : "0%";
+          await refreshStatus();
+          if (job.status === "done") {
+            logBox.textContent += "\n✅ 全部模型已就绪！正在自动刷新 ComfyUI 节点模型列表...";
+            logBox.scrollTop = logBox.scrollHeight;
+            try { await window.app?.refreshComboInNodes?.(); } catch (e) {}
+          }
+        }
+      } catch (e) {}
+    }, 1500);
+  }
+
+  async function startJob(payload) {
+    setBusy(true);
+    logBox.textContent = "正在提交下载任务...";
+    progWrap.style.display = "block";
+    progBar.style.width = "10%";
+    try {
+      const r = await fetch("/api/ct/pull-workflow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        logBox.textContent = `❌ 错误: ${data.error || r.statusText}`;
+        setBusy(false);
+        return;
+      }
+      watchJob(data.job_id);
+    } catch (e) {
+      logBox.textContent = `❌ 请求失败: ${e}`;
+      setBusy(false);
+    }
+  }
+
+  btn.onclick = () => {
+    backdrop.style.display = "flex";
+    refreshStatus();
+  };
+  document.getElementById("ct-ssd-close-btn").onclick = () => {
+    backdrop.style.display = "none";
+  };
+  backdrop.onclick = (e) => {
+    if (e.target === backdrop) backdrop.style.display = "none";
+  };
+  canvasBtn.onclick = () => {
+    const wfJson = window.app?.graph?.serialize?.();
+    if (!wfJson || !wfJson.nodes || !wfJson.nodes.length) {
+      logBox.textContent = "⚠️ 当前画布为空，请先在画布中打开一个工作流，或在下方输入工作流 URL / 模板名。";
+      return;
+    }
+    startJob({ workflow_json: wfJson, workflow_name: "current_canvas_workflow.json" });
+  };
+  urlBtn.onclick = () => {
+    const spec = specInput.value.trim();
+    if (!spec) {
+      logBox.textContent = "⚠️ 请输入工作流 GitHub URL、官方模板名或网盘工作流文件名。";
+      return;
+    }
+    startJob({ workflow: spec });
+  };
+})();""")
+
 os.makedirs("/content/ComfyUI/custom_nodes", exist_ok=True)
 open("/content/ComfyUI/custom_nodes/ct_workflow_downloader.py", "w", encoding="utf-8").write(r"""import secrets, sys, threading, time
+from pathlib import Path
 from aiohttp import web
 from server import PromptServer
 sys.path.insert(0, "/content/ComfyUI")
-from ct_workflow_helper import sync_workflow_models
+from ct_workflow_helper import list_ssd_models, sync_workflow_models
 
 JOBS = {}
 _DL_LOCK = threading.Lock()
 
-def _run_job(job_id, wf):
+def _run_job(job_id, wf, wf_json_obj=None, wf_label=None):
     job = JOBS[job_id]
     with _DL_LOCK:
         try:
-            res = sync_workflow_models(wf, job=job)
+            res = sync_workflow_models(wf, job=job, wf_json_obj=wf_json_obj, wf_label=wf_label)
             job["result"] = res
             job["status"] = "done"
         except Exception as e:
@@ -1210,16 +1480,18 @@ def _run_job(job_id, wf):
 @PromptServer.instance.routes.post("/api/ct/pull-workflow")
 async def ct_pull_workflow(request):
     body = await request.json()
-    wf = body.get("workflow", "")
-    if not wf:
-        return web.json_response({"error": "missing 'workflow'"}, status=400)
+    wf = (body.get("workflow") or "").strip()
+    wf_json_obj = body.get("workflow_json")
+    wf_label = body.get("workflow_name") or "current_canvas.json"
+    if not wf and not isinstance(wf_json_obj, dict):
+        return web.json_response({"error": "missing 'workflow' or 'workflow_json'"}, status=400)
     job_id = secrets.token_hex(8)
     JOBS[job_id] = {
-        "job_id": job_id, "workflow_spec": wf, "status": "running",
+        "job_id": job_id, "workflow_spec": wf or wf_label, "status": "running",
         "total": 0, "completed": 0, "current": None, "models": [], "logs": [],
         "started_at": time.time(),
     }
-    threading.Thread(target=_run_job, args=(job_id, wf), daemon=True).start()
+    threading.Thread(target=_run_job, args=(job_id, wf, wf_json_obj, wf_label), daemon=True).start()
     return web.json_response(JOBS[job_id], status=202)
 
 @PromptServer.instance.routes.get("/api/ct/pull-workflow/{job_id}")
@@ -1228,6 +1500,18 @@ async def ct_pull_workflow_status(request):
     if job_id not in JOBS:
         return web.json_response({"error": "unknown job_id"}, status=404)
     return web.json_response(JOBS[job_id])
+
+@PromptServer.instance.routes.get("/api/ct/ssd-status")
+async def ct_ssd_status(request):
+    info = list_ssd_models()
+    active = [j for j in JOBS.values() if j.get("status") == "running"]
+    info["active_job"] = active[-1] if active else None
+    return web.json_response(info)
+
+@PromptServer.instance.routes.get("/api/ct/ssd-downloader.js")
+async def ct_ssd_downloader_js(request):
+    js = Path("/content/ComfyUI/ct_ssd_downloader.js").read_text(encoding="utf-8")
+    return web.Response(text=js, content_type="application/javascript")
 
 NODE_CLASS_MAPPINGS = {}
 """)
