@@ -136,7 +136,8 @@ def ensure_route(svc, config, hostname, state_root):
     credential=json.loads(credentials_path(state_root,config).read_text())
     dns=ensure_dns(svc,config,hostname)
     try:
-        result=remote(config,dict(action='route',project_id=config['project_id'],service=svc.name,hostname=hostname))
+        result=remote(config,dict(action='route',project_id=config['project_id'],service=svc.name,hostname=hostname,
+                                  profile='comfyui' if svc.base_name=='comfyui' else None))
     except Exception:
         rollback_dns(dns,hostname)
         raise

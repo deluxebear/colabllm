@@ -36,6 +36,24 @@ class FrpTest(unittest.TestCase):
     def args(self,**kw):
         return argparse.Namespace(**dict(domain=None,base_domain=None,quick_tunnel=False,transport=None,**kw))
 
+    def test_caddy_reload_recovers_only_after_main_process_has_exited(self):
+        meta=dict(caddy_binary='/bin/caddy',caddy_config='/etc/caddy/Caddyfile',caddy_unit='caddy.service')
+        for pid in ('0','123'):
+            with self.subTest(pid=pid):
+                def run(args, **kwargs):
+                    if args[:2]==['systemctl','reload']:
+                        raise server.subprocess.TimeoutExpired(args,15)
+                    return ''
+                with patch.object(server,'run',side_effect=run) as command, \
+                     patch.object(server.subprocess,'run',return_value=argparse.Namespace(stdout=pid)):
+                    if pid=='0':
+                        server.caddy_check_reload(meta)
+                    else:
+                        with self.assertRaises(server.subprocess.TimeoutExpired):
+                            server.caddy_check_reload(meta)
+                stopped=any(c.args[0][:2]==['systemctl','stop'] for c in command.call_args_list)
+                self.assertEqual(stopped,pid=='0')
+
     def test_configure_is_global_preserves_domain_and_redacts_credentials(self):
         args=argparse.Namespace(disable=False,server_ip=CONFIG['server_ip'],ssh=CONFIG['ssh'],base_domain='example.com',server_port=None)
         with patch.object(backend,'remote',return_value=dict(token='secret',ca_cert='BEGIN CERTIFICATE',frp_version='0.61.2')), \
@@ -159,7 +177,7 @@ class FrpTest(unittest.TestCase):
         etc=self.root/'etc';data=self.root/'data';binary=self.root/'bin';units=self.root/'units';units.mkdir()
         def download(repo,version,asset,checksum,members):
             for target in members.values():Path(target).write_text('test binary')
-        def run(args):
+        def run(args, **kwargs):
             if args[0]=='openssl':
                 (etc/'server.crt').write_text('BEGIN CERTIFICATE')
                 (etc/'server.key').write_text('private key')
@@ -186,7 +204,7 @@ class FrpTest(unittest.TestCase):
         original='existing.example.com {\n respond "existing"\n}\n';standard.write_text(original);standard.chmod(0o640)
         def download(repo,version,asset,checksum,members):
             for target in members.values():Path(target).write_text('test binary')
-        def run(args):
+        def run(args, **kwargs):
             if args[0]=='openssl':
                 (etc/'server.crt').write_text('BEGIN CERTIFICATE');(etc/'server.key').write_text('private key')
             if args[:2]==['systemctl','show']:return str(standard)

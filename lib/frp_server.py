@@ -199,8 +199,8 @@ def discover_caddy():
     return found[0] if found else None
 
 
-def run(args):
-    result = subprocess.run(args, capture_output=True, text=True)
+def run(args, timeout=None):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     if result.returncode:
         # Never include argv/config contents: they may contain credentials.
         raise RuntimeError(f'{Path(args[0]).name} failed: {(result.stderr or result.stdout)[-1200:]}')
@@ -276,10 +276,19 @@ log.level = "info"
 '''
 
 
-def caddy_site(host, port, address='127.0.0.1'):
+def caddy_site(host, port, address='127.0.0.1', cache_assets=False):
     address='['+address+']' if ':' in address else address
+    cache = r'''    @hashed_assets {
+        method GET HEAD
+        path_regexp ^/assets/[^/]+-[A-Za-z0-9_-]{8}\.(js|css)$
+    }
+    header @hashed_assets {
+        Cache-Control "private, max-age=31536000, immutable"
+        match status 200
+    }
+''' if cache_assets else ''
     return f'''{host} {{
-    reverse_proxy {address}:{int(port)} {{
+{cache}    reverse_proxy {address}:{int(port)} {{
         flush_interval -1
         header_up X-Forwarded-Proto https
         header_up X-Forwarded-Host {{host}}
@@ -295,7 +304,19 @@ def caddy_check_reload(meta):
     except RuntimeError:
         run(['systemctl','start',meta['caddy_unit']])
     else:
-        run(['systemctl','reload',meta['caddy_unit']])
+        try:
+            run(['systemctl','reload',meta['caddy_unit']],timeout=15)
+        except (RuntimeError,subprocess.TimeoutExpired):
+            # Some old packaged Caddy/Go builds panic during reload and leave
+            # systemd stuck in reload-notify with no main process. Recover the
+            # already validated config; never stop a still-running server.
+            pid=subprocess.run(['systemctl','show',meta['caddy_unit'],'--property=MainPID','--value'],
+                               capture_output=True,text=True).stdout.strip()
+            if pid!='0':
+                raise
+            run(['systemctl','stop',meta['caddy_unit']],timeout=15)
+            run(['systemctl','start',meta['caddy_unit']],timeout=15)
+            run(['systemctl','is-active','--quiet',meta['caddy_unit']])
 
 
 def ensure_unit_started(unit):
@@ -506,9 +527,16 @@ def route(payload):
         site.unlink(missing_ok=True)
     else:
         port=allocate(registry,owner,hostname,meta.get('frp_allow_ports'))
-        atomic(site,caddy_site(hostname,port,meta.get('frp_proxy_addr','127.0.0.1')),0o644)
+        cache_assets=False
+        if payload.get('profile')=='comfyui':
+            version=run([meta['caddy_binary'],'version'])
+            match=re.search(r'\bv?(\d+)\.(\d+)\.(\d+)\b',version)
+            cache_assets=bool(match and tuple(map(int,match.groups()))>=(2,10,2))
+        content=caddy_site(hostname,port,meta.get('frp_proxy_addr','127.0.0.1'),cache_assets=cache_assets)
+        atomic(site,content,0o644)
     try:
-        caddy_check_reload(meta)
+        if removing or old!=content:
+            caddy_check_reload(meta)
         if removing:
             del registry[owner]
         else:

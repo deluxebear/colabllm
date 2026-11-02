@@ -89,7 +89,7 @@ class RealTransportTest(unittest.TestCase):
         self.wait_port(self.server_port)
         self.client=self.start('frpc',['-c',str(self.root/'frpc.toml')])
         self.wait_port(self.remote_port)
-        site=frp_server.caddy_site(f'https://127.0.0.1:{self.http_port}',self.remote_port)
+        site=frp_server.caddy_site(f'https://127.0.0.1:{self.http_port}',self.remote_port,cache_assets=True)
         site=site.replace('    reverse_proxy',f'    tls {self.root}/server.crt {self.root}/server.key\n    reverse_proxy',1)
         self.tls_context=ssl.create_default_context(cafile=str(self.root/'server.crt'))
         (self.root/'Caddyfile').write_text('{\n admin off\n auto_https disable_redirects\n}\n'+site)
@@ -119,6 +119,19 @@ class RealTransportTest(unittest.TestCase):
             except OSError:time.sleep(.05)
         logs='\n'.join(p.read_text(errors='replace') for p in self.root.glob('*.log'))
         self.fail(f'Port {port} not listening: {logs}')
+
+    def test_hashed_assets_cache_only_successful_authenticated_responses(self):
+        base=f'https://127.0.0.1:{self.http_port}'
+        asset='/assets/vendor-other-DMCJdr63.js'
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(base+asset,timeout=5,context=self.tls_context)
+        self.assertEqual(error.exception.code,401)
+        self.assertIsNone(error.exception.headers.get('Cache-Control'))
+        error.exception.close()
+        for path,cached in [(asset,True),('/api/system_stats',False),('/assets/extension.js',False)]:
+            request=urllib.request.Request(base+path,headers={'Authorization':'Bearer test-secret'})
+            with urllib.request.urlopen(request,timeout=5,context=self.tls_context) as response:
+                self.assertEqual('immutable' in response.headers.get('Cache-Control',''),cached)
 
     def test_auth_sse_websocket_and_client_reconnect(self):
         base=f'https://127.0.0.1:{self.http_port}'
