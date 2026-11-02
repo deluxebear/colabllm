@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `services/<name>.py` | 会话名与服务名一致 |
 | 免浏览器挂载网盘 (`colab dfs mount`) | 本地脚本 `services/<name>.py` | 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
-| 固定域名 (`--domain`) | 本地脚本 (`cf` CLI) | 创建/复用 `colab-<name>` 隧道、配置 ingress、绑定 DNS CNAME（默认后缀 `example.com`） |
+| 固定域名 (`--domain`) | 本地脚本 (`cf` CLI) | 创建/复用 `colab-<name>` 隧道、配置 ingress、绑定 DNS CNAME（主域名可配置，未配置时使用动态 URL） |
 | 密钥生成与注入 | 本地脚本 -> `--env` | 自动生成账号密码与 Bearer Token，保存在 `.state/<name>/state.json` (0600) |
 | 安装与启动服务 | 远端 `services/<name>.ipynb` | 幂等安装，服务仅监听 `127.0.0.1` |
 | 安全认证层 (Caddy) | 远端 `services/<name>.ipynb` | 对无自带认证的服务（如 Ollama）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
@@ -17,7 +17,7 @@
 
 ## 各运行时使用文档
 
-| 服务名称 | 默认 GPU | 认证方式 | 默认固定域名 (`--domain`) | 详细使用说明 |
+| 服务名称 | 默认 GPU | 认证方式 | 固定域名示例（主域名配置为 `example.com`） | 详细使用说明 |
 | --- | --- | --- | --- | --- |
 | **NVIDIA-Nemotron-3.5-Transcribe-30B-A4B** | `G4` | `vLLM` Bearer API Key (`builtin`) | `https://transcribe.example.com` | [docs/nemotron-transcribe.md](docs/nemotron-transcribe.md) |
 | **LongCat-Video-Avatar 1.5** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-avatar.example.com` | [docs/longcat-avatar.md](docs/longcat-avatar.md) |
@@ -64,15 +64,44 @@ colab dfs consent        # 一次性授权 Google Drive
 cf auth login            # 使用 --domain 固定域名时需登录 Cloudflare CLI
 ```
 
+## Cloudflare Tunnel 配置
+
+通过项目根目录的 `colabctl.py` 统一配置；所有现有及新增运行时、所有实例均读取同一份主域名配置，保存在本机 `.state/tunnel-config.json`。配置为空时，`up`（包括不带 HOST 的 `up --domain`）使用 Cloudflare Quick Tunnel 的随机 `https://*.trycloudflare.com` URL，无需 `cf` 登录；每次启动 URL 可能变化。代码中的历史 `example.com` 后缀不再自动启用。
+
+```bash
+# 查看 / 设置 / 清除全局主域名（项目根目录统一入口）
+./colabctl.py tunnel-config
+./colabctl.py tunnel-config --base-domain example.com
+./colabctl.py tunnel-config --clear
+
+# 只为本次启动指定主域名，不写入配置
+./services/longcat-avatar.py up --base-domain example.com
+# -> https://longcat-avatar.example.com
+./services/qwen-flash.py up -i 2 --base-domain example.com
+# -> https://qwen-2.example.com（保留服务别名与实例后缀）
+
+# 已配置主域名后：up 自动使用固定域名；也可以强制动态 URL
+./services/longcat-avatar.py up
+./services/longcat-avatar.py up --quick-tunnel
+
+# 完整域名覆盖自动生成的服务域名
+./services/longcat-avatar.py up --domain avatar.example.com
+```
+
+可设置环境变量 `COLABSVC_BASE_DOMAIN=example.com`。选择顺序：`--quick-tunnel` 强制动态；完整 `--domain HOST` > `--base-domain` > 环境变量 > 全局配置 > 动态 URL。三个启动选项互斥。域名只填 DNS 名称，不包含 `https://`、端口或路径。
+
+固定域名要求 `cf auth login` 且账户有该域名的 DNS Zone 权限，启动时自动创建/复用 named tunnel、设置 ingress 和 DNS CNAME。配置修改仅影响之后的启动，不会重启运行中的服务；已有服务需自行择机重启。切换动态模式不会删除旧隧道和 DNS，可使用 `down --delete-tunnel` 显式清理。
+
 ## 常用命令
 
 以 `unsloth-studio` 和 `ollama` 为例：
 
 ```bash
-# 1. 启动服务（默认使用随机 *.trycloudflare.com 临时链接）
+# 1. 启动服务（未配置主域名时使用随机 *.trycloudflare.com 临时链接）
 ./services/unsloth-studio.py up
 
-# 2. 启动并绑定固定域名（默认 <name>.example.com，或服务自定义的 default_hostname）
+# 2. 配置所有服务共享的主域名，再启动固定域名服务
+./colabctl.py tunnel-config --base-domain example.com
 ./services/ollama.py up --domain
 ./services/qwen-flash.py up --domain     # 绑定 https://qwen.example.com（G4 GPU，800K 上下文 + 视觉）
 

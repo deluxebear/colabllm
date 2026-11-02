@@ -1,5 +1,7 @@
 # Ollama 运行时使用说明
 
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+
 对应文件：
 - 执行脚本：[services/ollama.py](services/ollama.py)
 - 远端 Notebook：[services/ollama.ipynb](services/ollama.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
@@ -26,7 +28,7 @@
 ./services/ollama.py up --domain
 
 # 2. 使用临时 *.trycloudflare.com 链接启动，或指定 L4 GPU
-./services/ollama.py up --gpu L4
+./services/ollama.py up --quick-tunnel --gpu L4
 
 # 3. 查看访问地址、Basic Auth 账号密码与 Bearer API Token
 ./services/ollama.py info

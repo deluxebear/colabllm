@@ -1,5 +1,7 @@
 # NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech) 运行时使用说明
 
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+
 对应文件：
 - 执行脚本：[services/nemotron-transcribe.py](services/nemotron-transcribe.py)
 - 远端 Notebook：[services/nemotron-transcribe.ipynb](services/nemotron-transcribe.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
@@ -32,7 +34,7 @@
 ./services/nemotron-transcribe.py up --domain --precision nvfp4
 
 # 3. 使用随机临时域名 (*.trycloudflare.com) 启动
-./services/nemotron-transcribe.py up
+./services/nemotron-transcribe.py up --quick-tunnel
 
 # 4. 查看访问 URL 与 Bearer API Token
 ./services/nemotron-transcribe.py info

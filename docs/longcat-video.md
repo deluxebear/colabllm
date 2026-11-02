@@ -1,5 +1,7 @@
 # LongCat-Video（Colab G4）
 
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+
 基于 [meituan-longcat/LongCat-Video](https://github.com/meituan-longcat/LongCat-Video)，部署基础视频生成模型，提供带认证的 Gradio 网页：文生视频、图生视频、视频续写，以及多段连续生成。此服务不加载独立的 Avatar 模型。
 
 ```bash

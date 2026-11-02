@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import json
 import os
 import re
@@ -63,8 +64,8 @@ class Service:
     gpu: str | None = "T4"          # T4|L4|G4|H100|A100 or None for CPU
     tpu: str | None = None
     high_mem: bool = False
-    zone: str = DEFAULT_ZONE        # default zone for `--domain` without a value
-    default_hostname: str | None = None  # optional override for `--domain` without a value
+    zone: str = DEFAULT_ZONE        # legacy suffix used to extract service aliases
+    default_hostname: str | None = None  # legacy host supplying an alias (e.g. qwen.<zone>)
     auth_user: str = "admin"
     env: dict = dataclasses.field(default_factory=dict)   # extra env for the notebook
     ready_timeout: int = 3600       # seconds `up` waits for CT_READY
@@ -127,6 +128,69 @@ def apply_instance(svc: Service, inst: str | None) -> Service:
         else:
             svc.default_hostname = f"{base_host}{suffix}" if not base_host.endswith(suffix) else base_host
     return svc
+
+
+def validate_domain(value: str) -> str:
+    """Accept DNS hostnames, never URLs, wildcard patterns, ports or IPs."""
+    try:
+        host = value.strip().rstrip('.').encode('idna').decode('ascii').lower()
+    except (UnicodeError, AttributeError):
+        raise ValueError('域名格式无效，请填写 example.com，不包含协议、端口或路径') from None
+    labels = host.split('.')
+    if len(host) > 253 or len(labels) < 2 or any(
+        not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels
+    ):
+        raise ValueError('域名格式无效，请填写 example.com，不包含协议、端口或路径')
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    raise ValueError('请填写 DNS 域名，不能使用 IP 地址')
+
+
+def load_tunnel_config() -> dict:
+    path = STATE_ROOT / 'tunnel-config.json'
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError('tunnel-config.json 必须是 JSON 对象')
+    return {'base_domain': validate_domain(data['base_domain'])} if data.get('base_domain') else {}
+
+
+def tunnel_hostname(svc: Service, args) -> str | None:
+    if getattr(args, 'quick_tunnel', False):
+        return None
+    domain = getattr(args, 'domain', None)
+    if domain and domain not in (True, '@default'):
+        return validate_domain(domain)
+    base = (getattr(args, 'base_domain', None) or os.environ.get('COLABSVC_BASE_DOMAIN')
+            or load_tunnel_config().get('base_domain'))
+    if not base:
+        return None
+    base = validate_domain(base)
+    # Keep service aliases (qwen, transcribe, etc.) and instance suffixes,
+    # replacing only their historical base domain.
+    alias = svc.default_hostname or svc.name
+    if alias.endswith('.' + svc.zone):
+        alias = alias[:-(len(svc.zone) + 1)]
+    return validate_domain(f'{alias}.{base}')
+
+
+def cmd_tunnel_config(args) -> None:
+    path = STATE_ROOT / 'tunnel-config.json'
+    if args.clear:
+        path.unlink(missing_ok=True)
+    elif args.base_domain is not None:
+        domain = validate_domain(args.base_domain)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + '.' + secrets.token_hex(6) + '.tmp')
+        temporary.write_text(json.dumps({'base_domain': domain}, indent=2) + '\n')
+        temporary.replace(path)
+    saved = load_tunnel_config()
+    print(json.dumps({'base_domain': saved.get('base_domain'),
+                      'environment_override': os.environ.get('COLABSVC_BASE_DOMAIN') or None,
+                      'config_file': str(path)}, ensure_ascii=False, indent=2))
 
 
 def list_service_instances(base_name: str) -> list[dict]:
@@ -417,9 +481,10 @@ def ensure_session(svc: Service) -> None:
 
 
 def cmd_up(svc: Service, script: Path, a) -> None:
+    hostname = tunnel_hostname(svc, a)
     if a.gpu:
         svc.gpu = None if a.gpu.lower() in ("none", "cpu") else a.gpu
-    for tool in ("colab",) + (("cf",) if a.domain else ()):
+    for tool in ("colab",) + (("cf",) if hostname else ()):
         if not shutil.which(tool):
             die(f"`{tool}` CLI not found")
     state = State(svc)
@@ -433,8 +498,6 @@ def cmd_up(svc: Service, script: Path, a) -> None:
     nb_src = (script.parent / svc.notebook).resolve()
     skip = {int(x) for x in a.skip.split(",")} if a.skip else set()
     built, plan = build_notebook(nb_src, skip)
-    default_host = svc.default_hostname or f"{svc.name}.{svc.zone}"
-    hostname = (a.domain if a.domain not in (None, "@default") else default_host) if a.domain else None
     log(f"service {svc.name}: notebook {nb_src.name}, gpu {svc.tpu or svc.gpu or 'cpu'}, auth {svc.auth}, "
         f"{'domain ' + hostname if hostname else 'quick tunnel'}")
     print("\n".join(plan))
@@ -453,6 +516,9 @@ def cmd_up(svc: Service, script: Path, a) -> None:
            "CT_PUBLIC_PORT": str(svc.tunnel_port), "CT_AUTH": svc.auth,
            "CT_API_TOKEN": st["api_token"],
            "CT_DATA_DIR": f"/content/drive/MyDrive/colab-llm/{svc.base_name or svc.name}", **svc.env}
+    # Explicitly clear previous notebook-kernel values when switching to quick
+    # tunnels; reused Colab kernels retain env vars from earlier executions.
+    env.update(CT_TUNNEL_TOKEN="", CT_PUBLIC_HOSTNAME="")
     hf_tok = a.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or st.get("hf_token")
     if not hf_tok:
         for p in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
@@ -609,9 +675,12 @@ def main(svc: Service) -> None:
                    help="instance ID to create/manage multiple parallel instances (e.g. -i 1, -i 2)")
     sub = p.add_subparsers(dest="cmd", required=True)
     u = sub.add_parser("up", help="session -> Drive -> (cf tunnel) -> run notebook, keep it alive")
-    default_host = svc.default_hostname or f"{svc.name}.{svc.zone}"
-    u.add_argument("--domain", nargs="?", const="@default", metavar="HOST",
-                   help=f"fixed domain via a named tunnel (default host: {default_host})")
+    tunnel = u.add_mutually_exclusive_group()
+    tunnel.add_argument("--domain", nargs="?", const=True, metavar="HOST", type=validate_domain,
+                        help="完整固定域名；省略 HOST 时使用已配置的主域名，未配置则使用动态 URL")
+    tunnel.add_argument("--base-domain", metavar="DOMAIN", type=validate_domain,
+                        help="本次启动的主域名，如 example.com，自动生成 <service>.example.com")
+    tunnel.add_argument("--quick-tunnel", action="store_true", help="忽略主域名配置，强制使用动态 trycloudflare.com URL")
     u.add_argument("--gpu", help="override GPU (T4|L4|G4|H100|A100|none)")
     u.add_argument("--skip", default="", help="1-based code cells to skip, e.g. 1,2")
     u.add_argument("--no-drive", action="store_true", help="do not mount Google Drive")
@@ -630,12 +699,24 @@ def main(svc: Service) -> None:
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("-n", "--lines", type=int, default=80)
     sub.add_parser("status", help="colab status + public URL probe")
+    tc = sub.add_parser("tunnel-config", help="查看或设置所有服务共享的 Cloudflare 主域名；未设置时使用动态 URL")
+    settings = tc.add_mutually_exclusive_group()
+    settings.add_argument("--base-domain", metavar="DOMAIN", type=validate_domain)
+    settings.add_argument("--clear", action="store_true", help="移除持久主域名配置，恢复动态 URL 默认值")
     ex = sub.add_parser("_exec")          # internal: detached runner
     ex.add_argument("nb")
     a = p.parse_args(cleaned_argv)
 
     if a.cmd == "up":
-        cmd_up(svc, script, a)
+        try:
+            cmd_up(svc, script, a)
+        except (ValueError, OSError) as error:
+            p.error(str(error))
+    elif a.cmd == "tunnel-config":
+        try:
+            cmd_tunnel_config(a)
+        except (ValueError, OSError) as error:
+            p.error(str(error))
     elif a.cmd == "_exec":
         sys.exit(exec_runner(svc, Path(a.nb)))
     elif a.cmd == "down":

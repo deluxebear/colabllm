@@ -1,5 +1,7 @@
 # Qwen3.8-Flash-Next (G4 / 800K / Vision) 运行时使用说明
 
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+
 对应文件：
 - 执行脚本：[services/qwen-flash.py](services/qwen-flash.py)
 - 远端 Notebook：[services/qwen-flash.ipynb](services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
@@ -28,7 +30,7 @@
 ./services/qwen-flash.py up --domain
 
 # 2. 使用临时 *.trycloudflare.com 域名启动
-./services/qwen-flash.py up
+./services/qwen-flash.py up --quick-tunnel
 
 # 3. 查看访问地址与 Bearer API Token
 ./services/qwen-flash.py info

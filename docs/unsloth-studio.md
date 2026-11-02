@@ -1,5 +1,7 @@
 # Unsloth Studio 运行时使用说明
 
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+
 对应文件：
 - 执行脚本：[services/unsloth-studio.py](services/unsloth-studio.py)
 - 远端 Notebook：[services/unsloth-studio.ipynb](services/unsloth-studio.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
@@ -25,7 +27,7 @@
 ./services/unsloth-studio.py up --domain
 
 # 2. 使用随机 *.trycloudflare.com 临时域名启动
-./services/unsloth-studio.py up
+./services/unsloth-studio.py up --quick-tunnel
 
 # 3. 指定更高规格 GPU（如 A100）并传入 Hugging Face Token（用于下载受限模型或推送权重）
 ./services/unsloth-studio.py up --domain --gpu A100 --hf-token hf_xxx
