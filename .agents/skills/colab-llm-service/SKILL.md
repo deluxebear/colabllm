@@ -25,7 +25,10 @@ Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, 
 `qwen-flash` (`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF` IQ3_S, 800K YaRN 3.125x + BF16 vision,
 `llama-server --api-key-file` built-in auth, G4 GPU, default domain `qwen.example.com`),
 `nemotron-transcribe` (`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` via `vllm serve` + `nemo_speechlm`,
-Bearer API key auth, G4 GPU, default domain `transcribe.example.com`, single & batch Drive audio CLI `transcribe`).
+Bearer API key auth, G4 GPU, default domain `transcribe.example.com`, single & batch Drive audio CLI `transcribe`),
+`indextts` (`IndexTeam/IndexTTS-2.5` via `vllm serve --omni` 2-stage pipeline, Bearer API key auth, L4 GPU,
+default domain `indextts.example.com`, zero-shot voice cloning, persistent Drive voices, native speed 0.5-2.0x,
+multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`).
 
 ## Daily use
 

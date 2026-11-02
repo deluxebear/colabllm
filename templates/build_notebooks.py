@@ -3075,6 +3075,1001 @@ while True:
     nlog(f"heartbeat | up={int(time.monotonic() - started)}s | GPU: {gpu_mem}")
 '''
 
+# ---------------------------------------------------------------------------
+# IndexTTS-2.5 (L4 GPU / vLLM-Omni 2-stage zero-shot voice cloning & emotion TTS)
+# ---------------------------------------------------------------------------
+
+INDEXTTS_CFG = dict(
+    name="indextts",
+    service_port=8000,
+    auth="builtin",
+    public_port=8000,
+    health_path="/health",
+    ready_timeout=3600,
+)
+
+INDEXTTS_SETUP = r'''# @title 1. Setup -- install vLLM-Omni + pre-stage IndexTTS-2.5 & sub-models on local SSD
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+MODEL_REPO = os.environ.get("CT_INDEXTTS_MODEL", "IndexTeam/IndexTTS-2.5").strip() or "IndexTeam/IndexTTS-2.5"
+MODEL_ALIAS = os.environ.get("CT_INDEXTTS_ALIAS", "indextts-2.5").strip() or "indextts-2.5"
+STAGE0_GPU_MEM = float(os.environ.get("CT_INDEXTTS_GPU_MEM_STAGE0", "0.4"))
+STAGE1_GPU_MEM = float(os.environ.get("CT_INDEXTTS_GPU_MEM_STAGE1", "0.4"))
+MAX_MODEL_LEN = int(os.environ.get("CT_INDEXTTS_MAX_MODEL_LEN", "2560"))
+MAX_NUM_SEQS = int(os.environ.get("CT_INDEXTTS_MAX_NUM_SEQS", "4"))
+
+IT_WORK = Path("/content/indextts")
+VENV_DIR = IT_WORK / "venv"
+MODEL_DIR = IT_WORK / "model" / "IndexTTS-2.5"
+SPEAKERS_DIR = IT_WORK / "speakers"
+DEFAULT_REF_WAV = IT_WORK / "default_ref.wav"
+
+DRIVE_VOICES_DIR = Path(DATA_DIR) / "voices"
+DRIVE_OUTPUT_DIR = Path(DATA_DIR) / "outputs"
+FLASHINFER_DRIVE_DIR = Path(DATA_DIR) / "flashinfer-cache"
+FLASHINFER_CACHE_DIR = IT_WORK / "flashinfer-cache"
+TRITON_DRIVE_DIR = Path(DATA_DIR) / "triton-cache"
+TRITON_CACHE_DIR = IT_WORK / "triton-cache"
+VLLM_DRIVE_DIR = Path(DATA_DIR) / "vllm-cache"
+VLLM_CACHE_DIR = IT_WORK / "vllm-cache"
+
+for d in (
+    IT_WORK, MODEL_DIR, SPEAKERS_DIR,
+    DRIVE_VOICES_DIR, DRIVE_OUTPUT_DIR,
+    FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR,
+    TRITON_DRIVE_DIR, TRITON_CACHE_DIR,
+    VLLM_DRIVE_DIR, VLLM_CACHE_DIR,
+):
+    d.mkdir(parents=True, exist_ok=True)
+
+for _src_d, _dst_d in (
+    (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR),
+    (TRITON_DRIVE_DIR, TRITON_CACHE_DIR),
+    (VLLM_DRIVE_DIR, VLLM_CACHE_DIR),
+    (DRIVE_VOICES_DIR, SPEAKERS_DIR),
+):
+    if any(_src_d.iterdir()):
+        subprocess.run(["cp", "-rn", f"{_src_d}/.", f"{_dst_d}/"], check=False)
+
+def ilog(msg):
+    print(time.strftime("[%F %T] [indextts] ") + msg, flush=True)
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+gpu_info = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader"], text=True
+).strip()
+ilog(f"GPU detected: {gpu_info} | repo={MODEL_REPO} stage0_mem={STAGE0_GPU_MEM} stage1_mem={STAGE1_GPU_MEM}")
+
+if not shutil.which("ffmpeg"):
+    subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1", shell=True, check=False)
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def prepare_env():
+    env_log = IT_WORK / "env-setup.log"
+    marker = VENV_DIR / ".ct_env_ready"
+    vllm_bin = VENV_DIR / "bin" / "vllm"
+    py_bin = VENV_DIR / "bin" / "python"
+    if marker.is_file() and vllm_bin.is_file() and py_bin.is_file():
+        chk = subprocess.run(
+            [str(py_bin), "-c", "import vllm, vllm_omni, tiktoken, fugashi"],
+            capture_output=True,
+        )
+        if chk.returncode == 0:
+            ilog("Reusing existing vLLM + vLLM-Omni[indextts2] virtualenv")
+            return VENV_DIR
+
+    ilog(f"Setting up vLLM 0.32 + vLLM-Omni[indextts2] environment (log: {env_log})...")
+    uv_bin = shutil.which("uv") or "uv"
+    run_logged([uv_bin, "venv", "--python", "3.12", str(VENV_DIR), "--clear"], env_log)
+    run_logged(
+        [
+            uv_bin, "pip", "install",
+            "--python", str(py_bin),
+            "vllm==0.32.0",
+            "vllm-omni[indextts2]==0.32.0",
+            "tiktoken",
+            "soundfile",
+        ],
+        env_log,
+    )
+    subprocess.run([uv_bin, "cache", "clean"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    run_logged([str(vllm_bin), "download-kernels"], env_log, check=False)
+    marker.write_text("ok\n", encoding="utf-8")
+    ilog("vLLM 0.32 + vLLM-Omni[indextts2] environment ready")
+    return VENV_DIR
+
+def _cleanup_hf_temp():
+    for p in (
+        "/root/.cache/huggingface/xet",
+        "/root/.cache/huggingface/hub",
+        str(MODEL_DIR / ".cache"),
+        str(MODEL_DIR / "w2v-bert-2.0" / ".cache"),
+        str(MODEL_DIR / "bigvgan" / ".cache"),
+    ):
+        shutil.rmtree(p, ignore_errors=True)
+
+def _ensure_default_ref_wav():
+    if DEFAULT_REF_WAV.is_file() and DEFAULT_REF_WAV.stat().st_size > 1024:
+        return
+    drive_copy = DRIVE_VOICES_DIR / "default_ref.wav"
+    if drive_copy.is_file() and drive_copy.stat().st_size > 1024:
+        shutil.copyfile(drive_copy, DEFAULT_REF_WAV)
+        return
+    ref_url = "https://raw.githubusercontent.com/vllm-project/vllm-omni/main/tests/assets/indextts2/ref_audio.wav"
+    try:
+        urllib.request.urlretrieve(ref_url, str(DEFAULT_REF_WAV))
+    except Exception:
+        import math, struct, wave
+        sr = 24000
+        dur = 3.0
+        n = int(sr * dur)
+        with wave.open(str(DEFAULT_REF_WAV), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            samples = [
+                int(12000 * (0.6 * math.sin(2 * math.pi * 180 * i / sr) + 0.4 * math.sin(2 * math.pi * 360 * i / sr)))
+                for i in range(n)
+            ]
+            wf.writeframes(struct.pack(f"<{n}h", *samples))
+    if not drive_copy.is_file():
+        shutil.copyfile(DEFAULT_REF_WAV, drive_copy)
+
+def prepare_model():
+    dl_log = IT_WORK / "model-download.log"
+    marker = MODEL_DIR / ".ct_model_ready"
+    required_files = (
+        MODEL_DIR / "gpt.pth",
+        MODEL_DIR / "s2mel.pth",
+        MODEL_DIR / "codec.pth",
+        MODEL_DIR / "multilingual_zh_ja_yue_char_del.tiktoken",
+        MODEL_DIR / "qwen0.6bemo4-merge" / "model.safetensors",
+        MODEL_DIR / "w2v-bert-2.0" / "model.safetensors",
+        MODEL_DIR / "campplus_cn_common.bin",
+        MODEL_DIR / "bigvgan" / "bigvgan_generator.pt",
+    )
+    _ensure_default_ref_wav()
+    if marker.is_file() and all(p.is_file() for p in required_files):
+        ilog(f"Reusing local SSD IndexTTS-2.5 bundle at {MODEL_DIR}")
+        return MODEL_DIR
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+    _cleanup_hf_temp()
+    free_gb = shutil.disk_usage("/content").free / 1e9
+    ilog(f"Downloading {MODEL_REPO} + sub-models -> local SSD {MODEL_DIR} (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+    dl_script = r"""
+import shutil, sys
+from pathlib import Path
+from huggingface_hub import hf_hub_download, snapshot_download
+
+model_repo = sys.argv[1]
+model_dir = Path(sys.argv[2])
+model_dir.mkdir(parents=True, exist_ok=True)
+
+def clean():
+    for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub", str(model_dir / ".cache")):
+        shutil.rmtree(p, ignore_errors=True)
+
+print(f"[dl] 1/4 Downloading {model_repo} -> {model_dir}", flush=True)
+snapshot_download(repo_id=model_repo, local_dir=str(model_dir), max_workers=4)
+clean()
+
+w2v_dir = model_dir / "w2v-bert-2.0"
+print(f"[dl] 2/4 Downloading facebook/w2v-bert-2.0 -> {w2v_dir}", flush=True)
+snapshot_download(
+    repo_id="facebook/w2v-bert-2.0",
+    local_dir=str(w2v_dir),
+    allow_patterns=["config.json", "preprocessor_config.json", "model.safetensors"],
+    max_workers=4,
+)
+clean()
+
+print(f"[dl] 3/4 Downloading funasr/campplus -> {model_dir / 'campplus_cn_common.bin'}", flush=True)
+hf_hub_download(repo_id="funasr/campplus", filename="campplus_cn_common.bin", local_dir=str(model_dir))
+clean()
+
+bigvgan_dir = model_dir / "bigvgan"
+print(f"[dl] 4/4 Downloading nvidia/bigvgan_v2_22khz_80band_256x -> {bigvgan_dir}", flush=True)
+snapshot_download(
+    repo_id="nvidia/bigvgan_v2_22khz_80band_256x",
+    local_dir=str(bigvgan_dir),
+    allow_patterns=["config.json", "bigvgan_generator.pt"],
+    max_workers=4,
+)
+clean()
+"""
+    try:
+        run_logged([sys.executable, "-c", dl_script, MODEL_REPO, str(MODEL_DIR)], dl_log, env=dl_env)
+    finally:
+        _cleanup_hf_temp()
+
+    missing = [str(p) for p in required_files if not p.is_file()]
+    if missing:
+        raise RuntimeError(f"Model download incomplete; missing files: {missing}")
+    marker.write_text(MODEL_REPO + "\n", encoding="utf-8")
+    total_gb = sum(p.stat().st_size for p in MODEL_DIR.rglob("*") if p.is_file()) / 1e9
+    ilog(f"IndexTTS-2.5 + sub-models ready on local SSD: {MODEL_DIR} ({total_gb:.2f} GB)")
+    return MODEL_DIR
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    f_env = pool.submit(prepare_env)
+    f_mod = pool.submit(prepare_model)
+    while not (f_env.done() and f_mod.done()):
+        for fut in (f_env, f_mod):
+            if fut.done() and fut.exception():
+                raise fut.exception()
+        free_gb = shutil.disk_usage("/content").free / 1e9
+        ilog(f"Setup heartbeat | env={'done' if f_env.done() else 'running'} "
+             f"model={'done' if f_mod.done() else 'running'} | free_ssd={free_gb:.1f} GB")
+        time.sleep(30)
+    VENV_DIR = f_env.result()
+    MODEL_DIR = f_mod.result()
+
+ilog(f"Setup complete: venv={VENV_DIR} model={MODEL_DIR} drive_data={DATA_DIR}")
+'''
+
+INDEXTTS_SERVICE = r'''# @title 2. Service -- vLLM-Omni IndexTTS-2.5 on 127.0.0.1:8000 (L4 2-stage pipeline + Bearer Auth + Google Drive Voices)
+DEPLOY_YAML = IT_WORK / "indextts2_5.yaml"
+DEPLOY_YAML.write_text(f"""pipeline: indextts2_5
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    attention_backend: TRITON_ATTN
+    max_num_seqs: {MAX_NUM_SEQS}
+    max_model_len: {MAX_MODEL_LEN}
+    max_num_batched_tokens: {MAX_MODEL_LEN}
+    gpu_memory_utilization: {STAGE0_GPU_MEM}
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    hf_overrides:
+      use_gpt_latent: false
+    default_sampling_params:
+      temperature: 0.8
+      top_p: 0.8
+      top_k: 30
+      max_tokens: 1815
+      repetition_penalty: 10.0
+      seed: 42
+
+  - stage_id: 1
+    devices: "0"
+    max_num_seqs: {MAX_NUM_SEQS}
+    gpu_memory_utilization: {STAGE1_GPU_MEM}
+    enforce_eager: true
+    hf_overrides:
+      use_gpt_latent: false
+      s2mel_dit_bf16: true
+      s2mel_cfm_batch_size: 4
+      s2mel_dit_torch_compile: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 1815
+      seed: 42
+""", encoding="utf-8")
+
+(IT_WORK / "ct_indextts_middleware.py").write_text(r"""from __future__ import annotations
+
+import asyncio
+import base64
+import glob as glob_mod
+import json
+import os
+import shutil
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from http import HTTPStatus
+from pathlib import Path
+from typing import Any
+
+from starlette.datastructures import Headers
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+API_TOKEN = os.environ.get("CT_API_TOKEN", "")
+SERVICE_PORT = int(os.environ.get("CT_SERVICE_PORT", "8000"))
+DATA_DIR = Path(os.environ.get("CT_DATA_DIR", "/content/drive/MyDrive/colab-data/indextts"))
+SPEAKERS_DIR = Path(os.environ.get("SPEAKER_SAMPLES_DIR", "/content/indextts/speakers"))
+DEFAULT_REF_WAV = Path(os.environ.get("CT_DEFAULT_REF_WAV", "/content/indextts/default_ref.wav"))
+DRIVE_ROOT = Path("/content/drive")
+MYDRIVE_ROOT = Path("/content/drive/MyDrive")
+DRIVE_VOICES_DIR = DATA_DIR / "voices"
+DRIVE_OUTPUT_DIR = DATA_DIR / "outputs"
+
+AUDIO_EXTS = (
+    ".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".opus", ".webm", ".mp4", ".mkv", ".wma", ".mpga", ".mpeg",
+)
+SUPPORTED_LANGS = {
+    "zh": "Chinese (Mandarin)",
+    "en": "English",
+    "zhen": "Chinese-English code-switching",
+    "ja": "Japanese",
+    "es": "Spanish",
+    "ar": "Arabic",
+    "yue": "Cantonese",
+}
+EMOTION_LABELS = ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"]
+
+
+def _verify_auth(headers: Headers) -> bool:
+    if not API_TOKEN:
+        return True
+    auth = headers.get("authorization") or ""
+    if auth == f"Bearer {API_TOKEN}":
+        return True
+    xkey = headers.get("x-api-key") or ""
+    if xkey == API_TOKEN:
+        return True
+    return False
+
+
+def _resolve_drive_path(raw_spec: str) -> Path:
+    spec = (raw_spec or "").strip()
+    for prefix in ("drive://", "gdrive://", "file://"):
+        if spec.startswith(prefix):
+            spec = spec[len(prefix):]
+    spec = spec.lstrip("/")
+    if not spec:
+        return DRIVE_VOICES_DIR if DRIVE_VOICES_DIR.is_dir() else MYDRIVE_ROOT
+
+    candidates = []
+    if spec.startswith("content/drive/"):
+        candidates.append(Path("/") / spec)
+    elif spec.startswith("drive/"):
+        candidates.append(Path("/content") / spec)
+    elif spec.startswith("MyDrive/"):
+        candidates.append(DRIVE_ROOT / spec)
+    elif spec == "MyDrive":
+        candidates.append(MYDRIVE_ROOT)
+    else:
+        candidates.append(DRIVE_VOICES_DIR / spec)
+        candidates.append(DATA_DIR / spec)
+        candidates.append(MYDRIVE_ROOT / spec)
+        candidates.append(Path("/") / spec)
+
+    for c in candidates:
+        if c.exists():
+            return c.resolve()
+    return candidates[0].resolve()
+
+
+def _rel_to_mydrive(p: Path) -> str:
+    try:
+        return str(p.resolve().relative_to(MYDRIVE_ROOT.resolve()))
+    except Exception:
+        return str(p)
+
+
+SKIP_DRIVE_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "custom_nodes",
+    "models", ".runtimes", "Takeout", ".Trash", ".ipynb_checkpoints",
+    "flashinfer-cache", "triton-cache", "vllm-cache",
+}
+
+
+def _list_drive_audio_files(spec: str, recursive: bool = True) -> list[dict[str, Any]]:
+    raw = (spec or "").strip()
+    for prefix in ("drive://", "gdrive://", "file://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+
+    has_glob = any(ch in raw for ch in ("*", "?", "["))
+    matched_paths: list[Path] = []
+
+    if has_glob:
+        clean = raw.lstrip("/")
+        bases = []
+        if clean.startswith("content/drive/"):
+            bases.append(Path("/") / clean)
+        elif clean.startswith("MyDrive/"):
+            bases.append(DRIVE_ROOT / clean)
+        else:
+            bases.append(DRIVE_VOICES_DIR / clean)
+            bases.append(DATA_DIR / clean)
+            bases.append(MYDRIVE_ROOT / clean)
+        seen = set()
+        for pattern_path in bases:
+            for hit in sorted(glob_mod.glob(str(pattern_path), recursive=True)):
+                hp = Path(hit).resolve()
+                if hp.is_file() and hp.suffix.lower() in AUDIO_EXTS and str(hp) not in seen:
+                    seen.add(str(hp))
+                    matched_paths.append(hp)
+    else:
+        target = _resolve_drive_path(raw)
+        if target.is_file():
+            matched_paths.append(target)
+        elif target.is_dir():
+            if not recursive:
+                for hp in sorted(target.iterdir()):
+                    if hp.is_file() and hp.suffix.lower() in AUDIO_EXTS:
+                        matched_paths.append(hp.resolve())
+            else:
+                for root_dir, dirnames, filenames in os.walk(target):
+                    dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DRIVE_DIRS and not d.startswith("."))
+                    for fn in sorted(filenames):
+                        hp = Path(root_dir) / fn
+                        if hp.suffix.lower() in AUDIO_EXTS:
+                            matched_paths.append(hp.resolve())
+
+    items = []
+    for p in matched_paths:
+        st = p.stat()
+        items.append({
+            "drive_path": str(p),
+            "rel_path": _rel_to_mydrive(p),
+            "name": p.name,
+            "size_bytes": st.st_size,
+            "size_mb": round(st.st_size / 1e6, 2),
+            "mtime": int(st.st_mtime),
+        })
+    return items
+
+
+def _audio_path_to_wav_data_url(audio_path: Path, max_duration_sec: float = 24.0) -> str:
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error",
+        "-t", f"{max_duration_sec:.1f}",
+        "-i", str(audio_path),
+        "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if res.returncode != 0 or not res.stdout:
+        if audio_path.suffix.lower() == ".wav":
+            b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
+            return f"data:audio/wav;base64,{b64}"
+        err = res.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed decoding {audio_path.name}: {err}")
+    b64 = base64.b64encode(res.stdout).decode("ascii")
+    return f"data:audio/wav;base64,{b64}"
+
+
+def _sync_speakers_to_drive() -> None:
+    try:
+        DRIVE_VOICES_DIR.mkdir(parents=True, exist_ok=True)
+        if SPEAKERS_DIR.is_dir():
+            for sf in SPEAKERS_DIR.glob("*.safetensors"):
+                dst = DRIVE_VOICES_DIR / sf.name
+                if not dst.is_file() or sf.stat().st_mtime > dst.stat().st_mtime:
+                    shutil.copy2(sf, dst)
+    except Exception:
+        pass
+
+
+def _rewrite_speech_request_body(raw_body: bytes) -> tuple[bytes, str | None]:
+    if not raw_body:
+        return raw_body, None
+    try:
+        payload = json.loads(raw_body)
+    except Exception:
+        return raw_body, None
+    if not isinstance(payload, dict):
+        return raw_body, None
+
+    changed = False
+    save_drive_spec: str | None = None
+
+    # Allow top-level or extra_params shortcuts for lang, emo_*, save_to_drive
+    extras = payload.get("extra_params")
+    if not isinstance(extras, dict):
+        extras = {}
+
+    for top_key in ("lang", "text_normalization", "emo_audio", "emo_vector", "emo_alpha", "emo_text", "use_emo_text", "use_random"):
+        if top_key in payload and top_key not in extras:
+            extras[top_key] = payload.pop(top_key)
+            changed = True
+
+    for save_key in ("save_to_drive", "save_drive_path"):
+        val = payload.pop(save_key, None)
+        if val is None and save_key in extras:
+            val = extras.pop(save_key, None)
+            changed = True
+        elif val is not None:
+            changed = True
+        if val:
+            save_drive_spec = str(val) if not isinstance(val, bool) else "auto"
+
+    # Resolve drive:// or bare Drive paths in ref_audio
+    ref_audio = payload.get("ref_audio")
+    if isinstance(ref_audio, str) and ref_audio.strip():
+        ra = ref_audio.strip()
+        if ra.startswith(("drive://", "gdrive://", "/content/")) or not ra.startswith(("http://", "https://", "data:", "file://")):
+            ap = _resolve_drive_path(ra)
+            payload["ref_audio"] = _audio_path_to_wav_data_url(ap)
+            changed = True
+    elif ref_audio is None and (not payload.get("voice") or str(payload.get("voice")).strip() == "default"):
+        # vLLM-Omni reserves 'default' as a built-in placeholder name and requires either an uploaded voice (e.g. 'alloy') or ref_audio
+        if DEFAULT_REF_WAV.is_file():
+            payload["ref_audio"] = f"file://{DEFAULT_REF_WAV}"
+            payload.pop("voice", None)
+            changed = True
+
+    # Resolve drive:// or bare Drive paths in extra_params.emo_audio
+    emo_audio = extras.get("emo_audio")
+    if isinstance(emo_audio, str) and emo_audio.strip():
+        ea = emo_audio.strip()
+        if ea.startswith(("drive://", "gdrive://", "/content/")) or not ea.startswith(("http://", "https://", "data:", "file://")):
+            ap = _resolve_drive_path(ea)
+            extras["emo_audio"] = _audio_path_to_wav_data_url(ap)
+            changed = True
+
+    if extras:
+        payload["extra_params"] = extras
+    elif "extra_params" in payload and not extras:
+        payload.pop("extra_params", None)
+
+    if not changed:
+        return raw_body, save_drive_spec
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8"), save_drive_spec
+
+
+def _save_output_audio_to_drive(audio_bytes: bytes, spec: str, fmt: str = "wav") -> str:
+    DRIVE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ext = "." + (fmt or "wav").lstrip(".")
+    if spec and spec not in ("auto", "true", "True", "1"):
+        dest = _resolve_drive_path(spec)
+        if dest.is_dir() or spec.endswith("/"):
+            dest.mkdir(parents=True, exist_ok=True)
+            dest = dest / f"indextts-{time.strftime('%Y%m%d-%H%M%S')}{ext}"
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not dest.suffix:
+                dest = dest.with_suffix(ext)
+    else:
+        dest = DRIVE_OUTPUT_DIR / f"indextts-{time.strftime('%Y%m%d-%H%M%S')}{ext}"
+    dest.write_bytes(audio_bytes)
+    return str(dest)
+
+
+def _upload_drive_voice_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    name = str(body.get("name") or "").strip()
+    raw_path = str(body.get("drive_path") or body.get("audio") or body.get("path") or "").strip()
+    consent = str(body.get("consent") or "user-consent").strip()
+    ref_text = body.get("ref_text")
+    speaker_desc = body.get("speaker_description")
+    if not name or not raw_path:
+        return 400, {"error": "Both 'name' and 'drive_path' are required"}
+    ap = _resolve_drive_path(raw_path)
+    if not ap.is_file():
+        return 404, {"error": f"Audio file not found on Google Drive: {raw_path} (resolved to {ap})"}
+
+    # Convert to clean mono WAV bytes via ffmpeg
+    cmd = [
+        "ffmpeg", "-nostdin", "-v", "error", "-t", "24.0",
+        "-i", str(ap), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    wav_bytes = res.stdout if (res.returncode == 0 and res.stdout) else ap.read_bytes()
+
+    boundary = f"----ctvoice{int(time.time() * 1000)}"
+    parts: list[bytes] = []
+
+    def add_field(k: str, v: str):
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
+        )
+
+    add_field("name", name)
+    add_field("consent", consent)
+    if ref_text:
+        add_field("ref_text", str(ref_text))
+    if speaker_desc:
+        add_field("speaker_description", str(speaker_desc))
+
+    parts.append(
+        (
+            f"--{boundary}\r\n"
+            f"Content-Disposition: form-data; name=\"audio_sample\"; filename=\"{ap.stem}.wav\"\r\n"
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode("utf-8")
+        + wav_bytes
+        + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    )
+    body_bytes = b"".join(parts)
+    headers = {
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Authorization": f"Bearer {API_TOKEN}",
+    }
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{SERVICE_PORT}/v1/audio/voices",
+        data=body_bytes,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            out = json.loads(resp.read().decode("utf-8", errors="replace"))
+            _sync_speakers_to_drive()
+            return resp.status, out
+    except urllib.error.HTTPError as err:
+        raw_err = err.read().decode("utf-8", errors="replace")
+        try:
+            return err.code, json.loads(raw_err)
+        except Exception:
+            return err.code, {"error": raw_err}
+
+
+class IndexTTSMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        if scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
+        root_path = scope.get("root_path", "")
+        path = scope["path"].removeprefix(root_path)
+        headers = Headers(scope=scope)
+        client = scope.get("client")
+        client_host = (client[0] if client else "") or ""
+
+        if path == "/health" and client_host in ("127.0.0.1", "::1", "localhost") and not headers.get("authorization"):
+            await self.app(scope, receive, send)
+            return
+
+        if not _verify_auth(headers):
+            resp = JSONResponse(
+                {"error": {"message": "Unauthorized: invalid or missing Bearer token", "type": "AuthenticationError", "code": 401}},
+                status_code=HTTPStatus.UNAUTHORIZED,
+            )
+            await resp(scope, receive, send)
+            return
+
+        if scope["type"] == "http":
+            method = scope.get("method", "GET")
+
+            if method == "GET" and path == "/api/ct/info":
+                resp = JSONResponse({
+                    "service": "indextts",
+                    "model": "IndexTeam/IndexTTS-2.5",
+                    "languages": SUPPORTED_LANGS,
+                    "emotion_labels": EMOTION_LABELS,
+                    "speed_range": [0.5, 2.0],
+                    "default_ref_wav": str(DEFAULT_REF_WAV),
+                    "drive_voices_dir": str(DRIVE_VOICES_DIR),
+                    "drive_output_dir": str(DRIVE_OUTPUT_DIR),
+                })
+                await resp(scope, receive, send)
+                return
+
+            if method == "GET" and path == "/api/ct/logs":
+                from urllib.parse import parse_qs
+                qs = parse_qs((scope.get("query_string") or b"").decode("utf-8", errors="replace"))
+                n_lines = max(1, min(int((qs.get("lines") or ["120"])[0]), 2000))
+                log_file = Path("/content/ct/service.log")
+                lines = log_file.read_text(encoding="utf-8", errors="replace").splitlines()[-n_lines:] if log_file.is_file() else []
+                resp = JSONResponse({"lines": len(lines), "log": "\n".join(lines)})
+                await resp(scope, receive, send)
+                return
+
+            if method == "GET" and path == "/api/ct/drive-list":
+                from urllib.parse import parse_qs
+                qs = parse_qs((scope.get("query_string") or b"").decode("utf-8", errors="replace"))
+                spec = (qs.get("path") or [""])[0]
+                recursive = (qs.get("recursive") or ["1"])[0] not in ("0", "false", "False")
+                try:
+                    files = await asyncio.to_thread(_list_drive_audio_files, spec, recursive)
+                    resp = JSONResponse({
+                        "drive_mounted": MYDRIVE_ROOT.is_dir(),
+                        "query": spec,
+                        "count": len(files),
+                        "files": files,
+                    })
+                except Exception as e:
+                    resp = JSONResponse({"error": str(e)}, status_code=400)
+                await resp(scope, receive, send)
+                return
+
+            if method == "POST" and path == "/api/ct/drive-upload-voice":
+                chunks: list[bytes] = []
+                while True:
+                    msg = await receive()
+                    if msg["type"] == "http.request":
+                        chunks.append(msg.get("body", b""))
+                        if not msg.get("more_body", False):
+                            break
+                    elif msg["type"] == "http.disconnect":
+                        return
+                try:
+                    body = json.loads(b"".join(chunks))
+                    code, out = await asyncio.to_thread(_upload_drive_voice_sync, body)
+                    resp = JSONResponse(out, status_code=code)
+                except Exception as e:
+                    resp = JSONResponse({"error": str(e)}, status_code=500)
+                await resp(scope, receive, send)
+                return
+
+            if method == "POST" and path == "/v1/audio/speech":
+                chunks = []
+                while True:
+                    msg = await receive()
+                    if msg["type"] == "http.request":
+                        chunks.append(msg.get("body", b""))
+                        if not msg.get("more_body", False):
+                            break
+                    elif msg["type"] == "http.disconnect":
+                        return
+                raw_body = b"".join(chunks)
+                try:
+                    rewritten_body, save_drive_spec = await asyncio.to_thread(_rewrite_speech_request_body, raw_body)
+                except Exception as e:
+                    resp = JSONResponse(
+                        {"error": {"message": str(e), "type": "BadRequestError", "code": 400}},
+                        status_code=400,
+                    )
+                    await resp(scope, receive, send)
+                    return
+
+                header_save = headers.get("x-save-drive")
+                if header_save and not save_drive_spec:
+                    save_drive_spec = header_save
+
+                body_sent = False
+
+                async def replay_receive() -> Message:
+                    nonlocal body_sent
+                    if not body_sent:
+                        body_sent = True
+                        return {"type": "http.request", "body": rewritten_body, "more_body": False}
+                    return await receive()
+
+                if not save_drive_spec:
+                    await self.app(scope, replay_receive, send)
+                    return
+
+                # Tee audio response to Google Drive when save_drive_spec is requested
+                resp_status = 200
+                resp_headers: list[tuple[bytes, bytes]] = []
+                resp_chunks: list[bytes] = []
+                start_msg: Message | None = None
+
+                async def tee_send(message: Message) -> None:
+                    nonlocal resp_status, resp_headers, start_msg
+                    if message["type"] == "http.response.start":
+                        resp_status = message.get("status", 200)
+                        resp_headers = list(message.get("headers", []))
+                        start_msg = message
+                        if resp_status != 200:
+                            await send(message)
+                    elif message["type"] == "http.response.body":
+                        chunk = message.get("body", b"")
+                        more = message.get("more_body", False)
+                        if resp_status != 200:
+                            await send(message)
+                            return
+                        if chunk:
+                            resp_chunks.append(chunk)
+                        if not more and start_msg is not None:
+                            full_audio = b"".join(resp_chunks)
+                            saved_path = await asyncio.to_thread(
+                                _save_output_audio_to_drive, full_audio, save_drive_spec, "wav"
+                            )
+                            new_headers = [
+                                (k, v) for (k, v) in resp_headers if k.lower() != b"x-saved-drive-path"
+                            ]
+                            new_headers.append((b"x-saved-drive-path", saved_path.encode("utf-8")))
+                            start_msg["headers"] = new_headers
+                            await send(start_msg)
+                            await send({"type": "http.response.body", "body": full_audio, "more_body": False})
+                    else:
+                        await send(message)
+
+                await self.app(scope, replay_receive, tee_send)
+                return
+
+            if method in ("POST", "DELETE") and path.startswith("/v1/audio/voices"):
+                await self.app(scope, receive, send)
+                await asyncio.to_thread(_sync_speakers_to_drive)
+                return
+
+        await self.app(scope, receive, send)
+""", encoding="utf-8")
+
+VLLM_ENV = {
+    "PATH": f"{VENV_DIR}/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
+    "PYTHONPATH": f"{IT_WORK}:{os.environ.get('PYTHONPATH', '')}",
+    "VIRTUAL_ENV": str(VENV_DIR),
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+    "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+    "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
+    "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
+    "SPEAKER_SAMPLES_DIR": str(SPEAKERS_DIR),
+    "CT_API_TOKEN": API_TOKEN,
+    "CT_SERVICE_PORT": str(SERVICE_PORT),
+    "CT_DATA_DIR": str(DATA_DIR),
+    "CT_DEFAULT_REF_WAV": str(DEFAULT_REF_WAV),
+}
+
+SERVER_ARGS = [
+    str(VENV_DIR / "bin" / "vllm"), "serve", str(MODEL_DIR),
+    "--omni",
+    "--served-model-name", MODEL_REPO, MODEL_ALIAS,
+    "--host", "127.0.0.1",
+    "--port", str(SERVICE_PORT),
+    "--api-key", API_TOKEN,
+    "--trust-remote-code",
+    "--allowed-local-media-path", "/content",
+    "--stage-init-timeout", "900",
+    "--deploy-config", str(DEPLOY_YAML),
+    "--middleware", "ct_indextts_middleware.IndexTTSMiddleware",
+]
+
+def start_service():
+    subprocess.run(["pkill", "-9", "-f", "vllm|EngineCore"], check=False)
+    time.sleep(1)
+    ilog(f"Starting vLLM-Omni IndexTTS-2.5 server on 127.0.0.1:{SERVICE_PORT} (model={MODEL_REPO})")
+    return ct_spawn("service", SERVER_ARGS, env=VLLM_ENV, cwd=str(IT_WORK))
+
+PROCS["service"] = (start_service(), start_service)
+'''
+
+INDEXTTS_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- wait for 2-stage load, register default voice, warmup synthesis & sync caches
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=30):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url, headers=headers, data=None if payload is None else json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {})
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-token-probe", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 2400
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        raise RuntimeError("vLLM-Omni exited during startup:\n" + ct_tail("service", 80))
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 30:
+        gpu_stat = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader"],
+            text=True,
+        ).strip()
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["starting..."])[-1]
+        ilog(f"Waiting for 2-stage IndexTTS-2.5 init | GPU: {gpu_stat} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    raise RuntimeError("Timed out waiting for vLLM-Omni server to become ready:\n" + ct_tail("service", 80))
+
+auth_check(LOCAL_BASE, API_TOKEN)
+
+# Register 'alloy' voice preset from DEFAULT_REF_WAV if not already registered
+code, voices_data = http_json(LOCAL_BASE + "/v1/audio/voices", API_TOKEN, timeout=20)
+existing_voices = set(voices_data.get("voices") or [])
+for preset_voice in ("alloy",):
+    if preset_voice not in existing_voices and DEFAULT_REF_WAV.is_file():
+        v_code, v_res = http_json(
+            LOCAL_BASE + "/api/ct/drive-upload-voice",
+            API_TOKEN,
+            payload={
+                "name": preset_voice,
+                "drive_path": str(DEFAULT_REF_WAV),
+                "consent": "builtin-default-reference",
+                "speaker_description": "Default neutral reference speaker for IndexTTS-2.5",
+            },
+            timeout=60,
+        )
+        ilog(f"Registered preset voice '{preset_voice}': HTTP {v_code}")
+
+# Warmup synthesis to verify Stage 0 Talker + Stage 1 S2Mel DiT / BigVGAN and sync JIT caches to Drive
+warmup_req = urllib.request.Request(
+    LOCAL_BASE + "/v1/audio/speech",
+    headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
+    data=json.dumps({
+        "model": MODEL_REPO,
+        "input": "Hello, IndexTTS is ready.",
+        "voice": "default",
+        "response_format": "wav",
+        "extra_params": {"lang": "en"},
+    }).encode("utf-8"),
+)
+try:
+    with urllib.request.urlopen(warmup_req, timeout=180) as wresp:
+        wav_bytes = wresp.read()
+        ilog(f"Warmup synthesis succeeded ({len(wav_bytes)} bytes WAV)")
+except Exception as werr:
+    ilog(f"Warmup synthesis warning: {werr}")
+
+for _local_c, _drive_c in (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+    (SPEAKERS_DIR, DRIVE_VOICES_DIR),
+):
+    if _local_c.is_dir() and _drive_c.is_dir():
+        subprocess.run(["cp", "-ru", f"{_local_c}/.", f"{_drive_c}/"], check=False)
+
+pub_deadline = time.monotonic() + 120
+while time.monotonic() < pub_deadline:
+    try:
+        code, _ = http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)
+        if code == 200:
+            auth_check(PUBLIC_URL, API_TOKEN)
+            ilog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+            break
+    except Exception as err:
+        ilog(f"Public probe pending ({type(err).__name__}: {err})")
+    time.sleep(8)
+
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+started = time.monotonic()
+failures = 0
+while True:
+    time.sleep(60)
+    for name, (proc, restart) in list(PROCS.items()):
+        if proc.poll() is not None:
+            ilog(f"[watchdog] {name} exited with {proc.returncode}; restarting\n{ct_tail(name, 20)}")
+            PROCS[name] = (restart(), restart)
+    recent_log = ct_tail("service", 30)
+    if "replica-0 is dead" in recent_log:
+        ilog("[watchdog] Detected dead stage replica in service.log; restarting vLLM-Omni service")
+        PROCS["service"][0].terminate()
+        PROCS["service"] = (start_service(), start_service)
+        failures = 0
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        failures = 0 if code == 200 else failures + 1
+    except Exception:
+        failures += 1
+    if failures >= 6:
+        ilog("[watchdog] 6 failed health checks; restarting vLLM-Omni service")
+        PROCS["service"][0].terminate()
+        PROCS["service"] = (start_service(), start_service)
+        failures = 0
+    gpu_mem = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader"],
+        text=True,
+    ).strip()
+    ilog(f"heartbeat | up={int(time.monotonic() - started)}s | GPU: {gpu_mem}")
+'''
+
 if __name__ == "__main__":
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
@@ -3109,3 +4104,12 @@ if __name__ == "__main__":
                    "and direct Google Drive audio batch/single transcription endpoints.",
                    NEMOTRON_TRANSCRIBE_CFG, NEMOTRON_TRANSCRIBE_SETUP, NEMOTRON_TRANSCRIBE_SERVICE,
                    keepalive=NEMOTRON_TRANSCRIBE_KEEPALIVE))
+    write(ROOT / "services/indextts.ipynb",
+          notebook("IndexTTS-2.5 (L4 / vLLM-Omni 2-Stage Zero-Shot Voice Cloning & Emotion TTS)",
+                   "Serves `IndexTeam/IndexTTS-2.5` on a Colab L4 GPU via `vllm serve --omni` (Stage 0 Talker + "
+                   "Stage 1 EnhancedCodec/S2Mel DiT/BigVGAN) with Bearer token auth, zero-shot voice cloning, "
+                   "reusable uploaded voices (`/v1/audio/voices`), native speed control (0.5-2.0x), multilingual "
+                   "synthesis (`zh`, `en`, `zhen`, `ja`, `es`, `ar`, `yue`), emotion control (`emo_vector`, "
+                   "`emo_text`, `emo_audio`, `emo_alpha`), and Google Drive voice/output persistence.",
+                   INDEXTTS_CFG, INDEXTTS_SETUP, INDEXTTS_SERVICE,
+                   keepalive=INDEXTTS_KEEPALIVE))
