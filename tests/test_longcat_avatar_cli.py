@@ -106,6 +106,22 @@ class CliTest(unittest.TestCase):
         self.assertNotEqual(p.returncode,0)
         self.assertEqual(self.server.uploads,[])
 
+    def test_standard_sampling_reaches_server(self):
+        p=self.cli('generate','--audio',str(self.audio),'--prompt','test',
+                   '--sampling-mode','standard','--steps','30','--text-cfg','4','--audio-cfg','1')
+        self.assertEqual(p.returncode,0,p.stderr)
+        data=self.server.submitted
+        self.assertEqual((data['sampling_mode'],data['steps'],data['text_guidance_scale'],data['audio_guidance_scale']),
+                         ('standard',30,4,1))
+        self.assertFalse(data['use_distill'])
+
+    def test_incompatible_sampling_fails_before_upload(self):
+        for flags in [('--audio-cfg','3'),('--sampling-mode','standard','--audio-cfg','0.7')]:
+            with self.subTest(flags=flags):
+                p=self.cli('generate','--audio',str(self.audio),'--prompt','test',*flags)
+                self.assertNotEqual(p.returncode,0)
+                self.assertEqual(self.server.uploads,[])
+
     def test_drive_inputs_and_output_do_not_upload_local_files(self):
         p=self.cli('generate','--audio-drive','素材/声音.wav','--image','drive://素材/人像.png',
                    '--prompt','test','--drive-output','生成/作品')

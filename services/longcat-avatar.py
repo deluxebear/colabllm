@@ -25,6 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 from colabsvc import Service, State, apply_instance, extract_instance_arg, main  # noqa: E402
+from avatar_sampling import sampling_settings
 
 SERVICE = Service(
     name="longcat-avatar",
@@ -91,10 +92,12 @@ class AvatarClient:
     def source(self, value):
         return {"drive": value} if is_drive_path(value) else {"upload": self.upload(value)["path"]}
 
-    def submit(self, audio, image, prompt, resolution, frames, segments, seed, full_audio, output_dir=None):
+    def submit(self, audio, image, prompt, resolution, frames, segments, seed, full_audio, output_dir=None, sampling=None):
         data = dict(audio=self.source(audio), image=self.source(image) if image else None,
                     prompt=prompt, resolution=resolution, frames=frames, segments=segments,
                     seed=seed, auto_duration=full_audio)
+        if sampling:
+            data.update(sampling)
         if output_dir:
             data["output_dir"] = drive_spec(output_dir)
         with self.open("/jobs", json.dumps(data).encode(), {"Content-Type": "application/json"}) as response:
@@ -180,6 +183,11 @@ def custom_parser():
     prompt.add_argument("--prompt-file", help="从 UTF-8 文本文件读取描述")
     generate.add_argument("--resolution", choices=("480p", "720p"), default="480p")
     generate.add_argument("--seed", type=int, default=42)
+    generate.add_argument("--sampling-mode", choices=("distilled", "standard"), default="distilled",
+                          help="distilled：8 步快速模式；standard：关闭 DMD LoRA，允许调节 CFG")
+    generate.add_argument("--steps", type=int, help="推理步数；快速模式固定 8，标准模式默认 50")
+    generate.add_argument("--text-cfg", type=float, help="文本 CFG；标准模式默认 4.0")
+    generate.add_argument("--audio-cfg", type=float, help="音频 CFG；标准模式默认 3.0，并非嘴部幅度参数")
     generate.add_argument("--frames", type=int, help="手动模式每段帧数（17–161 的 4n+1）")
     generate.add_argument("--segments", type=int, help="手动生成段数（1–20）；省略则覆盖完整音频")
     job = commands.add_parser("job", help="查询任务；--wait 持续等待")
@@ -229,8 +237,9 @@ def run_custom(args):
         frames, segments = args.frames if args.frames is not None else 93, args.segments if args.segments is not None else 1
         if not (17 <= frames <= 161 and frames % 4 == 1 and 1 <= segments <= 20):
             raise ValueError("手动帧数须为 17–161 的 4n+1，段数须为 1–20")
+        sampling = sampling_settings(args.sampling_mode, args.steps, args.text_cfg, args.audio_cfg)
         job_id = client.submit(args.audio, args.image, prompt, args.resolution, frames, segments,
-                               args.seed, args.frames is None and args.segments is None, args.drive_output)
+                               args.seed, args.frames is None and args.segments is None, args.drive_output, sampling)
         if not args.wait and not args.output:
             print(json.dumps({"job_id": job_id}, ensure_ascii=False))
             return

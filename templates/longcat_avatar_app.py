@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from longcat_video_app import install_sdpa
+from avatar_sampling import sampling_settings, apply_sampling_mode
 
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None):
@@ -152,11 +153,14 @@ def main():
         mode, resolution = request['mode'], request['resolution']
         frames, segments, seed = request['frames'], request['segments'], request['seed']
         auto_duration = request['auto_duration']
+        sampling = sampling_settings(request.get('sampling_mode','distilled'), request.get('steps'),
+                                     request.get('text_guidance_scale'), request.get('audio_guidance_scale'))
         started = time.time()
         temp = work / 'jobs' / job_id
         temp.mkdir(parents=True,exist_ok=True)
         with lock, torch.inference_mode():
             try:
+                apply_sampling_mode(pipe, sampling)
                 source=audio
                 audio_seconds=None
                 if auto_duration:
@@ -184,8 +188,9 @@ def main():
                 for segment in range(next_segment,segments):
                     update(completed_segments=segment,message=f'正在生成第 {segment+1}/{segments} 段')
                     audio_start=sum(parts[:segment])-13*segment
-                    kwargs=dict(prompt=prompt,num_frames=parts[segment],num_inference_steps=8,
-                                text_guidance_scale=1.0,audio_guidance_scale=1.0,use_distill=True,
+                    kwargs=dict(prompt=prompt,num_frames=parts[segment],num_inference_steps=sampling['steps'],
+                                text_guidance_scale=sampling['text_guidance_scale'],
+                                audio_guidance_scale=sampling['audio_guidance_scale'],use_distill=sampling['use_distill'],
                                 output_type='both',generator=generator,
                                 audio_emb=window_audio(emb,audio_start,parts[segment]))
                     if segment==0:
@@ -227,7 +232,7 @@ def main():
                 with av.open(str(path)) as media:
                     width,height=media.streams.video[0].width,media.streams.video[0].height
                 metadata=dict(job_id=job_id,model='LongCat-Video-Avatar-1.5',precision='BF16',mode=mode,
-                              prompt=prompt,seed=seed,steps=8,fps=25,frames=target_frames,width=width,height=height,
+                              prompt=prompt,seed=seed,**sampling,fps=25,frames=target_frames,width=width,height=height,
                               segments=segments,auto_duration=bool(auto_duration),audio_duration_seconds=audio_seconds,
                               duration_seconds=round(duration,2),elapsed_seconds=round(time.time()-started,1),drive_output=str(path))
                 path.with_suffix('.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2))
@@ -240,7 +245,8 @@ def main():
 
     jobs=JobQueue(output_dir.parent/'jobs',run_job)
 
-    def submit(audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration=True,output_folder=None):
+    def submit(audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration=True,output_folder=None,
+               sampling_mode='distilled',steps=None,text_guidance_scale=None,audio_guidance_scale=None):
         if not audio or not prompt.strip():raise gr.Error('请上传音频并填写描述')
         if mode not in ('音频＋图片＋描述','音频＋描述') or resolution not in ('480p','720p'):
             raise gr.Error('生成模式或分辨率无效')
@@ -248,7 +254,8 @@ def main():
         frames,segments,seed=int(frames),int(segments),int(seed)
         if not (17<=frames<=161 and frames%4==1 and 1<=segments<=20):raise gr.Error('手动时长参数无效')
         if seed<0:seed=int.from_bytes(os.urandom(4),'little')
-        request=dict(prompt=prompt,mode=mode,resolution=resolution,frames=frames,segments=segments,
+        sampling=sampling_settings(sampling_mode,steps,text_guidance_scale,audio_guidance_scale)
+        request=dict(**sampling,prompt=prompt,mode=mode,resolution=resolution,frames=frames,segments=segments,
                      seed=seed,auto_duration=bool(auto_duration))
         if output_folder:
             request['output_dir']=str(resolve_drive(output_folder,directory=True,create=True))
@@ -304,6 +311,13 @@ def main():
                     frames = gr.Slider(17, 161, value=93, step=4, label='手动模式：每段帧数', interactive=False)
                     segments = gr.Slider(1, 20, value=1, step=1, label='手动模式：生成段数', interactive=False)
                     seed = gr.Number(value=42, precision=0, label='随机种子（-1 为随机）')
+                with gr.Accordion('口型与采样设置', open=False):
+                    sampling_mode = gr.Dropdown(choices=[('快速 · 8 步蒸馏','distilled'),('标准 · 非蒸馏，可调 CFG','standard')],
+                                               value='distilled', label='采样模式')
+                    steps = gr.Slider(8,100,value=8,step=1,label='推理步数',interactive=False)
+                    text_cfg = gr.Slider(1,10,value=1,step=0.1,label='文本 CFG',interactive=False)
+                    audio_cfg = gr.Slider(1,10,value=1,step=0.1,label='音频 CFG',interactive=False)
+                    gr.Markdown('标准模式较慢。音频 CFG 控制音频引导，降低可能影响同步；它不是嘴部幅度的直接控制。')
                 button = gr.Button('提交生成任务', variant='primary')
             with gr.Column():
                 job_id = gr.Textbox(label='任务编号（重新打开网页后可粘贴查询）')
@@ -328,20 +342,30 @@ def main():
         auto_duration.change(describe_duration, [audio,auto_duration], duration_info)
         auto_duration.change(lambda enabled: [gr.update(interactive=not enabled)]*2,
                              auto_duration, [frames,segments])
-        button.click(submit,[audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration],
+        def change_sampling(value):
+            settings=sampling_settings(value)
+            return [gr.update(value=settings[key],interactive=value=='standard')
+                    for key in ('steps','text_guidance_scale','audio_guidance_scale')]
+        def submit_ui(audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration=True,
+                      sampling_mode='distilled',steps=None,text_cfg=None,audio_cfg=None):
+            return submit(audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration,
+                          None,sampling_mode,steps,text_cfg,audio_cfg)
+        button.click(submit_ui,
+                     [audio,image,prompt,mode,resolution,frames,segments,seed,auto_duration,sampling_mode,steps,text_cfg,audio_cfg],
                      [job_id,status],api_name='submit',concurrency_limit=4)
         timer=gr.Timer(3)
         timer.tick(inspect_job,job_id,[status,video,download,metadata],api_name=False,queue=False)
         history.change(lambda value:value,history,job_id)
         demo.load(lambda:gr.update(choices=jobs.recent(),value=jobs.recent()[0] if jobs.recent() else None),
                   outputs=history)
+        sampling_mode.change(change_sampling,sampling_mode,[steps,text_cfg,audio_cfg])
     api = FastAPI()
 
     @api.get('/health')
     def health():
         return dict(status='ok', model='LongCat-Video-Avatar-1.5', precision='BF16',
                     gpu=torch.cuda.get_device_name(0), inference_verified=True,
-                    active_job=jobs.active,draining=jobs.draining)
+                    active_job=jobs.active,draining=jobs.draining,sampling_modes=['distilled','standard'])
 
     @api.post('/jobs',status_code=202)
     def create_job(body: dict):
@@ -352,7 +376,9 @@ def main():
             if not isinstance(automatic,bool):raise ValueError('auto_duration 必须为布尔值')
             job_id,_=submit(str(audio),str(image) if image else None,str(body.get('prompt','')),
                 '音频＋图片＋描述' if image else '音频＋描述',body.get('resolution','480p'),
-                body.get('frames',93),body.get('segments',1),body.get('seed',42),automatic,body.get('output_dir'))
+                body.get('frames',93),body.get('segments',1),body.get('seed',42),automatic,body.get('output_dir'),
+                body.get('sampling_mode','distilled'),body.get('steps'),
+                body.get('text_guidance_scale'),body.get('audio_guidance_scale'))
             return {'job_id':job_id}
         except (ValueError,OSError,gr.Error) as error:raise HTTPException(400,str(error))
 

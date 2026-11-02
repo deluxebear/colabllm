@@ -156,3 +156,25 @@ CLI 使用 `POST /jobs` 提交任务，`GET /jobs/<编号>` 查询，`GET /jobs/
 这些数据仅验证单层计算的潜力，不能直接等同整段视频速度或质量。测试中的调制层按官方 FP32 计算语义处理；激活值为合成输入。尚未做完整视频的画质、口型和长段衔接 A/B 验证，线上未启用这些优化。编译缓存已被先前试验预热，因此本次约 2.0 秒的首次调用不代表冷编译时间。
 
 复现脚本：`tools/bench_longcat_avatar.py`，在当前 Avatar 环境的空闲 GPU 上执行；脚本在独立进程里加载一个块，不改在线模型。编译测试需将 SDPA 适配函数注册到原 attention 模块，以便 Dynamo 正确建立全局函数检查。
+
+## 口型与采样设置
+
+网页的「口型与采样设置」和 CLI 都支持两种模式：
+
+- `distilled`（默认）：8 步，DMD LoRA 开启，文本和音频 CFG 固定 1.0。与已有任务兼容。
+- `standard`：关闭 DMD LoRA，使用非蒸馏采样，默认 50 步、文本 CFG 4.0、音频 CFG 3.0。后者是本服务的实验起点，不是最佳口型保证；运行显著慢于快速模式。
+
+音频 CFG 是音频引导强度，不是独立的嘴部幅度控制。降低后可能影响同步。当前适配要求文本和音频 CFG 均在 1–10，避免小于 1 时因上游 CFG 分支条件而不生效。快速模式拒绝不兼容的步数或 CFG，不会静默忽略。
+
+```bash
+./services/longcat-avatar.py generate \
+  --audio speech.wav --image person.png --prompt "A person speaking calmly." \
+  --sampling-mode standard --steps 30 --text-cfg 4 --audio-cfg 1 \
+  --frames 49 --segments 1 -o cfg-1.mp4
+```
+
+对照实验应固定素材、提示词、步数和种子，只改变 `--audio-cfg`。上例是约 1.96 秒的短片实验；省略 `--frames` / `--segments` 则按完整音频生成。
+
+`POST /jobs` 对应字段：`sampling_mode`、`steps`、`text_guidance_scale`、`audio_guidance_scale`。参数写入持久请求、输出 JSON 和任务结果，恢复任务时保持一致。旧请求缺少这些字段时继续使用快速模式。
+
+实测记录（2026-11-02）：同一咖啡广告音频/图片、克制表情提示词、种子 42、480p、49 帧、30 步、文本 CFG 4.0，分别运行音频 CFG 1.0 和 3.0。两个任务均完成并输出带音轨的 1.96 秒 MP4，耗时分别为 346.9 和 346.8 秒。结果确认非蒸馏控制链路有效，但没有做口型同步或张嘴幅度的量化评测，不能据此认定某一 CFG 最佳。

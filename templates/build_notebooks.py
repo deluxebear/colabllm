@@ -5770,6 +5770,10 @@ LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
     'def start_service():',
     '(LC_WORK / "longcat_avatar_drive.py").write_text(' + repr((ROOT / 'templates/longcat_avatar_drive.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
 
+LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
+    'def start_service():',
+    '(LC_WORK / "avatar_sampling.py").write_text(' + repr((ROOT / 'lib/avatar_sampling.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
+
 if __name__ == "__main__":
     write(ROOT / "services/longcat-avatar.ipynb",
           notebook("LongCat-Video-Avatar 1.5 (G4)",
