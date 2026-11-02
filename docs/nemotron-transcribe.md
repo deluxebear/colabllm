@@ -13,7 +13,7 @@
 | **模型仓库** | [`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B)（默认 BF16 全精度 ~67.5 GB；支持 `--precision fp8` ~34.7 GB 或 `--precision nvfp4` ~21.6 GB） |
 | **模型架构** | Mamba-2–Transformer Hybrid MoE 语音大模型（总参数 ~34B，每步激活 ~4.3B）+ Parallel Expert Encoder（ASR 编码器 + Sortformer 说话人编码器）+ CTC 词级时间戳对齐头 |
 | **硬件要求** | **Colab G4 GPU**（NVIDIA RTX PRO 6000 Blackwell `sm_120`，~96 GB VRAM，~176 GB RAM），默认不加 `--high-mem` |
-| **上下文与音频长度** | **65,536 tokens** 上下文窗口，单次请求支持最长 **1 小时（3600 秒）** 录音，支持 **40 种语言**（含中文、英文、日文、韩文、粤语/多语种混说 Code-Switching） |
+| **上下文与音频长度** | **65,536 tokens** 上下文窗口，单次原生跨度 **1 小时（3600 秒）**；对于 **超过 40 分钟 / 超过 1 小时（如 2~5 小时播客/长视频/会议）** 的音视频，内置 **基于 `ffprobe` + `ffmpeg silencedetect` 的静音对齐自动切片与时间戳无缝拼接**（`--chunk-minutes 40`），支持 **40 种语言**（含中文、英文、日文、韩文、粤语/多语种混说 Code-Switching） |
 | **推理引擎与加速** | `vllm serve` (0.32.0) + `NVIDIA-NeMo/Speech` (`VLLM_PLUGINS=nemo_speechlm`)，默认开启 **MTP8 投机解码**（`--mtp 8`）与 `ctc_timestamp_middleware` |
 | **存储布局** | **模型权重（67.5 GB）直接高速下载至 Colab 本地 NVMe SSD**（`/content/nemotron-transcribe/model`，自动清理 `hf_xet` 临时缓存，绝不占用 Google Drive 空间）；FlashInfer 编译内核缓存与转写输出持久化在 Google Drive（`/content/drive/MyDrive/colab-llm/nemotron-transcribe`） |
 | **安全认证** | Bearer Token 认证（`auth="builtin"`）：未授权访问任何接口均返回 `401 Unauthorized` |
@@ -152,12 +152,58 @@
   -j 2
 ```
 
-`tasks.jsonl` 示例（每行可独立配置 `audio`、`prompt`、`preset`、`reasoning`、`timestamps`、`context`、`lang`）：
+`tasks.jsonl` 示例（每行可独立配置 `audio` 或 `url`、`prompt`、`preset`、`reasoning`、`timestamps`、`context`、`lang`）：
 ```jsonl
 {"audio": "meetings/call_en.wav", "preset": "speaker", "timestamps": true}
-{"audio": "meetings/call_en.wav", "preset": "translate", "lang": "Chinese"}
+{"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "download_dir": "video/voices", "preset": "verbatim"}
+{"url": "https://x.com/user/status/1234567890", "preset": "translate", "lang": "Chinese"}
 {"audio": "meetings/podcast.mp3", "prompt": "Summarize the key decisions in bullet points.", "reasoning": true}
 {"audio": "meetings/tech_talk.m4a", "preset": "context", "context": "CUDA, Triton, Mamba-2, Sortformer"}
+```
+
+### 3.6 直接传入多媒体 URL（YouTube、Twitter/X、Bilibili、TikTok 等，`yt-dlp` 自动下载到网盘后识别）
+
+当向 `transcribe` 传入任何 `http://`、`https://` 或 `ytdl://` 多媒体链接时，系统会自动使用 `yt-dlp` 下载提取音频并保存到 Google Drive 网盘（默认目录 `/content/drive/MyDrive/colab-llm/nemotron-transcribe/audio/yt-dlp`，或通过 `--download-dir` 指定网盘目录），然后直接在 Colab G4 GPU 上读取该网盘音频文件进行转写（若同一视频已在网盘缓存则直接复用，加 `--force-download` 可强制重下；若远端 Colab 数据中心 IP 遇到站点风控，还会自动回退到本机 `yt-dlp` 下载并通过 `colab upload` 上传至网盘后再识别）：
+
+```bash
+# 1. 直接转写 YouTube / Twitter(X) / Bilibili 视频或播客链接（自动下载到网盘再转写）
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --preset verbatim
+
+# 2. 指定网盘保存目录 (--download-dir)，并开启说话人分离 + 词级时间戳 + 字幕保存回网盘 (--save-drive)
+./services/nemotron-transcribe.py transcribe "https://x.com/OpenAI/status/1234567890" \
+  --download-dir "video/voices" \
+  --preset speaker --timestamps \
+  --save-drive
+
+# 2b. 下载并保留完整视频文件 (.mp4) 到网盘 (--download-video，默认不加该参数时仅提取纯音频)
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+  --download-video \
+  --download-dir "video/voices" \
+  --preset verbatim
+
+# 2c. 仅临时下载识别，不将音视频文件保留在 Google Drive 网盘上 (--no-save-media-drive)
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+  --no-save-media-drive \
+  --preset verbatim
+
+# 3. 批量转写整个 YouTube 播放列表 (--playlist) 或多条链接
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/playlist?list=PLxxxx" \
+  --playlist \
+  --download-dir "video/voices" \
+  --preset clean \
+  --save-drive
+
+# 4. 如果视频需要登录 Cookie：
+#    - 方式 A：使用网盘上的 cookies.txt（远端 Colab 直接下载）
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=xxxx" \
+  --cookies-drive "colab-llm/cookies.txt" --preset verbatim
+#    - 方式 B：使用本地浏览器 Cookie 或本地 cookies.txt（本机 yt-dlp 下载后自动上传网盘并转写）
+./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=xxxx" \
+  --cookies-from-browser chrome --download-dir "video/voices" --preset verbatim
+
+# 5. 仅使用 yt-dlp 将多媒体 URL 下载提取音频到 Google Drive 网盘（不立即转写）
+./services/nemotron-transcribe.py download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+  --download-dir "video/voices"
 ```
 
 ---
@@ -249,14 +295,10 @@ print("Transcript:", response.choices[0].message.content)
 print("CTC Timestamps:", response.model_dump().get("ctc_timestamps"))
 ```
 
-### 4.3 专用网盘转写 REST 接口 (`/api/ct/drive-transcribe` & `/api/ct/drive-list`)
+### 4.3 专用网盘与多媒体 URL 转写 REST 接口 (`/api/ct/drive-transcribe` & `/api/ct/ytdlp-download`)
 
 ```bash
-# 1. 列出网盘音频文件
-curl -s "https://transcribe.example.com/api/ct/drive-list?path=meetings" \
-  -H "Authorization: Bearer $API_TOKEN" | jq
-
-# 2. 调用网盘音频转写（支持 preset / prompt / timestamps / reasoning / save_to_drive）
+# 1. 调用网盘音频转写（支持 preset / prompt / timestamps / reasoning / save_to_drive）
 curl -s "https://transcribe.example.com/api/ct/drive-transcribe" \
   -H "Authorization: Bearer $API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -266,5 +308,16 @@ curl -s "https://transcribe.example.com/api/ct/drive-transcribe" \
     "timestamps": true,
     "save_to_drive": true,
     "save_drive_dir": "meetings/transcripts"
+  }' | jq
+
+# 2. 直接传入多媒体 URL（YouTube / Twitter 等）：自动用 yt-dlp 下载到网盘再转写
+curl -s "https://transcribe.example.com/api/ct/drive-transcribe" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "download_dir": "video/voices",
+    "preset": "verbatim",
+    "save_to_drive": true
   }' | jq
 ```

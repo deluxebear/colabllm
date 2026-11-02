@@ -232,6 +232,15 @@ def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunn
 
 
 def write(path, nb):
+    import ast
+    for idx, c in enumerate(nb["cells"]):
+        if c["cell_type"] == "code":
+            src = c["source"] if isinstance(c["source"], str) else "".join(c["source"])
+            py_src = "\n".join(
+                ("# " + line if line.lstrip().startswith(("%", "!")) else line)
+                for line in src.splitlines()
+            )
+            ast.parse(py_src, filename=f"{path.name}:cell-{idx}")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
     print("wrote", path.relative_to(ROOT))
@@ -1714,6 +1723,9 @@ nlog(f"GPU detected: {gpu_info} | repo={MODEL_REPO} precision={PRECISION}")
 if not shutil.which("ffmpeg"):
     subprocess.run("apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1", shell=True, check=False)
 
+if not shutil.which("yt-dlp"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=False)
+
 if not shutil.which("uv"):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
 
@@ -1750,6 +1762,7 @@ def prepare_env():
         [uv_bin, "pip", "install", "--python", str(py_bin), "--no-deps", "av==19.0.2", "opencv-python-headless==5.0.0.93"],
         env_log,
     )
+    run_logged([uv_bin, "pip", "install", "--python", str(py_bin), "-U", "yt-dlp"], env_log, check=False)
 
     # Apply official NVIDIA DFlash2 safety patch to vLLM 0.32 if applicable
     patch_code = r"""
@@ -1834,10 +1847,13 @@ import glob as glob_mod
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -2095,25 +2111,137 @@ def _list_drive_audio_files(spec: str, recursive: bool = False) -> list[dict[str
         })
     return items
 
-def _load_audio_as_data_url(audio_path: Path, force_ffmpeg_16k: bool = False) -> str:
+def _probe_audio_duration_sec(audio_path: Path) -> float:
+    # Return audio/video duration in seconds using ffprobe (0.0 if unknown).
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        val = (res.stdout or "").strip()
+        return float(val) if val and val != "N/A" else 0.0
+    except Exception:
+        return 0.0
+
+
+def _find_silence_near(audio_path: Path, target_sec: float, window_sec: float = 45.0) -> float:
+    # Search for a natural speech pause within [target_sec - window_sec, target_sec + window_sec].
+    win_start = max(0.0, target_sec - window_sec)
+    win_dur = window_sec * 2.0
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-hide_banner",
+                "-ss", f"{win_start:.3f}", "-t", f"{win_dur:.3f}",
+                "-i", str(audio_path),
+                "-vn", "-af", "silencedetect=n=-35dB:d=0.35",
+                "-f", "null", "-",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=25,
+            check=False,
+        )
+        log_out = res.stderr or ""
+        starts = [float(x) for x in re.findall(r"silence_start:\s*([0-9.]+)", log_out)]
+        ends = [float(x) for x in re.findall(r"silence_end:\s*([0-9.]+)", log_out)]
+        candidates: list[float] = []
+        for idx, st in enumerate(starts):
+            ed = ends[idx] if idx < len(ends) else (st + 0.35)
+            mid = win_start + (st + ed) / 2.0
+            candidates.append(mid)
+        if candidates:
+            return min(candidates, key=lambda c: abs(c - target_sec))
+    except Exception:
+        pass
+    return target_sec
+
+
+def _compute_chunk_ranges(
+    audio_path: Path,
+    total_duration: float,
+    max_chunk_sec: float = 2400.0,
+) -> list[tuple[float, float]]:
+    # Split audio longer than max_chunk_sec into balanced, silence-aligned (start_sec, end_sec) chunks.
+    if max_chunk_sec <= 0 or total_duration <= 0 or total_duration <= max_chunk_sec:
+        return [(0.0, max(total_duration, 0.0))]
+
+    import math
+    num_chunks = max(2, int(math.ceil(total_duration / max_chunk_sec)))
+    ideal_len = total_duration / num_chunks
+    boundaries = [0.0]
+    for k in range(1, num_chunks):
+        target = k * ideal_len
+        split_pt = _find_silence_near(audio_path, target, window_sec=min(45.0, ideal_len * 0.15))
+        split_pt = max(boundaries[-1] + 30.0, min(split_pt, total_duration - 30.0))
+        boundaries.append(round(split_pt, 3))
+    boundaries.append(round(total_duration, 3))
+    return [(boundaries[i], boundaries[i + 1]) for i in range(len(boundaries) - 1)]
+
+
+def _load_audio_as_data_url(
+    audio_path: Path,
+    force_ffmpeg_16k: bool = False,
+    start_sec: float | None = None,
+    end_sec: float | None = None,
+) -> str:
     if not audio_path.is_file():
         raise FileNotFoundError(f"Audio file not found on Google Drive: {audio_path}")
     ext = audio_path.suffix.lower()
     sz = audio_path.stat().st_size
-    if not force_ffmpeg_16k and ext in DIRECT_MIMES and sz <= 140 * 1024 * 1024:
+    is_slice = (start_sec is not None and start_sec > 0.0) or (end_sec is not None and end_sec > 0.0)
+    if not is_slice and not force_ffmpeg_16k and ext in DIRECT_MIMES and sz <= 140 * 1024 * 1024:
         b64 = base64.b64encode(audio_path.read_bytes()).decode("ascii")
         return f"data:{DIRECT_MIMES[ext]};base64,{b64}"
-    # Convert video containers or large files to 16kHz mono PCM16 WAV in memory via ffmpeg
-    cmd = [
-        "ffmpeg", "-nostdin", "-v", "error", "-i", str(audio_path),
+    # Convert video containers, slices, or large files to 16kHz mono PCM16 WAV in memory via ffmpeg
+    cmd = ["ffmpeg", "-nostdin", "-v", "error"]
+    if start_sec is not None and start_sec > 0.0:
+        cmd.extend(["-ss", f"{start_sec:.3f}"])
+    if end_sec is not None and end_sec > 0.0:
+        dur = max(0.1, end_sec - (start_sec or 0.0))
+        cmd.extend(["-t", f"{dur:.3f}"])
+    cmd.extend([
+        "-i", str(audio_path),
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
-    ]
+    ])
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     if res.returncode != 0 or not res.stdout:
         err = res.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"ffmpeg failed decoding {audio_path.name}: {err}")
     b64 = base64.b64encode(res.stdout).decode("ascii")
     return f"data:audio/wav;base64,{b64}"
+
+
+def _shift_ctc_timestamps(ctc_ts: dict[str, Any] | None, offset_sec: float) -> dict[str, Any] | None:
+    if not isinstance(ctc_ts, dict) or offset_sec <= 0.0:
+        return ctc_ts
+    shifted: dict[str, Any] = dict(ctc_ts)
+    for key in ("words", "segments", "diarization"):
+        items = ctc_ts.get(key)
+        if isinstance(items, list):
+            new_items = []
+            for item in items:
+                if isinstance(item, dict):
+                    cp = dict(item)
+                    if cp.get("start") is not None:
+                        cp["start"] = round(float(cp["start"]) + offset_sec, 3)
+                    if cp.get("end") is not None:
+                        cp["end"] = round(float(cp["end"]) + offset_sec, 3)
+                    new_items.append(cp)
+                else:
+                    new_items.append(item)
+            shifted[key] = new_items
+    return shifted
 
 def _fmt_srt_time(seconds: float) -> str:
     ms = max(0, int(round(seconds * 1000)))
@@ -2228,13 +2356,229 @@ def _call_local_chat_completions(payload: dict[str, Any], timeout: int = 1800) -
         except Exception:
             return e.code, {"error": {"message": raw, "code": e.code}}
 
+def _is_media_url(spec: str) -> bool:
+    s = (spec or "").strip()
+    return s.startswith(("http://", "https://", "ytdl://", "yt-dlp://"))
+
+
+def _clean_media_url(spec: str) -> str:
+    s = (spec or "").strip()
+    for pfx in ("ytdl://", "yt-dlp://"):
+        if s.startswith(pfx):
+            return s[len(pfx):]
+    return s
+
+
+def _ensure_ytdlp() -> str:
+    for cand in (
+        shutil.which("yt-dlp"),
+        "/content/nemo-speech/.venv/bin/yt-dlp",
+        "/usr/local/bin/yt-dlp",
+    ):
+        if cand and os.path.isfile(cand):
+            return cand
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "yt-dlp"], check=True)
+    return shutil.which("yt-dlp") or "yt-dlp"
+
+
+def _prepare_cookies_file(cookies_spec: str = "") -> Path | None:
+    candidates = []
+    if cookies_spec:
+        candidates.append(_resolve_drive_path(cookies_spec))
+    candidates.extend([
+        DATA_DIR / "cookies.txt",
+        MYDRIVE_ROOT / "colab-llm" / "cookies.txt",
+        MYDRIVE_ROOT / "cookies.txt",
+    ])
+    for c in candidates:
+        if c.is_file() and c.stat().st_size > 0:
+            tmp_cookie = Path(f"/tmp/ct_ytdlp_cookies_{os.getpid()}.txt")
+            shutil.copyfile(c, tmp_cookie)
+            return tmp_cookie
+    return None
+
+
+def _sanitize_filename(name: str, max_len: int = 80) -> str:
+    cleaned = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (name or "").strip())
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("._ ")
+    return (cleaned[:max_len] or "audio").strip("._ ")
+
+
+def _download_media_url_to_drive(
+    raw_url: str,
+    download_dir: str = "",
+    audio_format: str = "mp3",
+    cookies_drive: str = "",
+    playlist: bool = False,
+    force_download: bool = False,
+    download_video: bool = False,
+    save_media_to_drive: bool = True,
+) -> list[dict[str, Any]]:
+    # Download media URL(s) (YouTube, Twitter/X, Bilibili, TikTok, etc.) via yt-dlp onto Google Drive (or local SSD temp).
+    url = _clean_media_url(raw_url)
+    if save_media_to_drive:
+        target_dir = _resolve_drive_path(download_dir) if (download_dir and download_dir.strip()) else (DATA_DIR / "audio" / "yt-dlp")
+    else:
+        target_dir = Path("/content/nemotron-transcribe/ytdlp-temp") / uuid.uuid4().hex[:12]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    fmt = (audio_format or "mp3").strip().lower().lstrip(".")
+    if fmt not in ("mp3", "m4a", "wav", "opus", "flac"):
+        fmt = "mp3"
+
+    ytdlp_bin = _ensure_ytdlp()
+    stage_dir = Path("/content/nemotron-transcribe/ytdlp-stage") / uuid.uuid4().hex[:12]
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    cookie_file = _prepare_cookies_file(cookies_drive)
+
+    try:
+        out_tmpl = str(stage_dir / "%(extractor)s__%(id)s.%(ext)s")
+        cmd = [
+            ytdlp_bin,
+            "--no-progress",
+            "--no-warnings",
+        ]
+        if download_video:
+            cmd.extend([
+                "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+                "--merge-output-format", "mp4",
+            ])
+        else:
+            cmd.extend([
+                "--extract-audio",
+                "--audio-format", fmt,
+                "--audio-quality", "0",
+            ])
+        cmd.extend([
+            "--write-info-json",
+            "--output", out_tmpl,
+        ])
+        if not playlist:
+            cmd.append("--no-playlist")
+        else:
+            cmd.append("--yes-playlist")
+        if cookie_file:
+            cmd.extend(["--cookies", str(cookie_file)])
+        cmd.append(url)
+
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1800, check=False)
+        info_files = sorted(stage_dir.glob("*.info.json"))
+        if res.returncode != 0 and not info_files:
+            err = (res.stderr or res.stdout or "").strip()[-1200:]
+            raise RuntimeError(f"yt-dlp failed for {url}: {err}")
+
+        downloaded_items: list[dict[str, Any]] = []
+        for info_path in info_files:
+            try:
+                info = json.loads(info_path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                info = {}
+            if info.get("_type") == "playlist":
+                continue
+            stem_prefix = info_path.name[:-len(".info.json")]
+            audio_candidates = [
+                p for p in stage_dir.glob(f"{stem_prefix}.*")
+                if p.suffix.lower() in AUDIO_EXTS and not p.name.endswith(".info.json")
+            ]
+            if not audio_candidates:
+                continue
+            staged_audio = audio_candidates[0]
+            extractor = _sanitize_filename(str(info.get("extractor") or info.get("extractor_key") or "media"), 24).lower()
+            vid_id = _sanitize_filename(str(info.get("id") or uuid.uuid4().hex[:8]), 40)
+            title = _sanitize_filename(str(info.get("title") or vid_id), 70)
+            dest_name = f"{extractor}_{vid_id}_{title}{staged_audio.suffix.lower()}"
+            dest_path = target_dir / dest_name
+
+            # Check if an earlier download for the same extractor_id already exists on Drive
+            if save_media_to_drive and not force_download and not dest_path.is_file():
+                existing = [
+                    p for p in target_dir.glob(f"{extractor}_{vid_id}_*{staged_audio.suffix.lower()}")
+                    if p.is_file() and p.stat().st_size > 0
+                ]
+                if existing:
+                    dest_path = existing[0]
+
+            if force_download or not dest_path.is_file() or dest_path.stat().st_size == 0:
+                partial_path = target_dir / f".{dest_name}.{os.getpid()}.partial"
+                shutil.copyfile(staged_audio, partial_path)
+                partial_path.replace(dest_path)
+
+            st = dest_path.stat()
+            downloaded_items.append({
+                "source_url": raw_url,
+                "webpage_url": info.get("webpage_url") or url,
+                "video_id": info.get("id"),
+                "extractor": info.get("extractor_key") or info.get("extractor"),
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "duration": info.get("duration"),
+                "media_type": "video" if download_video else "audio",
+                "saved_to_drive": save_media_to_drive,
+                "drive_path": str(dest_path),
+                "rel_path": _rel_to_mydrive(dest_path) if save_media_to_drive else dest_path.name,
+                "name": dest_path.name,
+                "size_bytes": st.st_size,
+                "size_mb": round(st.st_size / 1e6, 2),
+            })
+
+        # Fallback if yt-dlp produced an audio/video file without a matching per-entry info.json
+        if not downloaded_items:
+            for p in sorted(stage_dir.iterdir()):
+                if p.is_file() and p.suffix.lower() in AUDIO_EXTS:
+                    dest_path = target_dir / _sanitize_filename(p.stem, 90)
+                    dest_path = dest_path.with_suffix(p.suffix.lower())
+                    shutil.copyfile(p, dest_path)
+                    st = dest_path.stat()
+                    downloaded_items.append({
+                        "source_url": raw_url,
+                        "webpage_url": url,
+                        "media_type": "video" if download_video else "audio",
+                        "saved_to_drive": save_media_to_drive,
+                        "drive_path": str(dest_path),
+                        "rel_path": _rel_to_mydrive(dest_path) if save_media_to_drive else dest_path.name,
+                        "name": dest_path.name,
+                        "size_bytes": st.st_size,
+                        "size_mb": round(st.st_size / 1e6, 2),
+                    })
+
+        if not downloaded_items:
+            err = (res.stderr or res.stdout or "").strip()[-1200:]
+            raise RuntimeError(f"yt-dlp did not produce any media files for {url}. Output: {err}")
+        return downloaded_items
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        if cookie_file and cookie_file.is_file():
+            cookie_file.unlink(missing_ok=True)
+
+
 def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     t0 = time.monotonic()
-    raw_path = (body.get("drive_path") or body.get("audio") or body.get("path") or "").strip()
+    raw_path = (
+        body.get("drive_path") or body.get("audio") or body.get("path") or body.get("url") or body.get("media_url") or ""
+    ).strip()
     if not raw_path:
-        return 400, {"error": "Missing 'drive_path' (Google Drive audio file path)"}
+        return 400, {"error": "Missing 'drive_path' or 'url' (Google Drive audio file path or media URL)"}
 
-    audio_path = _resolve_drive_path(raw_path)
+    media_meta: dict[str, Any] | None = None
+    save_media_to_drive = bool(body.get("save_media_to_drive", True))
+    temp_media_path: Path | None = None
+    if _is_media_url(raw_path):
+        dl_items = _download_media_url_to_drive(
+            raw_url=raw_path,
+            download_dir=str(body.get("download_dir") or ""),
+            audio_format=str(body.get("audio_format") or "mp3"),
+            cookies_drive=str(body.get("cookies_drive") or ""),
+            playlist=bool(body.get("playlist", False)),
+            force_download=bool(body.get("force_download", False)),
+            download_video=bool(body.get("download_video", False)),
+            save_media_to_drive=save_media_to_drive,
+        )
+        media_meta = dl_items[0]
+        audio_path = Path(media_meta["drive_path"])
+        if not save_media_to_drive:
+            temp_media_path = audio_path
+    else:
+        audio_path = _resolve_drive_path(raw_path)
+
     if not audio_path.is_file():
         return 404, {
             "error": f"Audio file not found on Google Drive: '{raw_path}' (resolved to '{audio_path}')",
@@ -2244,18 +2588,19 @@ def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any
 
     user_prompt, sys_prompt, reasoning, timestamps = _build_prompt_and_settings(body)
     force_ffmpeg = bool(body.get("normalize_audio", False))
-    data_url = _load_audio_as_data_url(audio_path, force_ffmpeg_16k=force_ffmpeg)
 
-    messages: list[dict[str, Any]] = []
-    if sys_prompt:
-        messages.append({"role": "system", "content": sys_prompt})
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "text", "text": user_prompt},
-            {"type": "audio_url", "audio_url": {"url": data_url}},
-        ],
-    })
+    # Detect total duration and automatically split long audio (> chunk_minutes, default 40 min = 2400s)
+    total_duration = _probe_audio_duration_sec(audio_path)
+    raw_chunk_min = body.get("chunk_minutes")
+    if raw_chunk_min is not None:
+        max_chunk_sec = float(raw_chunk_min) * 60.0
+    elif body.get("chunk_seconds") is not None:
+        max_chunk_sec = float(body["chunk_seconds"])
+    else:
+        max_chunk_sec = 2400.0  # 40 minutes default (safe headroom inside 65536 context window & 1h encoder limit)
+
+    chunk_ranges = _compute_chunk_ranges(audio_path, total_duration, max_chunk_sec=max_chunk_sec)
+    is_multi_chunk = len(chunk_ranges) > 1
 
     extra_body: dict[str, Any] = {
         "chat_template_kwargs": {"enable_thinking": reasoning},
@@ -2279,34 +2624,112 @@ def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any
     if max_tokens is None:
         max_tokens = 20480 if reasoning else 16384
 
-    chat_payload = {
-        "model": body.get("model") or MODEL_REPO,
-        "messages": messages,
-        "temperature": float(temp),
-        "top_p": float(top_p),
-        "max_tokens": int(max_tokens),
-        **extra_body,
-    }
+    texts: list[str] = []
+    reasonings: list[str] = []
+    merged_words: list[dict[str, Any]] = []
+    merged_segments: list[dict[str, Any]] = []
+    merged_diarization: list[dict[str, Any]] = []
+    last_ctc_ts: dict[str, Any] | None = None
+    chunk_meta_list: list[dict[str, Any]] = []
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
-    status_code, completion = _call_local_chat_completions(chat_payload)
-    if status_code != 200:
-        return status_code, completion
+    for c_idx, (c_start, c_end) in enumerate(chunk_ranges, 1):
+        c_t0 = time.monotonic()
+        if is_multi_chunk:
+            data_url = _load_audio_as_data_url(audio_path, force_ffmpeg_16k=True, start_sec=c_start, end_sec=c_end)
+        else:
+            data_url = _load_audio_as_data_url(audio_path, force_ffmpeg_16k=force_ffmpeg)
 
-    choice = (completion.get("choices") or [{}])[0]
-    msg = choice.get("message") or {}
-    text = msg.get("content") or ""
-    reasoning_content = msg.get("reasoning_content") or msg.get("reasoning") or None
-    if not reasoning and body.get("cleanup_loops", True):
-        text = cleanup_generation_loops(text)
+        messages: list[dict[str, Any]] = []
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_prompt},
+                {"type": "audio_url", "audio_url": {"url": data_url}},
+            ],
+        })
 
-    ctc_ts = completion.get("ctc_timestamps")
-    words = (ctc_ts or {}).get("words") or [] if isinstance(ctc_ts, dict) else []
-    srt_text = _words_to_srt(words) if words else ""
+        chat_payload = {
+            "model": body.get("model") or MODEL_REPO,
+            "messages": messages,
+            "temperature": float(temp),
+            "top_p": float(top_p),
+            "max_tokens": int(max_tokens),
+            **extra_body,
+        }
+
+        status_code, completion = _call_local_chat_completions(chat_payload)
+        if status_code != 200:
+            return status_code, completion
+
+        choice = (completion.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        c_text = (msg.get("content") or "").strip()
+        c_reasoning = msg.get("reasoning_content") or msg.get("reasoning") or None
+        if not reasoning and body.get("cleanup_loops", True):
+            c_text = cleanup_generation_loops(c_text)
+
+        if c_text:
+            if is_multi_chunk and reasoning:
+                texts.append(f"[{_fmt_srt_time(c_start)[:8]} - {_fmt_srt_time(c_end)[:8]}]\n{c_text}")
+            else:
+                texts.append(c_text)
+        if c_reasoning:
+            if is_multi_chunk:
+                reasonings.append(f"[Chunk {c_idx}/{len(chunk_ranges)}: {_fmt_srt_time(c_start)[:8]} - {_fmt_srt_time(c_end)[:8]}]\n{c_reasoning}")
+            else:
+                reasonings.append(str(c_reasoning))
+
+        c_ctc = _shift_ctc_timestamps(completion.get("ctc_timestamps"), c_start)
+        if isinstance(c_ctc, dict):
+            last_ctc_ts = c_ctc
+            if isinstance(c_ctc.get("words"), list):
+                merged_words.extend(c_ctc["words"])
+            if isinstance(c_ctc.get("segments"), list):
+                merged_segments.extend(c_ctc["segments"])
+            if isinstance(c_ctc.get("diarization"), list):
+                merged_diarization.extend(c_ctc["diarization"])
+
+        u = completion.get("usage")
+        if isinstance(u, dict):
+            for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                total_usage[k] += int(u.get(k) or 0)
+
+        chunk_meta_list.append({
+            "chunk": c_idx,
+            "start_sec": round(c_start, 2),
+            "end_sec": round(c_end, 2),
+            "duration_sec": round(max(0.0, c_end - c_start), 2),
+            "elapsed_sec": round(time.monotonic() - c_t0, 2),
+        })
+
+    text = ("\n\n" if is_multi_chunk else "").join(texts)
+    reasoning_content = "\n\n".join(reasonings) if reasonings else None
+
+    if last_ctc_ts is not None:
+        ctc_ts: dict[str, Any] | None = dict(last_ctc_ts)
+        if merged_words:
+            ctc_ts["words"] = merged_words
+        if merged_segments:
+            ctc_ts["segments"] = merged_segments
+        if merged_diarization:
+            ctc_ts["diarization"] = merged_diarization
+    else:
+        ctc_ts = None
+
+    srt_text = _words_to_srt(merged_words) if merged_words else ""
 
     elapsed = round(time.monotonic() - t0, 2)
     result: dict[str, Any] = {
         "drive_path": str(audio_path),
         "rel_path": _rel_to_mydrive(audio_path),
+        "source_url": media_meta["source_url"] if media_meta else None,
+        "media_info": media_meta,
+        "duration_sec": round(total_duration, 2) if total_duration > 0 else None,
+        "chunk_count": len(chunk_ranges),
+        "chunks": chunk_meta_list if is_multi_chunk else None,
         "prompt": user_prompt,
         "system_prompt": sys_prompt,
         "preset": body.get("preset") or None,
@@ -2317,14 +2740,19 @@ def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any
         "ctc_timestamps": ctc_ts,
         "srt": srt_text or None,
         "elapsed_sec": elapsed,
-        "usage": completion.get("usage"),
+        "usage": total_usage if total_usage["total_tokens"] > 0 else None,
         "saved_drive_files": [],
     }
 
     save_to_drive = bool(body.get("save_to_drive", False))
     save_drive_dir = (body.get("save_drive_dir") or "").strip()
     if save_to_drive or save_drive_dir:
-        out_dir = _resolve_drive_path(save_drive_dir) if save_drive_dir else audio_path.parent
+        if save_drive_dir:
+            out_dir = _resolve_drive_path(save_drive_dir)
+        elif temp_media_path is not None:
+            out_dir = DATA_DIR / "transcripts"
+        else:
+            out_dir = audio_path.parent
         out_dir.mkdir(parents=True, exist_ok=True)
         stem = audio_path.stem
         txt_file = out_dir / f"{stem}.txt"
@@ -2340,10 +2768,26 @@ def _run_drive_transcribe_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any
             srt_file.write_text(srt_text, encoding="utf-8")
             result["saved_drive_files"].append(str(srt_file))
 
+    if temp_media_path is not None:
+        shutil.rmtree(temp_media_path.parent, ignore_errors=True)
+        result["drive_path"] = None
+
     return 200, result
 
+YTDLP_DOMAIN_MARKERS = (
+    "youtube.com/", "youtu.be/", "twitter.com/", "x.com/", "t.co/",
+    "bilibili.com/", "b23.tv/", "tiktok.com/", "soundcloud.com/",
+    "vimeo.com/", "twitch.tv/", "xiaoyuzhoufm.com/", "podcasts.apple.com/",
+    "ytdl://", "yt-dlp://",
+)
+
 def _rewrite_drive_urls_in_chat_body(raw_body: bytes) -> bytes | None:
-    if b"drive://" not in raw_body and b"gdrive://" not in raw_body and b"/content/drive/" not in raw_body:
+    if (
+        b"drive://" not in raw_body
+        and b"gdrive://" not in raw_body
+        and b"/content/drive/" not in raw_body
+        and not any(m.encode() in raw_body for m in YTDLP_DOMAIN_MARKERS)
+    ):
         return None
     try:
         payload = json.loads(raw_body)
@@ -2361,8 +2805,15 @@ def _rewrite_drive_urls_in_chat_body(raw_body: bytes) -> bytes | None:
                 continue
             aurl = item.get("audio_url")
             url_val = aurl.get("url") if isinstance(aurl, dict) else None
-            if isinstance(url_val, str) and url_val.startswith(("drive://", "gdrive://", "/content/drive/", "file:///content/drive/")):
+            if not isinstance(url_val, str):
+                continue
+            if url_val.startswith(("drive://", "gdrive://", "/content/drive/", "file:///content/drive/")):
                 ap = _resolve_drive_path(url_val)
+                aurl["url"] = _load_audio_as_data_url(ap)
+                changed = True
+            elif any(m in url_val for m in YTDLP_DOMAIN_MARKERS):
+                dl_items = _download_media_url_to_drive(url_val)
+                ap = Path(dl_items[0]["drive_path"])
                 aurl["url"] = _load_audio_as_data_url(ap)
                 changed = True
     if not changed:
@@ -2399,6 +2850,27 @@ async def nemotron_middleware(request: Any, call_next: Any) -> Any:
             })
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+
+    if request.method == "POST" and path == "/api/ct/ytdlp-download":
+        try:
+            body = json.loads(await request.body())
+            raw_url = (body.get("url") or body.get("media_url") or body.get("audio") or "").strip()
+            if not raw_url:
+                return JSONResponse({"error": "Missing 'url'"}, status_code=400)
+            items = await asyncio.to_thread(
+                _download_media_url_to_drive,
+                raw_url=raw_url,
+                download_dir=str(body.get("download_dir") or ""),
+                audio_format=str(body.get("audio_format") or "mp3"),
+                cookies_drive=str(body.get("cookies_drive") or ""),
+                playlist=bool(body.get("playlist", False)),
+                force_download=bool(body.get("force_download", False)),
+                download_video=bool(body.get("download_video", False)),
+                save_media_to_drive=bool(body.get("save_media_to_drive", True)),
+            )
+            return JSONResponse({"count": len(items), "files": items})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
 
     if request.method == "POST" and path == "/api/ct/drive-transcribe":
         try:
