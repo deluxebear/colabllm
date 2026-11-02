@@ -62,6 +62,45 @@ attached (= keep-alive). Requirements: `colab` CLI logged in, `colab dfs consent
    (0600) and injects them with `colab exec --env`.
 10. **`cf` (beta) quirk**: `cf tunnels config update --tunnel-config-ingress` demands unrelated Access
     flags -> send `--body '{"config":{"ingress":[...]}}'` instead.
+11. **vLLM services MUST use the two-tier JIT kernel precompilation cache (Local SSD $\leftrightarrow$ Google Drive)**:
+    vLLM compiles FlashInfer JIT (`fused_moe_<sm>`, etc.), Triton kernels, and TorchInductor/vLLM CUDA graphs on first startup (taking 5–10 minutes on Blackwell `sm_120` / Hopper `sm_90`). Never point compiler cache dirs directly at `/content/drive` (FUSE lockfile/rename bottlenecks slow down `ninja`/`nvcc`), and never leave them only in ephemeral `/root/.cache`. Always stage them on local NVMe SSD and sync with `DATA_DIR` on Google Drive (see **vLLM deployment standard** below).
+
+## vLLM deployment standard (precompiled JIT kernel cache & storage layout)
+
+Whenever deploying a model with **vLLM** (`vllm serve` or `vllm.LLM`), follow this unified storage and precompilation cache pattern (reference implementation: `NEMOTRON_TRANSCRIBE_*` in `templates/build_notebooks.py`):
+
+1. **Model weights on local NVMe SSD (`/content/<service>/model`), never on Google Drive**:
+   - Download weights directly from Hugging Face to `/content/<service>/model` with `HF_XET_CHUNK_CACHE_SIZE_BYTES="0"` (and delete `/root/.cache/huggingface/xet` afterwards) to avoid exhausting either the 15–100 GB Google Drive quota or the Colab SSD.
+2. **Two-tier JIT kernel cache (`flashinfer-cache`, `triton-cache`, `vllm-cache`)**:
+   - **Why multi-GPU safe**: FlashInfer (`*_120`, `*_90`, `*_80`), Triton, and vLLM/TorchInductor automatically namespace/hash compiled `.so`/`.cubin` artifacts by GPU compute capability (`sm_120` for G4, `sm_90` for H100, `sm_80` for A100). Different GPU types coexist in the same Drive cache directory without overwriting each other.
+   - **Step A — Cell 1 (`Setup`)**: Restore cached kernels from Google Drive (`DATA_DIR`) to local NVMe SSD before starting `vllm`:
+     ```python
+     WORK_DIR = Path(f"/content/{SERVICE}")
+     FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR = Path(DATA_DIR) / "flashinfer-cache", WORK_DIR / "flashinfer-cache"
+     TRITON_DRIVE_DIR,     TRITON_CACHE_DIR     = Path(DATA_DIR) / "triton-cache",     WORK_DIR / "triton-cache"
+     VLLM_DRIVE_DIR,       VLLM_CACHE_DIR       = Path(DATA_DIR) / "vllm-cache",       WORK_DIR / "vllm-cache"
+     for d in (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR, TRITON_DRIVE_DIR, TRITON_CACHE_DIR, VLLM_DRIVE_DIR, VLLM_CACHE_DIR):
+         d.mkdir(parents=True, exist_ok=True)
+     for src_d, dst_d in ((FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR), (TRITON_DRIVE_DIR, TRITON_CACHE_DIR), (VLLM_DRIVE_DIR, VLLM_CACHE_DIR)):
+         if any(src_d.iterdir()):
+             subprocess.run(["cp", "-rn", f"{src_d}/.", f"{dst_d}/"], check=False)
+     ```
+   - **Step B — Cell 2 (`Service`)**: Inject the local SSD cache paths into `vllm serve`'s environment:
+     ```python
+     VLLM_ENV = {
+         **os.environ,
+         "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+         "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+         "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
+         "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
+     }
+     ```
+   - **Step C — Cell 5 (`Ready + keep-alive`)**: Once `/health` returns `200` (all JIT warmup compilations complete), incrementally merge (`cp -ru`) the local SSD cache back to Google Drive so all future sessions (and parallel instances `-i 1`, `-i 2`, or different `--gpu` architectures) reuse the compiled binaries:
+     ```python
+     for local_c, drive_c in ((FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR), (TRITON_CACHE_DIR, TRITON_DRIVE_DIR), (VLLM_CACHE_DIR, VLLM_DRIVE_DIR)):
+         if local_c.is_dir() and drive_c.is_dir():
+             subprocess.run(["cp", "-ru", f"{local_c}/.", f"{drive_c}/"], check=False)
+     ```
 
 ## Notebook contract
 

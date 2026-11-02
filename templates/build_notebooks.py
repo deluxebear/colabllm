@@ -1696,11 +1696,25 @@ DRIVE_AUDIO_DIR = Path(DATA_DIR) / "audio"
 DRIVE_OUTPUT_DIR = Path(DATA_DIR) / "outputs"
 FLASHINFER_DRIVE_DIR = Path(DATA_DIR) / "flashinfer-cache"
 FLASHINFER_CACHE_DIR = NT_WORK / "flashinfer-cache"
+TRITON_DRIVE_DIR = Path(DATA_DIR) / "triton-cache"
+TRITON_CACHE_DIR = NT_WORK / "triton-cache"
+VLLM_DRIVE_DIR = Path(DATA_DIR) / "vllm-cache"
+VLLM_CACHE_DIR = NT_WORK / "vllm-cache"
 
-for d in (NT_WORK, MODEL_DIR.parent, DRIVE_AUDIO_DIR, DRIVE_OUTPUT_DIR, FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR):
+for d in (
+    NT_WORK, MODEL_DIR.parent, DRIVE_AUDIO_DIR, DRIVE_OUTPUT_DIR,
+    FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR,
+    TRITON_DRIVE_DIR, TRITON_CACHE_DIR,
+    VLLM_DRIVE_DIR, VLLM_CACHE_DIR,
+):
     d.mkdir(parents=True, exist_ok=True)
-if any(FLASHINFER_DRIVE_DIR.iterdir()):
-    subprocess.run(["cp", "-rn", f"{FLASHINFER_DRIVE_DIR}/.", f"{FLASHINFER_CACHE_DIR}/"], check=False)
+for _src_d, _dst_d in (
+    (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR),
+    (TRITON_DRIVE_DIR, TRITON_CACHE_DIR),
+    (VLLM_DRIVE_DIR, VLLM_CACHE_DIR),
+):
+    if any(_src_d.iterdir()):
+        subprocess.run(["cp", "-rn", f"{_src_d}/.", f"{_dst_d}/"], check=False)
 
 def nlog(msg):
     print(time.strftime("[%F %T] [nemotron] ") + msg, flush=True)
@@ -2909,6 +2923,9 @@ VLLM_ENV = {
     "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB": "180",
     "VLLM_USE_V2_MODEL_RUNNER": "0",
     "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+    "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
+    "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
     "CT_API_TOKEN": API_TOKEN,
     "CT_SERVICE_PORT": str(SERVICE_PORT),
     "CT_DATA_DIR": str(DATA_DIR),
@@ -3006,8 +3023,13 @@ else:
     raise RuntimeError("Timed out waiting for vLLM server to become ready:\n" + ct_tail("service", 60))
 
 auth_check(LOCAL_BASE, API_TOKEN)
-if FLASHINFER_CACHE_DIR.is_dir() and FLASHINFER_DRIVE_DIR.is_dir():
-    subprocess.run(["cp", "-ru", f"{FLASHINFER_CACHE_DIR}/.", f"{FLASHINFER_DRIVE_DIR}/"], check=False)
+for _local_c, _drive_c in (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+):
+    if _local_c.is_dir() and _drive_c.is_dir():
+        subprocess.run(["cp", "-ru", f"{_local_c}/.", f"{_drive_c}/"], check=False)
 code, presets_info = http_json(LOCAL_BASE + "/api/ct/prompts", API_TOKEN)
 if code != 200:
     raise RuntimeError(f"Local /api/ct/prompts check failed: HTTP {code}")
