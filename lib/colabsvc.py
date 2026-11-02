@@ -155,7 +155,32 @@ def load_tunnel_config() -> dict:
     data = json.loads(path.read_text())
     if not isinstance(data, dict):
         raise ValueError('tunnel-config.json 必须是 JSON 对象')
-    return {'base_domain': validate_domain(data['base_domain'])} if data.get('base_domain') else {}
+    if data.get('base_domain'):
+        data['base_domain']=validate_domain(data['base_domain'])
+    if data.get('frp') is not None:
+        from frp_backend import validate_config
+        data['frp']=validate_config(data['frp'])
+    return data
+
+
+def save_tunnel_config(data: dict) -> None:
+    from frp_backend import write_private
+    path=STATE_ROOT/'tunnel-config.json'
+    if data:
+        write_private(path,data)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def tunnel_transport(args) -> str:
+    explicit=getattr(args,'transport',None)
+    if getattr(args,'quick_tunnel',False):
+        if explicit=='frp':
+            raise ValueError('--quick-tunnel cannot be used with --transport frp')
+        return 'cloudflare'
+    if explicit:
+        return explicit
+    return 'frp' if load_tunnel_config().get('frp',{}).get('enabled') else 'cloudflare'
 
 
 def tunnel_hostname(svc: Service, args) -> str | None:
@@ -179,16 +204,19 @@ def tunnel_hostname(svc: Service, args) -> str | None:
 
 def cmd_tunnel_config(args) -> None:
     path = STATE_ROOT / 'tunnel-config.json'
+    saved=load_tunnel_config()
     if args.clear:
-        path.unlink(missing_ok=True)
+        if saved.get('frp',{}).get('enabled'):
+            raise ValueError('FRP requires a base domain; disable FRP before clearing it')
+        saved.pop('base_domain',None)
+        save_tunnel_config(saved)
     elif args.base_domain is not None:
-        domain = validate_domain(args.base_domain)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + '.' + secrets.token_hex(6) + '.tmp')
-        temporary.write_text(json.dumps({'base_domain': domain}, indent=2) + '\n')
-        temporary.replace(path)
+        saved['base_domain']=validate_domain(args.base_domain)
+        save_tunnel_config(saved)
     saved = load_tunnel_config()
     print(json.dumps({'base_domain': saved.get('base_domain'),
+                      'transport': 'frp' if saved.get('frp',{}).get('enabled') else 'cloudflare',
+                      'frp': saved.get('frp'),
                       'environment_override': os.environ.get('COLABSVC_BASE_DOMAIN') or None,
                       'config_file': str(path)}, ensure_ascii=False, indent=2))
 
@@ -395,12 +423,17 @@ def ensure_named_tunnel(svc: Service, hostname: str) -> dict:
     body = json.dumps({"type": "CNAME", "name": hostname, "content": target, "proxied": True,
                        "comment": f"colabsvc {svc.name}"})
     records = cf_json("dns", "records", "list", "-z", zone["id"], "--name", hostname)
+    if len(records)>1:
+        raise ValueError(f'DNS conflict for {hostname}: multiple existing records')
     if not records:
         cf_json("dns", "records", "create", "-z", zone["id"], "--body", body)
         log(f"cf: DNS CNAME {hostname} -> {target} (created)")
     elif records[0]["type"] == "CNAME" and records[0]["content"] == target:
         log(f"cf: DNS CNAME {hostname} already points at the tunnel")
-    elif records[0]["type"] == "CNAME":
+    elif records[0].get('comment')==f'colabsvc {svc.name}' or (
+        records[0].get('comment')==State(svc).load().get('frp_route',{}).get('dns_owner')
+        and records[0].get('comment','').startswith('colabsvc-frp ')
+    ):
         cf_json("dns", "records", "edit", records[0]["id"], "-z", zone["id"], "--body", body)
         log(f"cf: DNS CNAME {hostname} -> {target} (updated from {records[0]['content']})")
     else:
@@ -482,9 +515,17 @@ def ensure_session(svc: Service) -> None:
 
 def cmd_up(svc: Service, script: Path, a) -> None:
     hostname = tunnel_hostname(svc, a)
+    transport=tunnel_transport(a)
+    frp_config=None
+    if transport=='frp':
+        frp_config=load_tunnel_config().get('frp')
+        if not frp_config or not frp_config.get('server_ip') or not hostname:
+            raise ValueError('FRP requires server configuration and a public domain; run colabctl.py frp-config')
+        from frp_backend import validate_config
+        frp_config=validate_config({**frp_config,'enabled':True})
     if a.gpu:
         svc.gpu = None if a.gpu.lower() in ("none", "cpu") else a.gpu
-    for tool in ("colab",) + (("cf",) if hostname else ()):
+    for tool in ("colab",) + (("cf",) if hostname else ()) + (("ssh",) if transport=='frp' else ()):
         if not shutil.which(tool):
             die(f"`{tool}` CLI not found")
     state = State(svc)
@@ -499,7 +540,7 @@ def cmd_up(svc: Service, script: Path, a) -> None:
     skip = {int(x) for x in a.skip.split(",")} if a.skip else set()
     built, plan = build_notebook(nb_src, skip)
     log(f"service {svc.name}: notebook {nb_src.name}, gpu {svc.tpu or svc.gpu or 'cpu'}, auth {svc.auth}, "
-        f"{'domain ' + hostname if hostname else 'quick tunnel'}")
+        f"transport {transport}, {'domain ' + hostname if hostname else 'quick tunnel'}")
     print("\n".join(plan))
     if a.dry_run:
         return
@@ -518,7 +559,9 @@ def cmd_up(svc: Service, script: Path, a) -> None:
            "CT_DATA_DIR": f"/content/drive/MyDrive/colab-llm/{svc.base_name or svc.name}", **svc.env}
     # Explicitly clear previous notebook-kernel values when switching to quick
     # tunnels; reused Colab kernels retain env vars from earlier executions.
-    env.update(CT_TUNNEL_TOKEN="", CT_PUBLIC_HOSTNAME="")
+    env.update(CT_TRANSPORT=transport,CT_TUNNEL_TOKEN="", CT_PUBLIC_HOSTNAME="")
+    for key in ('SERVER_IP','SERVER_PORT','REMOTE_PORT','PROXY_NAME','TOKEN','CA_CERT','VERSION','SERVER_NAME','AUTH_SCOPES'):
+        env['CT_FRP_'+key]=''
     hf_tok = a.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or st.get("hf_token")
     if not hf_tok:
         for p in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
@@ -532,10 +575,23 @@ def cmd_up(svc: Service, script: Path, a) -> None:
         env.update(CT_AUTH_USER=st["auth_user"], CT_AUTH_PASS=st["auth_pass"])
 
     # 1. named tunnel + DNS (local, cf CLI)
-    if hostname:
+    if transport=='frp':
+        from frp_backend import ensure_route
+        if st.get('frp_route'):
+            previous=st['frp_route']
+            if previous['hostname']!=hostname or any(previous['frp'].get(k)!=frp_config.get(k)
+                for k in ('server_ip','server_port','ssh','project_id')):
+                raise ValueError('Existing FRP route targets another endpoint; use down --delete-tunnel first')
+        route,frp_env=ensure_route(svc,frp_config,hostname,STATE_ROOT)
+        env.update(frp_env)
+        st=state.save(transport=transport,hostname=hostname,frp_route=route)
+    elif hostname:
         info = ensure_named_tunnel(svc, hostname)
         env.update(CT_TUNNEL_TOKEN=info["token"], CT_PUBLIC_HOSTNAME=hostname)
-        st = state.save(**{k: v for k, v in info.items() if k != "token"})
+        route={k: v for k, v in info.items() if k != 'token'}
+        st = state.save(transport=transport,cloudflare_route=route,**route)
+    else:
+        st=state.save(transport=transport)
     # 2. session + 3. Drive
     ensure_session(svc)
     if not a.no_drive:
@@ -654,11 +710,16 @@ def cmd_down(svc: Service, a) -> None:
             pass
     log(f"colab stop -s {svc.name}")
     run(["colab", "stop", "-s", svc.name], check=False)
-    if a.delete_tunnel and st.get("tunnel_id"):
-        delete_named_tunnel(st)
+    if a.delete_tunnel and st.get('frp_route'):
+        from frp_backend import remove_route
+        remove_route(st['frp_route'],svc.name)
+        st.pop('frp_route',None)
+    if a.delete_tunnel and (st.get("tunnel_id") or st.get('cloudflare_route')):
+        delete_named_tunnel(st.get('cloudflare_route') or st)
+        st.pop('cloudflare_route',None)
         st = {k: v for k, v in st.items() if k not in ("tunnel_id", "tunnel_name", "zone_id", "hostname")}
     keep = {k: st[k] for k in ("auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
-                               "zone_id", "hostname") if k in st}
+                               "zone_id", "hostname", "transport", "frp_route", "cloudflare_route") if k in st}
     state.dir.mkdir(parents=True, exist_ok=True)
     state.path.write_text(json.dumps(keep, indent=2))
     os.chmod(state.path, 0o600)
@@ -681,6 +742,7 @@ def main(svc: Service) -> None:
     tunnel.add_argument("--base-domain", metavar="DOMAIN", type=validate_domain,
                         help="本次启动的主域名，如 example.com，自动生成 <service>.example.com")
     tunnel.add_argument("--quick-tunnel", action="store_true", help="忽略主域名配置，强制使用动态 trycloudflare.com URL")
+    u.add_argument('--transport',choices=('cloudflare','frp'),help='本次启动覆盖全局隧道后端')
     u.add_argument("--gpu", help="override GPU (T4|L4|G4|H100|A100|none)")
     u.add_argument("--skip", default="", help="1-based code cells to skip, e.g. 1,2")
     u.add_argument("--no-drive", action="store_true", help="do not mount Google Drive")
@@ -710,7 +772,7 @@ def main(svc: Service) -> None:
     if a.cmd == "up":
         try:
             cmd_up(svc, script, a)
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             p.error(str(error))
     elif a.cmd == "tunnel-config":
         try:

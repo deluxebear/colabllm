@@ -15,7 +15,12 @@ URL is reachable by anyone who learns it.
 
 ```
 internet -> Cloudflare -> cloudflared -> Caddy :CT_PUBLIC_PORT -> service 127.0.0.1:CT_SERVICE_PORT
+internet -> server HTTPS Caddy -> frps -> Colab frpc -> Caddy :CT_PUBLIC_PORT -> service
 ```
+
+With FRP, the server Caddy terminates public HTTPS; the Colab Caddy still enforces
+the service's authentication. FRP's connection Token is separate from the model API
+Token. For `auth=builtin`, frpc targets the app's authenticated port directly.
 
 - Browsers: HTTP basic auth (`CT_AUTH_USER` / `CT_AUTH_PASS`, bcrypt-hashed in the Caddyfile).
 - API clients: `Authorization: Bearer <CT_API_TOKEN>` (works with OpenAI SDKs: `api_key=<token>`).
@@ -50,4 +55,6 @@ client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN)
 - Fixed domain + Cloudflare Access (Zero Trust, email OTP) in front of Caddy:
   `cf zero-trust access applications create --body '{...self_hosted, domain: <host>...}'`.
   Browser-only; API clients then need Access service tokens.
+  This requires traffic to pass through Cloudflare; FRP's default DNS-only records
+  route requests directly to the server Caddy.
 - Rotate credentials after sharing a URL; `down` the service when not in use.

@@ -156,40 +156,9 @@ else:
     print(f"auth={AUTH}: no proxy, cloudflared targets the service on :{PUBLIC_PORT} directly")
 '''
 
-TUNNEL = r'''# @title 4. Cloudflare tunnel -- token: fixed domain (named tunnel, created by the service script via `cf`)
-#                               no token: temporary *.trycloudflare.com URL
-CLOUDFLARED = ct_fetch_binary("/usr/local/bin/cloudflared",
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64")
-
-def start_cloudflared():
-    subprocess.run(["pkill", "-f", "cloudflared tunnel"], check=False)
-    open(f"{WORK}/cloudflared.log", "w").close()
-    if TUNNEL_TOKEN:   # ingress (hostname -> localhost:PUBLIC_PORT) lives in the Cloudflare config
-        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token", TUNNEL_TOKEN]
-    else:
-        args = [CLOUDFLARED, "tunnel", "--no-autoupdate", "--protocol", "http2",
-                "--url", f"http://127.0.0.1:{PUBLIC_PORT}"]
-    return ct_spawn("cloudflared", args)
-
-def wait_public_url(timeout=90):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        log = ct_tail("cloudflared", 400)
-        if TUNNEL_TOKEN and "Registered tunnel connection" in log:
-            return f"https://{PUBLIC_HOST}"
-        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log)
-        if not TUNNEL_TOKEN and m:
-            return m.group(0)
-        time.sleep(1)
-    raise RuntimeError("cloudflared did not come up:\n" + ct_tail("cloudflared"))
-
-# A failing cell does not stop `colab exec`, so guard explicitly: no auth layer -> no tunnel.
-if not globals().get("AUTH_OK"):
-    raise RuntimeError("auth layer not ready (cell 3 failed) -- refusing to expose the service")
-PROCS["cloudflared"] = (start_cloudflared(), start_cloudflared)
-PUBLIC_URL = wait_public_url()
-print(f"CT_PUBLIC_URL={PUBLIC_URL}")
-'''
+TUNNEL = ("# @title 4. Tunnel -- Cloudflare by default, or project-configured FRP + HTTPS\n"
+          + (ROOT / "templates/tunnel_client.py").read_text()
+          + "\nrun_tunnel(globals())\n")
 
 KEEPALIVE = r'''# @title 5. Ready + keep-alive -- KEEP THIS CELL RUNNING
 # The Colab session only lives while the `colab exec` connection is open and this cell blocks.
@@ -803,7 +772,7 @@ while True:
     status_rec = {
         "service": SERVICE,
         "kernel_pid": os.getpid(), "server_pid": PROCS["service"][0].pid,
-        "tunnel_pid": PROCS["cloudflared"][0].pid, "context": CFG["context"],
+        "tunnel_pid": PROCS[TUNNEL_PROCESS_KEY][0].pid, "context": CFG["context"],
         "alias": CFG["alias"], "url": PUBLIC_URL + "/v1",
         "updated_at": time.strftime("%FT%T%z"), "uptime_sec": int(time.monotonic() - started),
         "gpu_memory": gpu_mem,

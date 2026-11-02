@@ -1,36 +1,42 @@
-# Fixed domain with the `cf` CLI (`up --domain`)
+# Cloudflare backend and global domains
 
-Default zone: **example.com** (`Service.zone`). `--domain` alone → `<name>.example.com`;
-`--domain host.other-zone.com` works for any zone in the logged-in account (longest suffix match).
+Read the current configuration with `./colabctl.py tunnel-config`. The shared file is
+`.state/tunnel-config.json`; changing it does not move existing runtime connections.
+FRP enabled there makes FRP the default. To operate Cloudflare for one launch, pass
+`--transport cloudflare`, or `--quick-tunnel` for a dynamic URL regardless of saved domains.
 
-## What `ensure_named_tunnel()` does (idempotent, runs locally before the VM starts)
+Domain precedence: explicit `--domain HOST`, one-launch `--base-domain`,
+`COLABSVC_BASE_DOMAIN`, saved project base domain, then a dynamic URL. The three hostname
+options (`--domain`, `--base-domain`, `--quick-tunnel`) are mutually exclusive.
+Service aliases and instance suffixes are retained, e.g. `qwen-2.example.com`.
+`Service.zone` is a historical alias suffix, not a default deployment target.
 
-```bash
-cf tunnels list --name colab-<name> --is-deleted false        # reuse if it exists
-cf tunnels create --name colab-<name> --config-source cloudflare
-cf tunnels config update <tunnel-id> \
-   --body '{"config":{"ingress":[{"hostname":"<host>","service":"http://localhost:<CT_PUBLIC_PORT>"},
-                                 {"service":"http_status:404"}]}}'
-cf zones list                                                 # find the zone of <host>
-cf dns records list -z <zone-id> --name <host>                # create / repoint CNAME, never overwrite A/AAAA
-cf dns records create -z <zone-id> --body '{"type":"CNAME","name":"<host>",
-   "content":"<tunnel-id>.cfargotunnel.com","proxied":true,"comment":"colabsvc <name>"}'
-cf tunnels token get <tunnel-id>                              # -> CT_TUNNEL_TOKEN via colab exec --env
-```
+Global configuration commands are documented in
+[README.md](../../../../README.md#cloudflare-tunnel-配置).
+Use `./colabctl.py tunnel-config --clear` to clear the saved domain; if FRP is enabled,
+disable it first because FRP requires a hostname. Environment overrides still apply.
 
-The notebook then runs `cloudflared tunnel --no-autoupdate run --token $CT_TUNNEL_TOKEN`; the ingress
-(hostname → `localhost:CT_PUBLIC_PORT`) lives in Cloudflare (remote-managed tunnel), so the notebook
-needs no config file. Readiness = `Registered tunnel connection` in `/content/ct/cloudflared.log`.
+## Named tunnel versus Quick Tunnel
 
-Without `--domain` the notebook runs a quick tunnel (`cloudflared tunnel --url http://127.0.0.1:PORT`)
-and prints the random `*.trycloudflare.com` URL (changes on every start).
+With a hostname, `lib/colabsvc.py:ensure_named_tunnel()` uses the local `cf` login to
+create/reuse `colab-<service-instance>`, configure ingress to `svc.tunnel_port`, set a
+proxied CNAME, and retrieve the token. Zone lookup uses the longest matching suffix.
+On Colab, `templates/tunnel_client.py` starts cloudflared; registration is logged in
+`/content/ct/cloudflared.log`.
 
-## Gotchas
+Without a hostname, cloudflared starts a Quick Tunnel and reports a random
+`https://*.trycloudflare.com` URL. This path needs no `cf` login. Omitting `--domain`
+does not imply a Quick Tunnel when a project domain or FRP backend is configured.
 
-- `cf` is beta: the `--tunnel-config-*` flags of `cf tunnels config update` require unrelated Access
-  flags -- always use `--body`.
-- One tunnel per service (`colab-<name>`); the tunnel and DNS record are kept on `down` so the URL is
-  stable. `down --delete-tunnel` removes both (`cf dns records delete --force`, `cf tunnels connections cleanup --force`, `cf tunnels delete --force`).
-- A tunnel token is a secret: stored only in `.state/<name>/state.json` (0600) and the local
-  colab-cli history, never in notebooks.
-- Check auth/zones: `cf auth whoami`, `cf zones list`, `cf tunnels list --name colab-<name>`.
+## DNS and lifecycle
+
+- Use `cf auth whoami` and `cf zones list` to diagnose account/Zone access.
+- Keep DNS ownership checks in the shared backend. Unrelated records and multiple
+  conflicting records cause an error. Switching this instance's owned FRP record to a
+  named tunnel is supported; generic A/AAAA records are not safe to overwrite.
+- `cf`'s beta `--tunnel-config-*` flags can demand unrelated Access options. The runner
+  uses `--body` JSON for ingress updates; retain that approach.
+- Tokens live in private `.state/` data and injected environment, not notebook source.
+- `down` retains named tunnels/DNS. `down --delete-tunnel` cleans recorded resources;
+  separate Cloudflare and FRP identities are preserved across backend switches.
+  Use the recorded hostname/Zone, not the current global defaults, for cleanup.

@@ -1,11 +1,10 @@
 ---
 name: colab-llm-service
 description: >-
-  Run a large-model service (Unsloth Studio, Ollama, vLLM, llama.cpp, ComfyUI, Gradio apps...) on a
-  Google Colab GPU via the Colab CLI and expose it through Cloudflare Tunnel, following this repo's
-  "one service = one notebook + one Python script" convention. Use when adding a new service,
-  starting/stopping one, giving it a fixed domain with the `cf` CLI, putting Caddy auth in front of a
-  service without its own login, or debugging Colab session / tunnel / keep-alive problems.
+  Deploy and operate large-model services on Google Colab through this repository's
+  one-notebook/one-script convention. Use for service setup, lifecycle, project-global
+  domains, Cloudflare Tunnel or SSH-managed FRP/Caddy, authentication, and session or
+  tunnel troubleshooting.
 ---
 
 # Colab LLM service
@@ -13,37 +12,61 @@ description: >-
 Every model service in this repo is a pair of files in `services/`, sharing one library:
 
 ```
-services/<name>.py       execution script (local): session, Drive, cf tunnel, credentials, keep-alive
-services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared, keep-alive loop
+services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
+services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
 lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
+colabctl.py             project-global domain and FRP configuration
+lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
+templates/tunnel_client.py  shared cloudflared/frpc implementation embedded in all notebooks
 templates/               service.py + service.ipynb to copy; build_notebooks.py regenerates notebooks
-.state/<name>/           runtime state (chmod 600): url, passwords, tunnel id, run.log  -- gitignored
+.state/<name>/           private runtime state and resource identities (gitignored)
+.state/tunnel-config.json  shared base domain and optional FRP metadata
+.state/frp/             private per-server client credentials (0600)
 ```
 
 Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, T4),
 `comfyui` (ComfyUI + ComfyUI-Manager, Caddy auth, L4, on-demand workflow model download to local SSD via `--workflow` / `pull-workflow`),
 `qwen-flash` (`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF` IQ3_S, 800K YaRN 3.125x + BF16 vision,
-`llama-server --api-key-file` built-in auth, G4 GPU, default domain `qwen.example.com`),
+`llama-server --api-key-file` built-in auth, G4 GPU, domain alias `qwen`),
 `nemotron-transcribe` (`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` via `vllm serve` + `nemo_speechlm`,
-Bearer API key auth, G4 GPU, default domain `transcribe.example.com`, single & batch Drive audio CLI `transcribe`),
+Bearer API key auth, G4 GPU, domain alias `transcribe`, single & batch Drive audio CLI `transcribe`),
 `indextts` (`IndexTeam/IndexTTS-2.5` via `vllm serve --omni` 2-stage pipeline, Bearer API key auth, L4 GPU,
-default domain `indextts.example.com`, zero-shot voice cloning, persistent Drive voices, native speed 0.5-2.0x,
+domain alias `indextts`, zero-shot voice cloning, persistent Drive voices, native speed 0.5-2.0x,
 multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`),
-`qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, default domain `qwen3-tts.example.com`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
+`qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, domain alias `qwen3-tts`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
 
-## Daily use
+## Daily use and transport selection
+
+Read `./colabctl.py tunnel-config` before choosing a public URL. It reports project-wide
+settings, not settings for one runtime. `up` follows these settings:
+
+- FRP enabled: use FRP and the configured base domain.
+- Otherwise use Cloudflare: configured domain -> named tunnel; no domain -> dynamic Quick Tunnel URL.
+- `--transport cloudflare|frp` overrides the backend for one launch. `--quick-tunnel` forces
+  Cloudflare's dynamic URL and conflicts with `--transport frp`.
+- `--domain HOST` supplies a full hostname; `--base-domain` supplies a one-launch suffix.
+  Bare `--domain` uses the configured suffix or a dynamic URL if none exists. Historical
+  `Service.zone` / `default_hostname` values retain aliases, not an implicit `example.com` deployment.
 
 ```bash
-./services/<name>.py up                 # quick tunnel  https://<random>.trycloudflare.com
-./services/<name>.py up --domain        # fixed domain  https://<name>.example.com   (cf CLI)
-./services/<name>.py up --domain llm.example.com --gpu A100
-./services/<name>.py info               # URL + credentials        logs -f   status (probes the URL)
-./services/<name>.py down               # stop runner + Colab VM  (--delete-tunnel: also tunnel + DNS)
+./colabctl.py tunnel-config
+./colabctl.py tunnel-config --base-domain example.com  # shared by all services/instances
+./services/<name>.py up                                # selected global backend
+./services/<name>.py up --quick-tunnel
+./services/<name>.py up --transport cloudflare --domain llm.example.com --gpu A100
+./services/<name>.py info               # prints credentials; avoid echoing them in tool output
+./services/<name>.py logs -f
+./services/<name>.py down               # stop runner + VM; --delete-tunnel cleans this instance's resources
 ```
 
+For **Cloudflare setup, DNS ownership or cleanup**, read [references/cf-tunnel.md](references/cf-tunnel.md).
+For **FRP setup, existing frps/Caddy adoption or FRP connection failures**, read
+[references/frp.md](references/frp.md). Use the user's actual server/domain values, not examples.
+Configuration changes affect future starts; preserve running generation tasks when changing code or transport.
+
 `up` returns once the notebook prints `CT_READY`; a detached local runner keeps `colab exec`
-attached (= keep-alive). Requirements: `colab` CLI logged in, `colab dfs consent` done once,
-`cf` CLI logged in (`cf auth whoami`) for `--domain`.
+attached (= keep-alive). Requirements: `colab` CLI logged in, `colab dfs consent` done once.
+Fixed domains use the local `cf` login for DNS in either backend. FRP server management also needs SSH.
 
 ## Hard-won rules (verified on real runs -- do not "simplify" them away)
 
@@ -114,9 +137,11 @@ Env injected by the script (`CT_*`), defaults let the notebook also run pasted i
 | --- | --- |
 | `CT_SERVICE`, `CT_SERVICE_PORT` | service name; port the service listens on **127.0.0.1** |
 | `CT_AUTH` | `caddy` (service has no auth) / `builtin` (own login or API key) / `none` |
-| `CT_PUBLIC_PORT` | what cloudflared targets: Caddy port if `caddy`, else the service port |
+| `CT_PUBLIC_PORT` | transport target: Colab authentication Caddy port if `caddy`, else the service port |
 | `CT_AUTH_USER`, `CT_AUTH_PASS`, `CT_API_TOKEN` | Caddy basic-auth login and Bearer token |
-| `CT_TUNNEL_TOKEN`, `CT_PUBLIC_HOSTNAME` | set with `--domain`: run the named tunnel |
+| `CT_TRANSPORT` | `cloudflare` (default) or `frp`, chosen by the local runner |
+| `CT_TUNNEL_TOKEN`, `CT_PUBLIC_HOSTNAME` | Cloudflare named-tunnel token, and public hostname for either fixed-domain backend |
+| `CT_FRP_*` | server, token, CA, TLS name, scopes, client version and proxy identity; runner supplies these privately |
 | `CT_DATA_DIR` | `/content/drive/MyDrive/colab-llm/<name>` -- cache models/outputs here |
 
 Markers the notebook prints (parsed by `colabsvc`): `CT_PUBLIC_URL=<url>`,
@@ -124,13 +149,16 @@ Markers the notebook prints (parsed by `colabsvc`): `CT_PUBLIC_URL=<url>`,
 
 Standard cell order (generated by `templates/build_notebooks.py`):
 `0 config` → `1 setup (idempotent)` → `2 service: def start_service(); PROCS["service"]=...` →
-`3 Caddy auth` → `4 cloudflared (token → fixed domain, else quick)` → `5 CT_READY + watchdog loop`.
+`3 Caddy auth` → `4 shared transport (cloudflared or frpc)` → `5 CT_READY + watchdog loop`.
+Use `TUNNEL_PROCESS_KEY` to access the active transport in `PROCS`; its key is `cloudflared` or `frpc`.
+The runner clears unused backend variables when reusing a Colab kernel. A registered tunnel or
+HTTPS 502 during model loading is not service readiness; keep the service health/warmup gate before `CT_READY`.
 Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 
 ## Add a new service
 
 1. Copy the pair: `cp templates/service.py services/<name>.py; cp templates/service.ipynb services/<name>.ipynb`
-   (`<name>` = file name = Colab session = tunnel `colab-<name>` = host `<name>.example.com`).
+   (`<name>` = file name = Colab session; hostname uses the project base domain).
 2. Edit `services/<name>.py`: `name`, `notebook`, `service_port`, `auth`, `gpu`, extra `env`.
 3. Edit the notebook's **cell 1 (setup)** and **cell 2 (`start_service`)** only; bind to `127.0.0.1`.
    Cache large downloads in `DATA_DIR`. Adjust the health path in cell 5 if `/` is not a good probe.
@@ -143,5 +171,6 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 ## References
 
 - [references/auth.md](references/auth.md) -- choosing builtin vs Caddy, client usage, hardening
-- [references/cf-tunnel.md](references/cf-tunnel.md) -- what `--domain` does with the `cf` CLI, cleanup
+- [references/cf-tunnel.md](references/cf-tunnel.md) -- Cloudflare quick/named tunnels and project-domain selection
+- [references/frp.md](references/frp.md) -- FRP provisioning/adoption, credentials, DNS, diagnostics and cleanup
 - [references/troubleshooting.md](references/troubleshooting.md) -- symptoms → causes → fixes
