@@ -28,7 +28,8 @@ Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, 
 Bearer API key auth, G4 GPU, default domain `transcribe.example.com`, single & batch Drive audio CLI `transcribe`),
 `indextts` (`IndexTeam/IndexTTS-2.5` via `vllm serve --omni` 2-stage pipeline, Bearer API key auth, L4 GPU,
 default domain `indextts.example.com`, zero-shot voice cloning, persistent Drive voices, native speed 0.5-2.0x,
-multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`).
+multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`),
+`qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, default domain `qwen3-tts.example.com`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
 
 ## Daily use
 

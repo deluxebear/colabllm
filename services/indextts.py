@@ -406,7 +406,8 @@ def cmd_tts(args: argparse.Namespace) -> int:
         print(f"[indextts] HTTP {err.code} from /v1/audio/speech:\n{raw_err}", file=sys.stderr)
         return 1
 
-    out_path = Path(args.output).expanduser()
+    out_str = args.output or f"indextts-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+    out_path = Path(out_str).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(audio_bytes)
     msg = (
@@ -433,7 +434,7 @@ def _build_custom_parser() -> argparse.ArgumentParser:
         sp.add_argument("text", nargs="?", help="Text to synthesize (supports <word|PRONUNCIATION> annotations)")
         sp.add_argument("--text", dest="text_opt", help="Text to synthesize (alternative to positional arg)")
         sp.add_argument("--text-file", help="Read text to synthesize from a local UTF-8 file")
-        sp.add_argument("-o", "--output", default="indextts_output.wav", help="Local output audio file path (default: indextts_output.wav)")
+        sp.add_argument("-o", "--output", default=None, help="Local output audio file path (default: ./indextts-<timestamp>.wav)")
         sp.add_argument("--format", default="wav", choices=["wav", "mp3", "flac", "opus", "pcm"], help="Output audio format (default: wav)")
         sp.add_argument("--voice", help="Uploaded/preset voice name (default: 'default' when --ref-audio is omitted)")
         sp.add_argument("--ref-audio", help="Reference audio for zero-shot voice cloning (local file, drive:// path, or URL)")
