@@ -223,13 +223,13 @@ def code(text):
     return {"cell_type": "code", "metadata": {}, "outputs": [], "execution_count": None, "source": text}
 
 
-def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunnel=None):
+def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunnel=None, auth_cell=None):
     cells = [md(f"# {title}\n\n{intro}\n\n"
                 "Run it with the service script (`services/<name>.py up`), which creates the Colab session, "
                 "mounts Drive with `colab dfs`, optionally creates a named Cloudflare tunnel, and injects "
                 "`CT_*` settings. Cell order is the standard contract -- see "
                 "`.agents/skills/colab-llm-service/SKILL.md`."),
-             code(CONFIG % cfg), code(setup), code(service), code(CADDY), code(TUNNEL)]
+             code(CONFIG % cfg), code(setup), code(service), code(auth_cell if auth_cell is not None else CADDY), code(TUNNEL)]
     if extra_after_tunnel:
         cells.append(code(extra_after_tunnel))
     cells.append(code(keepalive if keepalive is not None else KEEPALIVE % cfg))
@@ -5596,7 +5596,191 @@ while True:
     qlog(f"heartbeat | up={int(time.monotonic() - started)}s | GPU: {gpu_mem}")
 '''
 
+# --------------------------------------------------------------------------- longcat-video (single G4 / Caddy + Gradio)
+LONGCAT_VIDEO_CFG = dict(name="longcat-video", service_port=7860, auth="caddy", public_port=18080,
+                         health_path="/health", ready_timeout=3600)
+# Gradio builds absolute media/API URLs from forwarded host and scheme. The
+# Cloudflare HTTPS edge connects to Caddy over HTTP inside this authenticated VM.
+LONGCAT_VIDEO_CADDY = CADDY.replace("REWRITE_HOST = True", "REWRITE_HOST = False").replace(
+    "flush_interval -1", "header_up X-Forwarded-Proto https\n            flush_interval -1")
+LONGCAT_VIDEO_SETUP = r'''# @title 1. Setup -- LongCat-Video on local SSD, Blackwell-compatible CUDA environment
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+LC_WORK = Path("/content/longcat-video")
+LC_REPO = LC_WORK / "repo"
+LC_MODEL = LC_WORK / "model"
+LC_VENV = LC_WORK / "venv"
+LC_REVISION = "6b3f4b8582a8bc3f20f795735f5383716c4ba794"
+LC_WORK.mkdir(parents=True, exist_ok=True)
+LC_OUTPUT = Path(DATA_DIR) / "output"
+LC_OUTPUT.mkdir(parents=True, exist_ok=True)
+LC_ENV = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0",
+          "HF_HUB_DISABLE_PROGRESS_BARS": "1", "PYTHONUNBUFFERED": "1"}
+LC_CACHE_PAIRS = []
+for name in ("triton-cache", "inductor-cache"):
+    local_cache, drive_cache = LC_WORK / name, Path(DATA_DIR) / name
+    local_cache.mkdir(exist_ok=True)
+    drive_cache.mkdir(exist_ok=True)
+    subprocess.run(["cp", "-rn", f"{drive_cache}/.", f"{local_cache}/"], check=False)
+    LC_CACHE_PAIRS.append((local_cache, drive_cache))
+
+if not (LC_REPO / ".git").exists():
+    subprocess.run(["git", "clone", "https://github.com/meituan-longcat/LongCat-Video.git", str(LC_REPO)], check=True)
+subprocess.run(["git", "-C", str(LC_REPO), "checkout", "--detach", LC_REVISION], check=True)
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "uv"], check=True)
+UV = shutil.which("uv")
+if not (LC_VENV / "bin/python").exists():
+    subprocess.run([UV, "venv", "--python", "3.11", "--seed", str(LC_VENV)], check=True)
+LC_PYTHON = str(LC_VENV / "bin/python")
+
+def lc_install():
+    marker = LC_WORK / "environment-v1.ok"
+    if marker.exists():
+        return
+    log_path = LC_WORK / "install.log"
+    with log_path.open("a") as log_file:
+        def run(args):
+            subprocess.run(args, stdout=log_file, stderr=subprocess.STDOUT, env=LC_ENV, check=True)
+        # Upstream's torch 2.6/cu124 predates sm_120; use CUDA 13 wheels for G4.
+        run([UV, "pip", "install", "--python", LC_PYTHON, "torch==2.11.0", "torchvision==0.26.0",
+             "--index-url", "https://download.pytorch.org/whl/cu130"])
+        run([UV, "pip", "install", "--python", LC_PYTHON,
+             "numpy==1.26.4", "transformers==4.41.0", "diffusers==0.35.1",
+             "einops==0.8.0", "ftfy==6.2.0", "loguru==0.7.2", "psutil",
+             "av==12.0.0", "opencv-python-headless==4.9.0.80", "imageio==2.37.0",
+             "imageio-ffmpeg==0.6.0", "huggingface-hub==0.36.0", "hf_xet",
+             "accelerate>=1,<2", "sentencepiece", "gradio==5.49.1", "uvicorn", "fastapi"])
+    marker.write_text("ok\n")
+
+def lc_download():
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface-hub", "hf_xet"], check=True)
+    # snapshot_download validates the local snapshot on each run; interrupted downloads resume.
+    download = (
+        "from huggingface_hub import snapshot_download; "
+        "snapshot_download('meituan-longcat/LongCat-Video', local_dir=" + repr(str(LC_MODEL)) +
+        ", allow_patterns=['*.json', 'dit/*', 'text_encoder/*', 'tokenizer/*', 'vae/*', "
+        "'scheduler/*', 'lora/cfg_step_lora.safetensors'])"
+    )
+    with (LC_WORK / "download.log").open("a") as log_file:
+        subprocess.run([sys.executable, "-c", download], stdout=log_file, stderr=subprocess.STDOUT,
+                       env=LC_ENV, check=True)
+    shutil.rmtree("/root/.cache/huggingface/xet", ignore_errors=True)
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    jobs = [pool.submit(lc_install), pool.submit(lc_download)]
+    while not all(job.done() for job in jobs):
+        for job in jobs:
+            if job.done():
+                job.result()
+        print("LongCat setup: environment=" + ("ready" if jobs[0].done() else "installing") +
+              " model=" + ("ready" if jobs[1].done() else "downloading") +
+              f" SSD free={shutil.disk_usage('/content').free / 1e9:.1f} GB; logs={LC_WORK}", flush=True)
+        time.sleep(20)
+    for job in jobs:
+        job.result()
+print("LongCat environment and model ready", flush=True)
+'''
+LONGCAT_VIDEO_SERVICE = r'''# @title 2. Service -- load BF16 model, verify inference, then serve Gradio on loopback
+LC_APP = LC_WORK / "longcat_video_app.py"
+LC_APP.write_text(__LONGCAT_APP_SOURCE__, encoding="utf-8")
+
+def start_service():
+    return ct_spawn("service", [LC_PYTHON, str(LC_APP)], cwd=str(LC_REPO), env={
+        "PYTHONPATH": str(LC_REPO), "PYTHONUNBUFFERED": "1",
+        "CT_LONGCAT_MODEL_DIR": str(LC_MODEL), "CT_LONGCAT_WORK_DIR": str(LC_WORK),
+        "CT_LONGCAT_OUTPUT_DIR": str(LC_OUTPUT),
+        "CT_SERVICE_PORT": str(SERVICE_PORT),
+        "TRITON_CACHE_DIR": str(LC_WORK / "triton-cache"),
+        "TORCHINDUCTOR_CACHE_DIR": str(LC_WORK / "inductor-cache"),
+        "GRADIO_ANALYTICS_ENABLED": "False",
+    })
+
+PROCS["service"] = (start_service(), start_service)
+# Wait for model + real inference before the shared authentication/tunnel cells.
+deadline = time.time() + 1800
+while time.time() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        raise RuntimeError("LongCat service exited:\n" + ct_tail("service", 60))
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=3) as response:
+            if json.load(response).get("inference_verified"):
+                break
+    except (OSError, ValueError):
+        pass
+    print("LongCat loading / warming up:\n" + ct_tail("service", 3), flush=True)
+    time.sleep(20)
+else:
+    raise TimeoutError("LongCat inference readiness timed out:\n" + ct_tail("service", 60))
+for local_cache, drive_cache in LC_CACHE_PAIRS:
+    subprocess.run(["cp", "-ru", f"{local_cache}/.", f"{drive_cache}/"], check=False)
+print("LongCat inference verified; compiled kernels synced to Drive", flush=True)
+'''.replace("__LONGCAT_APP_SOURCE__", repr((ROOT / "templates/longcat_video_app.py").read_text()))
+
+
+# --------------------------------------------------------------------------- longcat-avatar (Avatar 1.5 / single G4)
+LONGCAT_AVATAR_CFG = dict(name="longcat-avatar", service_port=7860, auth="caddy", public_port=18080,
+                          health_path="/health", ready_timeout=3600)
+LONGCAT_AVATAR_DOWNLOAD = r'''def lc_download():
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "huggingface-hub", "hf_xet"], check=True)
+    download = r"""
+from huggingface_hub import snapshot_download
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+snapshot_download('meituan-longcat/LongCat-Video', local_dir=root / 'LongCat-Video',
+                  allow_patterns=['tokenizer/*', 'text_encoder/*', 'vae/*'])
+snapshot_download('meituan-longcat/LongCat-Video-Avatar-1.5', local_dir=root / 'LongCat-Video-Avatar-1.5',
+                  allow_patterns=['base_model/*', 'scheduler/*', 'lora/dmd_lora.safetensors',
+                                  'whisper-large-v3/*.json', 'whisper-large-v3/*.txt',
+                                  'whisper-large-v3/model.safetensors'])
+"""
+    with (LC_WORK / "download.log").open("a") as log_file:
+        subprocess.run([sys.executable, "-c", download, str(LC_MODEL)], stdout=log_file, stderr=subprocess.STDOUT,
+                       env=LC_ENV, check=True)
+    shutil.rmtree("/root/.cache/huggingface/xet", ignore_errors=True)
+'''
+# Reuse the validated G4 environment and two-tier cache layout. Download only
+# Avatar's BF16 DiT/Whisper/DMD and the shared tokenizer/T5/VAE, not the base DiT.
+LONGCAT_AVATAR_SETUP = LONGCAT_VIDEO_SETUP.replace('"/content/longcat-video"', '"/content/longcat-avatar"').replace(
+    '"torchvision==0.26.0",', '"torchvision==0.26.0", "torchaudio==2.11.0",').replace(
+    '"sentencepiece", "gradio==5.49.1"',
+    '"sentencepiece", "librosa==0.11.0", "pyloudnorm==0.1.1", "soundfile==0.13.1", "scipy==1.15.3", "gradio==5.49.1"')
+_dl_start = LONGCAT_AVATAR_SETUP.index('def lc_download():')
+_dl_end = LONGCAT_AVATAR_SETUP.index('\nwith ThreadPoolExecutor', _dl_start)
+LONGCAT_AVATAR_SETUP = (LONGCAT_AVATAR_SETUP[:_dl_start] + LONGCAT_AVATAR_DOWNLOAD +
+                        LONGCAT_AVATAR_SETUP[_dl_end:]).replace(
+    '# @title 1. Setup -- LongCat-Video', '# @title 1. Setup -- LongCat-Video-Avatar 1.5')
+LONGCAT_AVATAR_SERVICE = LONGCAT_VIDEO_SERVICE.replace(
+    '# @title 2. Service -- load BF16 model', '# @title 2. Service -- load Avatar 1.5 BF16 + Whisper + DMD').replace(
+    'LC_APP = LC_WORK / "longcat_video_app.py"\nLC_APP.write_text(' + repr((ROOT / 'templates/longcat_video_app.py').read_text()) + ', encoding="utf-8")',
+    '(LC_WORK / "longcat_video_app.py").write_text(' + repr((ROOT / 'templates/longcat_video_app.py').read_text()) + ', encoding="utf-8")\n'
+    'LC_APP = LC_WORK / "longcat_avatar_app.py"\nLC_APP.write_text(' + repr((ROOT / 'templates/longcat_avatar_app.py').read_text()) + ', encoding="utf-8")').replace(
+    '"CT_SERVICE_PORT": str(SERVICE_PORT),', '"CT_SERVICE_PORT": str(SERVICE_PORT), "CT_LONGCAT_REPO_DIR": str(LC_REPO),')
+
+
+LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
+    'def start_service():',
+    '(LC_WORK / "longcat_avatar_jobs.py").write_text(' + repr((ROOT / 'templates/longcat_avatar_jobs.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
+
+LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
+    'def start_service():',
+    '(LC_WORK / "longcat_avatar_drive.py").write_text(' + repr((ROOT / 'templates/longcat_avatar_drive.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
+
 if __name__ == "__main__":
+    write(ROOT / "services/longcat-avatar.ipynb",
+          notebook("LongCat-Video-Avatar 1.5 (G4)",
+                   "Audio-driven single-person video, BF16 + Whisper + 8-step DMD; outputs on Drive.",
+                   LONGCAT_AVATAR_CFG, LONGCAT_AVATAR_SETUP, LONGCAT_AVATAR_SERVICE,
+                   auth_cell=LONGCAT_VIDEO_CADDY))
+    write(ROOT / "services/longcat-video.ipynb",
+          notebook("LongCat-Video (G4)", "Single-GPU BF16 text-to-video, image-to-video and video continuation; "
+                   "models on local SSD, generated videos on Drive, Caddy authentication.",
+                   LONGCAT_VIDEO_CFG, LONGCAT_VIDEO_SETUP, LONGCAT_VIDEO_SERVICE,
+                   auth_cell=LONGCAT_VIDEO_CADDY))
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
                    TEMPLATE_CFG, TEMPLATE_SETUP, TEMPLATE_SERVICE))
