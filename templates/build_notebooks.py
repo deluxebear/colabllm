@@ -897,10 +897,37 @@ if UI_MODE in ("legacy", "both"):
     if os.path.exists(f"{mgr_dir}/requirements.txt"):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{mgr_dir}/requirements.txt"], check=True)
 
+# Built-in custom nodes always provisioned before ComfyUI starts
+BUILTIN_CUSTOM_NODES = [
+    ("ComfyUI-MiniMaxH3-PrefixStream", "https://github.com/knoic/ComfyUI-MiniMaxH3-PrefixStream.git"),
+    ("ComfyUI-VideoHelperSuite", "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"),
+]
+for node_name, node_repo in BUILTIN_CUSTOM_NODES:
+    # Manager may install a registry package using a lowercase directory name.
+    # Loading both copies registers the same frontend twice and breaks VHSHelp.
+    node_root = Path(COMFY_DIR) / "custom_nodes"
+    for duplicate in sorted(node_root.iterdir()):
+        if duplicate.name != node_name and duplicate.name.casefold() == node_name.casefold():
+            backup_root = Path(DATA_DIR) / "custom_nodes-disabled"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            import uuid
+            backup = backup_root / f"{duplicate.name}-{uuid.uuid4().hex}"
+            shutil.move(str(duplicate), str(backup))
+            print(f"Archived duplicate custom node: {duplicate} -> {backup}")
+    node_dir = f"{COMFY_DIR}/custom_nodes/{node_name}"
+    if not os.path.isdir(f"{node_dir}/.git"):
+        if os.path.isdir(node_dir):
+            shutil.rmtree(node_dir)
+        subprocess.run(["git", "clone", "--depth", "1", node_repo, node_dir], check=True)
+    else:
+        subprocess.run(["git", "-C", node_dir, "pull", "--ff-only"], check=False)
+    if os.path.isfile(f"{node_dir}/requirements.txt"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", f"{node_dir}/requirements.txt"], check=True)
+
 # Install requirements of any other persisted custom_nodes on Drive
 for entry in sorted(os.listdir(f"{COMFY_DIR}/custom_nodes")):
     req = f"{COMFY_DIR}/custom_nodes/{entry}/requirements.txt"
-    if entry != "ComfyUI-Manager" and os.path.isfile(req):
+    if entry not in ("ComfyUI-Manager", *(n for n, _ in BUILTIN_CUSTOM_NODES)) and os.path.isfile(req):
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", req], check=False)
 
 # --- On-demand workflow model downloader (downloads directly to local NVMe SSD /content/ComfyUI/models) ---
