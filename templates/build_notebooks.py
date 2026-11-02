@@ -98,6 +98,8 @@ def start_caddy():
         urllib.request.urlretrieve(f"https://github.com/caddyserver/caddy/releases/download/{tag}/"
                                    f"caddy_{tag.lstrip('v')}_linux_amd64.tar.gz", tgz)
         subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+    import hashlib
+    cookie_tok = hashlib.sha256(f"ct-cookie-v2:{AUTH_USER}:{AUTH_PASS}:{API_TOKEN}".encode()).hexdigest()
     hashed = subprocess.check_output(["caddy", "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
     upstream = f"""reverse_proxy 127.0.0.1:{SERVICE_PORT} {{
             {"header_up Host {upstream_hostport}" if REWRITE_HOST else ""}
@@ -115,16 +117,18 @@ def start_caddy():
     handle @bearer {{
         {upstream}
     }}
-    @cookie header Cookie *ct_session={API_TOKEN}*
+    @cookie header Cookie *ct_session={cookie_tok}*
     handle @cookie {{
         {upstream}
     }}
     handle {{
-        basic_auth {{
-            {AUTH_USER} {hashed}
+        route {{
+            basic_auth {{
+                {AUTH_USER} {hashed}
+            }}
+            header +Set-Cookie "ct_session={cookie_tok}; Path=/; HttpOnly; SameSite=Lax"
+            {upstream}
         }}
-        header +Set-Cookie "ct_session={API_TOKEN}; Path=/; HttpOnly; SameSite=Lax"
-        {upstream}
     }}
 }}
 """
@@ -138,8 +142,13 @@ if AUTH == "caddy":
     time.sleep(2)
     if PROCS["caddy"][0].poll() is not None:   # e.g. port taken (Colab uses 8080 itself)
         raise RuntimeError(f"caddy exited -- is :{PUBLIC_PORT} in use?\n" + ct_tail("caddy"))
-    # Must be 401 from *our* Caddy; anything else means something else answers on that port.
+    # Must be 401 from *our* Caddy and must NOT leak Set-Cookie on unauthenticated 401 responses.
     ct_wait_http(f"http://127.0.0.1:{PUBLIC_PORT}/", timeout=60, ok=lambda c: c == 401)
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{PUBLIC_PORT}/", timeout=5)
+    except urllib.error.HTTPError as _e:
+        if _e.headers.get("Set-Cookie"):
+            raise RuntimeError("Caddy leaked Set-Cookie on unauthenticated 401 response!")
     AUTH_OK = True
     print(f"caddy on :{PUBLIC_PORT} -> 127.0.0.1:{SERVICE_PORT} (unauthenticated request -> 401)")
 else:
