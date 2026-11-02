@@ -3159,17 +3159,30 @@ for d in (
 ):
     d.mkdir(parents=True, exist_ok=True)
 
-for _src_d, _dst_d in (
-    (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR),
-    (TRITON_DRIVE_DIR, TRITON_CACHE_DIR),
-    (VLLM_DRIVE_DIR, VLLM_CACHE_DIR),
-    (DRIVE_VOICES_DIR, SPEAKERS_DIR),
-):
-    if any(_src_d.iterdir()):
-        subprocess.run(["cp", "-rn", f"{_src_d}/.", f"{_dst_d}/"], check=False)
-
 def ilog(msg):
     print(time.strftime("[%F %T] [indextts] ") + msg, flush=True)
+
+# One archive per cache/environment/GPU avoids Drive's small-file latency.
+(IT_WORK / "colab_cache.py").write_text(__INDEXTTS_CACHE_SOURCE__, encoding="utf-8")
+sys.path.insert(0, str(IT_WORK))
+from colab_cache import restore_cache, save_cache
+_gpu_arch = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], text=True).strip().splitlines()[0]
+CACHE_KEY = "vllm-0.32.0-py312-sm" + _gpu_arch.replace(".", "")
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, ilog)
+    except (OSError, ValueError) as err:
+        ilog(f"Cache restore warning ({_local_c.name}): {err}; continuing with local cache")
+ilog("Restoring registered voice samples from Drive")
+subprocess.run(["cp", "-rn", f"{DRIVE_VOICES_DIR}/.", f"{SPEAKERS_DIR}/"], check=False)
+ilog("Cache/voice restore finished; preparing environment and model")
 
 def run_logged(cmd, log_path, env=None, cwd=None, check=True):
     with open(log_path, "a", encoding="utf-8") as f:
@@ -3356,7 +3369,7 @@ with ThreadPoolExecutor(max_workers=2) as pool:
     MODEL_DIR = f_mod.result()
 
 ilog(f"Setup complete: venv={VENV_DIR} model={MODEL_DIR} drive_data={DATA_DIR}")
-'''
+'''.replace("__INDEXTTS_CACHE_SOURCE__", repr((ROOT / 'templates/colab_cache.py').read_text()))
 
 INDEXTTS_SERVICE = r'''# @title 2. Service -- vLLM-Omni IndexTTS-2.5 on 127.0.0.1:8000 (L4 2-stage pipeline + Bearer Auth + Google Drive Voices)
 DEPLOY_YAML = IT_WORK / "indextts2_5.yaml"
@@ -4051,14 +4064,13 @@ try:
 except Exception as werr:
     ilog(f"Warmup synthesis warning: {werr}")
 
-for _local_c, _drive_c in (
-    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
-    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
-    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
-    (SPEAKERS_DIR, DRIVE_VOICES_DIR),
-):
-    if _local_c.is_dir() and _drive_c.is_dir():
-        subprocess.run(["cp", "-ru", f"{_local_c}/.", f"{_drive_c}/"], check=False)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, ilog)
+    except (OSError, ValueError) as err:
+        ilog(f"Cache archive save warning ({_local_c.name}): {err}")
+# User voice samples remain ordinary Drive files, not compiler-cache archives.
+subprocess.run(["cp", "-ru", f"{SPEAKERS_DIR}/.", f"{DRIVE_VOICES_DIR}/"], check=False)
 
 pub_deadline = time.monotonic() + 120
 while time.monotonic() < pub_deadline:
@@ -4170,17 +4182,30 @@ for d in (
 ):
     d.mkdir(parents=True, exist_ok=True)
 
-for _src_d, _dst_d in (
-    (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR),
-    (TRITON_DRIVE_DIR, TRITON_CACHE_DIR),
-    (VLLM_DRIVE_DIR, VLLM_CACHE_DIR),
-    (DRIVE_VOICES_DIR, SPEAKERS_DIR),
-):
-    if any(_src_d.iterdir()):
-        subprocess.run(["cp", "-rn", f"{_src_d}/.", f"{_dst_d}/"], check=False)
-
 def qlog(msg):
     print(time.strftime("[%F %T] [qwen3-tts] ") + msg, flush=True)
+
+# One archive per cache/environment/GPU avoids Drive's small-file latency.
+(QT_WORK / "colab_cache.py").write_text(__QWEN3_CACHE_SOURCE__, encoding="utf-8")
+sys.path.insert(0, str(QT_WORK))
+from colab_cache import restore_cache, save_cache
+_gpu_arch = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], text=True).strip().splitlines()[0]
+CACHE_KEY = "vllm-0.32.0-py312-sm" + _gpu_arch.replace(".", "")
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, qlog)
+    except (OSError, ValueError) as err:
+        qlog(f"Cache restore warning ({_local_c.name}): {err}; continuing with local cache")
+qlog("Restoring registered voice samples from Drive")
+subprocess.run(["cp", "-rn", f"{DRIVE_VOICES_DIR}/.", f"{SPEAKERS_DIR}/"], check=False)
+qlog("Cache/voice restore finished; preparing environment and model")
 
 def run_logged(cmd, log_path, env=None, cwd=None, check=True):
     with open(log_path, "a", encoding="utf-8") as f:
@@ -4357,7 +4382,7 @@ with ThreadPoolExecutor(max_workers=2) as pool:
     MODEL_DIR = f_mod.result()
 
 qlog(f"Setup complete: venv={VENV_DIR} model={MODEL_DIR} drive_data={DATA_DIR}")
-'''
+'''.replace("__QWEN3_CACHE_SOURCE__", repr((ROOT / 'templates/colab_cache.py').read_text()))
 
 QWEN3_TTS_SERVICE = r'''# @title 2. Service -- vLLM-Omni Qwen3-TTS on 127.0.0.1:8000 + Aux Multi-Task Worker on :8001 + Bearer Auth
 DEPLOY_YAML = QT_WORK / "qwen3_tts.yaml"
@@ -5541,14 +5566,13 @@ try:
 except Exception as werr:
     qlog(f"Warmup synthesis warning: {werr}")
 
-for _local_c, _drive_c in (
-    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
-    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
-    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
-    (SPEAKERS_DIR, DRIVE_VOICES_DIR),
-):
-    if _local_c.is_dir() and _drive_c.is_dir():
-        subprocess.run(["cp", "-ru", f"{_local_c}/.", f"{_drive_c}/"], check=False)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, qlog)
+    except (OSError, ValueError) as err:
+        qlog(f"Cache archive save warning ({_local_c.name}): {err}")
+# User voice samples remain ordinary Drive files, not compiler-cache archives.
+subprocess.run(["cp", "-ru", f"{SPEAKERS_DIR}/.", f"{DRIVE_VOICES_DIR}/"], check=False)
 
 pub_deadline = time.monotonic() + 120
 while time.monotonic() < pub_deadline:
