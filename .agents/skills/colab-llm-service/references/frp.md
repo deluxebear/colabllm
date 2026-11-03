@@ -54,6 +54,32 @@ Use project/service/instance identities, not a port guessed from the model's lis
 Every runtime keeps its own resource record for cleanup even after global settings change.
 `down --delete-tunnel` removes that instance's owned route/DNS, not shared server programs.
 
+## DNS conflict after creating a new user configuration
+
+A service hostname is owned by the DNS comment `colabsvc-frp <project_id> <service-instance>`;
+the server registry uses `<project_id>:<service-instance>`. The project ID is persistent resource
+identity. Recreating local configuration can generate a new ID even when the domain, server IP
+and service name are unchanged. Matching IP addresses alone do not establish ownership.
+
+When `up` reports that existing DNS records are not exclusively managed by the service:
+
+1. Read sanitized local configuration, the exact hostname's DNS record/comment and `frp-status`.
+   Check the record ID, project ID, service name, hostname and server route/port together.
+2. Check `colab sessions` and process identity before touching a recorded runner. A live PID can
+   outlast its reclaimed Colab VM; `colab status` can print "not found" yet exit 0. An HTTPS 502
+   alone does not establish whether the model is loading, the tunnel is down or the VM is absent.
+3. If evidence establishes these are the user's existing deployment, back up the user configuration
+   privately and restore the matching project ID only after checking the current ID has no separate
+   routes/instances that would be orphaned. Retain compatible current server credentials. This is
+   targeted identity repair, not an automatic `.state/` migration or permission to import all old state.
+4. Preserve existing DNS/ports/sites and running work. Stop a stale local runner only after verifying
+   its owner, exact service command, start identity and absent VM. Retry the requested startup and
+   verify readiness plus public unauthenticated/authenticated responses.
+
+Keep conflicting unrelated records intact. Do not solve this by allowing arbitrary ownership
+comments, deleting a foreign record or generating another ID. If ownership cannot be established,
+report the specific mismatch and obtain the missing deployment context before changing resources.
+
 ## Verification and diagnostics
 
 `colabllm frp-status` reports the actual unit names and reuse status. Check those units'

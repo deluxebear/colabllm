@@ -5,7 +5,7 @@
 | Service worked, then the URL died after a while | `colab exec` disconnected (Ctrl-C, terminal closed, laptop slept, network) -> Colab reclaimed the VM | Use the default detached `up`; keep the local machine awake / run on a server. `colab sessions` shows whether the VM still exists |
 | Later cells never ran | Disconnected before the last cell started (cells are sent one by one by the client) | Re-run `up` (session is reused; `--skip` finished cells) |
 | `colab exec` / `colab dfs status` hangs | The kernel is busy with the blocking last cell; new execs queue behind it | Expected. Use `logs`, `status` (HTTP probe), or `colab stop` / `down` |
-| `up` waits forever, no `CT_READY` | A cell raised (exit code stays 0) | `logs -n 200`; look for the traceback; fix the notebook; `down`, `up` |
+| `up` reaches its readiness timeout without `CT_READY` | A cell raised (exit code stays 0) | `logs -n 200`; inspect failures before restarting. Default-mode timeout leaves the runner active; use `--ready-timeout` for expected long loading |
 | Unauthenticated probe returns 404/200 on a Caddy service | Caddy is not the thing answering on `CT_PUBLIC_PORT` | Never use 8080 (Colab runtime server) or 8012 (dfs shim). The notebook now fails closed: cell 3 requires a 401 from Caddy and cell 4 refuses to start the tunnel otherwise |
 | `caddy exited -- is :PORT in use?` | Port collision on the VM | Change `public_port` in `src/colabllm/services/<name>.py` |
 | Ollama returns 403 through the proxy | Ollama rejects foreign `Host` headers | Keep `REWRITE_HOST = True` in cell 3 |
@@ -20,8 +20,13 @@
 | `up` unexpectedly uses a fixed URL or FRP | Project domain/FRP settings or an environment override are active | Read `colabllm tunnel-config`; use one-launch `--transport cloudflare` or `--quick-tunnel` if requested |
 | FRP setup finds 7000 occupied | Could be an existing frps rather than a conflict | Discover the listener, config and unit, then reuse compatible frps/Caddy; see [FRP adoption](frp.md#discover-before-installing) |
 | frpc rejects login/TLS | Server version, Token, scopes or certificate name differs from the client | Use discovered server metadata, preserve credentials and verify TLS SAN; see [FRP compatibility](frp.md#client-compatibility-and-routing) |
+| `info` shows no API key | Default credential redaction | `info --show-secrets` or `info --json --show-secrets`; see [key lookup](auth.md#api-key-lookup-and-clients) |
+| DNS conflict after reinstall or new configuration | A new project ID differs from the existing DNS/route owner | Compare record comments and `frp-status`; see [identity repair](frp.md#dns-conflict-after-creating-a-new-user-configuration) |
+| Changing local `api_token` does not change accepted requests | A running model has its old key loaded | Update persistent state and service-side authentication coherently; see [rotation](auth.md#user-supplied-keys-and-rotation) |
+| SSH diagnostic returns HTTP 429 | Another SSH channel is active | Finish the owned diagnostic connection; preserve unrelated user sessions |
 | `colab new` fails for a GPU | Quota / tier / availability | Try another `--gpu`, check `colab usage` |
 
+Start with offline `colabllm doctor`; use `doctor --online` only when read-only authorization probes are needed.
 Useful commands: `colab sessions`, `colab status -s <name>`, `colab usage`, `colab log -s <name>`,
 `colabllm tunnel-config`, `colabllm frp-status`,
 `cf tunnels list --name colab-<name>` (Cloudflare), `cf dns records list -z <zone-id> --name <host>`.

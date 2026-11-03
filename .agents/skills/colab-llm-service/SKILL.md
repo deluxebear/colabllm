@@ -3,8 +3,8 @@ name: colab-llm-service
 description: >-
   Deploy and operate large-model services on Google Colab through this repository's
   one-notebook/one-script convention and unified colabllm CLI. Use for service setup, lifecycle, project-global
-  domains, Cloudflare Tunnel or SSH-managed FRP/Caddy, authentication, and session or
-  tunnel troubleshooting.
+  domains, Cloudflare Tunnel or SSH-managed FRP/Caddy, API key lookup and rotation,
+  uv package installation checks, and session or tunnel troubleshooting.
 ---
 
 # Colab LLM service
@@ -46,6 +46,12 @@ Install a distributed wheel with `uv tool install /path/to/colabllm-VERSION-py3-
 After publication, users can use `uv tool install colabllm` and `uv tool upgrade colabllm`.
 Developers use `uv tool install --editable .`; `uv build --no-sources` produces wheel and sdist.
 Run `python tools/check_distribution.py dist/colabllm-VERSION-py3-none-any.whl` to verify distribution.
+For actual local installation, inspect `command -v colabllm` and `uv tool list` first. Replace the
+old checkout symlink with `uv tool install --force /path/to/package.whl` when switching installation
+methods. Test from outside the checkout: version, service help, JSON info, dry-run, offline doctor
+and completion. Keep configuration-write tests in a temporary `COLABLLM_HOME`.
+Local regression tests are `python -m unittest discover -s tests` and need only the standard library;
+`tests_colab/` belongs in the model environment. See `.github/workflows/ci.yml` for the platform matrix.
 
 The package includes each service script and matching notebook. The dispatcher executes the actual
 installed script so the detached `_exec` runner retains the script path. All application state is
@@ -96,12 +102,14 @@ colabllm <name> logs -f
 colabllm <name> down               # stop runner + VM; --delete-tunnel cleans this instance's resources
 ```
 
+For **API key lookup, user-supplied keys or rotation**, read [references/auth.md](references/auth.md).
 For **Cloudflare setup, DNS ownership or cleanup**, read [references/cf-tunnel.md](references/cf-tunnel.md).
-For **FRP setup, existing frps/Caddy adoption or FRP connection failures**, read
+For **FRP setup, project-ID/DNS conflicts, existing server adoption or connection failures**, read
 [references/frp.md](references/frp.md). Use the user's actual server/domain values, not examples.
 Configuration changes affect future starts; preserve running generation tasks when changing code or transport.
 
-`up` returns once the notebook prints `CT_READY`; a detached local runner keeps `colab exec`
+`up` normally returns once the notebook prints `CT_READY`; `--detach` returns before readiness.
+A detached local runner keeps `colab exec`
 attached (= keep-alive). Requirements: `colab` CLI logged in, `colab dfs consent` done once.
 Fixed domains use the local `cf` login for DNS in either backend. FRP server management also needs SSH.
 

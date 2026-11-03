@@ -8,7 +8,7 @@ URL is reachable by anyone who learns it.
 | Service | `auth=` | What protects it |
 | --- | --- | --- |
 | Has its own login (Unsloth Studio, Open WebUI, ComfyUI-Manager w/ login...) | `builtin` | the app; credentials are reported via `CT_CREDENTIALS` |
-| OpenAI-compatible server with a native key (vLLM `--api-key`, llama.cpp `--api-key`, TGI) | `builtin` | pass the key from `CT_API_TOKEN`-like env you add in `Service.env` |
+| OpenAI-compatible server with a native key (vLLM `--api-key`, llama.cpp `--api-key`, TGI) | `builtin` | use the runner-injected `CT_API_TOKEN`; keep secrets out of `Service.env` in source |
 | No auth at all (Ollama, Gradio demos, ComfyUI, Jupyter-less HTTP servers, `http.server`) | `caddy` (default) | Caddy in the VM |
 
 ## Caddy layer (cell 3)
@@ -34,21 +34,59 @@ Token. For `auth=builtin`, frpc targets the app's authenticated port directly.
 Verified behaviour: no credentials → 401, wrong password → 401, basic auth → 200, Bearer → 200,
 wrong Bearer → 401.
 
-## Client examples
+## API key lookup and clients
+
+The default `info`, `ps` and `status` output hides credentials. A missing printed key does not mean
+that authentication is disabled. Use the CLI so `COLABLLM_HOME` and instance selection are honored:
 
 ```bash
-eval "$(colabllm ollama info --show-secrets >/dev/null; python3 - <<'EOF'
-import json; from pathlib import Path; s=json.loads((Path.home() / '.colabllm/services/ollama/state.json').read_text()); print(f"URL={s['url']} TOKEN={s['api_token']}")
-EOF
-)"
-curl -H "Authorization: Bearer $TOKEN" "$URL/api/generate" -d '{"model":"qwen2.5:0.5b","prompt":"hi","stream":false}'
-curl -u admin:<password> "$URL/api/tags"
+colabllm qwen-flash info --show-secrets
+colabllm qwen-flash info --json --show-secrets | jq -r '.api_token'
+colabllm qwen-flash info -i 2 --json --show-secrets | jq -r '.api_token'
 ```
 
-```python
-from openai import OpenAI      # Ollama exposes /v1 (OpenAI compatible)
-client = OpenAI(base_url=f"{URL}/v1", api_key=TOKEN)
+For client calls, capture credentials without echoing them or using `eval`:
+
+```bash
+URL=$(colabllm ollama info --json | jq -r '.url')
+TOKEN=$(colabllm ollama info --json --show-secrets | jq -r '.api_token')
+curl -H "Authorization: Bearer $TOKEN" "$URL/api/generate" \
+  -d '{"model":"qwen2.5:0.5b","prompt":"hi","stream":false}'
 ```
+
+`qwen-flash` exposes the OpenAI-compatible base URL `<public-url>/v1`, with native
+`llama-server --api-key-file` authentication. Check `/v1/models` when validating its key;
+`/health` can return 200 without authentication and is not proof of API access control.
+Use fake keys in examples and tests; real keys belong in private runtime state, not skill files,
+source, notebook cells, printed commands, logs, or version control.
+
+## User-supplied keys and rotation
+
+There is currently no public CLI command to set a user-supplied API key. `up --new-credentials`
+generates a random replacement and requires a stopped instance; it does not accept the supplied key.
+For a manual update, use the installed package's `State.update` transaction, not a direct JSON
+rewrite: change `api_token` and the saved `env.CT_API_TOKEN` together. This changes future startup
+injection but does not update the already running server or notebook kernel.
+
+Before applying a live update, inspect active requests/jobs and retain the Colab session and
+keep-alive connection. Choose the service-specific reload/restart path; avoid `down` when only the
+model process needs a restart, because `down` releases the VM. Transfer secrets privately, without
+embedding them in SSH command arguments. Verify the requested key succeeds and both no key and
+the previous key fail on an authenticated endpoint; then verify `status --json`. Keep failure state
+recoverable if applying the new key to the server fails.
+
+For an idle `qwen-flash`, the verified procedure is to inspect `/slots` for in-flight work, derive
+the key-file path from the running server's `--api-key-file` argument, replace that file atomically
+with mode 0600, and restart only that llama-server process via its existing watchdog. The key is
+read at server startup. Preserve the runner and kernel. Check the current watchdog implementation:
+its in-memory `API_TOKEN` remains old after a file-only change; any authenticated watchdog requests
+must be updated coherently or the rotation will cause restart loops. Reused notebook variables are
+refreshed by normal startup injection on the next full launch.
+
+A blocking keep-alive cell prevents queued `colab exec` code from running immediately. For live
+inspection, use the supported SSH channel with a finite local timeout; send Python via a quoted
+`python3 -c` command, reserving stdin for private data. A stale diagnostic SSH connection can cause
+HTTP 429 on the next attempt: close only the diagnostic connection you own before retrying.
 
 ## Extra hardening (optional)
 
