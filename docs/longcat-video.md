@@ -1,62 +1,56 @@
-# LongCat-Video（Colab G4）
+# LongCat Video：文生视频、图生视频与续写
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+默认 **G4**，Caddy Bearer/Basic Auth，提供 Gradio 网页与其公开的生成接口；与独立 Avatar 模型不同。
 
-基于 [meituan-longcat/LongCat-Video](https://github.com/meituan-longcat/LongCat-Video)，部署基础视频生成模型，提供带认证的 Gradio 网页：文生视频、图生视频、视频续写，以及多段连续生成。此服务不加载独立的 Avatar 模型。
+共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 
-```bash
-colabllm longcat-video up --domain   # 默认 G4，https://longcat-video.example.com
-colabllm longcat-video info --show-secrets          # 查看地址、登录账号、密码、API Token
-colabllm longcat-video status
-colabllm longcat-video logs -f
-colabllm longcat-video down
-
-# 多实例与 GPU 覆盖仍使用共享运行库的标准参数
-colabllm longcat-video up -i 2 --domain --gpu G4
-```
-
-默认快速模式启用官方 CFG/step LoRA，16 步生成 93 帧、15 fps 视频（约 6.2 秒）。标准模式默认 50 步、CFG 4；随机种子设为 -1 可随机生成。连续生成会用上一段末尾 13 帧作为下一段的条件，拼接时去除重叠帧。多段文生视频会根据所选 480p / 720p 分辨率和宽高比例使用官方尺寸桶，使各段尺寸一致。
-
-## 运行环境
-
-- 默认 G4，单 GPU BF16 推理；上游源码固定在 `6b3f4b8582a8bc3f20f795735f5383716c4ba794`。
-- 独立 Python 3.11 环境，PyTorch 2.11 / CUDA 13，支持 Blackwell；不用上游面向旧硬件的 PyTorch 2.6 / CUDA 12.4 固定依赖。
-- 原生 PyTorch 融合 SDPA 代替上游 FlashAttention-2。自注意力保持原有缩放，交叉注意力按每个样本的真实文本长度分别计算，保留变长掩码语义。部署仅支持单 GPU。
-- 初次安装会并行下载约 80 GB 权重与安装环境；不下载此服务未使用的 refinement LoRA。权重全部存放在本地 SSD `/content/longcat-video/model`。
-- 生成的 MP4 和记录提示词、参数、种子的 JSON 写入 `/content/drive/MyDrive/colab-llm/longcat-video/output`。输入文件由 Gradio 临时保存，不保证跨会话持久化。
-- Triton / Inductor 缓存先在本地 SSD 使用，并在就绪后增量同步到 Drive。
-- 模型加载并成功执行 256×256、9 帧、1 步推理后，`/health` 才返回成功；这是基础推理检查，不代表所有分辨率和长视频参数都已验证。
-
-## 认证与接口
-
-服务只监听 `127.0.0.1:7860`，公网经 Caddy `:18080`：浏览器 Basic Auth，API 使用 `Authorization: Bearer <API_TOKEN>`。凭据在本地 `~/.colabllm/services/longcat-video/state.json`，不写入 Notebook。
-
-带认证访问 `/health` 返回模型和 GPU 信息。Gradio 的 API 页面提供 `generate` 接口参数说明；API 与网页共享串行生成队列，避免并发争用显存。
-
-## 文件与日志
-
-- [src/colabllm/services/longcat-video.py](.colabllm longcat-video)：会话、认证、隧道和保活入口。
-- [src/colabllm/services/longcat-video.ipynb](../services/longcat-video.ipynb)：自包含部署 Notebook。
-- [templates/longcat_video_app.py](../templates/longcat_video_app.py)：Gradio 应用及 SDPA 适配器；生成器将源码嵌入 Notebook。
-- `templates/build_notebooks.py`：`LONGCAT_VIDEO_*` 部署单元。
-- 远端日志：`/content/longcat-video/install.log`、`download.log`、`/content/ct/service.log`。
-
-修改应用或部署单元后运行 `python templates/build_notebooks.py`，再启动服务。大分辨率、更多帧和更多段会增加显存与生成时间；默认不启用超分辨率或 BSA refinement。
-
-## 已验证
-
-2026-11-02 在 Colab G4（RTX PRO 6000 Blackwell、约 96 GB 显存）完成验证：
-
-- 无凭据 / 错误 Bearer 返回 401，且不返回会话 Cookie；Basic Auth、Bearer、登录后 Cookie 均可用。
-- Gradio 配置及视频文件链接使用公网 HTTPS，带认证可下载有效 MP4。
-- 默认 832×480、93 帧、16 步快速文生视频成功，本次耗时约 145 秒（6.2 秒视频；单次样本，不是性能保证）。
-- 256×256、17 帧、16 步快速文生视频成功；480p 尺寸桶下的 17 帧图生视频与视频续写成功。
-- 两段各 17 帧连续生成成功，去除 13 帧重叠后输出 21 帧，尺寸保持一致。
-- GPU 回归测试覆盖自注意力的不同查询 / 缓存长度，以及打包文本的不同长度与样本隔离。
-
-GPU 测试命令（在仓库目录执行，环境需能导入上游 LongCat-Video）：
+## 启动和登录
 
 ```bash
-PYTHONPATH=/content/longcat-video/repo \
-  /content/longcat-video/venv/bin/python tests/test_longcat_attention.py
+colabllm longcat-video up --ready-timeout 3600
+colabllm longcat-video status --json
+colabllm longcat-video info --json
+colabllm longcat-video info --show-secrets
+colabllm longcat-video logs -n 100
 ```
+
+从 `info` 的 URL 打开网页，使用 `auth_user/auth_pass` 登录；API 使用 `api_token`。
+就绪前要完成模型加载和小尺寸推理预热，首次准备约 80 GB 级权重可能耗时较长。
+
+## 网页生成流程
+
+1. **文生视频**：选择该模式，填写镜头、人物、动作与场景描述，设置尺寸和种子，点击生成。
+2. **图生视频**：上传本机参考图，选择模式及 480p/720p，描述希望的动作。
+3. **视频续写**：上传参考视频，选择模式及分辨率。参考视频按 15 fps 采样后需至少 13 帧。
+4. 生成后查看结果视频、下载控件和参数 JSON；保存 MP4 及元数据，不能仅交付临时网页链接。
+
+默认快速模式启用 CFG/step LoRA，固定 16 步；标准模式默认 50 步、CFG 4。
+每段默认 93 帧、15 fps，约 6.2 秒。帧数为 17–161 的 `4n+1`，宽高为 256–1024 的 16 倍数。
+连续段数为 1–10，后续段复用末尾 13 帧并移除重叠。图生/续写及多段会使用分辨率尺寸桶，不一定等于手填尺寸。
+种子 -1 随机；较大分辨率、更多帧/段增加 GPU 占用，先用短预览检查。
+
+## API 与输出
+
+应用的 Gradio API 名为 `generate`；从网页 API 页面读取**当前版本的参数顺序和类型**后调用。
+不要把 Avatar 的 `colabllm longcat-avatar generate` 误认为本运行时命令，本运行时只有共享生命周期 CLI。
+程序化调用需要在客户端附上 Caddy Bearer 或 Basic Auth，并按 Gradio 队列协议等待。
+API 和 UI 共享串行生成队列，提交成功不等于生成完成。
+
+生成的 MP4 与记录提示词、参数、种子的 JSON 写入
+`MyDrive/colab-llm/longcat-video/output/`；网页上传的输入可能只是临时文件，需另行保存原素材。
+模型权重位于 VM SSD `/content/longcat-video/model`；缓存可持久化，但停止 VM 后需重新安装/下载/加载部分环境。
+离开网页不等于取消 GPU 生成，也不能据此提前停止 VM。下载后验证文件存在且能播放。
+
+## 多实例与排错
+
+```bash
+colabllm longcat-video up -i 2
+colabllm longcat-video info -i 2 --json
+colabllm longcat-video ps --json
+colabllm longcat-video logs -i 2 -f
+colabllm longcat-video down -i 2
+```
+
+远端日志包括 `/content/ct/service.log` 及工作目录的安装/下载日志。
+`/health` 成功表示已完成基础模型和小推理验证，不代表所有长视频/高分辨率参数都保证成功。
+显存不足先减小分辨率、帧数或段数，不在有任务运行时反复重启。

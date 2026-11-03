@@ -36,6 +36,12 @@ domain alias `indextts`, zero-shot voice cloning, persistent Drive voices, nativ
 multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`),
 `qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, domain alias `qwen3-tts`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
 
+Also available: `unlimited-ocr` (A100, Caddy auth, persistent Drive OCR jobs),
+`longcat-avatar` (G4, Caddy auth, audio-driven avatar generation with job/download commands),
+and `longcat-video` (G4, Caddy auth, Gradio text/image-to-video and continuation UI).
+For each runtime's current concrete usage, read `docs/<name>.md`; portable copies are bundled in
+`skills/colabllm/references/<name>.md`.
+
 ## Unified CLI convention
 
 Use `colabllm <name> <command> [args...]` for runtime operations and user-facing examples.
@@ -212,7 +218,8 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
    auth**; if it has none, `auth="caddy"`.
 5. Update the distributed user skill in `skills/colabllm/` in the same change. Add the runtime to
    `SKILL.md`'s task/runtime/reference table and document its actual user workflow in an appropriate
-   `references/*.md` file (create one only for a distinct task category). Cover prerequisites/GPU,
+   per-runtime reference. Canonical usage guides live in `docs/<name>.md`; run
+   `python tools/sync_runtime_docs.py` to update the matching portable skill references. Cover prerequisites/GPU,
    startup, inference or UI access, input/output locations, authentication, waiting/recovery and
    service-specific limits. Use installed CLI commands and portable examples, not checkout paths,
    personal domains or credentials. Update the skill description if the new capability changes
@@ -221,7 +228,7 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 6. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
    Run `colabllm <name> up --dry-run`, then a real `up` (CPU `--gpu none` for wiring tests), check
    `status` (unauthenticated probe must be 401 for Caddy services), then `down`.
-7. Check user-skill links and parse its new examples against the actual CLI without submitting jobs.
+7. Run `python tools/sync_runtime_docs.py --check`, check user-skill links and parse its new examples against the actual CLI without submitting jobs.
    Build with `uv build --no-sources` and run `python tools/check_distribution.py <wheel>`; verify the
    new runtime and complete skill references are included and `colabllm skill --output <temporary-dir>`
    works outside the checkout. Adjust packaging rules and skill-export checks when adding resource

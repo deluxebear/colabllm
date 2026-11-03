@@ -1,106 +1,55 @@
-# Ollama 运行时使用说明
+# Ollama：模型管理与推理
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+默认 **T4**，Caddy 提供 Bearer 与浏览器 Basic Auth；Ollama 自身的端口不直接暴露公网。
 
-对应文件：
-- 执行脚本：[src/colabllm/services/ollama.py](../src/colabllm/services/ollama.py)
-- 远端 Notebook：[src/colabllm/services/ollama.ipynb](../src/colabllm/services/ollama.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
+共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 
----
-
-## 1. 架构与配置说明
-
-| 配置项 | 默认值 / 说明 |
-| --- | --- |
-| **默认 GPU** | `T4`（可通过 `--gpu L4` / `--gpu A100` 覆盖） |
-| **服务监听端口** | `127.0.0.1:11434`（仅本地回环，不直接对外暴露） |
-| **安全认证层** | **Caddy (`:18080` -> `127.0.0.1:11434`)**，自动重写 `Host` 与 `Origin` 请求头以通过 Ollama 的来源校验；浏览器走 Basic Auth，API 客户端走 `Authorization: Bearer <token>` |
-| **默认预拉取模型** | `CT_MODELS="qwen2.5:0.5b"`（支持逗号分隔配置多个模型） |
-| **模型持久化目录** | `OLLAMA_MODELS=/content/drive/MyDrive/colab-llm/ollama/models`（缓存在 Google Drive，跨会话复用） |
-| **默认固定域名** | `https://ollama.example.com`（使用 `--domain` 时） |
-
----
-
-## 2. 启动与日常管理命令
+## 启动与预加载
 
 ```bash
-# 1. 启动服务并绑定固定域名 https://ollama.example.com
-colabllm ollama up --domain
-
-# 2. 使用临时 *.trycloudflare.com 链接启动，或指定 L4 GPU
-colabllm ollama up --quick-tunnel --gpu L4
-
-# 3. 查看访问地址、Basic Auth 账号密码与 Bearer API Token
-colabllm ollama info --show-secrets
-
-# 4. 查看实时日志 / 检查服务状态与安全探测
-colabllm ollama logs -f
-colabllm ollama status
-
-# 5. 停止服务并释放 Colab VM
-colabllm ollama down
+colabllm ollama up --models qwen2.5:7b
+colabllm ollama status --json
+colabllm ollama info --json
+colabllm ollama logs -n 100
 ```
 
-### 2.1 多实例（多会话）并发运行与启动时指定模型
+`up --models` 可重复或用逗号分隔；不指定时脚本默认预加载 `qwen2.5:0.5b`。
+这些是远端 Ollama 模型名；应根据所选 GPU 的内存选模型。`--models` 是启动参数，不是推理命令。
+
+## 列模型、生成文本、拉取模型
+
+下面使用已安装的 `curl` 和 `jq` 捕获连接信息；不打印 API Key：
 
 ```bash
-# 启动时通过 --models 指定要预拉取的模型列表
-colabllm ollama up --domain --models qwen2.5:7b,llama3.2:3b
-
-# 启动第 2 个独立实例（会话 ollama-2，绑定 https://ollama-2.example.com）
-colabllm ollama up -i 2 --domain --gpu L4 --models deepseek-r1:14b
-
-# 查看所有 Ollama 实例列表与状态
-colabllm ollama ps
-
-# 查看指定实例详情 / 日志 / 停止全部实例
-colabllm ollama info --show-secrets -i 2
-colabllm ollama logs -i 2 -f
-colabllm ollama down --all
+URL=$(colabllm ollama info --json | jq -r '.url')
+TOKEN=$(colabllm ollama info --json --show-secrets | jq -r '.api_token')
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" "$URL/api/tags"
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$URL/api/generate" -d '{"model":"qwen2.5:7b","prompt":"介绍一下你自己。","stream":false}'
 ```
 
----
-
-## 3. API 调用与在线拉取新模型
-
-先通过 `colabllm ollama info --show-secrets` 获取 `URL` 与 `TOKEN`：
-
-### 3.1 在线拉取其他 Ollama 模型 (`/api/pull`)
-
-服务运行期间无需重启，可直接通过 API 拉取任意 Ollama 模型：
+正在运行时可通过模型 API 拉取另一个适配当前 GPU 的模型：
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" https://ollama.example.com/api/pull \
-  -d '{"name": "qwen2.5:7b"}'
+curl --fail-with-body -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  "$URL/api/pull" -d '{"model":"qwen2.5:0.5b","stream":false}'
 ```
 
-### 3.2 查看已安装模型列表 (`/api/tags`)
+`/api/chat` 适合多轮消息；兼容的 OpenAI 客户端可用 `<URL>/v1`，`api_key` 仍是 Caddy Token。
+API 的模型名以 `/api/tags` 返回值为准。流式模式可能返回逐行 JSON，示例 `stream:false` 才是单个 JSON。
+拉模型只下载权重，不等于已生成响应；没有 `colabllm ollama generate` 子命令。
+请求字段与接口细节见 [Ollama 官方 API 文档](https://github.com/ollama/ollama/blob/main/docs/api.md#pull-a-model)。
+
+## 输出、实例与停止
 
 ```bash
-curl -s -H "Authorization: Bearer $TOKEN" https://ollama.example.com/api/tags | jq
+colabllm ollama up -i 2 --models qwen2.5:0.5b
+colabllm ollama ps --json
+colabllm ollama info -i 2 --json
+colabllm ollama down -i 2
 ```
 
-### 3.3 原生生成接口 (`/api/generate` / `/api/chat`)
-
-```bash
-curl -s -H "Authorization: Bearer $TOKEN" https://ollama.example.com/api/generate \
-  -d '{
-    "model": "qwen2.5:0.5b",
-    "prompt": "你好，请用一句话介绍自己。",
-    "stream": false
-  }' | jq
-```
-
-### 3.4 OpenAI 兼容接口 (`/v1/chat/completions`)
-
-Ollama 原生提供 `/v1/chat/completions`，可直接接入各类 OpenAI 客户端（将 Base URL 设为 `https://ollama.example.com/v1`，API Key 设为 `$TOKEN`）：
-
-```bash
-curl -s https://ollama.example.com/v1/chat/completions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen2.5:0.5b",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }' | jq
-```
+实例凭据各自独立。当前 notebook 默认 `OLLAMA_MODELS=/content/ollama/models`，权重在 VM 本地 SSD，
+释放 VM 后需要重新拉取；不能假定挂载 Drive 就会自动保存 Ollama 模型。
+模型响应由客户端保存。`up` 后模型拉取完成才进入共享就绪阶段；若 GPU 不足，检查 Ollama 日志，
+优先使用更小模型或用户指定的适配 GPU。避免为了加载新模型停止正在服务的实例。

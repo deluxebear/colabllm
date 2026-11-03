@@ -71,7 +71,7 @@ def check(wheel):
         exported = Path(run([command, 'skill', '--output', str(skill_parent)]).strip())
         assert exported == skill_parent / 'colabllm'
         assert (exported / 'SKILL.md').read_text() == skill_text
-        for reference in ('ocr', 'speech', 'inference', 'media', 'operations'):
+        for reference in (*services, 'runtime-common', 'ocr', 'speech', 'inference', 'media', 'operations'):
             assert (exported / 'references' / (reference + '.md')).is_file()
         config = json.loads(run([command, 'tunnel-config', '--base-domain', 'example.com']))
         state_home = home / '.colabllm'

@@ -1,134 +1,72 @@
-# Qwen3.8-Flash-Next (G4 / 800K / Vision) 运行时使用说明
+# Qwen Flash：LLM 与视觉推理
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+默认 **G4**，使用 llama.cpp 原生 Bearer 认证；提供 OpenAI 兼容接口，支持文本和视觉输入。
 
-对应文件：
-- 执行脚本：[src/colabllm/services/qwen-flash.py](../src/colabllm/services/qwen-flash.py)
-- 远端 Notebook：[src/colabllm/services/qwen-flash.ipynb](../src/colabllm/services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
+共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 
----
-
-## 1. 服务特性与架构配置
-
-| 配置项 | 默认值 / 说明 |
-| --- | --- |
-| **模型仓库** | `SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF` (`IQ3_S` 双分片，约 84.3 GB) |
-| **多模态视觉投影器** | `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (BF16 精度，约 1.13 GB，通过 `--mmproj` 加载) |
-| **硬件要求** | **Colab G4 GPU**（NVIDIA RTX PRO 6000 Blackwell `sm_120`，~96 GB VRAM，~176 GB 系统内存），**不加 `--high-mem`** |
-| **超长上下文** | **800K (`819200` tokens)**，基于 YaRN (`--rope-scaling yarn --rope-scale 3.125 --yarn-orig-ctx 262144`)，KV Cache `f16` + Flash Attention (`-fa on`) |
-| **加载模式** | `--load-mode none --lazy-mode off`（将 27.5 GiB 的 `token_embd_ngram` 表常驻 CPU RAM，GPU 显存容纳主权重与 800K KV Cache） |
-| **编译与模型缓存** | 并发准备：① `llama.cpp` 针对 CUDA `sm_120` 编译并缓存于 Google Drive (`/content/drive/MyDrive/models/.runtimes/llama.cpp/`)；② 模型优先通过 HF Xet 下载至本地高速 SSD (`/content/qwen-flash/model`) 并做 SHA256 校验，若 HF 不可用自动回退从 Google Drive 备份分片拷贝 |
-| **安全认证** | `llama-server --api-key-file` 原生 Bearer Token 认证（`auth="builtin"`，无需前置 Caddy） |
-| **默认固定域名** | `https://qwen.example.com`（OpenAI 兼容 Base URL：`https://qwen.example.com/v1`） |
-
----
-
-## 2. 启动与日常管理命令
+## 启动与凭据
 
 ```bash
-# 1. 启动服务并绑定默认域名 https://qwen.example.com（自动申请 G4 GPU）
-colabllm qwen-flash up --domain
-
-# 2. 使用临时 *.trycloudflare.com 域名启动
-colabllm qwen-flash up --quick-tunnel
-
-# 3. 查看访问地址与 Bearer API Token
-colabllm qwen-flash info --show-secrets
-
-# 4. 查看实时准备进度（HF 下载 / llama.cpp 编译 / 模型加载心跳）
-colabllm qwen-flash logs -f
-
-# 5. 检查 Colab 会话状态与 /v1/models 连通性探测
-colabllm qwen-flash status
-
-# 6. 轮换生成新的 API Key
-colabllm qwen-flash up --domain --new-credentials
-
-# 7. 停止服务并释放 G4 实例
-colabllm qwen-flash down
+colabllm qwen-flash up --ready-timeout 3600
+colabllm qwen-flash status --json
+colabllm qwen-flash info --json
+colabllm qwen-flash info --json --show-secrets
+colabllm qwen-flash logs -n 100
 ```
 
-### 2.1 多实例（多会话）并发运行
+API Base URL 为返回的 `url` 后加 `/v1`；不要把网页地址误当成模型 ID。
+`GET /v1/models` 返回实际 alias。`/health` 可以无需认证返回 200，校验 API Key 应使用 `/v1/models`：无密钥/错误密钥须失败。
 
-支持通过 `-i <ID>` / `--instance <ID>` 同时启动多个 Qwen3.8-Flash-Next G4 实例（共享 Google Drive 上的 `sm_120` 编译缓存与模型分片备份，无需重复编译）：
+## 调用聊天 API
+
+下例使用 Python 标准库，不安装 OpenAI SDK，不显示密钥，并拒绝重定向：
+
+```python
+import json
+import subprocess
+import urllib.request
+
+info = json.loads(subprocess.check_output(
+    ["colabllm", "qwen-flash", "info", "--json", "--show-secrets"], text=True))
+base = info["url"].rstrip("/")
+headers = {"Authorization": "Bearer " + info["api_token"], "Content-Type": "application/json"}
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+opener = urllib.request.build_opener(NoRedirect())
+with opener.open(urllib.request.Request(base + "/v1/models", headers=headers), timeout=30) as response:
+    model = json.load(response)["data"][0]["id"]
+payload = {"model": model, "messages": [{"role": "user", "content": "用一句话解释向量数据库。"}],
+           "max_tokens": 256, "stream": False}
+with opener.open(urllib.request.Request(base + "/v1/chat/completions", headers=headers,
+        data=json.dumps(payload).encode()), timeout=120) as response:
+    print(json.load(response)["choices"][0]["message"]["content"])
+```
+
+视觉输入将消息 `content` 改成内容块列表：
+
+```json
+[{"type":"text","text":"描述图片"},{"type":"image_url","image_url":{"url":"data:image/png;base64,IMAGE_BASE64"}}]
+```
+
+图片使用服务支持的可访问 URL 或真实 base64 数据；本机文件路径不能直接传给远端模型。
+`IMAGE_BASE64` 为占位值。服务没有 `chat` CLI 子命令，请调用 API。
+流式调用使用 `stream: true` 并处理 SSE，不能把流式返回一次性当 JSON 解析。
+
+## 多实例与存储
 
 ```bash
-# 启动第 2 个实例（自动分配会话 qwen-flash-2，绑定 https://qwen-2.example.com）
-colabllm qwen-flash up -i 2 --domain
-
-# 查看所有实例状态、URL 与 API Token
-colabllm qwen-flash ps
-
-# 查看第 2 个实例的日志或状态
-colabllm qwen-flash logs -i 2 -f
-colabllm qwen-flash status -i 2
-
-# 停止第 2 个实例，或停止所有实例
+colabllm qwen-flash up -i 2
+colabllm qwen-flash info -i 2 --json
+colabllm qwen-flash ps --json
 colabllm qwen-flash down -i 2
-colabllm qwen-flash down --all
 ```
 
-> **提示**：首次启动时需将 ~85 GB 模型分片下载到本地 SSD 并加载进显存/内存，耗时约 5~15 分钟，可通过 `colabllm qwen-flash logs -f` 查看实时进度。
+调用实例 2 时，示例 Python 的 `info` 参数同样加 `-i 2`。
+当前模型是 IQ3_S GGUF 与 BF16 视觉投影器，配置为约 800K 上下文、YaRN 和全 GPU offload。
+G4 上首次准备大模型及编译可能较久；内存/显存需求不适合随意改用 T4。
+模型暂存 `/content/qwen-flash/model`，llama.cpp 编译缓存保存在 Drive 运行时目录；停止 VM 会丢失本地 SSD 文件。
+API 不自动把聊天记录或响应存入 Drive，客户端需自行保存；服务的长上下文能力不代表单次请求应无上限生成。
 
----
-
-## 3. OpenAI 兼容 API 调用示例
-
-先通过 `colabllm qwen-flash info --show-secrets` 获取 `API_TOKEN`：
-
-### 3.1 查看模型列表 (`/v1/models`)
-
-```bash
-curl -s https://qwen.example.com/v1/models \
-  -H "Authorization: Bearer $API_TOKEN" | jq
-```
-
-### 3.2 文本对话 (`/v1/chat/completions`)
-
-```bash
-curl -s https://qwen.example.com/v1/chat/completions \
-  -H "Authorization: Bearer $API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-flash-next",
-    "messages": [
-      {"role": "user", "content": "请用三句话概括 Blackwell 架构的主要特点。"}
-    ],
-    "temperature": 0.6,
-    "max_tokens": 512
-  }' | jq
-```
-
-### 3.3 多模态视觉理解 (`image_url`)
-
-```bash
-curl -s https://qwen.example.com/v1/chat/completions \
-  -H "Authorization: Bearer $API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "qwen3.8-flash-next",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {"type": "text", "text": "描述这张图片里的内容"},
-          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}}
-        ]
-      }
-    ],
-    "max_tokens": 256
-  }' | jq
-```
-
----
-
-## 4. 可选环境变量覆盖
-
-如需调整上下文长度或量化版本，可在 [`src/colabllm/services/qwen-flash.py`](../src/colabllm/services/qwen-flash.py) 的 `SERVICE.env` 中修改：
-
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `CT_QWEN_CONTEXT` | `819200` | 上下文窗口大小（可改为 `524288` 或原生 `262144`） |
-| `CT_QWEN_ROPE_SCALE` | `3.125` | YaRN 缩放倍数（800K 对应 `3.125`，512K 对应 `2.0`） |
-| `CT_QWEN_QUANT` | `IQ3_S` | 模型量化子目录名 |
-| `CT_QWEN_ALIAS` | `qwen3.8-flash-next` | OpenAI API 中的 `model` 名称 |
+更新指定 Key 时须同时更新私密状态和实际服务端认证；只编辑本机状态不会改变运行中 server。
+单纯换 Key 不必释放 GPU，但应先检查在途请求，再按服务重载方式操作并验证新旧 Key。

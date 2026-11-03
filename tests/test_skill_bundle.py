@@ -31,7 +31,9 @@ class SkillBundleTest(unittest.TestCase):
             target = export_skill(Path(temp)/'skills')
             self.assertEqual(target, Path(temp)/'skills/colabllm')
             self.assertEqual((target/'SKILL.md').read_bytes(), (bundle_root()/'SKILL.md').read_bytes())
-            self.assertEqual(len(list((target/'references').glob('*.md'))), 5)
+            self.assertEqual(
+                {p.name for p in (target/'references').glob('*.md')},
+                {p.name for p in (bundle_root()/'references').glob('*.md')})
             (target/'SKILL.md').write_text('user customization')
             with self.assertRaises(CliError):
                 export_skill(target.parent)

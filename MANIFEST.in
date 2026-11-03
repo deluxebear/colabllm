@@ -5,6 +5,7 @@ recursive-include templates *.py *.ipynb
 recursive-include tests *.py
 recursive-include tests_colab *.py
 include tools/check_distribution.py
+include tools/sync_runtime_docs.py
 recursive-include docs *.md
 global-exclude *.pyc
 prune .state

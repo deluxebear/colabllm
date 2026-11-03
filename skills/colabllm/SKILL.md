@@ -31,13 +31,21 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 
 | Task | Runtime | Reference to read |
 | --- | --- | --- |
-| OpenAI-compatible LLM / vision | `qwen-flash`; `ollama` for its model API | [Inference](references/inference.md) |
-| PDF/image files or directories to Markdown | `unlimited-ocr` | [OCR](references/ocr.md) |
-| Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Speech](references/speech.md) |
-| Speech synthesis, named voices, voice cloning | `qwen3-tts`, `indextts` | [Speech](references/speech.md) |
-| Audio-driven avatar generation | `longcat-avatar` | [Media](references/media.md) |
-| Video generation UI; workflow-driven images/video | `longcat-video`, `comfyui` | [Media](references/media.md) |
-| Training/inference UI | `unsloth-studio` | [Inference](references/inference.md) |
+| OpenAI-compatible LLM / vision | `qwen-flash` | [Qwen Flash](references/qwen-flash.md) |
+| Ollama models and inference API | `ollama` | [Ollama](references/ollama.md) |
+| PDF/image files or directories to Markdown | `unlimited-ocr` | [Unlimited-OCR](references/unlimited-ocr.md) |
+| Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |
+| Built-in speech, voice design and cloning | `qwen3-tts` | [Qwen3-TTS](references/qwen3-tts.md) |
+| Voice cloning, emotion and speed | `indextts` | [IndexTTS](references/indextts.md) |
+| Audio-driven avatar generation | `longcat-avatar` | [LongCat Avatar](references/longcat-avatar.md) |
+| Text/image-to-video and continuation UI | `longcat-video` | [LongCat Video](references/longcat-video.md) |
+| Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
+| Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
+
+Read the selected runtime reference before constructing its task commands. The [common operations
+guide](references/runtime-common.md) defines shared lifecycle, path and timeout semantics. These guides
+are bundled with the skill and need no repository access. Their command examples are checked offline
+against the real parser; GPU behavior still depends on the installed runtime and available hardware.
 
 Discover first; service names above are not a promise that every installed version includes them.
 Reuse a ready instance for the task instead of starting another GPU session.
