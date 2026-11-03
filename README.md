@@ -253,7 +253,7 @@ tests_colab/                   # 仅在 Colab 模型环境运行的回归测试
 | Python 3.12+ | 必需 | 执行 `src/colabllm/services/*.py`、`src/colabllm/control.py`，满足 `google-colab-cli` 的 Python 要求 |
 | `uv` | 包安装与升级 | 隔离安装 colabllm 和 Colab CLI；Git 仅开发时需要 |
 | `colab` CLI | 必需 | PyPI 包 `google-colab-cli`，用于会话、文件操作及执行 Notebook |
-| `colab dfs` 扩展 | 默认网盘流程必需 | 额外扩展，提供 `consent`、`mount`、`doctor`；**不是安装 Colab CLI 后自带的标准功能** |
+| `colab dfs` 扩展 | 默认网盘流程必需 | [colab-dfs-ext](https://github.com/deluxebear/colab-dfs-ext)，提供 `consent`、`mount`、`doctor`；需单独安装 |
 | Node.js、npm、Cloudflare `cf` CLI | 固定域名或 FRP 模式 | 本机调用 Cloudflare API 管理 DNS；Cloudflare named tunnel 也由它配置。Quick Tunnel 不需要它 |
 | OpenSSH 客户端 `ssh` | FRP 模式；或 Colab SSH 排错 | 用于连接 FRP 服务器，复用 `~/.ssh/config` 的密钥、端口和跳板配置 |
 
@@ -280,9 +280,13 @@ colab usage          # 查看账号计算单元用量/余额
 
 ### 2. 安装并授权 `colab dfs` 扩展
 
-本项目启动时默认调用 `colab dfs mount`，不依赖 Notebook 内交互式的 `drive.mount()`。`colab dfs` 是**独立的本地扩展**；本仓库目前未分发扩展源码或独立安装包。新机器需先取得兼容的扩展并按其安装方式注入到提供 `colab` 命令的 Python 环境，不能只执行 `uv tool install google-colab-cli` 就认为网盘依赖已齐备。
+本项目启动时默认调用 `colab dfs mount`，不依赖 Notebook 内交互式的 `drive.mount()`。扩展来自 [deluxebear/colab-dfs-ext](https://github.com/deluxebear/colab-dfs-ext)，需在安装 Colab CLI 后单独安装：
 
-当前部署使用的扩展源码位于 `~/.colab-dfs-ext/`。安装好扩展后检查并进行一次性 Drive 授权：
+```bash
+curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh
+```
+
+也可以克隆扩展仓库后运行 `python3 install.py`。安装器将源码保存到 `~/.colab-dfs-ext/`，并自动接入提供 `colab` 命令的 Python 环境；详细选项见[扩展中文说明](https://github.com/deluxebear/colab-dfs-ext/blob/main/README.zh-CN.md)。安装后检查并进行一次性 Drive 授权：
 
 ```bash
 colab dfs --help
@@ -294,20 +298,14 @@ colab dfs show        # 查看授权摘要，不打印 refresh token
 
 Drive 授权与 Colab 会话认证分别进行。扩展凭据保存在 `~/.config/colab-cli/dfs_credentials.json`。正常使用时，服务脚本自动挂载远端 `/content/drive`，无需手工调用 `mount`；已有空闲会话可用 `colab dfs mount -s <会话名>` 验证。
 
-升级 Colab CLI 后，应再次执行 `colab dfs --help` 检查扩展是否仍在；命令可用时可运行 `colab dfs install` 重新注入。若出现 `No such command: dfs`，且原扩展源码仍在 `~/.colab-dfs-ext/`，可从源码恢复注入：
+升级 Colab CLI 后，可执行 `colab dfs --help` 检查扩展是否仍在；命令可用时可运行 `colab dfs install` 重新接入。若出现 `No such command: dfs`，且扩展仍在 `~/.colab-dfs-ext/`，可重新运行安装器修复：
 
 ```bash
-PYTHONPATH="$HOME/.colab-dfs-ext" python3 - <<'PYDFS'
-from colab_dfs_ext.inject import ensure
-result = ensure()
-if result.get("error"):
-    raise SystemExit(result["error"])
-print("colab dfs 注入完成")
-PYDFS
+python3 "$HOME/.colab-dfs-ext/install.py"
 colab dfs --help
 ```
 
-上面的恢复命令以已有扩展源码为前提，不会下载缺失的扩展。`up --no-drive` 可跳过自动挂载，但需要网盘音色、任务持久化和输出保存的功能仍依赖 Drive，不适合作为这些功能的替代配置。
+若扩展目录缺失，重新运行上面的安装命令。`up --no-drive` 可跳过自动挂载，但需要网盘音色、任务持久化和输出保存的功能仍依赖 Drive，不适合作为这些功能的替代配置。
 
 ### 3. 安装 Cloudflare `cf` CLI
 
