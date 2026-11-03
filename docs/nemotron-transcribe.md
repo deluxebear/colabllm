@@ -3,8 +3,8 @@
 > Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[src/colabllm/services/nemotron-transcribe.py](services/nemotron-transcribe.py)
-- 远端 Notebook：[src/colabllm/services/nemotron-transcribe.ipynb](services/nemotron-transcribe.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/nemotron-transcribe.py](../src/colabllm/services/nemotron-transcribe.py)
+- 远端 Notebook：[src/colabllm/services/nemotron-transcribe.ipynb](../src/colabllm/services/nemotron-transcribe.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
 
 ---
 
@@ -37,7 +37,7 @@ colabllm nemotron-transcribe up --domain --precision nvfp4
 colabllm nemotron-transcribe up --quick-tunnel
 
 # 4. 查看访问 URL 与 Bearer API Token
-colabllm nemotron-transcribe info
+colabllm nemotron-transcribe info --show-secrets
 
 # 5. 查看实时准备进度（NeMo Speech + vLLM 环境安装 / 模型下载 / FlashInfer 编译预热）
 colabllm nemotron-transcribe logs -f
@@ -62,7 +62,7 @@ colabllm nemotron-transcribe up -i 2 --domain
 colabllm nemotron-transcribe ps
 
 # 查看或管理指定实例
-colabllm nemotron-transcribe info -i 2
+colabllm nemotron-transcribe info --show-secrets -i 2
 colabllm nemotron-transcribe logs -f -i 2
 colabllm nemotron-transcribe status -i 2
 
@@ -212,7 +212,7 @@ colabllm nemotron-transcribe download "https://www.youtube.com/watch?v=dQw4w9WgX
 
 ## 4. 远端 API 调用示例
 
-先通过 `colabllm nemotron-transcribe info` 获取服务地址（如 `https://transcribe.example.com`）和 `API_TOKEN`。
+先通过 `colabllm nemotron-transcribe info --show-secrets` 获取服务地址（如 `https://transcribe.example.com`）和 `API_TOKEN`。
 
 ### 4.1 OpenAI Python SDK 标准调用（上传本地音频 Base64）
 
@@ -223,7 +223,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="https://transcribe.example.com/v1",
-    api_key="sk-...",  # colabllm nemotron-transcribe info 查看
+    api_key="sk-...",  # colabllm nemotron-transcribe info --show-secrets 查看
 )
 
 audio_b64 = base64.b64encode(Path("sample.wav").read_bytes()).decode("ascii")

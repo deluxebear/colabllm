@@ -29,6 +29,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import contextlib
+import fcntl
+import signal
+import tempfile
 import ipaddress
 import json
 import os
@@ -43,6 +47,8 @@ import urllib.request
 from pathlib import Path
 
 from paths import private_dir, user_home
+from cli_support import CliError, UsageError, diagnostic, safe_urlopen
+from processes import process_identity, runner_alive, stop_owned_process
 
 STATE_ROOT = user_home()
 DEFAULT_ZONE = "example.com"
@@ -88,27 +94,38 @@ class Service:
 def extract_instance_arg(argv: list[str] | None = None) -> tuple[str | None, list[str]]:
     """Extract `-i <id>` / `--instance <id>` from anywhere in argv so it works before or after the subcommand."""
     args = list(sys.argv[1:] if argv is None else argv)
-    inst: str | None = os.environ.get("CT_INSTANCE") or None
-    cleaned: list[str] = []
+    inst = os.environ.get("CT_INSTANCE") or None
+    cleaned = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a in ("-i", "--instance") and i + 1 < len(args):
-            inst = args[i + 1].strip()
+        if a == "--":
+            cleaned.extend(args[i:])
+            break
+        if a in ("-i", "--instance"):
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                raise UsageError(f"{a} 需要有效的实例 ID")
+            inst = validate_instance(args[i + 1])
             i += 2
         elif a.startswith("--instance="):
-            inst = a.split("=", 1)[1].strip()
+            inst = validate_instance(a.split("=", 1)[1])
             i += 1
         else:
             cleaned.append(a)
             i += 1
-    if inst:
-        inst = re.sub(r"[^a-zA-Z0-9_-]+", "-", inst).strip("-") or None
-    return inst, cleaned
+    return validate_instance(inst) if inst is not None else None, cleaned
+
+
+def validate_instance(value):
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}", value):
+        raise UsageError("实例 ID 须为 1–64 位字母、数字、下划线或连字符，且不能以连字符开头")
+    return value
 
 
 def apply_instance(svc: Service, inst: str | None) -> Service:
     """Apply an instance suffix (`-i 2` -> `<base>-2`, domain `<host>-2.<zone>`) to `svc` in place."""
+    if inst is not None:
+        validate_instance(inst)
     base = svc.base_name or svc.name
     svc.base_name = base
     base_host = svc.base_default_hostname
@@ -153,7 +170,10 @@ def load_tunnel_config() -> dict:
     path = STATE_ROOT / 'tunnel-config.json'
     if not path.exists():
         return {}
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except (ValueError, UnicodeError) as error:
+        raise RuntimeError(f"配置文件损坏：{path}；请修复该 JSON 文件或从备份恢复") from error
     if not isinstance(data, dict):
         raise ValueError('tunnel-config.json 必须是 JSON 对象')
     if data.get('base_domain'):
@@ -244,7 +264,7 @@ def list_service_instances(base_name: str) -> list[dict]:
             st = json.loads(sp.read_text())
         except Exception:
             continue
-        alive = pid_alive(st.get("runner_pid"))
+        alive = runner_alive(st)
         items.append({
             "instance": inst_id or "default",
             "instance_arg": inst_id,
@@ -264,22 +284,21 @@ def list_service_instances(base_name: str) -> list[dict]:
 
 # --------------------------------------------------------------------------- utils
 def log(msg: str) -> None:
-    print(f"\033[36m[colabsvc]\033[0m {msg}", flush=True)
+    diagnostic(f"[colabsvc] {msg}", "36")
 
 
 def warn(msg: str) -> None:
-    print(f"\033[33m[colabsvc] {msg}\033[0m", flush=True)
+    diagnostic(f"[colabsvc] {msg}", "33")
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"\033[31m[colabsvc] {msg}\033[0m", file=sys.stderr, flush=True)
+    print(f"[colabsvc] {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
 def banner(lines: list[str]) -> None:
     w = max(len(l) for l in lines) + 8
-    print("\n\033[32m" + "=" * w + "\n" + "\n".join(f"    {l}" for l in lines) + "\n" + "=" * w + "\033[0m\n",
-          flush=True)
+    print("\n" + "=" * w + "\n" + "\n".join(f"    {line}" for line in lines) + "\n" + "=" * w + "\n", flush=True)
 
 
 def run(cmd: list[str], *, capture: bool = False, check: bool = True, input: str | None = None):
@@ -289,7 +308,7 @@ def run(cmd: list[str], *, capture: bool = False, check: bool = True, input: str
     if check and res.returncode != 0:
         if capture:
             sys.stderr.write((res.stdout or "") + (res.stderr or ""))
-        die(f"command failed ({res.returncode}): {' '.join(cmd[:4])} ...")
+        raise CliError(f"命令执行失败 ({res.returncode}): {' '.join(cmd[:4])}", res.returncode if res.returncode > 0 else 1)
     return res
 
 
@@ -301,16 +320,6 @@ def cf_json(*args: str):
         die(f"unexpected output from cf {' '.join(args[:3])}: {res.stdout[:300]}")
 
 
-def pid_alive(pid) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except OSError:
-        return False
-
-
 # --------------------------------------------------------------------------- state
 class State:
     def __init__(self, svc: Service):
@@ -318,19 +327,47 @@ class State:
         self.path = self.dir / "state.json"
 
     def load(self) -> dict:
-        return json.loads(self.path.read_text()) if self.path.exists() else {}
+        try:
+            data = json.loads(self.path.read_text()) if self.path.exists() else {}
+            if not isinstance(data, dict):
+                raise ValueError("expected an object")
+            return data
+        except (ValueError, UnicodeError) as error:
+            raise RuntimeError(f"状态文件损坏：{self.path}；请修复该 JSON 文件或从备份恢复") from error
 
-    def save(self, **kw) -> dict:
+    @contextlib.contextmanager
+    def lock(self, name="state", blocking=True):
         private_dir(STATE_ROOT)
         private_dir(self.dir.parent)
         private_dir(self.dir)
-        st = self.load()
-        st.update(kw)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(st, indent=2, ensure_ascii=False))
-        os.chmod(tmp, 0o600)            # holds passwords and tunnel tokens
-        tmp.replace(self.path)
-        return st
+        with (self.dir / f".{name}.lock").open("a") as lockfile:
+            os.chmod(lockfile.name, 0o600)
+            try:
+                fcntl.flock(lockfile, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                raise RuntimeError(f"{self.dir.name} 正在执行其他生命周期操作，请稍后重试") from None
+            try:
+                yield
+            finally:
+                fcntl.flock(lockfile, fcntl.LOCK_UN)
+
+    def update(self, change):
+        with self.lock():
+            st = change(self.load())
+            fd, filename = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=self.dir)
+            temporary = Path(filename)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as output:
+                    json.dump(st, output, indent=2, ensure_ascii=False)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.replace(self.path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return st
+
+    def save(self, **kw) -> dict:
+        return self.update(lambda st: {**st, **kw})
 
     @property
     def log_path(self) -> Path:
@@ -461,40 +498,70 @@ def delete_named_tunnel(st: dict) -> None:
 
 
 # --------------------------------------------------------------------------- runner (attached `colab exec`)
+def finish_runner(state, pid, identity, exit_code=None):
+    def finish(st):
+        if st.get("runner_pid") == pid and st.get("runner_identity") == identity:
+            st.update(runner_pid=None, runner_identity=None, exec_pid=None, exec_identity=None, ready=False,
+                      runner_exit=exit_code)
+        return st
+    state.update(finish)
+
+
 def exec_runner(svc: Service, nb_path: Path) -> int:
-    """Owns the `colab exec` connection (= the session's keep-alive) and records CT_* markers."""
+    """Own the Colab connection and always reap its separate process group."""
     state = State(svc)
     st = state.load()
+    pid, identity = os.getpid(), process_identity(os.getpid())
+    state.save(runner_pid=pid, runner_identity=identity)
     cmd = ["colab", "exec", "-s", svc.name, "-f", str(nb_path), "--timeout", str(7 * 24 * 3600)]
-    for k, v in st.get("env", {}).items():
-        cmd += ["--env", f"{k}={v}"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    tail, last_cell = "", False
-    while True:
-        chunk = os.read(proc.stdout.fileno(), 65536)
-        if not chunk:
-            break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.flush()
-        tail = (tail + ANSI_RE.sub("", chunk.decode("utf-8", "replace")))[-16000:]
-        upd = {}
-        for cur, total in CELL_RE.findall(tail):
-            if cur == total and not last_cell:
-                last_cell = upd["last_cell_started"] = True
-        m = URL_MARK_RE.findall(tail) or QUICK_URL_RE.findall(tail)
-        if m and m[-1] != st.get("url"):
-            upd["url"] = m[-1]
-        c = CRED_RE.findall(tail)
-        if c and list(c[-1]) != [st.get("login_user"), st.get("login_pass")]:
-            upd["login_user"], upd["login_pass"] = c[-1]
-        if "CT_READY" in tail and not st.get("ready"):
-            upd["ready"] = True
-        if upd:
-            st = state.save(**upd)
-    rc = proc.wait()
-    state.save(runner_exit=rc, ready=False)
-    print(f"\n[colabsvc] colab exec exited with code {rc}", flush=True)
-    return rc
+    for key, value in st.get("env", {}).items():
+        cmd += ["--env", f"{key}={value}"]
+    proc = None
+    child_identity = None
+    old_handler = signal.getsignal(signal.SIGTERM)
+    def terminated(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminated)
+    rc = None
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        child_identity = process_identity(proc.pid)
+        state.save(exec_pid=proc.pid, exec_identity=child_identity)
+        tail, last_cell = "", False
+        while True:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+            tail = (tail + ANSI_RE.sub("", chunk.decode("utf-8", "replace")))[-16000:]
+            update = {}
+            for cur, total in CELL_RE.findall(tail):
+                if cur == total and not last_cell:
+                    last_cell = update["last_cell_started"] = True
+            urls = URL_MARK_RE.findall(tail) or QUICK_URL_RE.findall(tail)
+            if urls and urls[-1] != st.get("url"):
+                update["url"] = urls[-1]
+            credentials = CRED_RE.findall(tail)
+            if credentials and list(credentials[-1]) != [st.get("login_user"), st.get("login_pass")]:
+                update["login_user"], update["login_pass"] = credentials[-1]
+            if "CT_READY" in tail and not st.get("ready"):
+                update["ready"] = True
+            if update:
+                st = state.save(**update)
+        rc = proc.wait()
+        if rc == 0 and not st.get("ready"):
+            warn("Colab 在 CT_READY 之前退出，请查看日志中的启动错误")
+            rc = 1
+        return rc if rc >= 0 else 128 - rc
+    finally:
+        signal.signal(signal.SIGTERM, old_handler)
+        if proc is not None:
+            stop_owned_process(proc.pid, child_identity, group=True)
+            proc.wait(timeout=5)
+            if proc.stdout:
+                proc.stdout.close()
+        finish_runner(state, pid, identity, rc)
 
 
 # --------------------------------------------------------------------------- commands
@@ -518,6 +585,23 @@ def ensure_session(svc: Service) -> None:
 
 
 def cmd_up(svc: Service, script: Path, a) -> None:
+    state = State(svc)
+    if a.dry_run:
+        return _start_up(svc, script, a)
+    with state.lock("operation", blocking=False):
+        launched = _start_up(svc, script, a)
+    if a.foreground:
+        try:
+            raise SystemExit(exec_runner(svc, launched))
+        finally:
+            finish_runner(state, os.getpid(), process_identity(os.getpid()))
+    if getattr(a, "detach", False):
+        show_info(svc, reveal=False)
+        return
+    _wait_ready(svc, launched)
+
+
+def _start_up(svc: Service, script: Path, a):
     hostname = tunnel_hostname(svc, a)
     transport=tunnel_transport(a)
     frp_config=None
@@ -537,7 +621,7 @@ def cmd_up(svc: Service, script: Path, a) -> None:
     busy = {8080: "Colab runtime server", 8012: "colab dfs creds shim"}
     for port in {svc.service_port, svc.tunnel_port} & busy.keys():
         die(f"port {port} is used on Colab VMs by the {busy[port]}; pick another port in services/{svc.name}.py")
-    if pid_alive(st.get("runner_pid")):
+    if runner_alive(st):
         die(f"'{svc.name}' is already running (runner pid {st['runner_pid']}); use `down` first")
 
     nb_src = (script.parent / svc.notebook).resolve()
@@ -608,14 +692,23 @@ def cmd_up(svc: Service, script: Path, a) -> None:
 
     # 4. notebook through an attached `colab exec` (keep-alive)
     if a.foreground:
-        os.environ["COLABSVC_FOREGROUND"] = "1"
-        rc = exec_runner(svc, nb_path)
-        sys.exit(rc)
+        state.save(runner_pid=os.getpid(), runner_identity=process_identity(os.getpid()), runner_mode="foreground")
+        return nb_path
     state.log_path.write_bytes(b"")
+    state.log_path.chmod(0o600)
     exec_cmd = [sys.executable, str(script), *(["-i", svc.instance] if svc.instance else []), "_exec", str(nb_path)]
-    proc = subprocess.Popen(exec_cmd, stdin=subprocess.DEVNULL, stdout=open(state.log_path, "ab"),
-                            stderr=subprocess.STDOUT, start_new_session=True)
-    state.save(runner_pid=proc.pid)
+    with state.log_path.open("ab") as logfile:
+        proc = subprocess.Popen(exec_cmd, stdin=subprocess.DEVNULL, stdout=logfile,
+                                stderr=subprocess.STDOUT, start_new_session=True)
+    identity = process_identity(proc.pid)
+    if not identity:
+        raise RuntimeError(f"后台进程在登记前退出；请查看 {state.log_path}")
+    state.save(runner_pid=proc.pid, runner_identity=identity, runner_mode="background")
+    return proc
+
+
+def _wait_ready(svc, proc):
+    state = State(svc)
     log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path}")
     log("streaming progress until the service reports CT_READY (Ctrl-C only stops watching)")
     offset, deadline = 0, time.time() + svc.ready_timeout
@@ -635,10 +728,10 @@ def cmd_up(svc: Service, script: Path, a) -> None:
                 die(f"runner exited early (code {proc.returncode}); see {state.log_path}")
             time.sleep(1)
         else:
-            warn("timed out waiting for CT_READY; the runner keeps going -- check `logs -f`")
+            raise TimeoutError("等待 CT_READY 超时；后台进程继续运行，请使用 status 或 logs -f 检查")
     except KeyboardInterrupt:
-        print()
-    show_info(svc, do_probe=True)
+        raise
+    show_info(svc, do_probe=True, reveal=False)
 
 
 def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = None) -> str:
@@ -650,7 +743,7 @@ def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = No
     elif bearer:
         req.add_header("Authorization", f"Bearer {bearer}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with safe_urlopen(req, timeout=15) as r:
             return str(r.status)
     except urllib.error.HTTPError as e:
         return str(e.code)
@@ -658,43 +751,57 @@ def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = No
         return f"error ({type(e).__name__})"
 
 
-def show_info(svc: Service, do_probe: bool = False) -> None:
+def show_info(svc: Service, do_probe=False, reveal=False, output_json=False):
     st = State(svc).load()
-    lines = [f"service : {svc.name}   (runner {'alive' if pid_alive(st.get('runner_pid')) else 'stopped'})"]
+    alive = runner_alive(st)
+    ready = bool(alive and st.get("ready"))
+    data = dict(service=svc.name, running=alive, ready=ready, url=st.get("url"))
+    lines = [f"service : {svc.name}   (runner {'alive' if alive else 'stopped'})",
+             f"ready   : {ready}"]
     if st.get("url"):
         lines.append(f"URL     : {st['url']}")
-    if svc.auth == "caddy" and st.get("auth_pass"):
-        lines.append(f"login   : {st['auth_user']} / {st['auth_pass']}   (Caddy basic auth)")
-        lines.append(f"API     : Authorization: Bearer {st['api_token']}")
-    elif svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
-        lines.append(f"API     : Authorization: Bearer {st['api_token']}")
-    if st.get("login_user"):
-        lines.append(f"app login: {st['login_user']} / {st['login_pass']}")
+    if reveal:
+        for key in ("auth_user", "auth_pass", "api_token", "login_user", "login_pass"):
+            if st.get(key):
+                data[key] = st[key]
+                lines.append(f"{key}: {st[key]}")
+    healthy = ready
     if do_probe and st.get("url"):
-        lines.append(f"probe   : GET {st['url']} -> {probe(st['url'])} (no credentials)")
-        if svc.auth == "caddy" and st.get("auth_pass"):
-            lines.append(f"probe   : GET {st['url']} -> {probe(st['url'], (st['auth_user'], st['auth_pass']))} "
-                         "(basic auth)")
+        url = st["url"]
+        if svc.auth == "caddy":
+            result = probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")))
         elif svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
-            lines.append(f"probe   : GET {st['url']}/v1/models -> "
-                         f"{probe(st['url'].rstrip('/') + '/v1/models', bearer=st['api_token'])} (bearer)")
-    banner(lines)
+            result = probe(url.rstrip('/') + '/v1/models', bearer=st["api_token"])
+        else:
+            result = probe(url)
+        data["http_status"] = result
+        lines.append(f"probe   : {result}")
+        healthy = bool(ready and result.isdigit() and 200 <= int(result) < 400)
+    elif do_probe:
+        healthy = False
+    if output_json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        banner(lines)
+    return healthy
 
 
-def show_instances(svc: Service) -> None:
+def show_instances(svc: Service, reveal=False, output_json=False):
     items = list_service_instances(svc.base_name or svc.name)
-    if not items:
-        log(f"no instances found in ~/.colabllm/services/ for '{svc.base_name or svc.name}'")
+    if not reveal:
+        items = [{key: value for key, value in item.items() if key not in ("api_token", "auth_pass", "auth_user")}
+                 for item in items]
+    if output_json:
+        print(json.dumps(items, ensure_ascii=False, indent=2))
         return
-    print(f"\nInstances of {svc.base_name or svc.name}:")
-    print(f"  {'INSTANCE':<12} {'SESSION':<28} {'STATE':<14} {'URL':<42} {'API TOKEN'}")
-    print("  " + "-" * 116)
-    for it in items:
-        state_str = "READY" if it["ready"] else ("STARTING" if it["alive"] else "STOPPED")
-        url_str = it.get("url") or "-"
-        tok = it.get("api_token") or "-"
-        print(f"  {it['instance']:<12} {it['name']:<28} {state_str:<14} {url_str:<42} {tok}")
-    print()
+    if not items:
+        log(f"no instances found for '{svc.base_name or svc.name}'")
+        return
+    print(f"{'INSTANCE':<12} {'SESSION':<28} {'STATE':<12} URL" + (" / API TOKEN" if reveal else ""))
+    for item in items:
+        label = "READY" if item["ready"] else ("STARTING" if item["alive"] else "STOPPED")
+        suffix = f" / {item.get('api_token', '-')}" if reveal else ""
+        print(f"{item['instance']:<12} {item['name']:<28} {label:<12} {item.get('url') or '-'}{suffix}")
 
 
 def cmd_down(svc: Service, a) -> None:
@@ -707,37 +814,28 @@ def cmd_down(svc: Service, a) -> None:
             cmd_down(sub_svc, sub_a)
         return
     state = State(svc)
-    st = state.load()
-    if pid_alive(st.get("runner_pid")):
-        log(f"stopping runner (pid {st['runner_pid']})")
-        try:
-            os.killpg(int(st["runner_pid"]), 15)
-        except OSError:
-            pass
-    log(f"colab stop -s {svc.name}")
-    run(["colab", "stop", "-s", svc.name], check=False)
-    if a.delete_tunnel and st.get('frp_route'):
-        from frp_backend import remove_route
-        remove_route(st['frp_route'],svc.name)
-        st.pop('frp_route',None)
-    if a.delete_tunnel and (st.get("tunnel_id") or st.get('cloudflare_route')):
-        delete_named_tunnel(st.get('cloudflare_route') or st)
-        st.pop('cloudflare_route',None)
-        st = {k: v for k, v in st.items() if k not in ("tunnel_id", "tunnel_name", "zone_id", "hostname")}
-    keep = {k: st[k] for k in ("auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
-                               "zone_id", "hostname", "transport", "frp_route", "cloudflare_route") if k in st}
-    private_dir(STATE_ROOT)
-    private_dir(state.dir.parent)
-    private_dir(state.dir)
-    state.path.write_text(json.dumps(keep, indent=2))
-    os.chmod(state.path, 0o600)
+    with state.lock("operation", blocking=False):
+        st = state.load()
+        log(f"colab stop -s {svc.name}")
+        result = run(["colab", "stop", "-s", svc.name], check=False)
+        if result.returncode != 0:
+            raise CliError(f"停止 {svc.name} 失败；已保留运行状态，可重试 down", result.returncode if result.returncode > 0 else 1)
+        stop_owned_process(st.get("exec_pid"), st.get("exec_identity"), group=True)
+        stop_owned_process(st.get("runner_pid"), st.get("runner_identity"), group=st.get("runner_mode") == "background")
+        if a.delete_tunnel and st.get('frp_route'):
+            from frp_backend import remove_route
+            remove_route(st['frp_route'],svc.name)
+            st.pop('frp_route',None)
+        if a.delete_tunnel and (st.get("tunnel_id") or st.get('cloudflare_route')):
+            delete_named_tunnel(st.get('cloudflare_route') or st)
+            st.pop('cloudflare_route',None)
+            st = {k: v for k, v in st.items() if k not in ("tunnel_id", "tunnel_name", "zone_id", "hostname")}
+        keys = ("auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
+                "zone_id", "hostname", "transport", "frp_route", "cloudflare_route")
+        state.update(lambda current: {k: st[k] for k in keys if k in st})
 
 
-def main(svc: Service) -> None:
-    script = Path(sys.argv[0]).resolve()
-    inst, cleaned_argv = extract_instance_arg(sys.argv[1:])
-    apply_instance(svc, inst)
-
+def build_parser(svc: Service, configure=None):
     p = argparse.ArgumentParser(prog=f"colabllm {svc.base_name}", description=(sys.modules["__main__"].__doc__ or "").strip(),
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-i", "--instance", metavar="ID",
@@ -757,30 +855,54 @@ def main(svc: Service) -> None:
     u.add_argument("--hf-token", metavar="TOKEN",
                    help="Hugging Face token (saved in ~/.colabllm and forwarded as HF_TOKEN; or set env HF_TOKEN)")
     u.add_argument("--new-credentials", action="store_true", help="rotate the Caddy password / API token")
-    u.add_argument("--foreground", action="store_true", help="stay attached in this terminal instead")
+    mode = u.add_mutually_exclusive_group()
+    mode.add_argument("--foreground", action="store_true", help="stay attached in this terminal instead")
+    mode.add_argument("--detach", action="store_true", help="return after starting the runner without waiting for readiness")
     u.add_argument("--dry-run", action="store_true", help="only show the cell plan")
     d = sub.add_parser("down", help="stop runner + Colab session")
     d.add_argument("--delete-tunnel", action="store_true", help="also delete the named tunnel and its DNS record")
     d.add_argument("--all", action="store_true", help="stop all instances of this service")
-    sub.add_parser("info", help="URL and credentials")
-    sub.add_parser("ps", help="list all instances of this service and their URLs / states")
-    sub.add_parser("list", help="alias for `ps`")
+    for name, help_text in (("info", "URL and state"), ("ps", "list instances"), ("list", "alias for ps"), ("status", "Colab status and authenticated health probe")):
+        output = sub.add_parser(name, help=help_text)
+        output.add_argument("--json", action="store_true", help="output machine-readable JSON")
+        output.add_argument("--show-secrets", action="store_true", help="include credentials in output")
     lg = sub.add_parser("logs", help="notebook output")
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("-n", "--lines", type=int, default=80)
-    sub.add_parser("status", help="colab status + public URL probe")
     tc = sub.add_parser("tunnel-config", help="查看或设置所有服务共享的 Cloudflare 主域名；未设置时使用动态 URL")
     settings = tc.add_mutually_exclusive_group()
     settings.add_argument("--base-domain", metavar="DOMAIN", type=validate_domain)
     settings.add_argument("--clear", action="store_true", help="移除持久主域名配置，恢复动态 URL 默认值")
-    ex = sub.add_parser("_exec")          # internal: detached runner
+    p.add_argument("--debug", action="store_true", help="show exception tracebacks")
+    p.add_argument("--quiet", action="store_true", help="suppress diagnostic progress")
+    p.add_argument("--no-color", action="store_true", help="disable diagnostic colors")
+    if configure:
+        configure(p, sub, u)
+    public = list(sub.choices)
+    sub.metavar = "{" + ",".join(public) + "}"
+    ex = sub.add_parser("_exec")
     ex.add_argument("nb")
+    return p
+
+
+def main(svc: Service, *, configure=None, handlers=None, prepare_up=None) -> None:
+    script = Path(sys.argv[0]).resolve()
+    inst, cleaned_argv = extract_instance_arg(sys.argv[1:])
+    apply_instance(svc, inst)
+    p = build_parser(svc, configure)
     a = p.parse_args(cleaned_argv)
+    if handlers and a.cmd in handlers:
+        code = handlers[a.cmd](a)
+        if isinstance(code, int) and code:
+            raise SystemExit(code)
+        return
 
     if a.cmd == "up":
         try:
+            if prepare_up:
+                prepare_up(a)
             cmd_up(svc, script, a)
-        except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        except ValueError as error:
             p.error(str(error))
     elif a.cmd == "tunnel-config":
         try:
@@ -792,12 +914,15 @@ def main(svc: Service) -> None:
     elif a.cmd == "down":
         cmd_down(svc, a)
     elif a.cmd == "info":
-        show_info(svc)
+        show_info(svc, reveal=a.show_secrets, output_json=a.json)
     elif a.cmd in ("ps", "list"):
-        show_instances(svc)
+        show_instances(svc, reveal=a.show_secrets, output_json=a.json)
     elif a.cmd == "status":
-        run(["colab", "status", "-s", svc.name], check=False)
-        show_info(svc, do_probe=True)
+        result = run(["colab", "status", "-s", svc.name], capture=True, check=False)
+        if result.returncode != 0:
+            raise CliError((result.stderr or "Colab 状态查询失败").strip(), result.returncode if result.returncode > 0 else 1)
+        if not show_info(svc, do_probe=True, reveal=a.show_secrets, output_json=a.json):
+            raise SystemExit(1)
     elif a.cmd == "logs":
         lp = State(svc).log_path
         if not lp.exists():

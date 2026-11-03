@@ -18,6 +18,7 @@ Usage:
   colabllm comfyui pull-model [-i ID | -A] https://huggingface.co/.../model.safetensors --dir loras [--name model.safetensors]
   colabllm comfyui ps | info [-i ID] | logs [-i ID] -f | status [-i ID] | down [-i ID | --all] [--delete-tunnel]
 """
+import argparse
 import copy
 import json
 import sys
@@ -28,12 +29,12 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cli_support import safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
     apply_instance,
     die,
-    extract_instance_arg,
     list_service_instances,
     log,
     main,
@@ -57,27 +58,6 @@ KNOWN_MODEL_DIRS = (
     "clip_vision", "controlnet", "upscale_models", "audio_encoders",
     "model_patches", "embeddings", "hypernetworks", "gligen", "style_models",
 )
-
-
-def _extract_workflow_arg() -> None:
-    """Support `--workflow <url-or-template>` (can be passed multiple times or comma-separated) on `up`."""
-    argv = sys.argv[1:]
-    workflows: list[str] = []
-    cleaned = [sys.argv[0]]
-    i = 0
-    while i < len(argv):
-        if argv[i] in ("--workflow", "-w") and i + 1 < len(argv):
-            workflows.append(argv[i + 1])
-            i += 2
-        elif argv[i].startswith("--workflow="):
-            workflows.append(argv[i].split("=", 1)[1])
-            i += 1
-        else:
-            cleaned.append(argv[i])
-            i += 1
-    if workflows:
-        SERVICE.env["CT_WORKFLOW"] = ",".join(workflows)
-    sys.argv = cleaned
 
 
 def _resolve_target_services(all_instances: bool = False, instances_csv: str = "") -> list[Service]:
@@ -109,29 +89,6 @@ def _resolve_target_services(all_instances: bool = False, instances_csv: str = "
     return [SERVICE]
 
 
-def _extract_multi_instance_flags(args: list[str]) -> tuple[list[str], bool, str]:
-    """Strip `-A / --all-instances` and `--instances <csv>` from args list."""
-    cleaned: list[str] = []
-    all_instances = False
-    instances_csv = ""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("--all-instances", "-A"):
-            all_instances = True
-            i += 1
-        elif a == "--instances" and i + 1 < len(args):
-            instances_csv = args[i + 1]
-            i += 2
-        elif a.startswith("--instances="):
-            instances_csv = a.split("=", 1)[1]
-            i += 1
-        else:
-            cleaned.append(a)
-            i += 1
-    return cleaned, all_instances, instances_csv
-
-
 def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
     svc = svc or SERVICE
     st = State(svc).load()
@@ -147,7 +104,7 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
     payload = json.dumps(body_dict).encode("utf-8")
     req = urllib.request.Request(f"{url}/api/ct/pull-workflow", data=payload, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with safe_urlopen(req, timeout=60) as resp:
             res = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -171,7 +128,7 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
         time.sleep(2)
         poll_req = urllib.request.Request(f"{url}/api/ct/pull-workflow/{job_id}", headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(poll_req, timeout=30) as resp:
+            with safe_urlopen(poll_req, timeout=30) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
             consecutive_errors = 0
         except Exception as e:
@@ -183,7 +140,8 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
 
 def _cmd_pull_workflow(raw_args: list[str]) -> None:
     """Trigger live on-demand model download into the running Colab VM's local SSD via /api/ct/pull-workflow."""
-    wf_specs, all_instances, instances_csv = _extract_multi_instance_flags(raw_args)
+    args = raw_args if isinstance(raw_args, argparse.Namespace) else pull_parser("pull-workflow").parse_args(raw_args)
+    wf_specs, all_instances, instances_csv = args.workflows, args.all_instances, args.instances
     if not wf_specs:
         die("usage: colabllm comfyui pull-workflow [-i ID | -A | --instances 1,2] <workflow-url-or-template-name> [...]")
     targets = _resolve_target_services(all_instances=all_instances, instances_csv=instances_csv)
@@ -195,35 +153,11 @@ def _cmd_pull_workflow(raw_args: list[str]) -> None:
 
 def _cmd_pull_model(raw_args: list[str]) -> None:
     """Download a single model URL directly into /content/ComfyUI/models/<directory>/<filename> on local SSD."""
-    args, all_instances, instances_csv = _extract_multi_instance_flags(raw_args)
-    model_url = ""
-    target_dir = ""
-    filename = ""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a in ("--dir", "-d", "--directory") and i + 1 < len(args):
-            target_dir = args[i + 1].strip().strip("/")
-            i += 2
-        elif a.startswith(("--dir=", "--directory=")):
-            target_dir = a.split("=", 1)[1].strip().strip("/")
-            i += 1
-        elif a in ("--name", "-n", "--filename") and i + 1 < len(args):
-            filename = args[i + 1].strip().lstrip("/")
-            i += 2
-        elif a.startswith(("--name=", "--filename=")):
-            filename = a.split("=", 1)[1].strip().lstrip("/")
-            i += 1
-        elif not model_url and not a.startswith("-"):
-            model_url = a.strip()
-            i += 1
-        elif not target_dir and not a.startswith("-"):
-            target_dir = a.strip().strip("/")
-            i += 1
-        else:
-            die(f"unknown argument: {a}\nusage: colabllm comfyui pull-model [-i ID | -A] <model-url> [--dir <directory>] [--name <filename>]")
-    if not model_url:
-        die("usage: colabllm comfyui pull-model [-i ID | -A] <model-url> [--dir <directory>] [--name <filename>]")
+    args = raw_args if isinstance(raw_args, argparse.Namespace) else pull_parser("pull-model").parse_args(raw_args)
+    all_instances, instances_csv = args.all_instances, args.instances
+    model_url = args.model_url
+    target_dir = (args.directory or args.directory_pos or "").strip("/")
+    filename = (args.filename or "").lstrip("/")
     clean_parts = [p for p in urllib.parse.unquote(model_url.split("?")[0]).split("/") if p]
     if not filename and clean_parts:
         filename = clean_parts[-1]
@@ -252,16 +186,34 @@ def _cmd_pull_model(raw_args: list[str]) -> None:
         }, svc=svc)
 
 
+
+def pull_parser(name, parser=None):
+    parser = parser or argparse.ArgumentParser(prog=f"colabllm comfyui {name}")
+    targets = parser.add_mutually_exclusive_group()
+    targets.add_argument("-A", "--all-instances", action="store_true", help="target all running instances")
+    targets.add_argument("--instances", default="", help="comma-separated instance IDs")
+    if name == "pull-workflow":
+        parser.add_argument("workflows", nargs="+", help="workflow URLs or template names")
+    else:
+        parser.add_argument("model_url")
+        parser.add_argument("directory_pos", nargs="?", help="model directory (or use --dir)")
+        parser.add_argument("--dir", "-d", "--directory", dest="directory")
+        parser.add_argument("--name", "-n", "--filename", dest="filename")
+    return parser
+
+
+def configure_cli(parser, commands, up):
+    up.add_argument("--workflow", "-w", action="append", help="workflow URL or template; repeat to download multiple")
+    for name in ("pull-workflow", "pull-model"):
+        pull_parser(name, commands.add_parser(name, help="download workflow models" if name == "pull-workflow" else "download a model"))
+
+
+def prepare_up(args):
+    if args.workflow:
+        SERVICE.env["CT_WORKFLOW"] = ",".join(args.workflow)
+
+
 if __name__ == "__main__":
-    SERVICE.base_name = SERVICE.name
-    _inst_id, _rem_argv = extract_instance_arg(sys.argv[1:])
-    if _inst_id:
-        apply_instance(SERVICE, _inst_id)
-    if len(_rem_argv) >= 1 and _rem_argv[0] == "pull-workflow":
-        _cmd_pull_workflow(_rem_argv[1:])
-        sys.exit(0)
-    if len(_rem_argv) >= 1 and _rem_argv[0] == "pull-model":
-        _cmd_pull_model(_rem_argv[1:])
-        sys.exit(0)
-    _extract_workflow_arg()
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli, prepare_up=prepare_up,
+        handlers={"pull-workflow": _cmd_pull_workflow, "pull-model": _cmd_pull_model}))

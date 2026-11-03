@@ -21,4 +21,5 @@ SERVICE = Service(
 )
 
 if __name__ == "__main__":
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE))

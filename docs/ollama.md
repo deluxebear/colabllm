@@ -3,8 +3,8 @@
 > Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[src/colabllm/services/ollama.py](services/ollama.py)
-- 远端 Notebook：[src/colabllm/services/ollama.ipynb](services/ollama.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/ollama.py](../src/colabllm/services/ollama.py)
+- 远端 Notebook：[src/colabllm/services/ollama.ipynb](../src/colabllm/services/ollama.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
 
 ---
 
@@ -31,7 +31,7 @@ colabllm ollama up --domain
 colabllm ollama up --quick-tunnel --gpu L4
 
 # 3. 查看访问地址、Basic Auth 账号密码与 Bearer API Token
-colabllm ollama info
+colabllm ollama info --show-secrets
 
 # 4. 查看实时日志 / 检查服务状态与安全探测
 colabllm ollama logs -f
@@ -54,7 +54,7 @@ colabllm ollama up -i 2 --domain --gpu L4 --models deepseek-r1:14b
 colabllm ollama ps
 
 # 查看指定实例详情 / 日志 / 停止全部实例
-colabllm ollama info -i 2
+colabllm ollama info --show-secrets -i 2
 colabllm ollama logs -i 2 -f
 colabllm ollama down --all
 ```
@@ -63,7 +63,7 @@ colabllm ollama down --all
 
 ## 3. API 调用与在线拉取新模型
 
-先通过 `colabllm ollama info` 获取 `URL` 与 `TOKEN`：
+先通过 `colabllm ollama info --show-secrets` 获取 `URL` 与 `TOKEN`：
 
 ### 3.1 在线拉取其他 Ollama 模型 (`/api/pull`)
 

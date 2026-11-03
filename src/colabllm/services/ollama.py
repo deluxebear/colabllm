@@ -28,26 +28,15 @@ SERVICE = Service(
 )
 
 
-def _extract_models_arg() -> None:
-    argv = sys.argv[1:]
-    cleaned = [sys.argv[0]]
-    models: list[str] = []
-    i = 0
-    while i < len(argv):
-        if argv[i] in ("--models", "--model", "-m") and i + 1 < len(argv):
-            models.append(argv[i + 1])
-            i += 2
-        elif argv[i].startswith(("--models=", "--model=")):
-            models.append(argv[i].split("=", 1)[1])
-            i += 1
-        else:
-            cleaned.append(argv[i])
-            i += 1
-    if models:
-        SERVICE.env["CT_MODELS"] = ",".join(models)
-    sys.argv = cleaned
+def configure_cli(parser, commands, up):
+    up.add_argument("--models", "--model", "-m", action="append", help="models to preload; repeat or separate with commas")
+
+
+def prepare_up(args):
+    if args.models:
+        SERVICE.env["CT_MODELS"] = ",".join(args.models)
 
 
 if __name__ == "__main__":
-    _extract_models_arg()
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli, prepare_up=prepare_up))

@@ -37,7 +37,7 @@ wrong Bearer → 401.
 ## Client examples
 
 ```bash
-eval "$(colabllm ollama info >/dev/null; python3 - <<'EOF'
+eval "$(colabllm ollama info --show-secrets >/dev/null; python3 - <<'EOF'
 import json; from pathlib import Path; s=json.loads((Path.home() / '.colabllm/services/ollama/state.json').read_text()); print(f"URL={s['url']} TOKEN={s['api_token']}")
 EOF
 )"

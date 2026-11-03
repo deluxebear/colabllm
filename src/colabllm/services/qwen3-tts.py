@@ -46,12 +46,11 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cli_support import safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
-    apply_instance,
     die,
-    extract_instance_arg,
     log,
     main,
 )
@@ -93,50 +92,22 @@ BUILTIN_SPEAKERS = {
 }
 
 
-def _extract_up_extra_args() -> None:
-    """Allow `--variant`, `--model`, `--alias`, `--preload-all`, `--stage0-gpu-mem`, `--stage1-gpu-mem` on `up`."""
-    flag_map = {
-        "--variant": "CT_QWEN3_TTS_VARIANT",
-        "--model": "CT_QWEN3_TTS_MODEL",
-        "--alias": "CT_QWEN3_TTS_ALIAS",
-        "--preload-all": "CT_QWEN3_TTS_PRELOAD_ALL",
-        "--stage0-gpu-mem": "CT_QWEN3_TTS_GPU_MEM_STAGE0",
-        "--stage1-gpu-mem": "CT_QWEN3_TTS_GPU_MEM_STAGE1",
-        "--max-model-len": "CT_QWEN3_TTS_MAX_MODEL_LEN",
-        "--max-seqs": "CT_QWEN3_TTS_MAX_NUM_SEQS",
-    }
-    variant_repos = {
-        "customvoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-        "1.7b-customvoice": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
-        "voicedesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-        "1.7b-voicedesign": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-        "base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        "1.7b-base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        "0.6b-customvoice": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
-        "0.6b-base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
-    }
-    argv = sys.argv[1:]
-    cleaned = [sys.argv[0]]
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in flag_map and i + 1 < len(argv):
-            val = argv[i + 1].strip()
-            SERVICE.env[flag_map[a]] = val
-            if a == "--variant" and val.lower() in variant_repos:
-                SERVICE.env["CT_QWEN3_TTS_MODEL"] = variant_repos[val.lower()]
-            i += 2
-        elif "=" in a and a.split("=", 1)[0] in flag_map:
-            k, v = a.split("=", 1)
-            val = v.strip()
-            SERVICE.env[flag_map[k]] = val
-            if k == "--variant" and val.lower() in variant_repos:
-                SERVICE.env["CT_QWEN3_TTS_MODEL"] = variant_repos[val.lower()]
-            i += 1
-        else:
-            cleaned.append(a)
-            i += 1
-    sys.argv = cleaned
+UP_ENV_FLAGS = {'--variant': 'CT_QWEN3_TTS_VARIANT',
+ '--model': 'CT_QWEN3_TTS_MODEL',
+ '--alias': 'CT_QWEN3_TTS_ALIAS',
+ '--preload-all': 'CT_QWEN3_TTS_PRELOAD_ALL',
+ '--stage0-gpu-mem': 'CT_QWEN3_TTS_GPU_MEM_STAGE0',
+ '--stage1-gpu-mem': 'CT_QWEN3_TTS_GPU_MEM_STAGE1',
+ '--max-model-len': 'CT_QWEN3_TTS_MAX_MODEL_LEN',
+ '--max-seqs': 'CT_QWEN3_TTS_MAX_NUM_SEQS'}
+VARIANT_REPOS = {'customvoice': 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
+ '1.7b-customvoice': 'Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
+ 'voicedesign': 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+ '1.7b-voicedesign': 'Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign',
+ 'base': 'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
+ '1.7b-base': 'Qwen/Qwen3-TTS-12Hz-1.7B-Base',
+ '0.6b-customvoice': 'Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice',
+ '0.6b-base': 'Qwen/Qwen3-TTS-12Hz-0.6B-Base'}
 
 
 def _get_endpoint(url_override: str | None = None, token_override: str | None = None) -> tuple[str, str]:
@@ -174,7 +145,7 @@ def _http_json(
         method=method or ("POST" if data is not None else "GET"),
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with safe_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw})
     except urllib.error.HTTPError as err:
@@ -388,7 +359,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+        with safe_urlopen(req, timeout=args.timeout) as resp:
             audio_bytes = resp.read()
             elapsed = time.monotonic() - t0
             saved_drive = resp.headers.get("X-Saved-Drive-Path")
@@ -418,9 +389,9 @@ def _add_endpoint_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--api-token", help="Override Bearer API token")
 
 
-def _build_custom_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="qwen3-tts.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
+    p = parser or argparse.ArgumentParser(prog="colabllm qwen3-tts")
+    sub = commands or p.add_subparsers(dest="cmd", required=True)
 
     for tts_name in ("tts", "speak"):
         sp = sub.add_parser(
@@ -507,22 +478,27 @@ def _build_custom_parser() -> argparse.ArgumentParser:
 CUSTOM_CMDS = {"tts", "speak", "design-voice", "voices", "upload-voice", "delete-voice", "ls-drive"}
 
 
+
+def configure_cli(parser, commands, up):
+    _build_custom_parser(parser, commands)
+    for flag, env in UP_ENV_FLAGS.items():
+        up.add_argument(flag, dest="up_" + env, help=f"override {env}")
+
+
+def prepare_up(args):
+    variant = getattr(args, "up_CT_QWEN3_TTS_VARIANT")
+    if variant:
+        if variant.lower() not in VARIANT_REPOS:
+            raise ValueError("未知 --variant，可选值：" + ", ".join(VARIANT_REPOS))
+        SERVICE.env["CT_QWEN3_TTS_MODEL"] = VARIANT_REPOS[variant.lower()]
+    for flag, env in UP_ENV_FLAGS.items():
+        value = getattr(args, "up_" + env)
+        if value is not None:
+            SERVICE.env[env] = value
+
+
 if __name__ == "__main__":
-    inst_id, rem_argv = extract_instance_arg(sys.argv[1:])
-    if inst_id:
-        apply_instance(SERVICE, inst_id)
-    if len(rem_argv) >= 1 and rem_argv[0] in CUSTOM_CMDS:
-        parser = _build_custom_parser()
-        parsed = parser.parse_args(rem_argv)
-        dispatch = {
-            "tts": cmd_tts,
-            "speak": cmd_tts,
-            "design-voice": cmd_design_voice,
-            "voices": cmd_voices,
-            "upload-voice": cmd_upload_voice,
-            "delete-voice": cmd_delete_voice,
-            "ls-drive": cmd_ls_drive,
-        }
-        sys.exit(dispatch[parsed.cmd](parsed))
-    _extract_up_extra_args()
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli, prepare_up=prepare_up,
+                        handlers={"tts": cmd_tts, "speak": cmd_tts, "voices": cmd_voices,
+                "upload-voice": cmd_upload_voice, "delete-voice": cmd_delete_voice, "ls-drive": cmd_ls_drive, "design-voice": cmd_design_voice}))

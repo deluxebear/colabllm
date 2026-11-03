@@ -313,14 +313,14 @@ transport.tls.keyFile = "/existing/server.key"
         self.assertEqual(state['env']['CT_TUNNEL_TOKEN'],'')
         self.assertEqual(state['env']['CT_FRP_TOKEN'],'test-token')
         colabsvc.save_tunnel_config({})
-        with patch.object(backend,'remove_route') as remove,patch.object(colabsvc,'run'),contextlib.redirect_stdout(io.StringIO()):
+        with patch.object(backend,'remove_route') as remove,patch.object(colabsvc,'run',return_value=argparse.Namespace(returncode=0)),contextlib.redirect_stdout(io.StringIO()):
             colabsvc.cmd_down(self.svc,argparse.Namespace(all=False,delete_tunnel=True))
         remove.assert_called_once_with(route,'avatar')
 
     def test_cleanup_remembers_cloudflare_hostname_after_frp_switch(self):
         old=dict(hostname='old.example.com',tunnel_id='tunnel',zone_id='zone')
         colabsvc.State(self.svc).save(hostname='new.example.com',transport='frp',cloudflare_route=old,tunnel_id='tunnel')
-        with patch.object(colabsvc,'run'),patch.object(colabsvc,'delete_named_tunnel') as delete, \
+        with patch.object(colabsvc,'run',return_value=argparse.Namespace(returncode=0)),patch.object(colabsvc,'delete_named_tunnel') as delete, \
              contextlib.redirect_stdout(io.StringIO()):
             colabsvc.cmd_down(self.svc,argparse.Namespace(all=False,delete_tunnel=True))
         delete.assert_called_once_with(old)

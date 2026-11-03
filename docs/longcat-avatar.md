@@ -6,7 +6,7 @@
 
 ```bash
 colabllm longcat-avatar up --domain
-colabllm longcat-avatar info       # 查看网页登录账号密码、API Token
+colabllm longcat-avatar info --show-secrets       # 查看网页登录账号密码、API Token
 colabllm longcat-avatar status
 colabllm longcat-avatar logs -f
 colabllm longcat-avatar down

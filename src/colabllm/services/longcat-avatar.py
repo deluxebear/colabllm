@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from colabsvc import Service, State, apply_instance, extract_instance_arg, main  # noqa: E402
+from colabsvc import Service, State, main  # noqa: E402
 from avatar_sampling import sampling_settings
 
 SERVICE = Service(
@@ -46,12 +46,7 @@ def drive_spec(value):
     return value if is_drive_path(value) else "drive://" + value.lstrip("/")
 
 
-class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
-        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
-            raise RuntimeError("拒绝向其他站点转发认证信息")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+from cli_support import SameOriginRedirect
 
 
 class AvatarClient:
@@ -167,9 +162,9 @@ class AvatarClient:
         return str(output)
 
 
-def custom_parser():
-    parser = argparse.ArgumentParser(description="Avatar 1.5：提交生成、查询后台任务、下载视频")
-    commands = parser.add_subparsers(dest="cmd", required=True)
+def custom_parser(parser=None, commands=None):
+    parser = parser or argparse.ArgumentParser(prog="colabllm longcat-avatar", description="Avatar 1.5：提交生成、查询后台任务、下载视频")
+    commands = commands or parser.add_subparsers(dest="cmd", required=True)
     generate = commands.add_parser("generate", help="提交生成任务；默认按完整音频时长生成")
     audio = generate.add_mutually_exclusive_group(required=True)
     audio.add_argument("--audio", help="本地音频或 drive:// 网盘路径")
@@ -253,20 +248,11 @@ def run_custom(args):
     print(json.dumps(state, ensure_ascii=False, indent=2))
 
 
+def configure_cli(parser, commands, up):
+    custom_parser(parser, commands)
+
+
 if __name__ == "__main__":
-    instance, argv = extract_instance_arg(sys.argv[1:])
-    if argv and argv[0] in ("generate", "job", "download", "ls-drive"):
-        apply_instance(SERVICE, instance)
-        try:
-            run_custom(custom_parser().parse_args(argv))
-        except KeyboardInterrupt:
-            print("已停止客户端等待；已提交的服务端任务继续运行，可用 job 命令查询。", file=sys.stderr)
-            sys.exit(130)
-        except (OSError, ValueError, RuntimeError) as error:
-            if isinstance(error, urllib.error.HTTPError):
-                print(f"HTTP {error.code}: {error.read(1024).decode(errors='replace')}", file=sys.stderr)
-            else:
-                print(str(error), file=sys.stderr)
-            sys.exit(1)
-    else:
-        main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli,
+        handlers={name: run_custom for name in ("generate", "job", "download", "ls-drive")}))

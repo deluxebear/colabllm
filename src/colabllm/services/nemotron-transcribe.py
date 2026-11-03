@@ -61,12 +61,12 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cli_support import safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
     apply_instance,
     die,
-    extract_instance_arg,
     list_service_instances,
     log,
     main,
@@ -232,45 +232,6 @@ SERVICE = Service(
 )
 
 
-def _extract_up_extra_args() -> None:
-    """Allow `--precision bf16|fp8|nvfp4`, `--repo <hf_repo>`, and `--mtp <N>` on `up`."""
-    argv = sys.argv[1:]
-    cleaned = [sys.argv[0]]
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--precision" and i + 1 < len(argv):
-            prec = argv[i + 1].strip().lower()
-            if prec not in PRECISION_REPOS:
-                die(f"unsupported --precision '{prec}'; choose from: {', '.join(PRECISION_REPOS)}")
-            SERVICE.env["CT_NEMOTRON_PRECISION"] = prec
-            SERVICE.env["CT_NEMOTRON_REPO"] = PRECISION_REPOS[prec]
-            i += 2
-        elif a.startswith("--precision="):
-            prec = a.split("=", 1)[1].strip().lower()
-            if prec not in PRECISION_REPOS:
-                die(f"unsupported --precision '{prec}'; choose from: {', '.join(PRECISION_REPOS)}")
-            SERVICE.env["CT_NEMOTRON_PRECISION"] = prec
-            SERVICE.env["CT_NEMOTRON_REPO"] = PRECISION_REPOS[prec]
-            i += 1
-        elif a == "--repo" and i + 1 < len(argv):
-            SERVICE.env["CT_NEMOTRON_REPO"] = argv[i + 1].strip()
-            i += 2
-        elif a.startswith("--repo="):
-            SERVICE.env["CT_NEMOTRON_REPO"] = a.split("=", 1)[1].strip()
-            i += 1
-        elif a == "--mtp" and i + 1 < len(argv):
-            SERVICE.env["CT_NEMOTRON_MTP"] = str(int(argv[i + 1]))
-            i += 2
-        elif a.startswith("--mtp="):
-            SERVICE.env["CT_NEMOTRON_MTP"] = str(int(a.split("=", 1)[1]))
-            i += 1
-        else:
-            cleaned.append(a)
-            i += 1
-    sys.argv = cleaned
-
-
 def _get_endpoint(url_override: str | None = None, token_override: str | None = None) -> tuple[str, str]:
     st = State(SERVICE).load()
     url = (url_override or os.environ.get("NEMOTRON_URL") or st.get("url") or "").rstrip("/")
@@ -339,7 +300,7 @@ def _http_request(url: str, token: str, payload: dict[str, Any] | None = None, t
         method = "POST"
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with safe_urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
@@ -678,16 +639,21 @@ def _list_drive_via_colab_cli(
     return base_dir, top_dirs, audio_items
 
 
-def _cmd_ls_drive(argv: list[str]) -> None:
-    p = argparse.ArgumentParser(
-        prog=f"{Path(sys.argv[0]).name} ls-drive",
+def _build_ls_drive_parser(parser=None):
+    p = parser or argparse.ArgumentParser(
+        prog=f"colabllm nemotron-transcribe ls-drive",
         description="直接通过 Colab 已挂载的 /content/drive 查询网盘目录与音频文件（无需走公网 HTTP 隧道）",
     )
     p.add_argument("path", nargs="?", default="", help="网盘相对路径、目录或通配符（如 'video' 或 'meetings/*.wav'，留空默认 MyDrive 根目录）")
     p.add_argument("-r", "--recursive", action="store_true", default=False, help="递归搜索子目录中的音频文件（默认仅列出当前目录，避免全盘扫描超时）")
     p.add_argument("--no-recursive", dest="recursive", action="store_false", help="仅列出当前层级目录")
     p.add_argument("--json", action="store_true", help="输出原始 JSON")
-    a = p.parse_args(argv)
+    return p
+
+
+def _cmd_ls_drive(argv) -> None:
+    p = _build_ls_drive_parser()
+    a = argv if isinstance(argv, argparse.Namespace) else p.parse_args(argv)
 
     base_dir, sub_dirs, audio_files = _list_drive_via_colab_cli(SERVICE.name, a.path, recursive=a.recursive)
     if a.json:
@@ -1339,9 +1305,9 @@ def _save_local_result(res: dict[str, Any], out_dir: Path) -> list[str]:
     return saved
 
 
-def _cmd_download(argv: list[str]) -> None:
-    p = argparse.ArgumentParser(
-        prog=f"{Path(sys.argv[0]).name} download",
+def _build_download_parser(parser=None):
+    p = parser or argparse.ArgumentParser(
+        prog=f"colabllm nemotron-transcribe download",
         description="使用 yt-dlp 将多媒体 URL（YouTube、Twitter/X、Bilibili、TikTok 等）自动下载音频或完整视频并保存到 Google Drive 网盘",
     )
     p.add_argument("urls", nargs="+", metavar="URL", help="一个或多个多媒体 URL（支持 YouTube、Twitter/X、Bilibili 等）")
@@ -1380,7 +1346,12 @@ def _cmd_download(argv: list[str]) -> None:
     p.add_argument("--url", help="覆盖服务公网 URL")
     p.add_argument("--api-token", help="覆盖 Bearer API Token")
     p.add_argument("--json", action="store_true", help="输出原始 JSON")
-    a = p.parse_args(argv)
+    return p
+
+
+def _cmd_download(argv) -> None:
+    p = _build_download_parser()
+    a = argv if isinstance(argv, argparse.Namespace) else p.parse_args(argv)
 
     if a.instance:
         apply_instance(SERVICE, a.instance)
@@ -1443,9 +1414,9 @@ def _cmd_download(argv: list[str]) -> None:
             print(f"     title     : {item['title']}")
 
 
-def _cmd_transcribe(argv: list[str]) -> None:
-    p = argparse.ArgumentParser(
-        prog=f"{Path(sys.argv[0]).name} transcribe",
+def _build_transcribe_parser(parser=None):
+    p = parser or argparse.ArgumentParser(
+        prog=f"colabllm nemotron-transcribe transcribe",
         description="调用 Colab G4 上的 Nemotron-3.5-Transcribe-30B-A4B 处理多媒体 URL（YouTube/Twitter 等 via yt-dlp）、Google Drive 网盘或本地单个/批量音频文件",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1544,7 +1515,12 @@ def _cmd_transcribe(argv: list[str]) -> None:
     p.add_argument("--url", help="覆盖服务公网 URL")
     p.add_argument("--api-token", help="覆盖 Bearer API Token")
     p.add_argument("--json", action="store_true", help="向标准输出打印完整 JSON 结果")
-    a = p.parse_args(argv)
+    return p
+
+
+def _cmd_transcribe(argv) -> None:
+    p = _build_transcribe_parser()
+    a = argv if isinstance(argv, argparse.Namespace) else p.parse_args(argv)
 
     if a.instance:
         apply_instance(SERVICE, a.instance)
@@ -1581,7 +1557,7 @@ def _cmd_transcribe(argv: list[str]) -> None:
                 if not a.json:
                     inst_tag = f" [{inst_name}]" if len(endpoints) > 1 else ""
                     hdr = f"[{idx}/{total}]{inst_tag} {res['label']} ({res.get('elapsed_sec', 0):.2f}s)"
-                    print(f"\n\033[32m=== {hdr} ===\033[0m", flush=True)
+                    print(f"\n=== {hdr} ===", flush=True)
                     if res.get("source_url") and res.get("drive_path"):
                         log(f"媒体 URL 已下载至网盘: {res['drive_path']} (来源: {res['source_url']})")
                     if (res.get("chunk_count") or 1) > 1:
@@ -1631,21 +1607,29 @@ def _cmd_transcribe(argv: list[str]) -> None:
         die(f"完成 {len(results)}/{total} 个任务，{len(errors)} 个任务失败。")
 
 
+
+def configure_cli(parser, commands, up):
+    _build_transcribe_parser(commands.add_parser("transcribe", aliases=["run"], help="transcribe audio"))
+    _build_download_parser(commands.add_parser("download", aliases=["yt-dlp", "ytdlp"], help="download media to Drive"))
+    _build_ls_drive_parser(commands.add_parser("ls-drive", help="list Drive audio"))
+    commands.add_parser("prompts", help="list transcription prompt presets")
+    up.add_argument("--precision", choices=tuple(PRECISION_REPOS))
+    up.add_argument("--repo", help="override model repository")
+    up.add_argument("--mtp", type=int, help="override MTP value")
+
+
+def prepare_up(args):
+    if args.precision:
+        SERVICE.env.update(CT_NEMOTRON_PRECISION=args.precision, CT_NEMOTRON_REPO=PRECISION_REPOS[args.precision])
+    if args.repo:
+        SERVICE.env["CT_NEMOTRON_REPO"] = args.repo
+    if args.mtp is not None:
+        SERVICE.env["CT_NEMOTRON_MTP"] = str(args.mtp)
+
+
 if __name__ == "__main__":
-    inst_id, rem_argv = extract_instance_arg(sys.argv[1:])
-    if inst_id:
-        apply_instance(SERVICE, inst_id)
-    if len(rem_argv) >= 1 and rem_argv[0] in ("transcribe", "run"):
-        _cmd_transcribe(rem_argv[1:])
-        sys.exit(0)
-    if len(rem_argv) >= 1 and rem_argv[0] in ("download", "yt-dlp", "ytdlp"):
-        _cmd_download(rem_argv[1:])
-        sys.exit(0)
-    if len(rem_argv) >= 1 and rem_argv[0] == "ls-drive":
-        _cmd_ls_drive(rem_argv[1:])
-        sys.exit(0)
-    if len(rem_argv) >= 1 and rem_argv[0] == "prompts":
-        _cmd_prompts()
-        sys.exit(0)
-    _extract_up_extra_args()
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli, prepare_up=prepare_up,
+        handlers={"transcribe": _cmd_transcribe, "run": _cmd_transcribe, "download": _cmd_download,
+                  "yt-dlp": _cmd_download, "ytdlp": _cmd_download, "ls-drive": _cmd_ls_drive,
+                  "prompts": lambda args: _cmd_prompts()}))

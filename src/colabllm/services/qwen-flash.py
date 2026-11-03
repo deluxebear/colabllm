@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from colabsvc import Service, apply_instance, extract_instance_arg, main  # noqa: E402
+from colabsvc import Service, main  # noqa: E402
 
 SERVICE = Service(
     name="qwen-flash",
@@ -51,7 +51,5 @@ SERVICE = Service(
 
 
 if __name__ == "__main__":
-    _inst_id, _rem = extract_instance_arg(sys.argv[1:])
-    if _inst_id:
-        apply_instance(SERVICE, _inst_id)
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE))

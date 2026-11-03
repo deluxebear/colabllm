@@ -8,7 +8,7 @@
 colabllm unlimited-ocr up
 colabllm unlimited-ocr status
 colabllm unlimited-ocr logs -f
-colabllm unlimited-ocr info  # 含凭证，请勿分享输出
+colabllm unlimited-ocr info --show-secrets  # 含凭证，请勿分享输出
 ```
 
 遵循 `colabllm tunnel-config` 的项目级设置；当前配置的域名对应 `https://unlimited-ocr.example.com`。支持 `up --gpu A100`、`--quick-tunnel`、`--transport cloudflare|frp`、`-i ID` 等共享参数。Caddy 提供 Basic / Bearer 认证。`CT_READY` 前必须完成模型加载和真实 GPU 推理预热。

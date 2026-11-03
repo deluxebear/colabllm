@@ -28,7 +28,8 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from colabsvc import Service, State, apply_instance, extract_instance_arg, main
+from cli_support import safe_urlopen
+from colabsvc import Service, State, main
 from ocr_parameters import add_inference_arguments, cli_parameters
 
 SERVICE = Service(name='unlimited-ocr', notebook='unlimited-ocr.ipynb', gpu='A100',
@@ -46,7 +47,7 @@ def request(path, args, payload=None):
         headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json',
                  'User-Agent': 'UnlimitedOCRCLI/1.0'})
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with safe_urlopen(req, timeout=60) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode(errors="replace")}') from error
@@ -176,9 +177,9 @@ def download_results(job, args):
     return job
 
 
-def cli(argv):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    commands = parser.add_subparsers(dest='command', required=True)
+def custom_parser(parser=None, commands=None):
+    parser = parser or argparse.ArgumentParser(prog="colabllm unlimited-ocr", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = commands or parser.add_subparsers(dest="command", required=True)
     ocr = commands.add_parser('ocr', aliases=['convert', 'run'], help='本地或 Drive 文件/目录批量转换')
     ocr.add_argument('inputs', nargs='+')
     mode = ocr.add_mutually_exclusive_group()
@@ -206,7 +207,15 @@ def cli(argv):
     for p in (ocr, job, resume, listing):
         p.add_argument('--url')
         p.add_argument('--poll-interval', type=float, default=5)
-    args = parser.parse_args(argv)
+    for name, command in commands.choices.items():
+        if name in ("ocr", "convert", "run", "job", "resume", "ls-drive"):
+            command.set_defaults(command=name)
+    return parser
+
+
+def cli(argv):
+    parser = custom_parser()
+    args = argv if isinstance(argv, argparse.Namespace) else parser.parse_args(argv)
     if args.poll_interval <= 0:
         parser.error('--poll-interval 必须大于 0')
     if args.command in ('ocr', 'convert', 'run'):
@@ -237,13 +246,11 @@ def cli(argv):
     return 1 if result.get('status') in ('failed', 'interrupted') else 0
 
 
+def configure_cli(parser, commands, up):
+    custom_parser(parser, commands)
+
+
 if __name__ == '__main__':
-    instance, remaining = extract_instance_arg(sys.argv[1:])
-    if remaining and remaining[0] in ('ocr', 'convert', 'run', 'job', 'resume', 'ls-drive'):
-        apply_instance(SERVICE, instance)
-        try:
-            sys.exit(cli(remaining))
-        except (ValueError, RuntimeError, OSError) as error:
-            print(str(error), file=sys.stderr)
-            sys.exit(1)
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli,
+        handlers={name: cli for name in ('ocr', 'convert', 'run', 'job', 'resume', 'ls-drive')}))

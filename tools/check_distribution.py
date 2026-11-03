@@ -44,8 +44,21 @@ def check(wheel):
         command = str(root / 'bin/colabllm')
         assert run([command, '--version']).startswith('colabllm ')
         assert run([command, 'services']).splitlines() == services
+        business = {
+            'qwen3-tts': ('tts', 'voices', 'design-voice'),
+            'indextts': ('tts', 'voices'),
+            'comfyui': ('pull-workflow', 'pull-model'),
+            'unlimited-ocr': ('ocr', 'job', 'resume'),
+            'longcat-avatar': ('generate', 'job', 'download'),
+            'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),
+        }
         for service in services:
-            run([command, service, '--help'])
+            help_text = run([command, service, '--help'])
+            assert '_exec' not in help_text
+            for subcommand in business.get(service, ()):
+                assert subcommand in help_text
+                run([command, service, subcommand, '--help'])
+            json.loads(run([command, service, 'info', '--json']))
         run([command, 'frp-config', '--help'])
         config = json.loads(run([command, 'tunnel-config', '--base-domain', 'example.com']))
         state_home = home / '.colabllm'

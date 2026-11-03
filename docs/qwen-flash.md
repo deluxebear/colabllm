@@ -3,8 +3,8 @@
 > Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[src/colabllm/services/qwen-flash.py](services/qwen-flash.py)
-- 远端 Notebook：[src/colabllm/services/qwen-flash.ipynb](services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/qwen-flash.py](../src/colabllm/services/qwen-flash.py)
+- 远端 Notebook：[src/colabllm/services/qwen-flash.ipynb](../src/colabllm/services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
 
 ---
 
@@ -33,7 +33,7 @@ colabllm qwen-flash up --domain
 colabllm qwen-flash up --quick-tunnel
 
 # 3. 查看访问地址与 Bearer API Token
-colabllm qwen-flash info
+colabllm qwen-flash info --show-secrets
 
 # 4. 查看实时准备进度（HF 下载 / llama.cpp 编译 / 模型加载心跳）
 colabllm qwen-flash logs -f
@@ -74,7 +74,7 @@ colabllm qwen-flash down --all
 
 ## 3. OpenAI 兼容 API 调用示例
 
-先通过 `colabllm qwen-flash info` 获取 `API_TOKEN`：
+先通过 `colabllm qwen-flash info --show-secrets` 获取 `API_TOKEN`：
 
 ### 3.1 查看模型列表 (`/v1/models`)
 
@@ -124,7 +124,7 @@ curl -s https://qwen.example.com/v1/chat/completions \
 
 ## 4. 可选环境变量覆盖
 
-如需调整上下文长度或量化版本，可在 [`src/colabllm/services/qwen-flash.py`](services/qwen-flash.py) 的 `SERVICE.env` 中修改：
+如需调整上下文长度或量化版本，可在 [`src/colabllm/services/qwen-flash.py`](../src/colabllm/services/qwen-flash.py) 的 `SERVICE.env` 中修改：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |

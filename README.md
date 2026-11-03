@@ -78,6 +78,20 @@ uv publish dist/colabllm-0.1.1-py3-none-any.whl dist/colabllm-0.1.1.tar.gz
 上传需要自行配置 PyPI 身份认证并选择项目许可证。版本号以 `pyproject.toml` 为准。
 通过本地 wheel 安装的用户可安装新 wheel 更新；通过 PyPI 安装的用户使用 `uv tool upgrade colabllm`。
 
+## CLI 行为约定
+
+- `colabllm <服务> --help` 列出生命周期和服务专用命令；`colabllm help <服务> <命令>` 查看详细帮助。
+- `-i/--instance` 可放在服务参数的任意位置，`--` 之后按字面解析；实例 ID 必须为 1–64 位字母、数字、下划线或连字符，且不能以连字符开头。
+- 普通结果写入 stdout，进度和告警写入 stderr；`--json` 的 stdout 只包含 JSON。
+- `info`、`ps`、`list`、`status` 支持 `--json`，默认隐藏凭据；需要时显式加 `--show-secrets`。
+- `--quiet` 抑制诊断进度，错误仍然显示；`--no-color` 或 `NO_COLOR` 关闭诊断颜色。非终端输出自动关闭诊断颜色。
+- 常见网络、文件和配置错误默认给出简洁提示；`--debug` 显示异常堆栈。
+- 成功退出码为 0；操作失败为非零，参数用法错误为 2；外部 Colab 命令失败时保留其正退出码；Ctrl+C 为 130。
+- `up` 默认等待 `CT_READY`；等待超时返回失败，但后台 runner 保留。`up --detach` 仅启动后台 runner，立即返回；`up --foreground` 在当前终端保持连接。
+- 同一实例的启动和停止互斥；状态事务使用文件锁和原子替换。前台/后台 runner 都记录进程启动身份，停止前校验身份并等待退出。
+- `down` 先确认远端停止成功，再停止本地连接并清理运行状态；远端停止失败时保留连接和追踪信息，便于重试。
+- 携带认证信息的 HTTP 请求拒绝跨来源重定向。
+
 ## 测试
 
 本地 CLI 与控制逻辑使用 Python 标准库，默认测试无需 Torch、NumPy 或 GPU：
@@ -318,7 +332,7 @@ colabllm ollama up --domain
 colabllm qwen-flash up --domain     # 绑定 https://qwen.example.com（G4 GPU，800K 上下文 + 视觉）
 
 # 3. 查看访问 URL、登录密码与 API Token
-colabllm ollama info
+colabllm ollama info --show-secrets
 
 # 4. 查看实时日志 / 检查状态与公网连通性
 colabllm ollama logs -f
@@ -352,7 +366,7 @@ colabllm nemotron-transcribe up -i 2 --domain   # -> https://transcribe-2.exampl
 colabllm <name> ps
 
 # 查看指定实例的详情 / 日志 / 状态
-colabllm <name> info -i 2
+colabllm <name> info --show-secrets -i 2
 colabllm <name> logs -i 2 -f
 colabllm <name> status -i 2
 

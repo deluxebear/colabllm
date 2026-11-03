@@ -16,6 +16,11 @@ def services():
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
+    flags = []
+    while argv and argv[0] in ('--debug', '--quiet', '--no-color'):
+        flags.append(argv.pop(0))
+    if len(argv) > 1 and argv[0] == 'help':
+        argv = [*argv[1:], '--help']
     available = services()
     if not argv or argv[0] in ('-h', '--help', 'help'):
         print('用法: colabllm <运行时> <命令> [参数...]\n'
@@ -28,6 +33,7 @@ def main(argv=None):
               '  colabllm unlimited-ocr ocr ./documents -O ./results\n'
               '  colabllm qwen3-tts up -i 2\n'
               '  colabllm tunnel-config\n\n'
+              '全局选项: --debug、--quiet、--no-color\n'
               'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
         return 0
     if argv == ['--version']:
@@ -51,7 +57,7 @@ def main(argv=None):
         return 2
     # Replace this process: preserve signals, exit codes and the caller's cwd/local file paths.
     # Keep the actual service script as argv[0], since its detached runner uses that path.
-    os.execv(sys.executable, [sys.executable, str(script), *remaining])
+    os.execv(sys.executable, [sys.executable, str(script), *flags, *remaining])
 
 
 if __name__ == '__main__':

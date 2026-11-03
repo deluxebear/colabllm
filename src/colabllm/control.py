@@ -3,7 +3,6 @@
 import argparse
 import sys
 import json
-import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
@@ -27,24 +26,22 @@ def main(argv=None):
     frp.add_argument('--disable',action='store_true',help='关闭全局 FRP，之后启动恢复使用 Cloudflare')
     commands.add_parser('frp-status',help='通过 SSH 检查 FRP/Caddy 服务和已分配路由')
     args = parser.parse_args(argv)
-    try:
-        if args.command=='tunnel-config':
-            cmd_tunnel_config(args)
-        elif args.command=='frp-config':
-            from frp_backend import configure
-            if args.disable and any(getattr(args,k) is not None for k in ('server_ip','ssh','base_domain','server_port')):
-                parser.error('--disable 不能与服务器配置参数同时使用')
-            result=configure(args,colabsvc.STATE_ROOT)
-            print(json.dumps(result,ensure_ascii=False,indent=2))
-        else:
-            from frp_backend import remote
-            config=colabsvc.load_tunnel_config().get('frp')
-            if not config:
-                raise ValueError('尚未配置 FRP 服务端')
-            print(json.dumps(remote(config,{'action':'status'}),ensure_ascii=False,indent=2))
-    except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
-        parser.error(str(error))
+    if args.command=='tunnel-config':
+        cmd_tunnel_config(args)
+    elif args.command=='frp-config':
+        from frp_backend import configure
+        if args.disable and any(getattr(args,k) is not None for k in ('server_ip','ssh','base_domain','server_port')):
+            parser.error('--disable 不能与服务器配置参数同时使用')
+        result=configure(args,colabsvc.STATE_ROOT)
+        print(json.dumps(result,ensure_ascii=False,indent=2))
+    else:
+        from frp_backend import remote
+        config=colabsvc.load_tunnel_config().get('frp')
+        if not config:
+            raise ValueError('尚未配置 FRP 服务端')
+        print(json.dumps(remote(config,{'action':'status'}),ensure_ascii=False,indent=2))
 
 
 if __name__ == '__main__':
-    main()
+    from cli_support import run_cli
+    run_cli(main)

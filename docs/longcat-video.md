@@ -6,7 +6,7 @@
 
 ```bash
 colabllm longcat-video up --domain   # 默认 G4，https://longcat-video.example.com
-colabllm longcat-video info          # 查看地址、登录账号、密码、API Token
+colabllm longcat-video info --show-secrets          # 查看地址、登录账号、密码、API Token
 colabllm longcat-video status
 colabllm longcat-video logs -f
 colabllm longcat-video down

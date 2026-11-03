@@ -3,8 +3,8 @@
 > Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[src/colabllm/services/unsloth-studio.py](services/unsloth-studio.py)
-- 远端 Notebook：[src/colabllm/services/unsloth-studio.ipynb](services/unsloth-studio.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/unsloth-studio.py](../src/colabllm/services/unsloth-studio.py)
+- 远端 Notebook：[src/colabllm/services/unsloth-studio.ipynb](../src/colabllm/services/unsloth-studio.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
 
 ---
 
@@ -33,7 +33,7 @@ colabllm unsloth-studio up --quick-tunnel
 colabllm unsloth-studio up --domain --gpu A100 --hf-token hf_xxx
 
 # 4. 查看访问 URL 与 Web 登录账号密码
-colabllm unsloth-studio info
+colabllm unsloth-studio info --show-secrets
 
 # 5. 查看实时训练/运行日志
 colabllm unsloth-studio logs -f
@@ -53,9 +53,9 @@ colabllm unsloth-studio down
 # 启动第 2 个实例（会话 unsloth-studio-2，绑定 https://unsloth-studio-2.example.com）
 colabllm unsloth-studio up -i 2 --domain --gpu A100
 
-# 查看所有 Unsloth Studio 实例状态、URL 与登录凭据
+# 查看所有 Unsloth Studio 实例状态与 URL；凭据需显式 --show-secrets
 colabllm unsloth-studio ps
-colabllm unsloth-studio info -i 2
+colabllm unsloth-studio info --show-secrets -i 2
 
 # 查看第 2 个实例日志 / 停止指定或全部实例
 colabllm unsloth-studio logs -i 2 -f
@@ -67,7 +67,7 @@ colabllm unsloth-studio down --all
 
 ## 3. Web 界面登录与使用
 
-1. 运行 `colabllm unsloth-studio up --domain` 等待就绪横幅输出（或随时运行 `colabllm unsloth-studio info`）：
+1. 运行 `colabllm unsloth-studio up --domain` 等待就绪，再运行 `colabllm unsloth-studio info --show-secrets` 获取登录信息：
    - `URL`：`https://unsloth-studio.example.com`
    - `app login`：显示的用户名与密码（`admin / <password>`）
 2. 在浏览器中打开该 URL，输入上述登录凭据即可进入 Unsloth Studio 可视化微调、推理与模型导出界面。

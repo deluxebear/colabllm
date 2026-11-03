@@ -55,6 +55,15 @@ locations. Relative input/output paths remain relative to the caller's working d
 Stop services before upgrading and restart them afterwards. Existing repository `.state/` is unused;
 there is no migration. New service pairs are discovered automatically and must be included in builds.
 
+Runtime command registration belongs in the shared parser (`main(..., configure=..., handlers=...)`),
+and script entry points use `cli_support.run_cli` for consistent errors. Local authenticated HTTP
+clients use `safe_urlopen` or `SameOriginRedirect`. Keep diagnostics on stderr and JSON on stdout.
+Instance IDs are validated strictly; parsing stops at `--`. State updates are locked transactions;
+startup/shutdown also use a per-instance operation lock. Both foreground and detached runners record
+PID plus start identity, and shutdown verifies ownership before signalling. `down` preserves state
+on remote stop failure; readiness timeout is nonzero, while `up --detach` explicitly skips waiting.
+`info/ps/status --json` default to redacted output; credentials require `--show-secrets`.
+
 ## Daily use and transport selection
 
 Read `colabllm tunnel-config` before choosing a public URL. It reports project-wide
@@ -74,7 +83,7 @@ colabllm tunnel-config --base-domain example.com  # shared by all services/insta
 colabllm <name> up                                # selected global backend
 colabllm <name> up --quick-tunnel
 colabllm <name> up --transport cloudflare --domain llm.example.com --gpu A100
-colabllm <name> info               # prints credentials; avoid echoing them in tool output
+colabllm <name> info --show-secrets               # prints credentials; avoid echoing them in tool output
 colabllm <name> logs -f
 colabllm <name> down               # stop runner + VM; --delete-tunnel cleans this instance's resources
 ```

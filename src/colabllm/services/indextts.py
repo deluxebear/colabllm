@@ -40,12 +40,11 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+from cli_support import safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
-    apply_instance,
     die,
-    extract_instance_arg,
     log,
     main,
 )
@@ -84,32 +83,12 @@ EMO_PRESETS: dict[str, list[float]] = {
 }
 
 
-def _extract_up_extra_args() -> None:
-    """Allow `--model`, `--alias`, `--stage0-gpu-mem`, `--stage1-gpu-mem`, `--max-model-len`, `--max-seqs` on `up`."""
-    flag_map = {
-        "--model": "CT_INDEXTTS_MODEL",
-        "--alias": "CT_INDEXTTS_ALIAS",
-        "--stage0-gpu-mem": "CT_INDEXTTS_GPU_MEM_STAGE0",
-        "--stage1-gpu-mem": "CT_INDEXTTS_GPU_MEM_STAGE1",
-        "--max-model-len": "CT_INDEXTTS_MAX_MODEL_LEN",
-        "--max-seqs": "CT_INDEXTTS_MAX_NUM_SEQS",
-    }
-    argv = sys.argv[1:]
-    cleaned = [sys.argv[0]]
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a in flag_map and i + 1 < len(argv):
-            SERVICE.env[flag_map[a]] = argv[i + 1].strip()
-            i += 2
-        elif "=" in a and a.split("=", 1)[0] in flag_map:
-            k, v = a.split("=", 1)
-            SERVICE.env[flag_map[k]] = v.strip()
-            i += 1
-        else:
-            cleaned.append(a)
-            i += 1
-    sys.argv = cleaned
+UP_ENV_FLAGS = {'--model': 'CT_INDEXTTS_MODEL',
+ '--alias': 'CT_INDEXTTS_ALIAS',
+ '--stage0-gpu-mem': 'CT_INDEXTTS_GPU_MEM_STAGE0',
+ '--stage1-gpu-mem': 'CT_INDEXTTS_GPU_MEM_STAGE1',
+ '--max-model-len': 'CT_INDEXTTS_MAX_MODEL_LEN',
+ '--max-seqs': 'CT_INDEXTTS_MAX_NUM_SEQS'}
 
 
 def _get_endpoint(url_override: str | None = None, token_override: str | None = None) -> tuple[str, str]:
@@ -147,7 +126,7 @@ def _http_json(
         method=method or ("POST" if data is not None else "GET"),
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with safe_urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
             return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {"raw": raw})
     except urllib.error.HTTPError as err:
@@ -305,7 +284,7 @@ def cmd_upload_voice(args: argparse.Namespace) -> int:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with safe_urlopen(req, timeout=90) as resp:
             out = json.loads(resp.read().decode("utf-8", errors="replace"))
             print(json.dumps(out, indent=2, ensure_ascii=False))
             return 0
@@ -396,7 +375,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
     )
     t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+        with safe_urlopen(req, timeout=args.timeout) as resp:
             audio_bytes = resp.read()
             elapsed = time.monotonic() - t0
             saved_drive = resp.headers.get("X-Saved-Drive-Path")
@@ -425,9 +404,9 @@ def _add_endpoint_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--api-token", help="Override Bearer API token")
 
 
-def _build_custom_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="indextts.py")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
+    p = parser or argparse.ArgumentParser(prog="colabllm indextts")
+    sub = commands or p.add_subparsers(dest="cmd", required=True)
 
     for tts_name in ("tts", "speak"):
         sp = sub.add_parser(tts_name, help="Synthesize speech via /v1/audio/speech (zero-shot or named voice)")
@@ -485,21 +464,22 @@ def _build_custom_parser() -> argparse.ArgumentParser:
 CUSTOM_CMDS = {"tts", "speak", "voices", "upload-voice", "delete-voice", "ls-drive"}
 
 
+
+def configure_cli(parser, commands, up):
+    _build_custom_parser(parser, commands)
+    for flag, env in UP_ENV_FLAGS.items():
+        up.add_argument(flag, dest="up_" + env, help=f"override {env}")
+
+
+def prepare_up(args):
+    for flag, env in UP_ENV_FLAGS.items():
+        value = getattr(args, "up_" + env)
+        if value is not None:
+            SERVICE.env[env] = value
+
+
 if __name__ == "__main__":
-    inst_id, rem_argv = extract_instance_arg(sys.argv[1:])
-    if inst_id:
-        apply_instance(SERVICE, inst_id)
-    if len(rem_argv) >= 1 and rem_argv[0] in CUSTOM_CMDS:
-        parser = _build_custom_parser()
-        parsed = parser.parse_args(rem_argv)
-        dispatch = {
-            "tts": cmd_tts,
-            "speak": cmd_tts,
-            "voices": cmd_voices,
-            "upload-voice": cmd_upload_voice,
-            "delete-voice": cmd_delete_voice,
-            "ls-drive": cmd_ls_drive,
-        }
-        sys.exit(dispatch[parsed.cmd](parsed))
-    _extract_up_extra_args()
-    main(SERVICE)
+    from cli_support import run_cli
+    run_cli(lambda: main(SERVICE, configure=configure_cli, prepare_up=prepare_up,
+                        handlers={"tts": cmd_tts, "speak": cmd_tts, "voices": cmd_voices,
+                "upload-voice": cmd_upload_voice, "delete-voice": cmd_delete_voice, "ls-drive": cmd_ls_drive}))

@@ -3,8 +3,8 @@
 > Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[src/colabllm/services/comfyui.py](services/comfyui.py)
-- 远端 Notebook：[src/colabllm/services/comfyui.ipynb](services/comfyui.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/comfyui.py](../src/colabllm/services/comfyui.py)
+- 远端 Notebook：[src/colabllm/services/comfyui.ipynb](../src/colabllm/services/comfyui.ipynb)（由 [templates/build_notebooks.py](../templates/build_notebooks.py) 生成）
 
 ---
 
@@ -37,7 +37,7 @@ colabllm comfyui up --domain \
 colabllm comfyui up --domain --gpu A100 --hf-token hf_xxx
 
 # 4. 查看访问地址、登录账号密码与 API Token
-colabllm comfyui info
+colabllm comfyui info --show-secrets
 
 # 5. 查看实时日志 / 检查运行状态与公网连通性
 colabllm comfyui logs -f
@@ -135,7 +135,7 @@ colabllm comfyui pull-model \
 
 ## 4. API 接口说明
 
-当通过程序调用 ComfyUI 或其扩展接口时，在请求头带上 `Authorization: Bearer <API_TOKEN>`（可通过 `colabllm comfyui info` 查看）：
+当通过程序调用 ComfyUI 或其扩展接口时，在请求头带上 `Authorization: Bearer <API_TOKEN>`（可通过 `colabllm comfyui info --show-secrets` 查看）：
 
 ```bash
 # 查询当前本地 SSD 剩余容量与已缓存模型列表
