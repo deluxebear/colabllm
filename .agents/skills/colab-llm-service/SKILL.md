@@ -210,9 +210,23 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
    For a reusable recipe add it to `templates/build_notebooks.py` instead and regenerate.
 4. Pick auth -- see [references/auth.md](references/auth.md). Rule: **never expose a service without
    auth**; if it has none, `auth="caddy"`.
-5. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
+5. Update the distributed user skill in `skills/colabllm/` in the same change. Add the runtime to
+   `SKILL.md`'s task/runtime/reference table and document its actual user workflow in an appropriate
+   `references/*.md` file (create one only for a distinct task category). Cover prerequisites/GPU,
+   startup, inference or UI access, input/output locations, authentication, waiting/recovery and
+   service-specific limits. Use installed CLI commands and portable examples, not checkout paths,
+   personal domains or credentials. Update the skill description if the new capability changes
+   when an agent should invoke it. Runtime removals and command/behavior changes require the same
+   reconciliation; the distributed skill is part of runtime delivery, not optional follow-up work.
+6. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
    Run `colabllm <name> up --dry-run`, then a real `up` (CPU `--gpu none` for wiring tests), check
    `status` (unauthenticated probe must be 401 for Caddy services), then `down`.
+7. Check user-skill links and parse its new examples against the actual CLI without submitting jobs.
+   Build with `uv build --no-sources` and run `python tools/check_distribution.py <wheel>`; verify the
+   new runtime and complete skill references are included and `colabllm skill --output <temporary-dir>`
+   works outside the checkout. Adjust packaging rules and skill-export checks when adding resource
+   types or changing the skill layout. Completion requires both the runtime and its exported user
+   guidance to be usable from the built package.
 
 ## References
 

@@ -9,7 +9,7 @@ from colabsvc import build_parser
 from paths import user_home
 
 ROOT = Path(__file__).resolve().parents[1]
-GLOBAL = ('services', 'help', 'doctor', 'completion', 'tunnel-config', 'frp-config', 'frp-status')
+GLOBAL = ('services', 'help', 'doctor', 'completion', 'skill', 'tunnel-config', 'frp-config', 'frp-status')
 FLAGS = ('--help', '--version', '--debug', '--quiet', '--no-color', '--command-timeout')
 
 
@@ -45,7 +45,7 @@ def candidates(words):
     if service == 'completion':
         return [shell for shell in ('bash', 'zsh', 'fish') if shell.startswith(prefix)]
     if service not in scripts:
-        parser = runpy.run_path(str(ROOT/'utility.py'))['build_parser']() if service == 'doctor' else None
+        parser = runpy.run_path(str(ROOT/'utility.py'))['build_parser']() if service in ('doctor', 'skill') else None
         if service in ('tunnel-config', 'frp-config', 'frp-status'):
             # Global controller parsers are also shared with completion.
             parser = runpy.run_path(str(ROOT/'control.py'))['build_parser']()

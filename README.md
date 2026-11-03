@@ -54,6 +54,34 @@ colabllm frp-status
 卸载使用 `uv tool uninstall colabllm`，用户配置目录保留。
 升级前先停止运行中的服务，升级后重新启动，避免后台 runner 依赖的安装文件被替换。
 
+## 安装 Agent Skill
+
+根目录 [skills/colabllm](skills/colabllm/SKILL.md) 提供面向使用者的独立技能，覆盖本项目所有运行时。
+它包含按任务加载的 OCR、语音、推理、媒体和排错参考，不依赖源码仓库或个人部署配置。
+
+wheel 和源码包均包含完整技能，安装 CLI 后即可导出：
+
+```bash
+# 查看主技能说明
+colabllm skill
+
+# Codex：将完整 colabllm/ 技能目录导出到个人技能目录
+colabllm skill --output "${CODEX_HOME:-$HOME/.codex}/skills"
+
+# 支持 ~/.agents/skills 的 Agent
+colabllm skill --output ~/.agents/skills
+
+# 其他 Agent：指定其实际技能目录
+colabllm skill --output /path/to/agent/skills
+```
+
+`--output` 是技能父目录，实际生成 `<目录>/colabllm/SKILL.md` 和 `references/`。
+目标已存在时返回错误，不覆盖用户修改。更新时先导出到新目录，比较后替换；CLI 升级不会自动覆盖已安装的技能。
+也可以直接从源码复制整个 `skills/colabllm/` 目录。安装后按 Agent 的方式重新加载技能或开启新会话，
+再请求“使用 colabllm 将本地 PDF 转为 Markdown”等任务。
+
+仓库内 `.agents/skills/colab-llm-service/` 是维护者技能；分发给使用者的是 `skills/colabllm/`。
+
 ## 开发、构建与发布
 
 ```bash
@@ -434,5 +462,7 @@ colabllm <name> down --all
 2. 修改 `src/colabllm/services/<name>.py` 中的 `Service(...)` 配置（端口、`auth="caddy"` 或 `"builtin"`、GPU 类型）。
 3. 修改 `src/colabllm/services/<name>.ipynb` 的 **Cell 1（安装）** 和 **Cell 2（启动服务，绑定 `127.0.0.1`）**。
 4. 先运行 `colabllm <name> up --dry-run` 检查执行计划，再正式运行 `up`。
+5. 同一变更中同步更新 `skills/colabllm/SKILL.md` 的运行时索引及对应 `references/` 用法，覆盖启动、调用、输入输出、认证和任务恢复；新增独立任务类别时再增加参考文件。新增、删除运行时或修改命令行为都需要同步维护用户技能。
+6. 核对技能示例与实际 CLI 参数一致，构建分发包，并用 `tools/check_distribution.py` 验证安装、运行时发现和完整技能导出；新增文件类型时同步调整打包规则。运行时及其用户技能均可从安装包使用后，才算完成新增流程。
 
 详细规范与排错指南见 [`.agents/skills/colab-llm-service/SKILL.md`](.agents/skills/colab-llm-service/SKILL.md)。

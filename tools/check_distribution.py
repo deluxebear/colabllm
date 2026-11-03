@@ -65,6 +65,14 @@ def check(wheel):
             assert 'colabllm _complete' in script
         assert 'tts' in run([command, '_complete', '--', 'qwen3-tts', 't']).splitlines()
         run([command, 'frp-config', '--help'])
+        skill_text = run([command, 'skill'])
+        assert 'name: colabllm' in skill_text
+        skill_parent = root / 'agent-skills'
+        exported = Path(run([command, 'skill', '--output', str(skill_parent)]).strip())
+        assert exported == skill_parent / 'colabllm'
+        assert (exported / 'SKILL.md').read_text() == skill_text
+        for reference in ('ocr', 'speech', 'inference', 'media', 'operations'):
+            assert (exported / 'references' / (reference + '.md')).is_file()
         config = json.loads(run([command, 'tunnel-config', '--base-domain', 'example.com']))
         state_home = home / '.colabllm'
         assert Path(config['config_file']) == state_home / 'tunnel-config.json'

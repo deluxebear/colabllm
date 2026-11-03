@@ -6,7 +6,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 GLOBAL_COMMANDS = ('tunnel-config', 'frp-config', 'frp-status')
-UTILITY_COMMANDS = ('doctor', 'completion')
+UTILITY_COMMANDS = ('doctor', 'completion', 'skill')
 
 
 def services():

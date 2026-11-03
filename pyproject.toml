@@ -25,3 +25,7 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 colabllm = ["lib/*.py", "services/*.py", "services/*.ipynb"]
+
+[tool.setuptools.data-files]
+"share/colabllm/skills/colabllm" = ["skills/colabllm/SKILL.md"]
+"share/colabllm/skills/colabllm/references" = ["skills/colabllm/references/*.md"]

@@ -20,7 +20,9 @@ def build_parser():
     doctor.add_argument('--timeout', type=positive_seconds, default=10, help='每项命令检查的超时秒数，默认 10')
     completion = commands.add_parser('completion', help='输出 Shell 补全脚本')
     completion.add_argument('shell', choices=('bash', 'zsh', 'fish'))
-    commands.metavar = '{doctor,completion}'
+    skill = commands.add_parser('skill', help='查看或导出随包提供的 Agent 技能')
+    skill.add_argument('--output', metavar='DIR', help='将完整技能导出到 DIR/colabllm；不覆盖已有目录')
+    commands.metavar = '{doctor,completion,skill}'
     hidden = commands.add_parser('_complete')
     hidden.add_argument('words', nargs=argparse.REMAINDER)
     return parser
@@ -36,6 +38,13 @@ def main():
             for check in result['checks']:
                 print(f"[{check['status'].upper()}] {check['name']}: {check['message']}")
         return 0 if result['ok'] else 1
+    if args.command == 'skill':
+        from skill_bundle import bundle_root, export_skill
+        if args.output:
+            print(export_skill(args.output))
+        else:
+            print((bundle_root() / 'SKILL.md').read_text(encoding='utf-8'), end='')
+        return 0
     from completion import candidates, shell_script
     if args.command == 'completion':
         print(shell_script(args.shell), end='')
