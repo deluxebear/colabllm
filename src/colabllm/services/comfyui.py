@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import safe_urlopen
+from cli_support import CliError, Deadline, positive_seconds, nonnegative_seconds, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -89,7 +89,8 @@ def _resolve_target_services(all_instances: bool = False, instances_csv: str = "
     return [SERVICE]
 
 
-def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
+def _run_remote_pull_job(body_dict: dict, svc: Service | None = None, *, timeout=0, poll=2) -> None:
+    deadline = Deadline(timeout)
     svc = svc or SERVICE
     st = State(svc).load()
     url = (st.get("url") or "").rstrip("/")
@@ -104,7 +105,7 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
     payload = json.dumps(body_dict).encode("utf-8")
     req = urllib.request.Request(f"{url}/api/ct/pull-workflow", data=payload, headers=headers, method="POST")
     try:
-        with safe_urlopen(req, timeout=60) as resp:
+        with safe_urlopen(req, timeout=deadline.remaining(60)) as resp:
             res = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -116,6 +117,7 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
     seen_logs = 0
     consecutive_errors = 0
     while True:
+        deadline.remaining()
         for line in res.get("logs", [])[seen_logs:]:
             print(f"[{svc.name}] {line}", flush=True)
             seen_logs += 1
@@ -125,17 +127,19 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None) -> None:
             break
         if status == "error":
             die(f"[{svc.name}] download failed: {res.get('error', 'unknown error')}")
-        time.sleep(2)
+        deadline.sleep(poll)
         poll_req = urllib.request.Request(f"{url}/api/ct/pull-workflow/{job_id}", headers=headers, method="GET")
         try:
-            with safe_urlopen(poll_req, timeout=30) as resp:
+            with safe_urlopen(poll_req, timeout=deadline.remaining(30)) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
             consecutive_errors = 0
+        except CliError:
+            raise
         except Exception as e:
             consecutive_errors += 1
             if consecutive_errors >= 10:
                 die(f"[{svc.name}] lost connection polling job {job_id}: {e}")
-            time.sleep(3)
+            deadline.sleep(3)
 
 
 def _cmd_pull_workflow(raw_args: list[str]) -> None:
@@ -148,7 +152,7 @@ def _cmd_pull_workflow(raw_args: list[str]) -> None:
     for svc in targets:
         for spec in wf_specs:
             log(f"[{svc.name}] requesting live SSD model download for workflow: {spec}")
-            _run_remote_pull_job({"workflow": spec}, svc=svc)
+            _run_remote_pull_job({"workflow": spec}, svc=svc, timeout=args.timeout, poll=args.poll)
 
 
 def _cmd_pull_model(raw_args: list[str]) -> None:
@@ -183,12 +187,14 @@ def _cmd_pull_model(raw_args: list[str]) -> None:
                     "models": [{"url": model_url, "directory": target_dir, "name": filename}],
                 }
             },
-        }, svc=svc)
+        }, svc=svc, timeout=args.timeout, poll=args.poll)
 
 
 
 def pull_parser(name, parser=None):
     parser = parser or argparse.ArgumentParser(prog=f"colabllm comfyui {name}")
+    parser.add_argument("--timeout", type=nonnegative_seconds, default=0, help="total wait seconds; 0 means unlimited")
+    parser.add_argument("--poll", type=positive_seconds, default=2, help="poll interval seconds")
     targets = parser.add_mutually_exclusive_group()
     targets.add_argument("-A", "--all-instances", action="store_true", help="target all running instances")
     targets.add_argument("--instances", default="", help="comma-separated instance IDs")

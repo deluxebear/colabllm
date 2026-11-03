@@ -6,6 +6,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 GLOBAL_COMMANDS = ('tunnel-config', 'frp-config', 'frp-status')
+UTILITY_COMMANDS = ('doctor', 'completion')
 
 
 def services():
@@ -17,8 +18,17 @@ def services():
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     flags = []
-    while argv and argv[0] in ('--debug', '--quiet', '--no-color'):
-        flags.append(argv.pop(0))
+    while argv:
+        if argv[0] in ('--debug', '--quiet', '--no-color') or argv[0].startswith('--command-timeout='):
+            flags.append(argv.pop(0))
+        elif argv[0] == '--command-timeout':
+            flags.append(argv.pop(0))
+            if not argv:
+                print('--command-timeout 需要秒数', file=sys.stderr)
+                return 2
+            flags.append(argv.pop(0))
+        else:
+            break
     if len(argv) > 1 and argv[0] == 'help':
         argv = [*argv[1:], '--help']
     available = services()
@@ -27,13 +37,13 @@ def main(argv=None):
               '      colabllm <全局配置命令> [参数...]\n'
               '\n'
               '运行时: ' + ', '.join(available) + '\n'
-              '全局配置: ' + ', '.join(GLOBAL_COMMANDS) + '\n\n'
+              '全局命令: ' + ', '.join((*GLOBAL_COMMANDS, *UTILITY_COMMANDS)) + '\n\n'
               '示例:\n'
               '  colabllm unlimited-ocr up\n'
               '  colabllm unlimited-ocr ocr ./documents -O ./results\n'
               '  colabllm qwen3-tts up -i 2\n'
               '  colabllm tunnel-config\n\n'
-              '全局选项: --debug、--quiet、--no-color\n'
+              '全局选项: --debug、--quiet、--no-color、--command-timeout SECONDS\n'
               'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
         return 0
     if argv == ['--version']:
@@ -49,6 +59,9 @@ def main(argv=None):
         return 0
     if command in available:
         script = available[command]
+    elif command in (*UTILITY_COMMANDS, '_complete'):
+        script = ROOT / 'utility.py'
+        remaining = [command, *remaining]
     elif command in GLOBAL_COMMANDS:
         script = ROOT / 'control.py'
         remaining = [command, *remaining]

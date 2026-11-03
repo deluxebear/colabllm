@@ -87,10 +87,55 @@ uv publish dist/colabllm-0.1.1-py3-none-any.whl dist/colabllm-0.1.1.tar.gz
 - `--quiet` 抑制诊断进度，错误仍然显示；`--no-color` 或 `NO_COLOR` 关闭诊断颜色。非终端输出自动关闭诊断颜色。
 - 常见网络、文件和配置错误默认给出简洁提示；`--debug` 显示异常堆栈。
 - 成功退出码为 0；操作失败为非零，参数用法错误为 2；外部 Colab 命令失败时保留其正退出码；Ctrl+C 为 130。
+- 就绪标记只接受完整的 `CT_READY` 协议行；日志中的普通文字提及不会被视为就绪。
 - `up` 默认等待 `CT_READY`；等待超时返回失败，但后台 runner 保留。`up --detach` 仅启动后台 runner，立即返回；`up --foreground` 在当前终端保持连接。
 - 同一实例的启动和停止互斥；状态事务使用文件锁和原子替换。前台/后台 runner 都记录进程启动身份，停止前校验身份并等待退出。
 - `down` 先确认远端停止成功，再停止本地连接并清理运行状态；远端停止失败时保留连接和追踪信息，便于重试。
-- 携带认证信息的 HTTP 请求拒绝跨来源重定向。
+- 携带认证信息的 HTTP 请求拒绝跨来源重定向。`--url` 或服务 URL 环境变量切换来源时，需要显式提供 Token，不能自动借用原服务的凭据。来源按协议、主机和有效端口比较。
+
+## 超时与环境诊断
+
+```bash
+# 外部命令上限：可放在服务名前后，也可设置 COLABLLM_COMMAND_TIMEOUT
+colabllm --command-timeout 60 ollama status
+
+# 默认模式超时只停止等待，后台 runner 保留；前台模式超时会断开本地连接
+colabllm ollama up --ready-timeout 600
+colabllm ollama up --foreground --ready-timeout 600
+
+# 轮询等待上限：0 保留不限时行为；每次请求也会受剩余时间约束
+colabllm unlimited-ocr job JOB_ID --wait --timeout 300
+colabllm comfyui pull-workflow TEMPLATE --timeout 300 --poll 2
+colabllm longcat-avatar job JOB_ID --wait --timeout 300
+
+# 默认只检查本机依赖、Drive 扩展、授权文件存在性和用户配置
+colabllm doctor
+colabllm doctor --json --transport quick --no-drive
+
+# 额外验证 Colab、Cloudflare、SSH 授权，按选中的后端执行限时只读检查
+colabllm doctor --online --timeout 10
+```
+
+超时退出码为 `124`。长驻的 `colab exec` 保活连接不受通用外部命令上限影响。
+未指定 `--command-timeout` 时，共享外部命令默认 300 秒，个别下载或 SSH 操作保留专属默认上限。
+`doctor` 不创建 GPU 会话、不挂载 Drive、不修改隧道，也不显示凭据或外部命令的原始输出。
+离线检查不会证明授权仍有效；需要时使用 `--online`，该模式禁用浏览器交互并限制每项检查时间。
+
+## Shell 补全
+
+命令、选项和枚举值来自实际解析器；实例 ID 从 `~/.colabllm/services/` 的目录名读取，补全过程不读取凭据、不联网。
+
+```bash
+# Bash：在当前 Shell 加载
+source <(colabllm completion bash)
+
+# Zsh：先启用补全系统，再加载
+# autoload -Uz compinit && compinit
+source <(colabllm completion zsh)
+```
+
+Fish 中执行 `colabllm completion fish | source`。需要持久启用时，将相应加载命令加入自己的 Shell 初始化文件，
+或将脚本保存在 `~/.colabllm/completions/` 后从初始化文件加载。
 
 ## 测试
 
@@ -108,6 +153,9 @@ python -m unittest discover -s tests
 PYTHONPATH=/content/longcat-video/repo python -m unittest discover -s tests_colab
 ```
 
+GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、三种 Shell 补全测试、构建和隔离 wheel 安装验证。工作流不执行模型测试、不启动 Colab、不自动发布包。
+
+本地缺少 Zsh/Fish 时跳过对应 Shell 集成测试；CI 会安装这些 Shell。
 本地测试中的真实 FRP 集成测试需额外指定 `COLABSVC_FRP_TEST_BIN`，默认跳过。
 
 ## 架构与职责

@@ -64,6 +64,14 @@ PID plus start identity, and shutdown verifies ownership before signalling. `dow
 on remote stop failure; readiness timeout is nonzero, while `up --detach` explicitly skips waiting.
 `info/ps/status --json` default to redacted output; credentials require `--show-secrets`.
 
+Readiness is parsed incrementally as complete protocol lines; preserve the exact `CT_READY` line
+when changing notebook output. Endpoint overrides reuse stored tokens only for the same origin;
+other origins require an explicit token. External CLI calls honor `--command-timeout` /
+`COLABLLM_COMMAND_TIMEOUT`, while `up --ready-timeout` bounds readiness waiting. Task polling
+supports `--timeout` (`0` unlimited); timeout exits use code 124. `doctor` is offline by default;
+`--online` performs bounded read-only authorization probes. `completion bash|zsh|fish` generates
+scripts using offline `_complete` introspection; completion reads instance directory names only.
+
 ## Daily use and transport selection
 
 Read `colabllm tunnel-config` before choosing a public URL. It reports project-wide

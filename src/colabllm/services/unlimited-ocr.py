@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from cli_support import safe_urlopen
+from cli_support import Deadline, positive_seconds, nonnegative_seconds, resolve_endpoint, safe_urlopen
 from colabsvc import Service, State, main
 from ocr_parameters import add_inference_arguments, cli_parameters
 
@@ -37,41 +37,45 @@ SERVICE = Service(name='unlimited-ocr', notebook='unlimited-ocr.ipynb', gpu='A10
 
 
 def request(path, args, payload=None):
-    state = State(SERVICE).load()
-    url = (args.url or os.environ.get('UNLIMITED_OCR_URL') or state.get('url') or '').rstrip('/')
-    token = os.environ.get('UNLIMITED_OCR_API_TOKEN') or state.get('api_token')
-    if not url or not token:
-        raise ValueError('请先启动服务，或设置 UNLIMITED_OCR_URL / UNLIMITED_OCR_API_TOKEN')
+    url, token = resolve_endpoint(State(SERVICE).load(), args.url, getattr(args, 'api_token', None),
+                                  url_env='UNLIMITED_OCR_URL', token_env='UNLIMITED_OCR_API_TOKEN')
     req = urllib.request.Request(url + path,
         data=json.dumps(payload).encode() if payload is not None else None,
         headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json',
                  'User-Agent': 'UnlimitedOCRCLI/1.0'})
     try:
-        with safe_urlopen(req, timeout=60) as response:
+        deadline = getattr(args, '_wait_deadline', None)
+        with safe_urlopen(req, timeout=deadline.remaining(60) if deadline else 60) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode(errors="replace")}') from error
 
 
 def wait_job(job, args):
-    last = None
-    while job['status'] in ('queued', 'running'):
-        summary = [(f['source'], f['status'], f.get('pages_done'), f.get('pages_total')) for f in job['files']]
-        if summary != last:
-            done = sum(f['status'] in ('completed', 'skipped', 'failed') for f in job['files'])
-            print(f"{job['id']} {job['status']} {done}/{len(job['files'])}", file=sys.stderr, flush=True)
-            for f in job['files']:
-                if f['status'] == 'running':
-                    print(f"  {f['source']}: {f.get('pages_done', 0)}/{f.get('pages_total', '?')} 页", file=sys.stderr)
-            last = summary
-        time.sleep(args.poll_interval)
-        try:
-            job = request('/api/jobs/' + job['id'], args)
-        except (OSError, RuntimeError) as error:
-            if isinstance(error, RuntimeError) and not re.match(r'HTTP 50[0-9]:', str(error)):
-                raise
-            print(f'服务暂不可用，等待恢复后继续查询: {error}', file=sys.stderr, flush=True)
-    return job
+    deadline = Deadline(getattr(args, 'timeout', 0), f"等待任务 {job['id']} 超时；任务仍在后台运行，可用 job 命令继续查询")
+    previous = getattr(args, '_wait_deadline', None)
+    args._wait_deadline = deadline
+    try:
+        last = None
+        while job['status'] in ('queued', 'running'):
+            summary = [(f['source'], f['status'], f.get('pages_done'), f.get('pages_total')) for f in job['files']]
+            if summary != last:
+                done = sum(f['status'] in ('completed', 'skipped', 'failed') for f in job['files'])
+                print(f"{job['id']} {job['status']} {done}/{len(job['files'])}", file=sys.stderr, flush=True)
+                for f in job['files']:
+                    if f['status'] == 'running':
+                        print(f"  {f['source']}: {f.get('pages_done', 0)}/{f.get('pages_total', '?')} 页", file=sys.stderr)
+                last = summary
+            deadline.sleep(args.poll_interval)
+            try:
+                job = request('/api/jobs/' + job['id'], args)
+            except (OSError, RuntimeError) as error:
+                if isinstance(error, RuntimeError) and not re.match(r'HTTP 50[0-9]:', str(error)):
+                    raise
+                print(f'服务暂不可用，等待恢复后继续查询: {error}', file=sys.stderr, flush=True)
+        return job
+    finally:
+        args._wait_deadline = previous
 
 
 EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
@@ -206,7 +210,9 @@ def custom_parser(parser=None, commands=None):
         p.add_argument('--local-output-dir', '-O', help='下载结果到本地目录；Drive 结果仍保留')
     for p in (ocr, job, resume, listing):
         p.add_argument('--url')
-        p.add_argument('--poll-interval', type=float, default=5)
+        p.add_argument('--api-token', help='explicit Bearer API token for the selected URL')
+        p.add_argument('--poll-interval', type=positive_seconds, default=5)
+        p.add_argument('--timeout', type=nonnegative_seconds, default=0, help='total wait seconds; 0 means unlimited')
     for name, command in commands.choices.items():
         if name in ("ocr", "convert", "run", "job", "resume", "ls-drive"):
             command.set_defaults(command=name)

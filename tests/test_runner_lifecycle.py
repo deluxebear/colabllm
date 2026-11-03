@@ -39,7 +39,11 @@ if sys.argv[1] == 'exec':
     if (root / 'exit-before-ready').exists():
         sys.exit(0)
     print('CT_PUBLIC_URL=' + os.environ['FAKE_COLAB_URL'], flush=True)
-    print('CT_READY', flush=True)
+    if (root / 'false-ready').exists():
+        print('ERROR: expected CT_READY but startup failed', flush=True)
+        sys.exit(0)
+    if not (root / 'never-ready').exists():
+        print('CT_READY', flush=True)
     while True:
         time.sleep(1)
 if sys.argv[1] == 'stop' and (root / 'fail-stop').exists():
@@ -101,6 +105,28 @@ if sys.argv[1] == 'stop' and (root / 'fail-stop').exists():
         st = json.loads(self.state_path.read_text())
         self.assertFalse(st['ready'])
         self.assertEqual(st['runner_exit'], 1)
+
+
+    def test_log_mention_is_not_a_ready_signal(self):
+        (self.root/'false-ready').touch()
+        result = self.cli('up', '--quick-tunnel', '--no-drive', '--foreground')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(json.loads(self.state_path.read_text())['ready'])
+
+    def test_background_readiness_timeout_keeps_runner(self):
+        (self.root/'never-ready').touch()
+        result = self.cli('up', '--quick-tunnel', '--no-drive', '--ready-timeout', '.1')
+        self.assertEqual(result.returncode, 124, result.stderr)
+        st = json.loads(self.state_path.read_text())
+        self.assertTrue(owned_process(st['runner_pid'], st['runner_identity']))
+        self.assertFalse(st['ready'])
+        self.assertEqual(self.cli('down').returncode, 0)
+
+    def test_foreground_readiness_timeout_stops_connection(self):
+        (self.root/'never-ready').touch()
+        result = self.cli('up', '--quick-tunnel', '--no-drive', '--foreground', '--ready-timeout', '.1')
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertIsNone(json.loads(self.state_path.read_text())['runner_pid'])
 
 
     def test_foreground_ps_duplicate_rejection_and_down(self):

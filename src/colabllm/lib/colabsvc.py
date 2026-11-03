@@ -32,6 +32,7 @@ import dataclasses
 import contextlib
 import fcntl
 import signal
+import selectors
 import tempfile
 import ipaddress
 import json
@@ -47,17 +48,13 @@ import urllib.request
 from pathlib import Path
 
 from paths import private_dir, user_home
-from cli_support import CliError, UsageError, diagnostic, safe_urlopen
+from cli_support import CliError, UsageError, command_timeout, positive_seconds, diagnostic, safe_urlopen
+from protocol import NotebookProtocol
 from processes import process_identity, runner_alive, stop_owned_process
 
 STATE_ROOT = user_home()
 DEFAULT_ZONE = "example.com"
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-CELL_RE = re.compile(r"\[colab\] Executing cell (\d+)/(\d+)")
-URL_MARK_RE = re.compile(r"CT_PUBLIC_URL=(https?://\S+)")
-QUICK_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
-CRED_RE = re.compile(r"CT_CREDENTIALS user=(\S+) pass=(\S+)")
 SKIP_RE = re.compile(r"^[ \t]*#[ \t]*@ct:skip\b", re.M)
 
 
@@ -301,10 +298,11 @@ def banner(lines: list[str]) -> None:
     print("\n" + "=" * w + "\n" + "\n".join(f"    {line}" for line in lines) + "\n" + "=" * w + "\n", flush=True)
 
 
-def run(cmd: list[str], *, capture: bool = False, check: bool = True, input: str | None = None):
+def run(cmd: list[str], *, capture: bool = False, check: bool = True, input: str | None = None, timeout=None):
     res = subprocess.run(cmd, text=True, input=input,
                          stdout=subprocess.PIPE if capture else None,
-                         stderr=subprocess.PIPE if capture else None)
+                         stderr=subprocess.PIPE if capture else None,
+                         timeout=command_timeout() if timeout is None else timeout)
     if check and res.returncode != 0:
         if capture:
             sys.stderr.write((res.stdout or "") + (res.stderr or ""))
@@ -523,32 +521,31 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, terminated)
     rc = None
+    selector = selectors.DefaultSelector()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         child_identity = process_identity(proc.pid)
         state.save(exec_pid=proc.pid, exec_identity=child_identity)
-        tail, last_cell = "", False
+        protocol = NotebookProtocol()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + st.get('ready_timeout', svc.ready_timeout) if st.get('runner_mode') == 'foreground' else None
         while True:
+            remaining = max(0, deadline - time.monotonic()) if deadline is not None and not st.get('ready') else None
+            if remaining == 0:
+                raise TimeoutError('等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话')
+            if not selector.select(remaining):
+                continue
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
                 break
             sys.stdout.buffer.write(chunk)
             sys.stdout.flush()
-            tail = (tail + ANSI_RE.sub("", chunk.decode("utf-8", "replace")))[-16000:]
-            update = {}
-            for cur, total in CELL_RE.findall(tail):
-                if cur == total and not last_cell:
-                    last_cell = update["last_cell_started"] = True
-            urls = URL_MARK_RE.findall(tail) or QUICK_URL_RE.findall(tail)
-            if urls and urls[-1] != st.get("url"):
-                update["url"] = urls[-1]
-            credentials = CRED_RE.findall(tail)
-            if credentials and list(credentials[-1]) != [st.get("login_user"), st.get("login_pass")]:
-                update["login_user"], update["login_pass"] = credentials[-1]
-            if "CT_READY" in tail and not st.get("ready"):
-                update["ready"] = True
+            update = {key: value for key, value in protocol.feed(chunk).items() if st.get(key) != value}
             if update:
                 st = state.save(**update)
+        update = protocol.feed(b"", final=True)
+        if update:
+            st = state.save(**update)
         rc = proc.wait()
         if rc == 0 and not st.get("ready"):
             warn("Colab 在 CT_READY 之前退出，请查看日志中的启动错误")
@@ -556,6 +553,7 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         return rc if rc >= 0 else 128 - rc
     finally:
         signal.signal(signal.SIGTERM, old_handler)
+        selector.close()
         if proc is not None:
             stop_owned_process(proc.pid, child_identity, group=True)
             proc.wait(timeout=5)
@@ -598,7 +596,7 @@ def cmd_up(svc: Service, script: Path, a) -> None:
     if getattr(a, "detach", False):
         show_info(svc, reveal=False)
         return
-    _wait_ready(svc, launched)
+    _wait_ready(svc, launched, timeout=getattr(a, "ready_timeout", None))
 
 
 def _start_up(svc: Service, script: Path, a):
@@ -688,7 +686,7 @@ def _start_up(svc: Service, script: Path, a):
         log("colab dfs mount")
         run(["colab", "dfs", "mount", "-s", svc.name])
     st = state.save(env=env, url=None, ready=False, last_cell_started=False, login_user=None, login_pass=None,
-                    runner_exit=None, started=time.strftime("%Y-%m-%d %H:%M:%S"))
+                    runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout, started=time.strftime("%Y-%m-%d %H:%M:%S"))
 
     # 4. notebook through an attached `colab exec` (keep-alive)
     if a.foreground:
@@ -707,13 +705,13 @@ def _start_up(svc: Service, script: Path, a):
     return proc
 
 
-def _wait_ready(svc, proc):
+def _wait_ready(svc, proc, timeout=None):
     state = State(svc)
     log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path}")
     log("streaming progress until the service reports CT_READY (Ctrl-C only stops watching)")
-    offset, deadline = 0, time.time() + svc.ready_timeout
+    offset, deadline = 0, time.monotonic() + (svc.ready_timeout if timeout is None else timeout)
     try:
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             with open(state.log_path, "rb") as f:
                 f.seek(offset)
                 data = f.read()
@@ -726,7 +724,7 @@ def _wait_ready(svc, proc):
                 break
             if proc.poll() is not None:
                 die(f"runner exited early (code {proc.returncode}); see {state.log_path}")
-            time.sleep(1)
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
         else:
             raise TimeoutError("等待 CT_READY 超时；后台进程继续运行，请使用 status 或 logs -f 检查")
     except KeyboardInterrupt:
@@ -858,6 +856,7 @@ def build_parser(svc: Service, configure=None):
     mode = u.add_mutually_exclusive_group()
     mode.add_argument("--foreground", action="store_true", help="stay attached in this terminal instead")
     mode.add_argument("--detach", action="store_true", help="return after starting the runner without waiting for readiness")
+    u.add_argument("--ready-timeout", type=positive_seconds, help="seconds to wait for readiness (default: service-specific)")
     u.add_argument("--dry-run", action="store_true", help="only show the cell plan")
     d = sub.add_parser("down", help="stop runner + Colab session")
     d.add_argument("--delete-tunnel", action="store_true", help="also delete the named tunnel and its DNS record")
@@ -873,6 +872,7 @@ def build_parser(svc: Service, configure=None):
     settings = tc.add_mutually_exclusive_group()
     settings.add_argument("--base-domain", metavar="DOMAIN", type=validate_domain)
     settings.add_argument("--clear", action="store_true", help="移除持久主域名配置，恢复动态 URL 默认值")
+    p.add_argument("--command-timeout", type=positive_seconds, help="external command timeout in seconds (default: 300, or COLABLLM_COMMAND_TIMEOUT)")
     p.add_argument("--debug", action="store_true", help="show exception tracebacks")
     p.add_argument("--quiet", action="store_true", help="suppress diagnostic progress")
     p.add_argument("--no-color", action="store_true", help="disable diagnostic colors")

@@ -46,7 +46,7 @@ def drive_spec(value):
     return value if is_drive_path(value) else "drive://" + value.lstrip("/")
 
 
-from cli_support import SameOriginRedirect
+from cli_support import Deadline, positive_seconds, nonnegative_seconds, SameOriginRedirect, resolve_endpoint
 
 
 class AvatarClient:
@@ -115,18 +115,16 @@ class AvatarClient:
                 print("网盘目录查询暂时失败，正在重试……", file=sys.stderr, flush=True)
                 time.sleep(1)
 
-    def job(self, job_id):
-        with self.open("/jobs/" + urllib.parse.quote(job_id, safe=""), timeout=30) as response:
+    def job(self, job_id, timeout=30):
+        with self.open("/jobs/" + urllib.parse.quote(job_id, safe=""), timeout=timeout) as response:
             return json.load(response)
 
     def wait(self, job_id, interval=3, timeout=0):
-        deadline = time.monotonic() + timeout if timeout else None
+        deadline = Deadline(timeout, f"等待超时，服务端任务仍会继续：{job_id}")
         previous = None
         while True:
-            if deadline and time.monotonic() >= deadline:
-                raise TimeoutError(f"等待超时，服务端任务仍会继续：{job_id}")
             try:
-                state = self.job(job_id)
+                state = self.job(job_id, timeout=deadline.remaining(30))
             except (urllib.error.URLError, OSError) as error:
                 if isinstance(error, urllib.error.HTTPError) and error.code not in (429, 502, 503, 504, 530):
                     raise
@@ -140,7 +138,7 @@ class AvatarClient:
             if message != previous:
                 print(message, file=sys.stderr, flush=True)
                 previous = message
-            time.sleep(min(interval, max(0, deadline-time.monotonic())) if deadline else interval)
+            deadline.sleep(interval)
 
     def download(self, state, destination):
         if state["status"] != "completed":
@@ -194,8 +192,8 @@ def custom_parser(parser=None, commands=None):
     for command in (generate, job, download):
         command.add_argument("--wait", action="store_true", help="等待完成；Ctrl+C 只停止等待")
         command.add_argument("-o", "--output", help="下载到本地文件；generate/job 会自动等待完成")
-        command.add_argument("--poll", type=float, default=3, help="查询间隔秒数，默认 3")
-        command.add_argument("--timeout", type=float, default=0, help="最长等待秒数；0 为不限")
+        command.add_argument("--poll", type=positive_seconds, default=3, help="查询间隔秒数，默认 3")
+        command.add_argument("--timeout", type=nonnegative_seconds, default=0, help="最长等待秒数；0 为不限")
     for command in (generate, job, download, listing):
         command.add_argument("--url", help="覆盖服务地址；也可设置 LONGCAT_AVATAR_URL")
         command.add_argument("--token", help="API Token；也可设置 LONGCAT_AVATAR_TOKEN")
@@ -205,15 +203,8 @@ def custom_parser(parser=None, commands=None):
 def run_custom(args):
     if getattr(args, "poll", 3) <= 0 or getattr(args, "timeout", 0) < 0:
         raise ValueError("--poll 须大于 0，--timeout 不能为负数")
-    url = args.url or os.environ.get("LONGCAT_AVATAR_URL")
-    token = args.token or os.environ.get("LONGCAT_AVATAR_TOKEN")
-    if not url or not token:
-        state = State(SERVICE).load()
-        url = url or state.get("url")
-        if url == state.get("url"):
-            token = token or state.get("api_token")
-    if not url or not token:
-        raise ValueError("缺少服务地址或 Token：先启动服务，或提供 --url 和 LONGCAT_AVATAR_TOKEN")
+    url, token = resolve_endpoint(State(SERVICE).load(), args.url, args.token,
+                                  url_env='LONGCAT_AVATAR_URL', token_env='LONGCAT_AVATAR_TOKEN')
     client = AvatarClient(url, token)
     if args.cmd == "ls-drive":
         print(json.dumps(client.list_drive(args.path), ensure_ascii=False, indent=2))

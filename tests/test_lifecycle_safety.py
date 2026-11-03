@@ -97,6 +97,17 @@ class LifecycleSafetyTest(unittest.TestCase):
             kill.assert_not_called(); killpg.assert_not_called()
             self.assertFalse(processes.runner_alive({'runner_pid': 123, 'runner_identity': 'old-start'}))
 
+    def test_macos_identity_survives_exec_and_process_state_changes(self):
+        stamp = 'Mon Nov  3 10:00:00 2026'
+        results = [subprocess.CompletedProcess([], 0, f'{state} {stamp}\n', '') for state in ('R', 'S', 'Z')]
+        with patch.object(processes.sys, 'platform', 'darwin'),              patch.object(processes.subprocess, 'run', side_effect=results) as run:
+            self.assertEqual(processes.process_identity(123), stamp)
+            self.assertEqual(processes.process_identity(123), stamp)
+            self.assertIsNone(processes.process_identity(123))
+            self.assertNotIn('command=', run.call_args.args[0])
+            self.assertEqual(run.call_args.kwargs['env']['TZ'], 'UTC')
+
+
     def test_owned_process_is_stopped_and_waited_for(self):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True)
         self.addCleanup(lambda: child.poll() is None and child.kill())

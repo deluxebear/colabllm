@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import safe_urlopen
+from cli_support import command_timeout, resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -233,16 +233,8 @@ SERVICE = Service(
 
 
 def _get_endpoint(url_override: str | None = None, token_override: str | None = None) -> tuple[str, str]:
-    st = State(SERVICE).load()
-    url = (url_override or os.environ.get("NEMOTRON_URL") or st.get("url") or "").rstrip("/")
-    token = (token_override or os.environ.get("NEMOTRON_API_TOKEN") or st.get("api_token") or "").strip()
-    if not url or not token:
-        die(
-            f"service URL or API token not found in {State(SERVICE).path}.\n"
-            f"Start the service first (`colabllm nemotron-transcribe up --domain` or `-i <id>`) "
-            f"or pass `--url` and `--api-token`."
-        )
-    return url, token
+    return resolve_endpoint(State(SERVICE).load(), url_override, token_override,
+                            url_env="NEMOTRON_URL", token_env="NEMOTRON_API_TOKEN")
 
 
 def _get_endpoint_pool(cli_args: argparse.Namespace) -> list[tuple[str, str, str]]:
@@ -464,7 +456,7 @@ def _download_media_locally_and_upload_to_drive(
         ["colab", "exec", "-s", session_name, "-c", f"mkdir -p '{target_drive_dir}'"],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=command_timeout(30),
         check=False,
     )
 
@@ -504,7 +496,7 @@ def _download_media_locally_and_upload_to_drive(
 
         kind_str = "视频 (.mp4)" if download_video else f"音频 (.{fmt})"
         log(f"正在本地执行 yt-dlp 下载{kind_str}: {url}")
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=900, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=command_timeout(900), check=False)
         audio_files = sorted(
             f for f in stage_dir.iterdir()
             if f.is_file() and f.suffix.lower() in AUDIO_EXTS
@@ -536,7 +528,7 @@ def _download_media_locally_and_upload_to_drive(
                 ["colab", "upload", "-s", session_name, str(af), remote_path],
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=command_timeout(300),
                 check=False,
             )
             if up_res.returncode != 0:
@@ -566,7 +558,7 @@ def _colab_ls_single(session_name: str, remote_path: str) -> tuple[list[str], li
         ["colab", "ls", "-s", session_name, remote_path],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=command_timeout(30),
         check=False,
     )
     if res.returncode != 0:
@@ -958,7 +950,7 @@ def _probe_local_audio_duration_sec(audio_path: Path) -> float:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
+            timeout=command_timeout(30),
             check=False,
         )
         val = (res.stdout or "").strip()
@@ -982,7 +974,7 @@ def _find_local_silence_near(audio_path: Path, target_sec: float, window_sec: fl
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=25,
+            timeout=command_timeout(25),
             check=False,
         )
         log_out = res.stderr or ""

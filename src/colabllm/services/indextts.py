@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import safe_urlopen
+from cli_support import resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -92,16 +92,8 @@ UP_ENV_FLAGS = {'--model': 'CT_INDEXTTS_MODEL',
 
 
 def _get_endpoint(url_override: str | None = None, token_override: str | None = None) -> tuple[str, str]:
-    st = State(SERVICE).load()
-    url = (url_override or os.environ.get("INDEXTTS_URL") or st.get("url") or "").rstrip("/")
-    token = (token_override or os.environ.get("INDEXTTS_API_TOKEN") or st.get("api_token") or "").strip()
-    if not url or not token:
-        die(
-            f"service URL or API token not found in {State(SERVICE).path}.\n"
-            f"Start the service first (`colabllm indextts up` or `colabllm indextts up --domain`) "
-            f"or pass `--url` and `--api-token`."
-        )
-    return url, token
+    return resolve_endpoint(State(SERVICE).load(), url_override, token_override,
+                            url_env="INDEXTTS_URL", token_env="INDEXTTS_API_TOKEN")
 
 
 def _http_json(

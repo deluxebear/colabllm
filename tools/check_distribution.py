@@ -59,6 +59,11 @@ def check(wheel):
                 assert subcommand in help_text
                 run([command, service, subcommand, '--help'])
             json.loads(run([command, service, 'info', '--json']))
+        run([command, 'doctor', '--help'])
+        for shell in ('bash', 'zsh', 'fish'):
+            script = run([command, 'completion', shell])
+            assert 'colabllm _complete' in script
+        assert 'tts' in run([command, '_complete', '--', 'qwen3-tts', 't']).splitlines()
         run([command, 'frp-config', '--help'])
         config = json.loads(run([command, 'tunnel-config', '--base-domain', 'example.com']))
         state_home = home / '.colabllm'

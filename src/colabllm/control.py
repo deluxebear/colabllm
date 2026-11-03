@@ -10,7 +10,7 @@ import colabsvc
 from colabsvc import cmd_tunnel_config, validate_domain
 
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(description='本项目所有运行时共享的全局配置')
     commands = parser.add_subparsers(dest='command', required=True)
     tunnel = commands.add_parser('tunnel-config', help='查看、设置或清除项目全局主域名')
@@ -25,6 +25,11 @@ def main(argv=None):
     frp.add_argument('--server-port',type=int,help='FRP 服务端端口，默认 7000')
     frp.add_argument('--disable',action='store_true',help='关闭全局 FRP，之后启动恢复使用 Cloudflare')
     commands.add_parser('frp-status',help='通过 SSH 检查 FRP/Caddy 服务和已分配路由')
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.command=='tunnel-config':
         cmd_tunnel_config(args)

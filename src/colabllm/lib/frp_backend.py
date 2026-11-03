@@ -7,6 +7,7 @@ import re
 import secrets
 import shutil
 import subprocess
+from cli_support import command_timeout
 from pathlib import Path
 
 
@@ -38,7 +39,7 @@ def remote(config, payload):
     # Static remote shell command; all input, including source, travels on stdin.
     command='if [ "$(id -u)" = 0 ]; then exec python3 -; else exec sudo -n python3 -; fi'
     result=subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=15','--',target,command],
-                          input=source,capture_output=True,text=True,timeout=600)
+                          input=source,capture_output=True,text=True,timeout=command_timeout(600))
     if result.returncode:
         raise RuntimeError('FRP server operation failed: '+result.stderr[-1600:])
     try:
