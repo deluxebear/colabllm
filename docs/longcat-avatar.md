@@ -1,40 +1,40 @@
 # LongCat-Video-Avatar 1.5（Colab G4）
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 官方模型：[meituan-longcat/LongCat-Video-Avatar-1.5](https://huggingface.co/meituan-longcat/LongCat-Video-Avatar-1.5)。独立于基础版 `longcat-video`，默认 G4、BF16 DiT + Whisper-Large-v3 + 官方 DMD LoRA，固定 8 步、25 fps。
 
 ```bash
-./services/longcat-avatar.py up --domain
-./services/longcat-avatar.py info       # 查看网页登录账号密码、API Token
-./services/longcat-avatar.py status
-./services/longcat-avatar.py logs -f
-./services/longcat-avatar.py down
+colabllm longcat-avatar up --domain
+colabllm longcat-avatar info       # 查看网页登录账号密码、API Token
+colabllm longcat-avatar status
+colabllm longcat-avatar logs -f
+colabllm longcat-avatar down
 ```
 
 ## CLI 生成与下载
 
-命令在本机执行，视频仍由 Colab GPU 后台生成。只需 Python 标准库，不需要安装 Gradio SDK。默认从 `.state/longcat-avatar/state.json` 读取地址和凭据。
+命令在本机执行，视频仍由 Colab GPU 后台生成。只需 Python 标准库，不需要安装 Gradio SDK。默认从 `~/.colabllm/services/longcat-avatar/state.json` 读取地址和凭据。
 
 ```bash
 # 异步提交：按完整音频长度生成，立即返回 JSON 中的 job_id
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio speech.wav --image person.png \
   --prompt "A person speaking naturally in a bright room."
 
 # 一条命令等待完成并下载；省略 --image 可用音频＋描述模式
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio speech.wav --image person.png \
   --prompt "A person speaking naturally in a bright room." \
   -o result.mp4
 
 # 查询现有任务，或等待它完成并下载
-./services/longcat-avatar.py job JOB_ID
-./services/longcat-avatar.py job JOB_ID --wait -o result.mp4
-./services/longcat-avatar.py download JOB_ID -o result.mp4
+colabllm longcat-avatar job JOB_ID
+colabllm longcat-avatar job JOB_ID --wait -o result.mp4
+colabllm longcat-avatar download JOB_ID -o result.mp4
 
 # 手动只生成短片：93 帧 / 25 fps，即约 3.72 秒
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio speech.wav --image person.png --prompt-file prompt.txt \
   --frames 93 --segments 1 -o preview.mp4
 ```
@@ -53,18 +53,18 @@
 
 ```bash
 # 列出网盘目录，查找素材路径
-./services/longcat-avatar.py ls-drive
-./services/longcat-avatar.py ls-drive "素材/数字人"
+colabllm longcat-avatar ls-drive
+colabllm longcat-avatar ls-drive "素材/数字人"
 
 # 直接使用网盘音频、图片，结果保存到指定网盘目录
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio "drive://素材/数字人/讲话.wav" \
   --image "drive://素材/数字人/人像.png" \
   --prompt "A person speaking naturally in a bright room." \
   --drive-output "成片/数字人"
 
 # 也可显式使用网盘参数；本地与网盘输入可以混用
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio-drive "素材/数字人/讲话.wav" \
   --image ./person.png \
   --prompt-file prompt.txt \
@@ -106,7 +106,7 @@ CLI 使用 `POST /jobs` 提交任务，`GET /jobs/<编号>` 查询，`GET /jobs/
 
 ## 开发文件
 
-- `services/longcat-avatar.py`、`services/longcat-avatar.ipynb`：服务入口与自包含 Notebook。
+- `src/colabllm/services/longcat-avatar.py`、`src/colabllm/services/longcat-avatar.ipynb`：服务入口与自包含 Notebook。
 - `templates/longcat_avatar_app.py`：Avatar 应用与音频注意力适配。
 - `templates/longcat_avatar_jobs.py`：持久后台任务、状态与重启恢复。
 - `templates/longcat_avatar_drive.py`：网盘路径、上传缓存及目录列表校验。
@@ -169,7 +169,7 @@ CLI 使用 `POST /jobs` 提交任务，`GET /jobs/<编号>` 查询，`GET /jobs/
 音频 CFG 是音频引导强度，不是独立的嘴部幅度控制。降低后可能影响同步。当前适配要求文本和音频 CFG 均在 1–10，避免小于 1 时因上游 CFG 分支条件而不生效。快速模式拒绝不兼容的步数或 CFG，不会静默忽略。
 
 ```bash
-./services/longcat-avatar.py generate \
+colabllm longcat-avatar generate \
   --audio speech.wav --image person.png --prompt "A person speaking calmly." \
   --sampling-mode standard --steps 30 --text-cfg 4 --audio-cfg 1 \
   --frames 49 --segments 1 -o cfg-1.mp4

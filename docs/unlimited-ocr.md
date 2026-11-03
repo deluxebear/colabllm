@@ -5,13 +5,13 @@
 ## 启动
 
 ```bash
-./services/unlimited-ocr.py up
-./services/unlimited-ocr.py status
-./services/unlimited-ocr.py logs -f
-./services/unlimited-ocr.py info  # 含凭证，请勿分享输出
+colabllm unlimited-ocr up
+colabllm unlimited-ocr status
+colabllm unlimited-ocr logs -f
+colabllm unlimited-ocr info  # 含凭证，请勿分享输出
 ```
 
-遵循 `./colabctl.py tunnel-config` 的项目级设置；当前配置的域名对应 `https://unlimited-ocr.example.com`。支持 `up --gpu A100`、`--quick-tunnel`、`--transport cloudflare|frp`、`-i ID` 等共享参数。Caddy 提供 Basic / Bearer 认证。`CT_READY` 前必须完成模型加载和真实 GPU 推理预热。
+遵循 `colabllm tunnel-config` 的项目级设置；当前配置的域名对应 `https://unlimited-ocr.example.com`。支持 `up --gpu A100`、`--quick-tunnel`、`--transport cloudflare|frp`、`-i ID` 等共享参数。Caddy 提供 Basic / Bearer 认证。`CT_READY` 前必须完成模型加载和真实 GPU 推理预热。
 
 ## 文件与目录批量转换
 
@@ -21,39 +21,39 @@
 
 ```bash
 # 本地单文件或文件夹，自动上传并下载完整结果到本机
-./services/unlimited-ocr.py ocr ./合同.pdf -O ./ocr-results
-./services/unlimited-ocr.py ocr ./documents --local -O ./ocr-results
+colabllm unlimited-ocr ocr ./合同.pdf -O ./ocr-results
+colabllm unlimited-ocr ocr ./documents --local -O ./ocr-results
 
 # 本地输入 -> 指定 Drive 目录，同时下载到本机
-./services/unlimited-ocr.py ocr ./documents --output-dir 'OCR/results' -O ./ocr-results
+colabllm unlimited-ocr ocr ./documents --output-dir 'OCR/results' -O ./ocr-results
 
 # Drive 输入 -> 本地输出
-./services/unlimited-ocr.py ocr 'drive://documents' -O ./ocr-results
+colabllm unlimited-ocr ocr 'drive://documents' -O ./ocr-results
 
 # 本地和 Drive 输入可混合
-./services/unlimited-ocr.py ocr ./合同.pdf 'drive://scans' -O ./ocr-results
+colabllm unlimited-ocr ocr ./合同.pdf 'drive://scans' -O ./ocr-results
 
 # 查看可处理文件（PDF、PNG、JPEG、WEBP、BMP、TIFF）
-./services/unlimited-ocr.py ls-drive 'documents'
+colabllm unlimited-ocr ls-drive 'documents'
 
 # 单文件；输出仍在 Drive
-./services/unlimited-ocr.py ocr 'documents/合同.pdf' --output-dir 'OCR/results'
+colabllm unlimited-ocr ocr 'documents/合同.pdf' --output-dir 'OCR/results'
 
 # 多个文件或文件夹；默认递归、去重；单个文件失败后继续其余文件
-./services/unlimited-ocr.py ocr 'documents/books' 'scans/照片.jpg' --output-dir 'OCR/results'
+colabllm unlimited-ocr ocr 'documents/books' 'scans/照片.jpg' --output-dir 'OCR/results'
 
 # 后台提交，关闭本次客户端也不会停止任务（本地输入上传完成后）
-./services/unlimited-ocr.py ocr 'documents' --output-dir 'OCR/results' --no-wait
-./services/unlimited-ocr.py job JOB_ID --wait
+colabllm unlimited-ocr ocr 'documents' --output-dir 'OCR/results' --no-wait
+colabllm unlimited-ocr job JOB_ID --wait
 # 稍后查询并下载本地结果（支持客户端断开后重新下载）
-./services/unlimited-ocr.py job JOB_ID --wait -O ./ocr-results
+colabllm unlimited-ocr job JOB_ID --wait -O ./ocr-results
 
 # 可选：非递归、重新识别、PDF 分辨率和页面窗口
-./services/unlimited-ocr.py ocr 'documents' --no-recursive --overwrite --dpi 200 --pages-per-chunk 10
+colabllm unlimited-ocr ocr 'documents' --no-recursive --overwrite --dpi 200 --pages-per-chunk 10
 
 # 多实例（每个实例内部顺序执行，避免多个任务同时占满显存）
-./services/unlimited-ocr.py up -i 2
-./services/unlimited-ocr.py ocr -i 2 'documents'
+colabllm unlimited-ocr up -i 2
+colabllm unlimited-ocr ocr -i 2 'documents'
 ```
 
 `convert` / `run` 是 `ocr` 的别名。默认输出根目录为 `MyDrive/colab-llm/unlimited-ocr/outputs`。
@@ -74,7 +74,7 @@ Drive 输入保留 MyDrive 相对目录及原扩展名。本地文件夹保留�
 
 ## API 与运行生命周期
 
-API 需 `Authorization: Bearer <API_TOKEN>`，CLI 默认读取对应实例 `.state/` 中的 URL 和 Token。可用 `UNLIMITED_OCR_URL` / `UNLIMITED_OCR_API_TOKEN` 环境变量及 `--url` 覆盖连接信息。
+API 需 `Authorization: Bearer <API_TOKEN>`，CLI 默认读取对应实例 `~/.colabllm/services/` 中的 URL 和 Token。可用 `UNLIMITED_OCR_URL` / `UNLIMITED_OCR_API_TOKEN` 环境变量及 `--url` 覆盖连接信息。
 
 - `POST /api/jobs`：JSON `{"inputs":["documents"],"output_dir":"OCR/results","pages_per_chunk":10}`，立即返回 job 记录（含 ID）。
 - `GET /api/jobs/<ID>`：任务和逐文件状态、当前页进度、错误及 Drive 输出目录。
@@ -86,9 +86,9 @@ API 需 `Authorization: Bearer <API_TOKEN>`，CLI 默认读取对应实例 `.sta
 队列在服务端执行，客户端断开后任务继续；Colab 会话仍依赖本机后台 runner 保持连接。不要关闭主机或运行 `down`，直到任务结束。关闭服务：
 
 ```bash
-./services/unlimited-ocr.py down
+colabllm unlimited-ocr down
 # 同时删除本实例域名/隧道资源：
-./services/unlimited-ocr.py down --delete-tunnel
+colabllm unlimited-ocr down --delete-tunnel
 ```
 
 源码：`templates/unlimited_ocr_app.py`、`templates/unlimited_ocr_setup.py`；通过 `python templates/build_notebooks.py` 再生成独立 notebook。官方模型以 `trust_remote_code=True` 加载，固定模型 revision 为 `0480966938291445591f69f08a13b041c073a96a`，后处理固定于上游提交 `ea42e6d15ff93fdd0e8041fc0ac70880513453d3`。
@@ -116,19 +116,19 @@ API 需 `Authorization: Bearer <API_TOKEN>`，CLI 默认读取对应实例 `.sta
 | 保存/统计/返回 | `save_results`, `test_compress`, `eval_mode`, `tps_interval`, `return_dict` |
 
 ```bash
-./services/unlimited-ocr.py ocr ./documents -O ./results \
+colabllm unlimited-ocr ocr ./documents -O ./results \
   --prompt 'Multi page parsing.' --temperature 0 \
   --crop-mode --max-crops 8 --image-size 640 \
   --max-new-tokens 16000 --no-repeat-ngram-size 35 --ngram-window 1024 \
   --dash-topm 16 --max-page-tokens 20000
 
 # JSON 文件或内联 JSON；未指定项沿用服务默认/模型默认
-./services/unlimited-ocr.py ocr 'drive://documents' --params-file ./ocr-params.json
-./services/unlimited-ocr.py ocr ./合同.pdf \
+colabllm unlimited-ocr ocr 'drive://documents' --params-file ./ocr-params.json
+colabllm unlimited-ocr ocr ./合同.pdf \
   --params-json '{"crop_mode":null,"max_new_tokens":null,"temperature":0}'
 
 # 单项 JSON 覆盖，可重复；字符串需要 JSON 引号，数组和 null 原样支持
-./services/unlimited-ocr.py ocr ./合同.pdf \
+colabllm unlimited-ocr ocr ./合同.pdf \
   --param 'prompt="Multi page parsing."' \
   --param 'ngram_whitelist_token_ids=[1,128827]' \
   --param 'crop_mode=null' --no-page-count-guard --save-results
@@ -170,10 +170,10 @@ API：`POST /api/jobs` 的 `inference_params` 字段直接传推理参数：
 
 ```bash
 # 原任务 ID 持续有效；服务暂时返回 5xx 或网络中断时，已开始的轮询会继续等待
-./services/unlimited-ocr.py job JOB_ID --wait -O ./results
+colabllm unlimited-ocr job JOB_ID --wait -O ./results
 
 # 显式恢复 failed 或旧版本 interrupted 任务；默认只入队，--wait 等待完成
-./services/unlimited-ocr.py resume JOB_ID --wait -O ./results
+colabllm unlimited-ocr resume JOB_ID --wait -O ./results
 ```
 
 API：`POST /api/jobs/JOB_ID/resume`，请求体 `{}`，返回 202 和原任务记录。运行/排队/已完成任务拒绝重复恢复。查询结果包含 `resume_count`、`automatic_resume` 和各文件 `resumed_chunks`（本次执行复用的组数）。普通模型/文件错误仍标记 failed，避免无限自动重试；可修正源文件后手动恢复。

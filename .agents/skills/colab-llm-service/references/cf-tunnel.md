@@ -1,7 +1,7 @@
 # Cloudflare backend and global domains
 
 Read the current configuration with `colabllm tunnel-config`. The shared file is
-`.state/tunnel-config.json`; changing it does not move existing runtime connections.
+`~/.colabllm/tunnel-config.json`; changing it does not move existing runtime connections.
 FRP enabled there makes FRP the default. To operate Cloudflare for one launch, pass
 `--transport cloudflare`, or `--quick-tunnel` for a dynamic URL regardless of saved domains.
 
@@ -18,7 +18,7 @@ disable it first because FRP requires a hostname. Environment overrides still ap
 
 ## Named tunnel versus Quick Tunnel
 
-With a hostname, `lib/colabsvc.py:ensure_named_tunnel()` uses the local `cf` login to
+With a hostname, `src/colabllm/lib/colabsvc.py:ensure_named_tunnel()` uses the local `cf` login to
 create/reuse `colab-<service-instance>`, configure ingress to `svc.tunnel_port`, set a
 proxied CNAME, and retrieve the token. Zone lookup uses the longest matching suffix.
 On Colab, `templates/tunnel_client.py` starts cloudflared; registration is logged in
@@ -36,7 +36,7 @@ does not imply a Quick Tunnel when a project domain or FRP backend is configured
   named tunnel is supported; generic A/AAAA records are not safe to overwrite.
 - `cf`'s beta `--tunnel-config-*` flags can demand unrelated Access options. The runner
   uses `--body` JSON for ingress updates; retain that approach.
-- Tokens live in private `.state/` data and injected environment, not notebook source.
+- Tokens live in private `~/.colabllm/services/` data and injected environment, not notebook source.
 - `down` retains named tunnels/DNS. `down --delete-tunnel` cleans recorded resources;
   separate Cloudflare and FRP identities are preserved across backend switches.
   Use the recorded hostname/Zone, not the current global defaults, for cleanup.

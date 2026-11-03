@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """my-service on Google Colab (notebook: my-service.ipynb).  <- copy of templates/service.py
 
-  ./services/my-service.py up [-i ID] [--domain [HOST]] [--gpu L4]
-  ./services/my-service.py ps | info [-i ID] | logs [-i ID] -f | status [-i ID] | down [-i ID | --all] [--delete-tunnel]
+  colabllm my-service up [-i ID] [--domain [HOST]] [--gpu L4]
+  colabllm my-service ps | info [-i ID] | logs [-i ID] -f | status [-i ID] | down [-i ID | --all] [--delete-tunnel]
 """
 import sys
 from pathlib import Path

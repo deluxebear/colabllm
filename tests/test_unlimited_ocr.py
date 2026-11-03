@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'lib'))
+sys.path.insert(0, str(ROOT / 'src/colabllm/lib'))
 spec = importlib.util.spec_from_file_location('unlimited_ocr_app', ROOT / 'templates/unlimited_ocr_app.py')
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
@@ -184,7 +184,7 @@ class LocalTransferTest(unittest.TestCase):
                 app.result_files(jobs, job['id'], 0, '../../outside')
 
     def test_cli_local_folder_and_forced_drive(self):
-        spec = importlib.util.spec_from_file_location('ocr_cli', ROOT / 'services/unlimited-ocr.py')
+        spec = importlib.util.spec_from_file_location('ocr_cli', ROOT / 'src/colabllm/services/unlimited-ocr.py')
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)
         import argparse

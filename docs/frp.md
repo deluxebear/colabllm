@@ -10,13 +10,13 @@
 cf auth login
 
 # 替换示例 IP 和域名；--ssh 支持 ~/.ssh/config 的别名、端口、密钥和跳板
-./colabctl.py frp-config \
+colabllm frp-config \
   --server-ip 203.0.113.10 \
   --ssh root@frpip \
   --base-domain example.com
 
-./colabctl.py frp-config       # 查看全局配置，不展示 Token
-./colabctl.py frp-status       # SSH 检查 frps、Caddy 和路由
+colabllm frp-config       # 查看全局配置，不展示 Token
+colabllm frp-status       # SSH 检查 frps、Caddy 和路由
 ```
 
 命令先验证 Cloudflare Zone 权限，再通过 SSH 检查监听进程、systemd 单元、配置路径和已安装二进制；不会仅因 7000 被占用就认定冲突。
@@ -38,21 +38,21 @@ Colab frpc 下载与服务端匹配的稳定版本（要求 >= 0.61.0）；既�
 
 ```bash
 # 全局 FRP 已配置：自动走 FRP，域名为 indextts.example.com
-./services/indextts.py up
+colabllm indextts up
 
 # 多实例保留原来的别名和实例后缀，例如 qwen-2.example.com
-./services/qwen-flash.py up -i 2
+colabllm qwen-flash up -i 2
 
 # 单次选择后端，或覆盖本次服务域名
-./services/longcat-avatar.py up --transport frp --domain avatar.example.com
-./services/longcat-avatar.py up --transport cloudflare
-./services/longcat-avatar.py up --quick-tunnel
+colabllm longcat-avatar up --transport frp --domain avatar.example.com
+colabllm longcat-avatar up --transport cloudflare
+colabllm longcat-avatar up --quick-tunnel
 
 # 关闭全局 FRP；主域名仍保留，因此之后默认是 Cloudflare 固定域名
-./colabctl.py frp-config --disable
+colabllm frp-config --disable
 
 # 如需恢复默认 Cloudflare 动态 URL，再清除主域名及环境变量覆盖
-./colabctl.py tunnel-config --clear
+colabllm tunnel-config --clear
 ```
 
 选择规则：`--quick-tunnel` 强制 Cloudflare 动态 URL；`--transport` 覆盖全局后端；否则启用 FRP 时用 FRP，未启用时用 Cloudflare。`--quick-tunnel` 与 `--transport frp` 不能同时使用。`--base-domain`、`--domain` 和 `COLABSVC_BASE_DOMAIN` 的主机名覆盖规则仍适用。
@@ -80,9 +80,9 @@ frpc 加入现有 watchdog，退出后自动重启；网络断开时由 frpc 自
 
 ## 配置、状态与清理
 
-- 全局主域名和 FRP 元数据：`.state/tunnel-config.json`。
-- 客户端 Token/信任证书：`.state/frp/<服务器标识>.json`，权限 `0600`。
-- 每个运行时的后端和独立资源记录：`.state/<service>/state.json`，权限 `0600`。
+- 全局主域名和 FRP 元数据：`~/.colabllm/tunnel-config.json`。
+- 客户端 Token/信任证书：`~/.colabllm/frp/<服务器标识>.json`，权限 `0600`。
+- 每个运行时的后端和独立资源记录：`~/.colabllm/services/<service>/state.json`，权限 `0600`。
 - 服务端 frps 和专用 Caddy 配置：`/etc/colabsvc-frp/`。
 - 路由注册表和证书数据：`/var/lib/colabsvc-frp/`。
 - 新装二进制：`/usr/local/lib/colabsvc-frp/`。
@@ -90,8 +90,8 @@ frpc 加入现有 watchdog，退出后自动重启；网络断开时由 frpc 自
 - Colab 客户端日志：`/content/ct/frpc.log`，配置文件 `/content/ct/frpc.toml` 权限 `0600`。
 
 ```bash
-./services/indextts.py down                   # 保留路由和 DNS，便于重启
-./services/indextts.py down --delete-tunnel   # 删除该实例的项目路由/DNS
+colabllm indextts down                   # 保留路由和 DNS，便于重启
+colabllm indextts down --delete-tunnel   # 删除该实例的项目路由/DNS
 ```
 
 清理根据实例保存的后端资源操作，不根据后来修改的全局配置猜测。Cloudflare 和 FRP 资源分别记录；只删除仍匹配所有权的 DNS 记录。更换该实例的 FRP 服务器或域名前，需先使用 `down --delete-tunnel` 清理旧路由。共享 frps/Caddy 不随单个实例停止而卸载。

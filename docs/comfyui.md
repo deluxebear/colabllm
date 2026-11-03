@@ -1,10 +1,10 @@
 # ComfyUI + ComfyUI-Manager 运行时使用说明
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[services/comfyui.py](services/comfyui.py)
-- 远端 Notebook：[services/comfyui.ipynb](services/comfyui.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/comfyui.py](services/comfyui.py)
+- 远端 Notebook：[src/colabllm/services/comfyui.ipynb](services/comfyui.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
 
 ---
 
@@ -25,26 +25,26 @@
 
 ```bash
 # 1. 启动服务并绑定固定域名 https://comfyui.example.com（默认使用 L4 GPU）
-./services/comfyui.py up --domain
+colabllm comfyui up --domain
 
 # 2. 启动时直接指定一个或多个工作流，自动预下载所需模型到本地 SSD
-./services/comfyui.py up --domain --workflow video_minimax_h3_t2v
-./services/comfyui.py up --domain \
+colabllm comfyui up --domain --workflow video_minimax_h3_t2v
+colabllm comfyui up --domain \
   --workflow video_minimax_h3_t2v \
   --workflow https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json
 
 # 3. 指定更高规格 GPU（如 A100 / H100 / G4）或传入 Hugging Face Token
-./services/comfyui.py up --domain --gpu A100 --hf-token hf_xxx
+colabllm comfyui up --domain --gpu A100 --hf-token hf_xxx
 
 # 4. 查看访问地址、登录账号密码与 API Token
-./services/comfyui.py info
+colabllm comfyui info
 
 # 5. 查看实时日志 / 检查运行状态与公网连通性
-./services/comfyui.py logs -f
-./services/comfyui.py status
+colabllm comfyui logs -f
+colabllm comfyui status
 
 # 6. 停止服务并释放 Colab VM（加 --delete-tunnel 同时清理 Cloudflare 隧道与 DNS）
-./services/comfyui.py down
+colabllm comfyui down
 ```
 
 ### 2.1 多实例（多会话）并发运行
@@ -53,20 +53,20 @@
 
 ```bash
 # 启动第 1、第 2 个实例（分别绑定 comfyui-1.example.com 与 comfyui-2.example.com）
-./services/comfyui.py up -i 1 --domain --workflow video_minimax_h3_t2v
-./services/comfyui.py up -i 2 --domain --workflow video_minimax_h3_i2v
+colabllm comfyui up -i 1 --domain --workflow video_minimax_h3_t2v
+colabllm comfyui up -i 2 --domain --workflow video_minimax_h3_i2v
 
 # 查看所有 ComfyUI 实例状态与 URL
-./services/comfyui.py ps
+colabllm comfyui ps
 
 # 向指定实例（-i 2）或所有运行中实例（-A / --all-instances）同步拉取工作流/模型到本地 SSD
-./services/comfyui.py pull-workflow -i 2 video_minimax_h3_r2v
-./services/comfyui.py pull-workflow -A video_minimax_h3_r2v
-./services/comfyui.py pull-model -A https://huggingface.co/.../model.safetensors --dir loras
+colabllm comfyui pull-workflow -i 2 video_minimax_h3_r2v
+colabllm comfyui pull-workflow -A video_minimax_h3_r2v
+colabllm comfyui pull-model -A https://huggingface.co/.../model.safetensors --dir loras
 
 # 停止单个实例或全部实例
-./services/comfyui.py down -i 2
-./services/comfyui.py down --all
+colabllm comfyui down -i 2
+colabllm comfyui down --all
 ```
 
 ---
@@ -93,13 +93,13 @@
 
 ```bash
 # 1. 传入完整的工作流 GitHub URL 或直链
-./services/comfyui.py pull-workflow https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json
+colabllm comfyui pull-workflow https://github.com/Comfy-Org/workflow_templates/blob/main/templates/video_minimax_h3_r2v.json
 
 # 2. 传入官方工作流模板名（可省略 .json 后缀）
-./services/comfyui.py pull-workflow video_minimax_h3_i2v
+colabllm comfyui pull-workflow video_minimax_h3_i2v
 
 # 3. 传入保存在 Google Drive 网盘工作流目录中的自定义工作流文件名
-./services/comfyui.py pull-workflow my_custom_workflow.json
+colabllm comfyui pull-workflow my_custom_workflow.json
 ```
 
 **工作流与模型解析规则**：
@@ -116,16 +116,16 @@
 
 ```bash
 # 指定模型 URL 与目标子目录（--dir / -d）
-./services/comfyui.py pull-model \
+colabllm comfyui pull-model \
   https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors \
   --dir loras
 
 # 若 URL 路径本身已包含标准目录名（如 /loras/、/vae/、/diffusion_models/），可省略 --dir 自动推断
-./services/comfyui.py pull-model \
+colabllm comfyui pull-model \
   https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/vae/minimax_h3_audio_vae_fp32.safetensors
 
 # 自定义保存文件名（--name / -n）
-./services/comfyui.py pull-model \
+colabllm comfyui pull-model \
   https://huggingface.co/example/repo/resolve/main/weights.safetensors \
   --dir checkpoints \
   --name custom_name.safetensors
@@ -135,7 +135,7 @@
 
 ## 4. API 接口说明
 
-当通过程序调用 ComfyUI 或其扩展接口时，在请求头带上 `Authorization: Bearer <API_TOKEN>`（可通过 `./services/comfyui.py info` 查看）：
+当通过程序调用 ComfyUI 或其扩展接口时，在请求头带上 `Authorization: Bearer <API_TOKEN>`（可通过 `colabllm comfyui info` 查看）：
 
 ```bash
 # 查询当前本地 SSD 剩余容量与已缓存模型列表

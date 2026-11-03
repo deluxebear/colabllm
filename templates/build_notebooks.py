@@ -11,7 +11,7 @@ Colab UI) and follows the same cell order:
   4. tunnel        -- cloudflared: token -> fixed domain, else quick tunnel; prints CT_PUBLIC_URL
   5. keep-alive    -- prints CT_READY, watchdog restarts dead processes, never returns
 
-Usage:  python3 templates/build_notebooks.py      (rewrites templates/ and services/*.ipynb)
+Usage:  python3 templates/build_notebooks.py      (rewrites templates/ and src/colabllm/services/*.ipynb)
 Edit the generated notebooks directly if a service needs something special; re-running this
 script overwrites them.
 """
@@ -194,7 +194,7 @@ def code(text):
 
 def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunnel=None, auth_cell=None):
     cells = [md(f"# {title}\n\n{intro}\n\n"
-                "Run it with the service script (`services/<name>.py up`), which creates the Colab session, "
+                "Run it with the service script (`colabllm <name> up`), which creates the Colab session, "
                 "mounts Drive with `colab dfs`, optionally creates a named Cloudflare tunnel, and injects "
                 "`CT_*` settings. Cell order is the standard contract -- see "
                 "`.agents/skills/colab-llm-service/SKILL.md`."),
@@ -615,7 +615,7 @@ def prepare_projector(config, service, work):
     return target
 
 if not Path("/content/drive/MyDrive").is_dir():
-    raise RuntimeError("Drive is not mounted. Run via `./services/qwen-flash.py up`.")
+    raise RuntimeError("Drive is not mounted. Run via `colabllm qwen-flash up`.")
 SERVICE_DIR = Path(CFG["service_dir"])
 SERVICE_DIR.mkdir(parents=True, exist_ok=True)
 QWEN_WORK = Path(CFG["work_dir"])
@@ -5765,7 +5765,7 @@ LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
 
 LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
     'def start_service():',
-    '(LC_WORK / "avatar_sampling.py").write_text(' + repr((ROOT / 'lib/avatar_sampling.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
+    '(LC_WORK / "avatar_sampling.py").write_text(' + repr((ROOT / 'src/colabllm/lib/avatar_sampling.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
 
 # Unlimited-OCR: source files are embedded to keep the notebook self-contained.
 UNLIMITED_OCR_CFG = dict(name="unlimited-ocr", service_port=8000, auth="caddy", public_port=18080,
@@ -5773,7 +5773,7 @@ UNLIMITED_OCR_CFG = dict(name="unlimited-ocr", service_port=8000, auth="caddy", 
 UNLIMITED_OCR_SETUP = ("OCR_CACHE_SOURCE = " + repr((ROOT / "templates/colab_cache.py").read_text()) + "\n"
                        + (ROOT / "templates/unlimited_ocr_setup.py").read_text())
 UNLIMITED_OCR_SERVICE = ("# @title 2. Unlimited-OCR Drive job service\n"
-    + "(OCR_WORK / 'ocr_parameters.py').write_text(" + repr((ROOT / "lib/ocr_parameters.py").read_text()) + ", encoding='utf-8')\n"
+    + "(OCR_WORK / 'ocr_parameters.py').write_text(" + repr((ROOT / "src/colabllm/lib/ocr_parameters.py").read_text()) + ", encoding='utf-8')\n"
     + "(OCR_WORK / 'unlimited_ocr_app.py').write_text(" + repr((ROOT / "templates/unlimited_ocr_app.py").read_text()) + ", encoding='utf-8')\n"
     + """def start_service():
     return ct_spawn("service", [OCR_PY, str(OCR_WORK / 'unlimited_ocr_app.py')], cwd=str(OCR_WORK),
@@ -5791,17 +5791,17 @@ UNLIMITED_OCR_KEEPALIVE = (KEEPALIVE % UNLIMITED_OCR_CFG).replace(
 print("CT_READY", flush=True)""")
 
 if __name__ == "__main__":
-    write(ROOT / "services/unlimited-ocr.ipynb",
+    write(ROOT / "src/colabllm/services/unlimited-ocr.ipynb",
           notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR; official Transformers backend, "
                    "local SSD model and kernels, persistent Drive results, Caddy auth and asynchronous CLI jobs.",
                    UNLIMITED_OCR_CFG, UNLIMITED_OCR_SETUP, UNLIMITED_OCR_SERVICE,
                    keepalive=UNLIMITED_OCR_KEEPALIVE))
-    write(ROOT / "services/longcat-avatar.ipynb",
+    write(ROOT / "src/colabllm/services/longcat-avatar.ipynb",
           notebook("LongCat-Video-Avatar 1.5 (G4)",
                    "Audio-driven single-person video, BF16 + Whisper + 8-step DMD; outputs on Drive.",
                    LONGCAT_AVATAR_CFG, LONGCAT_AVATAR_SETUP, LONGCAT_AVATAR_SERVICE,
                    auth_cell=LONGCAT_VIDEO_CADDY))
-    write(ROOT / "services/longcat-video.ipynb",
+    write(ROOT / "src/colabllm/services/longcat-video.ipynb",
           notebook("LongCat-Video (G4)", "Single-GPU BF16 text-to-video, image-to-video and video continuation; "
                    "models on local SSD, generated videos on Drive, Caddy authentication.",
                    LONGCAT_VIDEO_CFG, LONGCAT_VIDEO_SETUP, LONGCAT_VIDEO_SERVICE,
@@ -5809,29 +5809,29 @@ if __name__ == "__main__":
     write(ROOT / "templates/service.ipynb",
           notebook("my-service (template)", "Template: replace cells 1 and 2 with the real model service.",
                    TEMPLATE_CFG, TEMPLATE_SETUP, TEMPLATE_SERVICE))
-    write(ROOT / "services/comfyui.ipynb",
+    write(ROOT / "src/colabllm/services/comfyui.ipynb",
           notebook("ComfyUI + ComfyUI-Manager",
                    "ComfyUI with ComfyUI-Manager enabled behind Caddy auth (basic auth for browser UI, "
                    "Bearer token for API clients). Models live on fast local NVMe SSD (`/content/ComfyUI/models`) "
                    "and are downloaded on demand per workflow (`--workflow <url-or-template>` or `pull-workflow`); "
                    "custom_nodes, user settings, input, and output persist on Google Drive.",
                    COMFYUI_CFG, COMFYUI_SETUP, COMFYUI_SERVICE))
-    write(ROOT / "services/ollama.ipynb",
+    write(ROOT / "src/colabllm/services/ollama.ipynb",
           notebook("Ollama", "Ollama API behind Caddy auth (Ollama has no auth of its own). "
                    "Models: `CT_MODELS` (comma separated, default `qwen2.5:0.5b`).",
                    OLLAMA_CFG, OLLAMA_SETUP, OLLAMA_SERVICE))
-    write(ROOT / "services/unsloth-studio.ipynb",
+    write(ROOT / "src/colabllm/services/unsloth-studio.ipynb",
           notebook("Unsloth Studio", "Based on https://github.com/unslothai/unsloth/blob/main/studio/"
                    "Unsloth_Studio_Colab.ipynb -- built-in login, our own cloudflared (quick or fixed domain).",
                    UNSLOTH_CFG, UNSLOTH_SETUP, UNSLOTH_SERVICE, keepalive=UNSLOTH_KEEPALIVE))
-    write(ROOT / "services/qwen-flash.ipynb",
+    write(ROOT / "src/colabllm/services/qwen-flash.ipynb",
           notebook("Qwen3.8-Flash-Next (G4 / 800K / Vision)",
-                   "Migrated from `~/legacy/qwen-flash-colab`. Runs `SC117/Qwen3.8-Flash-Next-GSQ-RCO-"
+                   "Runs `SC117/Qwen3.8-Flash-Next-GSQ-RCO-"
                    "abliterated-GGUF` (IQ3_S, 819200 context with YaRN 3.125x, BF16 vision projector, "
                    "`--load-mode none --lazy-mode off`) on a Colab G4 (RTX PRO 6000 Blackwell sm_120) with "
                    "`llama-server --api-key-file` authentication.",
                    QWEN_FLASH_CFG, QWEN_FLASH_SETUP, QWEN_FLASH_SERVICE, keepalive=QWEN_FLASH_KEEPALIVE))
-    write(ROOT / "services/nemotron-transcribe.ipynb",
+    write(ROOT / "src/colabllm/services/nemotron-transcribe.ipynb",
           notebook("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech)",
                    "Serves `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` (BF16 / FP8 / NVFP4, 65536 context, "
                    "up to 1-hour audio, 40 languages, MTP8 speculative decoding, CTC word timestamps & speaker "
@@ -5839,7 +5839,7 @@ if __name__ == "__main__":
                    "and direct Google Drive audio batch/single transcription endpoints.",
                    NEMOTRON_TRANSCRIBE_CFG, NEMOTRON_TRANSCRIBE_SETUP, NEMOTRON_TRANSCRIBE_SERVICE,
                    keepalive=NEMOTRON_TRANSCRIBE_KEEPALIVE))
-    write(ROOT / "services/indextts.ipynb",
+    write(ROOT / "src/colabllm/services/indextts.ipynb",
           notebook("IndexTTS-2.5 (L4 / vLLM-Omni 2-Stage Zero-Shot Voice Cloning & Emotion TTS)",
                    "Serves `IndexTeam/IndexTTS-2.5` on a Colab L4 GPU via `vllm serve --omni` (Stage 0 Talker + "
                    "Stage 1 EnhancedCodec/S2Mel DiT/BigVGAN) with Bearer token auth, zero-shot voice cloning, "
@@ -5848,7 +5848,7 @@ if __name__ == "__main__":
                    "`emo_text`, `emo_audio`, `emo_alpha`), and Google Drive voice/output persistence.",
                    INDEXTTS_CFG, INDEXTTS_SETUP, INDEXTTS_SERVICE,
                    keepalive=INDEXTTS_KEEPALIVE))
-    write(ROOT / "services/qwen3-tts.ipynb",
+    write(ROOT / "src/colabllm/services/qwen3-tts.ipynb",
           notebook("Qwen3-TTS (L4 / vLLM-Omni 2-Stage CustomVoice, VoiceDesign & 3s Voice Clone)",
                    "Serves `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`, `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`, and "
                    "`Qwen/Qwen3-TTS-12Hz-1.7B-Base` on a Colab L4 GPU via `vllm serve --omni` (Stage 0 Talker + "

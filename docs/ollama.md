@@ -1,10 +1,10 @@
 # Ollama 运行时使用说明
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[services/ollama.py](services/ollama.py)
-- 远端 Notebook：[services/ollama.ipynb](services/ollama.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/ollama.py](services/ollama.py)
+- 远端 Notebook：[src/colabllm/services/ollama.ipynb](services/ollama.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
 
 ---
 
@@ -25,45 +25,45 @@
 
 ```bash
 # 1. 启动服务并绑定固定域名 https://ollama.example.com
-./services/ollama.py up --domain
+colabllm ollama up --domain
 
 # 2. 使用临时 *.trycloudflare.com 链接启动，或指定 L4 GPU
-./services/ollama.py up --quick-tunnel --gpu L4
+colabllm ollama up --quick-tunnel --gpu L4
 
 # 3. 查看访问地址、Basic Auth 账号密码与 Bearer API Token
-./services/ollama.py info
+colabllm ollama info
 
 # 4. 查看实时日志 / 检查服务状态与安全探测
-./services/ollama.py logs -f
-./services/ollama.py status
+colabllm ollama logs -f
+colabllm ollama status
 
 # 5. 停止服务并释放 Colab VM
-./services/ollama.py down
+colabllm ollama down
 ```
 
 ### 2.1 多实例（多会话）并发运行与启动时指定模型
 
 ```bash
 # 启动时通过 --models 指定要预拉取的模型列表
-./services/ollama.py up --domain --models qwen2.5:7b,llama3.2:3b
+colabllm ollama up --domain --models qwen2.5:7b,llama3.2:3b
 
 # 启动第 2 个独立实例（会话 ollama-2，绑定 https://ollama-2.example.com）
-./services/ollama.py up -i 2 --domain --gpu L4 --models deepseek-r1:14b
+colabllm ollama up -i 2 --domain --gpu L4 --models deepseek-r1:14b
 
 # 查看所有 Ollama 实例列表与状态
-./services/ollama.py ps
+colabllm ollama ps
 
 # 查看指定实例详情 / 日志 / 停止全部实例
-./services/ollama.py info -i 2
-./services/ollama.py logs -i 2 -f
-./services/ollama.py down --all
+colabllm ollama info -i 2
+colabllm ollama logs -i 2 -f
+colabllm ollama down --all
 ```
 
 ---
 
 ## 3. API 调用与在线拉取新模型
 
-先通过 `./services/ollama.py info` 获取 `URL` 与 `TOKEN`：
+先通过 `colabllm ollama info` 获取 `URL` 与 `TOKEN`：
 
 ### 3.1 在线拉取其他 Ollama 模型 (`/api/pull`)
 

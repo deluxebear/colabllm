@@ -10,7 +10,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
-SCRIPT=Path(__file__).resolve().parents[1]/'services/longcat-avatar.py'
+SCRIPT=Path(__file__).resolve().parents[1]/'src/colabllm/services/longcat-avatar.py'
 VIDEO=b'\x00\x00\x00\x18ftypmp42-test-video'
 
 class Handler(BaseHTTPRequestHandler):

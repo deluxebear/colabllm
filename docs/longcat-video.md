@@ -1,18 +1,18 @@
 # LongCat-Video（Colab G4）
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 基于 [meituan-longcat/LongCat-Video](https://github.com/meituan-longcat/LongCat-Video)，部署基础视频生成模型，提供带认证的 Gradio 网页：文生视频、图生视频、视频续写，以及多段连续生成。此服务不加载独立的 Avatar 模型。
 
 ```bash
-./services/longcat-video.py up --domain   # 默认 G4，https://longcat-video.example.com
-./services/longcat-video.py info          # 查看地址、登录账号、密码、API Token
-./services/longcat-video.py status
-./services/longcat-video.py logs -f
-./services/longcat-video.py down
+colabllm longcat-video up --domain   # 默认 G4，https://longcat-video.example.com
+colabllm longcat-video info          # 查看地址、登录账号、密码、API Token
+colabllm longcat-video status
+colabllm longcat-video logs -f
+colabllm longcat-video down
 
 # 多实例与 GPU 覆盖仍使用共享运行库的标准参数
-./services/longcat-video.py up -i 2 --domain --gpu G4
+colabllm longcat-video up -i 2 --domain --gpu G4
 ```
 
 默认快速模式启用官方 CFG/step LoRA，16 步生成 93 帧、15 fps 视频（约 6.2 秒）。标准模式默认 50 步、CFG 4；随机种子设为 -1 可随机生成。连续生成会用上一段末尾 13 帧作为下一段的条件，拼接时去除重叠帧。多段文生视频会根据所选 480p / 720p 分辨率和宽高比例使用官方尺寸桶，使各段尺寸一致。
@@ -29,14 +29,14 @@
 
 ## 认证与接口
 
-服务只监听 `127.0.0.1:7860`，公网经 Caddy `:18080`：浏览器 Basic Auth，API 使用 `Authorization: Bearer <API_TOKEN>`。凭据在本地 `.state/longcat-video/state.json`，不写入 Notebook。
+服务只监听 `127.0.0.1:7860`，公网经 Caddy `:18080`：浏览器 Basic Auth，API 使用 `Authorization: Bearer <API_TOKEN>`。凭据在本地 `~/.colabllm/services/longcat-video/state.json`，不写入 Notebook。
 
 带认证访问 `/health` 返回模型和 GPU 信息。Gradio 的 API 页面提供 `generate` 接口参数说明；API 与网页共享串行生成队列，避免并发争用显存。
 
 ## 文件与日志
 
-- [services/longcat-video.py](../services/longcat-video.py)：会话、认证、隧道和保活入口。
-- [services/longcat-video.ipynb](../services/longcat-video.ipynb)：自包含部署 Notebook。
+- [src/colabllm/services/longcat-video.py](.colabllm longcat-video)：会话、认证、隧道和保活入口。
+- [src/colabllm/services/longcat-video.ipynb](../services/longcat-video.ipynb)：自包含部署 Notebook。
 - [templates/longcat_video_app.py](../templates/longcat_video_app.py)：Gradio 应用及 SDPA 适配器；生成器将源码嵌入 Notebook。
 - `templates/build_notebooks.py`：`LONGCAT_VIDEO_*` 部署单元。
 - 远端日志：`/content/longcat-video/install.log`、`download.log`、`/content/ct/service.log`。

@@ -1,11 +1,11 @@
 # IndexTTS-2.5 操作说明
 
 ```bash
-./services/indextts.py up
-./services/indextts.py tts "你好，这是语音合成测试。" -o speech.wav
+colabllm indextts up
+colabllm indextts tts "你好，这是语音合成测试。" -o speech.wav
 ```
 
-主域名在项目根目录统一设置：`./colabctl.py tunnel-config --base-domain example.com`。未配置时使用动态 URL。详见 [项目操作说明](../README.md#cloudflare-tunnel-配置)。
+主域名在项目根目录统一设置：`colabllm tunnel-config --base-domain example.com`。未配置时使用动态 URL。详见 [项目操作说明](../README.md#cloudflare-tunnel-配置)。
 
 ## 启动与编译缓存
 

@@ -2,15 +2,13 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
-import os
 from pathlib import Path
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader('colabllm_cli', str(ROOT / 'colabllm'))
+loader = importlib.machinery.SourceFileLoader('colabllm_cli', str(ROOT / 'src/colabllm/cli.py'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 cli = importlib.util.module_from_spec(spec)
 loader.exec_module(cli)
@@ -32,7 +30,7 @@ class UnifiedCliTest(unittest.TestCase):
         for name in cli.GLOBAL_COMMANDS:
             with patch.object(cli.os, 'execv') as execute:
                 cli.main([name, '--help'])
-                execute.assert_called_once_with(sys.executable, [sys.executable, str(ROOT / 'colabctl.py'), name, '--help'])
+                execute.assert_called_once_with(sys.executable, [sys.executable, str(ROOT / 'src/colabllm/control.py'), name, '--help'])
 
     def test_listing_and_unknown_command_never_execute_a_service(self):
         with patch.object(cli.os, 'execv') as execute, contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
@@ -42,19 +40,9 @@ class UnifiedCliTest(unittest.TestCase):
             self.assertEqual(cli.main(['services', 'up']), 2)
             execute.assert_not_called()
 
-    def test_install_is_idempotent_and_preserves_unrelated_files(self):
-        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            target = Path(d) / 'bin/colabllm'
-            cli.install(['--bin-dir', str(target.parent)])
-            cli.install(['--bin-dir', str(target.parent)])
-            self.assertEqual(target.resolve(), ROOT / 'colabllm')
-            target.unlink()
-            target.write_text('unrelated')
-            with self.assertRaises(SystemExit):
-                cli.install(['--bin-dir', str(target.parent)])
-            self.assertEqual(target.read_text(), 'unrelated')
-            cli.install(['--bin-dir', str(target.parent), '--force'])
-            self.assertEqual(target.resolve(), ROOT / 'colabllm')
+    def test_repository_symlink_installer_is_removed(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(['install']), 2)
 
 
 if __name__ == '__main__':

@@ -1,85 +1,9 @@
 #!/usr/bin/env python3
-"""Unified CLI for this checkout's Colab model services (Python standard library only)."""
-import argparse
-import os
-from pathlib import Path
+"""Development entry point; install the distribution with `uv tool install .`."""
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from colabllm.cli import main
 
-ROOT = Path(__file__).resolve().parent
-GLOBAL_COMMANDS = ('tunnel-config', 'frp-config', 'frp-status')
-
-
-def services():
-    """Discover service pairs without importing or starting their implementation."""
-    return {p.stem: p for p in sorted((ROOT / 'services').glob('*.py'))
-            if p.with_suffix('.ipynb').is_file()}
-
-
-def install(argv):
-    parser = argparse.ArgumentParser(prog='colabllm install', description='将本 checkout 的统一 CLI 链接到 PATH 目录')
-    parser.add_argument('--bin-dir', type=Path, default=Path.home() / '.local/bin')
-    parser.add_argument('--force', action='store_true', help='替换已存在的 colabllm 文件或链接')
-    args = parser.parse_args(argv)
-    directory = args.bin_dir.expanduser().resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / 'colabllm'
-    source = ROOT / 'colabllm'
-    if target == source:
-        parser.error('安装目录不能是项目根目录')
-    if target.is_symlink() and target.resolve() == source:
-        pass
-    else:
-        if target.exists() or target.is_symlink():
-            if not args.force or target.is_dir():
-                parser.error(f'{target} 已存在；请选择其他目录或使用 --force 替换文件/链接')
-            target.unlink()
-        target.symlink_to(source)
-    print(f'已安装: {target} -> {source}')
-    if str(directory) not in os.environ.get('PATH', '').split(os.pathsep):
-        print(f'请将 {directory} 加入 PATH（例如在 shell 配置中添加）：')
-        import shlex
-        print(f'export PATH={shlex.quote(str(directory))}:"$PATH"')
-    print('可从任意目录使用：colabllm unlimited-ocr up')
-
-
-def main(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    available = services()
-    if not argv or argv[0] in ('-h', '--help', 'help'):
-        print('用法: colabllm <运行时> <命令> [参数...]\n'
-              '      colabllm <全局配置命令> [参数...]\n'
-              '      colabllm install [--bin-dir DIR] [--force]\n\n'
-              '运行时: ' + ', '.join(available) + '\n'
-              '全局配置: ' + ', '.join(GLOBAL_COMMANDS) + '\n\n'
-              '示例:\n'
-              '  colabllm unlimited-ocr up\n'
-              '  colabllm unlimited-ocr ocr ./documents -O ./results\n'
-              '  colabllm qwen3-tts up -i 2\n'
-              '  colabllm tunnel-config\n\n'
-              'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
-        return 0
-    command, *remaining = argv
-    if command in ('services', '--list'):
-        if remaining:
-            print('用法: colabllm services', file=sys.stderr)
-            return 2
-        print('\n'.join(available))
-        return 0
-    if command == 'install':
-        install(remaining)
-        return 0
-    if command in available:
-        script = available[command]
-    elif command in GLOBAL_COMMANDS:
-        script = ROOT / 'colabctl.py'
-        remaining = [command, *remaining]
-    else:
-        print(f'未知运行时或命令: {command}\n使用 colabllm --help 查看可用命令。', file=sys.stderr)
-        return 2
-    # Replace this process: preserve signals, exit codes and the caller's cwd/local file paths.
-    # Keep the actual service script as argv[0], since its detached runner uses that path.
-    os.execv(sys.executable, [sys.executable, str(script), *remaining])
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())

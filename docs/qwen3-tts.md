@@ -1,12 +1,12 @@
 # Qwen3-TTS 操作说明
 
 ```bash
-./services/qwen3-tts.py up
-./services/qwen3-tts.py tts "给忙碌的早晨，留一点香气。" \
+colabllm qwen3-tts up
+colabllm qwen3-tts tts "给忙碌的早晨，留一点香气。" \
   --voice serena --lang Chinese -o speech.wav
 ```
 
-使用项目全局主域名：`./colabctl.py tunnel-config --base-domain example.com`。未配置时使用动态 URL。详见 [项目操作说明](../README.md#cloudflare-tunnel-配置)。
+使用项目全局主域名：`colabllm tunnel-config --base-domain example.com`。未配置时使用动态 URL。详见 [项目操作说明](../README.md#cloudflare-tunnel-配置)。
 
 ## 启动缓存优化
 

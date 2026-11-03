@@ -1,10 +1,10 @@
 # NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech) 运行时使用说明
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[services/nemotron-transcribe.py](services/nemotron-transcribe.py)
-- 远端 Notebook：[services/nemotron-transcribe.ipynb](services/nemotron-transcribe.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/nemotron-transcribe.py](services/nemotron-transcribe.py)
+- 远端 Notebook：[src/colabllm/services/nemotron-transcribe.ipynb](services/nemotron-transcribe.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
 
 ---
 
@@ -27,48 +27,48 @@
 
 ```bash
 # 1. 启动服务并绑定默认域名 https://transcribe.example.com（默认 G4 GPU + BF16 权重）
-./services/nemotron-transcribe.py up --domain
+colabllm nemotron-transcribe up --domain
 
 # 2. 可选：使用 FP8 或 NVFP4 量化权重启动（体积更小、吞吐更高）
-./services/nemotron-transcribe.py up --domain --precision fp8
-./services/nemotron-transcribe.py up --domain --precision nvfp4
+colabllm nemotron-transcribe up --domain --precision fp8
+colabllm nemotron-transcribe up --domain --precision nvfp4
 
 # 3. 使用随机临时域名 (*.trycloudflare.com) 启动
-./services/nemotron-transcribe.py up --quick-tunnel
+colabllm nemotron-transcribe up --quick-tunnel
 
 # 4. 查看访问 URL 与 Bearer API Token
-./services/nemotron-transcribe.py info
+colabllm nemotron-transcribe info
 
 # 5. 查看实时准备进度（NeMo Speech + vLLM 环境安装 / 模型下载 / FlashInfer 编译预热）
-./services/nemotron-transcribe.py logs -f
+colabllm nemotron-transcribe logs -f
 
 # 6. 检查 Colab 会话状态与公网认证连通性探测
-./services/nemotron-transcribe.py status
+colabllm nemotron-transcribe status
 
 # 7. 停止服务并释放 G4 实例
-./services/nemotron-transcribe.py down
+colabllm nemotron-transcribe down
 ```
 
 ### 2.1 多实例部署与管理 (`-i / --instance` & `ps`)
 
-所有命令均支持 `-i <ID>`（或 `--instance <ID>`）参数来创建和管理多个相互独立的 Colab G4 实例（每个实例拥有独立的 Colab 会话、独立的状态目录 `.state/nemotron-transcribe-<ID>`、独立的 Cloudflare 隧道与子域名 `transcribe-<ID>.example.com`，同时共享 Google Drive 上的 `flashinfer-cache` 与音频目录）：
+所有命令均支持 `-i <ID>`（或 `--instance <ID>`）参数来创建和管理多个相互独立的 Colab G4 实例（每个实例拥有独立的 Colab 会话、独立的状态目录 `~/.colabllm/services/nemotron-transcribe-<ID>`、独立的 Cloudflare 隧道与子域名 `transcribe-<ID>.example.com`，同时共享 Google Drive 上的 `flashinfer-cache` 与音频目录）：
 
 ```bash
 # 启动多个并行 G4 实例（自动映射为 transcribe-1.example.com, transcribe-2.example.com ...）
-./services/nemotron-transcribe.py up -i 1 --domain
-./services/nemotron-transcribe.py up -i 2 --domain
+colabllm nemotron-transcribe up -i 1 --domain
+colabllm nemotron-transcribe up -i 2 --domain
 
 # 查看所有实例的运行状态、URL 与 API Token
-./services/nemotron-transcribe.py ps
+colabllm nemotron-transcribe ps
 
 # 查看或管理指定实例
-./services/nemotron-transcribe.py info -i 2
-./services/nemotron-transcribe.py logs -f -i 2
-./services/nemotron-transcribe.py status -i 2
+colabllm nemotron-transcribe info -i 2
+colabllm nemotron-transcribe logs -f -i 2
+colabllm nemotron-transcribe status -i 2
 
 # 停止指定实例，或一次性停止全部实例 (--all)
-./services/nemotron-transcribe.py down -i 2
-./services/nemotron-transcribe.py down --all
+colabllm nemotron-transcribe down -i 2
+colabllm nemotron-transcribe down --all
 ```
 
 ---
@@ -81,23 +81,23 @@
 
 ```bash
 # 列出 Google Drive 上的音频文件（支持子目录或通配符）
-./services/nemotron-transcribe.py ls-drive
-./services/nemotron-transcribe.py ls-drive "meetings/*.wav"
-./services/nemotron-transcribe.py ls-drive "colab-llm/nemotron-transcribe/audio"
+colabllm nemotron-transcribe ls-drive
+colabllm nemotron-transcribe ls-drive "meetings/*.wav"
+colabllm nemotron-transcribe ls-drive "colab-llm/nemotron-transcribe/audio"
 
 # 查看内置的 11 种 NVIDIA 官方推荐 Prompt 预设模板
-./services/nemotron-transcribe.py prompts
+colabllm nemotron-transcribe prompts
 ```
 
 ### 3.2 单个网盘音频文件 + 自定义 Prompt
 
 ```bash
 # 指定网盘路径（相对于 /content/drive/MyDrive/ 或完整路径）和自定义 Prompt
-./services/nemotron-transcribe.py transcribe "audio/meeting01.wav" \
+colabllm nemotron-transcribe transcribe "audio/meeting01.wav" \
   --prompt "Audio transcription. Language: as spoken. Wording: verbatim, including fillers and repetitions. Formatting: punctuation and capitalization. Output: transcript only."
 
 # 将结果同时保存回 Google Drive（同目录生成 .txt / .nemotron.json）并保存到本地文件
-./services/nemotron-transcribe.py transcribe "audio/meeting01.wav" \
+colabllm nemotron-transcribe transcribe "audio/meeting01.wav" \
   --preset clean \
   --save-drive \
   -o ./meeting01.txt
@@ -106,7 +106,7 @@
 ### 3.3 说话人分离 + 词级时间戳 + 自动导出 `.srt` 字幕 (`--preset speaker --timestamps`)
 
 ```bash
-./services/nemotron-transcribe.py transcribe "audio/panel_discussion.mp3" \
+colabllm nemotron-transcribe transcribe "audio/panel_discussion.mp3" \
   --preset speaker --timestamps \
   --save-drive "audio/transcripts" \
   -O ./outputs
@@ -117,15 +117,15 @@
 
 ```bash
 # 1. 将外语录音直接翻译为中文
-./services/nemotron-transcribe.py transcribe "audio/keynote_en.m4a" \
+colabllm nemotron-transcribe transcribe "audio/keynote_en.m4a" \
   --preset translate --lang Chinese
 
 # 2. 传入专有名词 / 术语表提升识别准确率
-./services/nemotron-transcribe.py transcribe "audio/earnings_call.wav" \
+colabllm nemotron-transcribe transcribe "audio/earnings_call.wav" \
   --preset context --context "Nemotron, Blackwell, RTX PRO 6000, vLLM, FlashInfer"
 
 # 3. 音频理解与问答（开启推理思考模式 --reasoning）
-./services/nemotron-transcribe.py transcribe "audio/interview.wav" \
+colabllm nemotron-transcribe transcribe "audio/interview.wav" \
   --prompt "请根据这段录音总结受访者提到的三个核心观点，并列出提到的所有公司名称。" \
   --reasoning
 ```
@@ -134,21 +134,21 @@
 
 ```bash
 # 方式 A：批量转写网盘某个目录或通配符匹配的音频（并发数 2，结果写回网盘指定目录并存本地 ./out）
-./services/nemotron-transcribe.py transcribe "meetings/*.mp3" \
+colabllm nemotron-transcribe transcribe "meetings/*.mp3" \
   --prompt "Audio transcription. Language: as spoken. Wording: omit fillers and accidental repetitions; keep the remaining spoken wording unchanged. Formatting: punctuation and capitalization. Output: transcript only." \
   --save-drive "meetings/transcripts" \
   -O ./out \
   -j 2
 
 # 方式 B：直接传入网盘文件夹路径（默认递归扫描里面所有 .wav/.mp3/.flac/.m4a/.ogg/.mp4 等）
-./services/nemotron-transcribe.py transcribe "meetings/" \
+colabllm nemotron-transcribe transcribe "meetings/" \
   --preset verbatim \
   --save-drive \
   -O ./out
 
 # 方式 C：通过批量任务清单文件 (--batch-file)，为不同音频指定不同的 Prompt / 模式
 # 支持 .jsonl / .json / .csv / .tsv / .txt
-./services/nemotron-transcribe.py transcribe --batch-file tasks.jsonl \
+colabllm nemotron-transcribe transcribe --batch-file tasks.jsonl \
   --save-drive "meetings/outputs" \
   -O ./out \
   -j 2
@@ -169,27 +169,27 @@
 
 ```bash
 # 1. 直接转写 YouTube / Twitter(X) / Bilibili 视频或播客链接（自动下载到网盘再转写）
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --preset verbatim
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --preset verbatim
 
 # 2. 指定网盘保存目录 (--download-dir)，并开启说话人分离 + 词级时间戳 + 字幕保存回网盘 (--save-drive)
-./services/nemotron-transcribe.py transcribe "https://x.com/OpenAI/status/1234567890" \
+colabllm nemotron-transcribe transcribe "https://x.com/OpenAI/status/1234567890" \
   --download-dir "video/voices" \
   --preset speaker --timestamps \
   --save-drive
 
 # 2b. 下载并保留完整视频文件 (.mp4) 到网盘 (--download-video，默认不加该参数时仅提取纯音频)
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
   --download-video \
   --download-dir "video/voices" \
   --preset verbatim
 
 # 2c. 仅临时下载识别，不将音视频文件保留在 Google Drive 网盘上 (--no-save-media-drive)
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
   --no-save-media-drive \
   --preset verbatim
 
 # 3. 批量转写整个 YouTube 播放列表 (--playlist) 或多条链接
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/playlist?list=PLxxxx" \
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/playlist?list=PLxxxx" \
   --playlist \
   --download-dir "video/voices" \
   --preset clean \
@@ -197,14 +197,14 @@
 
 # 4. 如果视频需要登录 Cookie：
 #    - 方式 A：使用网盘上的 cookies.txt（远端 Colab 直接下载）
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=xxxx" \
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/watch?v=xxxx" \
   --cookies-drive "colab-llm/cookies.txt" --preset verbatim
 #    - 方式 B：使用本地浏览器 Cookie 或本地 cookies.txt（本机 yt-dlp 下载后自动上传网盘并转写）
-./services/nemotron-transcribe.py transcribe "https://www.youtube.com/watch?v=xxxx" \
+colabllm nemotron-transcribe transcribe "https://www.youtube.com/watch?v=xxxx" \
   --cookies-from-browser chrome --download-dir "video/voices" --preset verbatim
 
 # 5. 仅使用 yt-dlp 将多媒体 URL 下载提取音频到 Google Drive 网盘（不立即转写）
-./services/nemotron-transcribe.py download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
+colabllm nemotron-transcribe download "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
   --download-dir "video/voices"
 ```
 
@@ -212,7 +212,7 @@
 
 ## 4. 远端 API 调用示例
 
-先通过 `./services/nemotron-transcribe.py info` 获取服务地址（如 `https://transcribe.example.com`）和 `API_TOKEN`。
+先通过 `colabllm nemotron-transcribe info` 获取服务地址（如 `https://transcribe.example.com`）和 `API_TOKEN`。
 
 ### 4.1 OpenAI Python SDK 标准调用（上传本地音频 Base64）
 
@@ -223,7 +223,7 @@ from openai import OpenAI
 
 client = OpenAI(
     base_url="https://transcribe.example.com/v1",
-    api_key="sk-...",  # ./services/nemotron-transcribe.py info 查看
+    api_key="sk-...",  # colabllm nemotron-transcribe info 查看
 )
 
 audio_b64 = base64.b64encode(Path("sample.wav").read_bytes()).decode("ascii")

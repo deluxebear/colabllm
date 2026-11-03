@@ -28,7 +28,7 @@ Token. For `auth=builtin`, frpc targets the app's authenticated port directly.
   upstream (`REWRITE_HOST`, needed by Ollama; set `False` for apps that build absolute URLs from Host).
 - `flush_interval -1` so token streaming (SSE / chunked) and WebSockets pass through unbuffered.
 - The service must bind to `127.0.0.1`, otherwise the proxy can be bypassed inside the VM network.
-- Credentials are generated once per service by the script, kept in `.state/<name>/state.json`
+- Credentials are generated once per service by the script, kept in `~/.colabllm/services/<name>/state.json`
   (0600) and reused across restarts; rotate with `up --new-credentials`.
 
 Verified behaviour: no credentials → 401, wrong password → 401, basic auth → 200, Bearer → 200,
@@ -38,7 +38,7 @@ wrong Bearer → 401.
 
 ```bash
 eval "$(colabllm ollama info >/dev/null; python3 - <<'EOF'
-import json; s=json.load(open('.state/ollama/state.json')); print(f"URL={s['url']} TOKEN={s['api_token']}")
+import json; from pathlib import Path; s=json.loads((Path.home() / '.colabllm/services/ollama/state.json').read_text()); print(f"URL={s['url']} TOKEN={s['api_token']}")
 EOF
 )"
 curl -H "Authorization: Bearer $TOKEN" "$URL/api/generate" -d '{"model":"qwen2.5:0.5b","prompt":"hi","stream":false}'

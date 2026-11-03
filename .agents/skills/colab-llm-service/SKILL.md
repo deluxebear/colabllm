@@ -9,20 +9,20 @@ description: >-
 
 # Colab LLM service
 
-Every model service in this repo is a pair of files in `services/`, sharing one library:
+Every model service in this repo is a pair of files in `src/colabllm/services/`, sharing one library:
 
 ```
-colabllm                unified CLI: service dispatch, project configuration, PATH installation
-services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
-services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
-lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
-colabctl.py             project-global domain and FRP configuration
-lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
+src/colabllm/cli.py     packaged CLI: service dispatch and project configuration
+src/colabllm/services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
+src/colabllm/services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
+src/colabllm/lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
+src/colabllm/control.py             project-global domain and FRP configuration
+src/colabllm/lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
 templates/tunnel_client.py  shared cloudflared/frpc implementation embedded in all notebooks
 templates/               service.py + service.ipynb to copy; build_notebooks.py regenerates notebooks
-.state/<name>/           private runtime state and resource identities (gitignored)
-.state/tunnel-config.json  shared base domain and optional FRP metadata
-.state/frp/             private per-server client credentials (0600)
+~/.colabllm/services/<name>/           private runtime state and resource identities (outside the checkout)
+~/.colabllm/tunnel-config.json  shared base domain and optional FRP metadata
+~/.colabllm/frp/             private per-server client credentials (0600)
 ```
 
 Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, T4),
@@ -42,16 +42,18 @@ Use `colabllm <name> <command> [args...]` for runtime operations and user-facing
 Use `colabllm tunnel-config`, `colabllm frp-config`, and `colabllm frp-status` for project configuration.
 Run `colabllm services` to discover runtimes and `colabllm <name> --help` for their commands.
 
-On a new machine, clone the project, prepare the Colab/Drive/tunnel prerequisites, then run
-`./colabllm install` from the checkout to link `~/.local/bin/colabllm`. Follow its PATH output;
-`./colabllm <name> ...` also works before PATH setup. The link uses this checkout's code and
-`.state/`; moving the checkout requires installing the link again. Local relative input/output
-paths remain relative to the caller's working directory.
+Install a distributed wheel with `uv tool install /path/to/colabllm-VERSION-py3-none-any.whl`.
+After publication, users can use `uv tool install colabllm` and `uv tool upgrade colabllm`.
+Developers use `uv tool install --editable .`; `uv build --no-sources` produces wheel and sdist.
+Run `python tools/check_distribution.py dist/colabllm-VERSION-py3-none-any.whl` to verify distribution.
 
-Keep `services/<name>.py` and its matching notebook as the implementation pair; the dispatcher
-executes the real script so its detached `_exec` runner keeps the correct script path. Legacy
-`./services/<name>.py ...` and `./colabctl.py ...` remain supported. New matching service pairs
-are discovered automatically, with all service-specific commands and instance flags forwarded.
+The package includes each service script and matching notebook. The dispatcher executes the actual
+installed script so the detached `_exec` runner retains the script path. All application state is
+in `~/.colabllm/` (override: `COLABLLM_HOME`); instances use `services/<name>/`, global tunnel settings
+use `tunnel-config.json`, and FRP credentials use `frp/`. External CLI authentication keeps its own
+locations. Relative input/output paths remain relative to the caller's working directory.
+Stop services before upgrading and restart them afterwards. Existing repository `.state/` is unused;
+there is no migration. New service pairs are discovered automatically and must be included in builds.
 
 ## Daily use and transport selection
 
@@ -103,7 +105,7 @@ Fixed domains use the local `cf` login for DNS in either backend. FRP server man
 7. **A failing cell does not change `colab exec`'s exit code** -> readiness is signalled with markers
    (`CT_READY`), never inferred from exit codes.
 8. **Each `colab exec` call starts in `/content`**; `%cd` only persists within one exec.
-9. **Secrets never go into the notebook**: the script generates them, stores them in `.state/`
+9. **Secrets never go into the notebook**: the script generates them, stores them in `~/.colabllm/services/`
    (0600) and injects them with `colab exec --env`.
 10. **`cf` (beta) quirk**: `cf tunnels config update --tunnel-config-ingress` demands unrelated Access
     flags -> send `--body '{"config":{"ingress":[...]}}'` instead.
@@ -175,9 +177,9 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 
 ## Add a new service
 
-1. Copy the pair: `cp templates/service.py services/<name>.py; cp templates/service.ipynb services/<name>.ipynb`
+1. Copy the pair: `cp templates/service.py src/colabllm/services/<name>.py; cp templates/service.ipynb src/colabllm/services/<name>.ipynb`
    (`<name>` = file name = Colab session; hostname uses the project base domain).
-2. Edit `services/<name>.py`: `name`, `notebook`, `service_port`, `auth`, `gpu`, extra `env`.
+2. Edit `src/colabllm/services/<name>.py`: `name`, `notebook`, `service_port`, `auth`, `gpu`, extra `env`.
 3. Edit the notebook's **cell 1 (setup)** and **cell 2 (`start_service`)** only; bind to `127.0.0.1`.
    Cache large downloads in `DATA_DIR`. Adjust the health path in cell 5 if `/` is not a good probe.
    For a reusable recipe add it to `templates/build_notebooks.py` instead and regenerate.

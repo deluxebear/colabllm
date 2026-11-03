@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'lib'))
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src/colabllm/lib'))
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'templates'))
 import frp_server
 from tunnel_client import render_frpc, run_tunnel

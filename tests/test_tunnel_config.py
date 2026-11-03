@@ -11,7 +11,7 @@ import runpy
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src/colabllm/lib'))
 import colabsvc as svc
 
 
@@ -110,10 +110,10 @@ class TunnelConfigTest(unittest.TestCase):
                 self.assertEqual(svc.tunnel_hostname(self.service,up.call_args.args[2]),expected)
 
     def test_project_entry_configures_all_runtime_services(self):
-        entry = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'colabctl.py'))
+        entry = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'src/colabllm/control.py'))
         with contextlib.redirect_stdout(io.StringIO()):
             entry['main'](['tunnel-config','--base-domain','example.com'])
-        services = Path(__file__).resolve().parents[1] / 'services'
+        services = Path(__file__).resolve().parents[1] / 'src/colabllm/services'
         for script in services.glob('*.py'):
             with self.subTest(service=script.stem):
                 service=runpy.run_path(str(script))['SERVICE']

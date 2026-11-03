@@ -1,15 +1,23 @@
 # Google Colab 大模型服务
 
 在 Google Colab GPU 上运行大模型服务，通过 Cloudflare Tunnel（默认）或 FRP + Caddy 提供公网访问。
-遵循 **“一个服务 = 一个 notebook (`services/<name>.ipynb`) + 一个执行脚本 (`services/<name>.py`)”** 的约定。
+遵循 **“一个服务 = 一个 notebook (`src/colabllm/services/<name>.ipynb`) + 一个执行脚本 (`src/colabllm/services/<name>.py`)”** 的约定。
 
 ## 统一命令入口
 
-在项目目录执行一次安装（无额外 Python 依赖、无需 sudo）：
+用户通过分发包安装，无需克隆源码。尚未上传包索引时，可直接安装发布者提供的 wheel：
 
 ```bash
-./colabllm install
-# 默认链接到 ~/.local/bin/colabllm；若目录不在 PATH，按安装输出设置 PATH
+uv tool install ./colabllm-0.1.0-py3-none-any.whl
+# 如果命令目录尚未加入 PATH
+uv tool update-shell
+```
+
+发布到 PyPI 后（需先确认包名可用）：
+
+```bash
+uv tool install colabllm
+uv tool upgrade colabllm
 ```
 
 之后可以在任意目录使用 `colabllm <运行时名称> <命令> [参数...]`：
@@ -30,22 +38,76 @@ colabllm frp-config --help
 colabllm frp-status
 ```
 
-适用于所有 `services/` 中的运行时，现有参数直接透传，包含各服务专用命令和 `-i` 多实例参数。原 `./services/<名称>.py ...` 和 `./colabctl.py ...` 仍可使用。新命令使用当前 checkout 的脚本、notebook 和 `.state/`；本地相对文件路径按调用时所在目录解析。
+所有运行脚本和 notebook 都包含在安装包中。本地相对输入/输出路径按调用时所在目录解析。
+本项目的配置和运行状态统一写入 `~/.colabllm/`，不读取仓库旧 `.state/`，不提供旧配置迁移。
+可设置 `COLABLLM_HOME=/absolute/path` 使用独立目录。
 
-安装链接指向当前项目目录；部署到其他机器时克隆项目、准备下文的 Colab/Drive/隧道依赖，再执行 `./colabllm install`。更新当前 checkout 后命令立即使用新代码，无需重新安装。项目移动后重新安装；已有同名命令会被保护，可用 `./colabllm install --force` 显式替换，或使用 `--bin-dir /path/to/bin` 指定安装目录。删除安装链接即可卸载入口，项目文件和运行时不受影响。
+```text
+~/.colabllm/
+├── tunnel-config.json           # 全局主域名与 FRP 设置
+├── services/<name>/state.json   # 实例凭据、会话、隧道与 runner PID
+├── services/<name>/run.log      # 日志；执行用 notebook 也在实例目录
+└── frp/<server-id>.json         # FRP 私密凭据
+```
+
+`colab`、`cf` 和 `ssh` 的授权/配置仍由各自工具管理；Google Drive 数据仍保存在远端。
+卸载使用 `uv tool uninstall colabllm`，用户配置目录保留。
+升级前先停止运行中的服务，升级后重新启动，避免后台 runner 依赖的安装文件被替换。
+
+## 开发、构建与发布
+
+```bash
+# 开发安装：修改源码立即生效，源码目录需要保留
+uv tool install --editable .
+
+# 普通本地安装 / 更新
+uv tool install --force .
+
+# 构建 wheel 和源码分发包（dist/）
+uv build --no-sources
+
+# 验证 wheel 在隔离环境中的安装与运行
+python tools/check_distribution.py dist/colabllm-0.1.0-py3-none-any.whl
+
+# 发布新版本时先修改版本号、重新构建，再上传对应版本
+uv version 0.1.1
+uv build --no-sources
+uv publish dist/colabllm-0.1.1-py3-none-any.whl dist/colabllm-0.1.1.tar.gz
+```
+
+上传需要自行配置 PyPI 身份认证并选择项目许可证。版本号以 `pyproject.toml` 为准。
+通过本地 wheel 安装的用户可安装新 wheel 更新；通过 PyPI 安装的用户使用 `uv tool upgrade colabllm`。
+
+## 测试
+
+本地 CLI 与控制逻辑使用 Python 标准库，默认测试无需 Torch、NumPy 或 GPU：
+
+```bash
+python -m unittest discover -s tests
+```
+
+`tests_colab/` 单独保存 Colab 端模型代码的回归测试（如 LongCat attention 和音频分段）。
+它们会导入模型运行代码，仅在对应的 Colab 服务环境中运行；attention 测试还需要 CUDA 和上游 LongCat 源码。
+在该环境中，将项目源码放入 VM 后执行：
+
+```bash
+PYTHONPATH=/content/longcat-video/repo python -m unittest discover -s tests_colab
+```
+
+本地测试中的真实 FRP 集成测试需额外指定 `COLABSVC_FRP_TEST_BIN`，默认跳过。
 
 ## 架构与职责
 
 | 阶段 / 职责 | 执行位置 | 说明 |
 | --- | --- | --- |
-| 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `services/<name>.py` | 会话名与服务名一致 |
-| 免浏览器挂载网盘 (`colab dfs mount`) | 本地脚本 `services/<name>.py` | 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
+| 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `src/colabllm/services/<name>.py` | 会话名与服务名一致 |
+| 免浏览器挂载网盘 (`colab dfs mount`) | 本地脚本 `src/colabllm/services/<name>.py` | 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
 | Cloudflare 固定域名 | 本地脚本 (`cf` CLI) | 创建/复用 named tunnel、配置 ingress 和 DNS CNAME；未配置主域名时使用动态 URL |
 | FRP 固定域名 | 本地脚本 (`ssh` + `cf` CLI) | SSH 安装或复用服务端 frps/Caddy，通过 Cloudflare DNS 将域名指向服务器 IP |
-| 密钥生成与注入 | 本地脚本 -> `--env` | 自动生成账号密码与 Bearer Token，保存在 `.state/<name>/state.json` (0600) |
-| 安装与启动服务 | 远端 `services/<name>.ipynb` | 幂等安装，服务仅监听 `127.0.0.1` |
-| 安全认证层 (Caddy) | 远端 `services/<name>.ipynb` | 对无自带认证的服务（如 Ollama）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
-| 启动 `cloudflared` / `frpc` 与保活 | 远端 `services/<name>.ipynb` | 最后一个 cell 持续阻塞并监控子进程；本地后台进程保持 `colab exec` 连接以防 Colab 回收会话 |
+| 密钥生成与注入 | 本地脚本 -> `--env` | 自动生成账号密码与 Bearer Token，保存在 `~/.colabllm/services/<name>/state.json` (0600) |
+| 安装与启动服务 | 远端 `src/colabllm/services/<name>.ipynb` | 幂等安装，服务仅监听 `127.0.0.1` |
+| 安全认证层 (Caddy) | 远端 `src/colabllm/services/<name>.ipynb` | 对无自带认证的服务（如 Ollama）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
+| 启动 `cloudflared` / `frpc` 与保活 | 远端 `src/colabllm/services/<name>.ipynb` | 最后一个 cell 持续阻塞并监控子进程；本地后台进程保持 `colab exec` 连接以防 Colab 回收会话 |
 
 ## 各运行时使用文档
 
@@ -64,31 +126,16 @@ colabllm frp-status
 
 ## 目录结构
 
-```
-├── .agents/skills/colab-llm-service/   # 本项目 Agent Skill（最佳实践、排错、认证与隧道参考）
-├── docs/                               # 各运行时详细使用文档
-│   ├── nemotron-transcribe.md          # NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / 远端 API + 网盘批量音频转写)
-│   ├── comfyui.md                      # ComfyUI + ComfyUI-Manager 使用说明（含本地 SSD 模型按需下载）
-│   ├── qwen-flash.md                   # Qwen3.8-Flash-Next (G4 / 800K / Vision) 使用说明
-│   ├── ollama.md                       # Ollama 使用说明
-│   └── unsloth-studio.md               # Unsloth Studio 使用说明
-├── lib/colabsvc.py                     # 共享运行库（Service 定义与 CLI 实现）
-├── services/
-│   ├── nemotron-transcribe.py          # Nemotron-3.5-Transcribe-30B-A4B 执行脚本（G4，支持 transcribe 单文件/批量调用网盘音频）
-│   ├── nemotron-transcribe.ipynb       # Nemotron-3.5-Transcribe-30B-A4B notebook（vLLM 0.32 + NeMo Speech SALM + MTP8 + CTC 时间戳）
-│   ├── comfyui.py                      # ComfyUI + ComfyUI-Manager 执行脚本（Caddy 认证，默认 L4，支持 --workflow / pull-workflow / pull-model）
-│   ├── comfyui.ipynb                   # ComfyUI + ComfyUI-Manager notebook（模型存本地高速 SSD，插件/工作流/输出持久化到 Google Drive）
-│   ├── unsloth-studio.py               # Unsloth Studio 执行脚本（自带登录 auth="builtin"，默认 L4）
-│   ├── unsloth-studio.ipynb            # Unsloth Studio notebook
-│   ├── ollama.py                       # Ollama 执行脚本（Caddy 认证 auth="caddy"，默认 T4）
-│   ├── ollama.ipynb                    # Ollama notebook
-│   ├── qwen-flash.py                   # Qwen3.8-Flash-Next 执行脚本（llama-server API Key，G4 GPU，默认域名 qwen.example.com）
-│   └── qwen-flash.ipynb                # Qwen3.8-Flash-Next notebook（800K YaRN 3.125x + BF16 视觉 + sm_120 编译缓存）
-├── templates/
-│   ├── service.py                      # 新服务脚本模板
-│   ├── service.ipynb                   # 新服务 notebook 模板
-│   └── build_notebooks.py              # 标准 notebook 生成器
-└── .state/<name>/                      # 运行时状态与日志（已 gitignore）
+```text
+pyproject.toml                 # 包元数据、版本、colabllm 命令入口
+src/colabllm/
+├── cli.py                     # 统一命令分发
+├── control.py                 # 全局域名与 FRP 管理
+├── lib/                       # 本地共享 runner、状态与 FRP 实现
+└── services/                  # <name>.py + <name>.ipynb；随包安装
+templates/                     # 开发用 notebook 生成器与模板
+tests/                         # 本地测试（Python 标准库）
+tests_colab/                   # 仅在 Colab 模型环境运行的回归测试
 ```
 
 ## 本地环境与前置准备
@@ -100,8 +147,8 @@ colabllm frp-status
 | 本机环境 / 工具 | 何时需要 | 说明 |
 | --- | --- | --- |
 | Linux 或 macOS | 必需 | Colab CLI 当前支持的平台；本项目后台进程管理也使用 Unix 进程组 |
-| Python 3.12+ | 必需 | 执行 `services/*.py`、`colabctl.py`，满足 `google-colab-cli` 的 Python 要求 |
-| `uv`、Git | 推荐安装方式 / 获取项目 | `uv` 用于隔离安装 Colab CLI；项目脚本本身使用 Python 标准库 |
+| Python 3.12+ | 必需 | 执行 `src/colabllm/services/*.py`、`src/colabllm/control.py`，满足 `google-colab-cli` 的 Python 要求 |
+| `uv` | 包安装与升级 | 隔离安装 colabllm 和 Colab CLI；Git 仅开发时需要 |
 | `colab` CLI | 必需 | PyPI 包 `google-colab-cli`，用于会话、文件操作及执行 Notebook |
 | `colab dfs` 扩展 | 默认网盘流程必需 | 额外扩展，提供 `consent`、`mount`、`doctor`；**不是安装 Colab CLI 后自带的标准功能** |
 | Node.js、npm、Cloudflare `cf` CLI | 固定域名或 FRP 模式 | 本机调用 Cloudflare API 管理 DNS；Cloudflare named tunnel 也由它配置。Quick Tunnel 不需要它 |
@@ -199,40 +246,40 @@ command -v colab
 colab version
 colab dfs --help
 colab dfs show
-./colabctl.py tunnel-config
+colabllm tunnel-config
 # 固定域名 / FRP 模式还需检查
 command -v cf
 cf --version
 cf auth whoami
 # FRP 模式还需检查
 ssh -V
-./colabctl.py frp-status
+colabllm frp-status
 ```
 
-认证文件保存在本机用户目录，运行时状态保存在已被 Git 忽略的 `.state/`。执行脚本的本机需要持续在线且避免休眠：后台 runner 维持 `colab exec` 连接，断开可能导致 Colab 会话被回收。远端所需模型依赖、`cloudflared`/`frpc` 和认证 Caddy 由 Notebook 安装，不需要在本机重复安装。
+认证文件保存在本机用户目录，运行时状态保存在用户目录 `~/.colabllm/services/`。执行脚本的本机需要持续在线且避免休眠：后台 runner 维持 `colab exec` 连接，断开可能导致 Colab 会话被回收。远端所需模型依赖、`cloudflared`/`frpc` 和认证 Caddy 由 Notebook 安装，不需要在本机重复安装。
 
 ## Cloudflare Tunnel 配置
 
-通过项目根目录的 `colabctl.py` 统一配置；所有现有及新增运行时、所有实例均读取同一份主域名配置，保存在本机 `.state/tunnel-config.json`。未启用 FRP 且配置为空时，`up`（包括不带 HOST 的 `up --domain`）使用 Cloudflare Quick Tunnel 的随机 `https://*.trycloudflare.com` URL，无需 `cf` 登录；每次启动 URL 可能变化。代码中的历史 `example.com` 后缀不再自动启用。
+通过 `colabllm tunnel-config` 统一配置；所有现有及新增运行时、所有实例均读取同一份主域名配置，保存在本机 `~/.colabllm/tunnel-config.json`。未启用 FRP 且配置为空时，`up`（包括不带 HOST 的 `up --domain`）使用 Cloudflare Quick Tunnel 的随机 `https://*.trycloudflare.com` URL，无需 `cf` 登录；每次启动 URL 可能变化。代码中的历史 `example.com` 后缀不再自动启用。
 
 ```bash
 # 查看 / 设置 / 清除全局主域名（项目根目录统一入口）
-./colabctl.py tunnel-config
-./colabctl.py tunnel-config --base-domain example.com
-./colabctl.py tunnel-config --clear
+colabllm tunnel-config
+colabllm tunnel-config --base-domain example.com
+colabllm tunnel-config --clear
 
 # 只为本次启动指定主域名，不写入配置
-./services/longcat-avatar.py up --base-domain example.com
+colabllm longcat-avatar up --base-domain example.com
 # -> https://longcat-avatar.example.com
-./services/qwen-flash.py up -i 2 --base-domain example.com
+colabllm qwen-flash up -i 2 --base-domain example.com
 # -> https://qwen-2.example.com（保留服务别名与实例后缀）
 
 # 已配置主域名后：up 自动使用固定域名；也可以强制动态 URL
-./services/longcat-avatar.py up
-./services/longcat-avatar.py up --quick-tunnel
+colabllm longcat-avatar up
+colabllm longcat-avatar up --quick-tunnel
 
 # 完整域名覆盖自动生成的服务域名
-./services/longcat-avatar.py up --domain avatar.example.com
+colabllm longcat-avatar up --domain avatar.example.com
 ```
 
 可设置环境变量 `COLABSVC_BASE_DOMAIN=example.com`。选择顺序：`--quick-tunnel` 强制动态；完整 `--domain HOST` > `--base-domain` > 环境变量 > 全局配置 > 动态 URL。三个启动选项互斥。域名只填 DNS 名称，不包含 `https://`、端口或路径。
@@ -245,14 +292,14 @@ Cloudflare 固定域名要求 `cf auth login` 且账户有该域名的 DNS Zone 
 
 ```bash
 # 配置并通过 SSH 自动安装服务端（替换示例 IP、SSH 目标和域名）
-./colabctl.py frp-config --server-ip 203.0.113.10 --ssh root@frpip --base-domain example.com
-./colabctl.py frp-status
-./services/indextts.py up
+colabllm frp-config --server-ip 203.0.113.10 --ssh root@frpip --base-domain example.com
+colabllm frp-status
+colabllm indextts up
 
 # 本次覆盖 / 关闭全局 FRP
-./services/indextts.py up --transport cloudflare
-./services/indextts.py up --quick-tunnel
-./colabctl.py frp-config --disable
+colabllm indextts up --transport cloudflare
+colabllm indextts up --quick-tunnel
+colabllm frp-config --disable
 ```
 
 FRP 服务端默认 TCP 7000，Caddy 使用 80/443；DNS 经本机 `cf` 自动配置为 DNS only。配置、自动安装、认证及清理说明见 [FRP 操作说明](docs/frp.md)。现有运行时不会自动切换。
@@ -263,67 +310,67 @@ FRP 服务端默认 TCP 7000，Caddy 使用 80/443；DNS 经本机 `cf` 自动�
 
 ```bash
 # 1. 启动服务（未配置主域名时使用随机 *.trycloudflare.com 临时链接）
-./services/unsloth-studio.py up
+colabllm unsloth-studio up
 
 # 2. 配置所有服务共享的主域名，再启动固定域名服务
-./colabctl.py tunnel-config --base-domain example.com
-./services/ollama.py up --domain
-./services/qwen-flash.py up --domain     # 绑定 https://qwen.example.com（G4 GPU，800K 上下文 + 视觉）
+colabllm tunnel-config --base-domain example.com
+colabllm ollama up --domain
+colabllm qwen-flash up --domain     # 绑定 https://qwen.example.com（G4 GPU，800K 上下文 + 视觉）
 
 # 3. 查看访问 URL、登录密码与 API Token
-./services/ollama.py info
+colabllm ollama info
 
 # 4. 查看实时日志 / 检查状态与公网连通性
-./services/ollama.py logs -f
-./services/ollama.py status
+colabllm ollama logs -f
+colabllm ollama status
 
 # 5. 停止服务并释放 Colab VM（加 --delete-tunnel 同时删除 Cloudflare 隧道和 DNS 记录）
-./services/ollama.py down
-./services/ollama.py down --delete-tunnel
+colabllm ollama down
+colabllm ollama down --delete-tunnel
 ```
 
 ## 多实例（多会话）并发支持（所有运行时通用）
 
 所有运行时脚本（`nemotron-transcribe.py`、`comfyui.py`、`qwen-flash.py`、`ollama.py`、`unsloth-studio.py` 以及 `templates/service.py`）均原生支持通过 **`-i <ID>` / `--instance <ID>`**（或环境变量 `CT_INSTANCE=<ID>`）创建和管理多个独立的 Colab GPU 会话与隧道：
 
-| 实例参数 | Colab 会话名 (`-s`) | 状态目录 (`.state/`) | 隧道名 (`--domain`) | 默认域名 (`--domain`) | 网盘共享目录 (`CT_DATA_DIR`) |
+| 实例参数 | Colab 会话名 (`-s`) | 状态目录 (`~/.colabllm/services/`) | 隧道名 (`--domain`) | 默认域名 (`--domain`) | 网盘共享目录 (`CT_DATA_DIR`) |
 | --- | --- | --- | --- | --- | --- |
-| 默认（不传 `-i`） | `<name>` | `.state/<name>/` | `colab-<name>` | `<host>.example.com` | `/content/drive/MyDrive/colab-llm/<name>` |
-| `-i 1` | `<name>-1` | `.state/<name>-1/` | `colab-<name>-1` | `<host>-1.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
-| `-i 2` | `<name>-2` | `.state/<name>-2/` | `colab-<name>-2` | `<host>-2.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
+| 默认（不传 `-i`） | `<name>` | `~/.colabllm/services/<name>/` | `colab-<name>` | `<host>.example.com` | `/content/drive/MyDrive/colab-llm/<name>` |
+| `-i 1` | `<name>-1` | `~/.colabllm/services/<name>-1/` | `colab-<name>-1` | `<host>-1.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
+| `-i 2` | `<name>-2` | `~/.colabllm/services/<name>-2/` | `colab-<name>-2` | `<host>-2.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
 
 ```bash
 # 启动任意运行时的多个并发实例（各自拥有独立的 Colab GPU VM、Cloudflare 隧道与域名）
-./services/comfyui.py up -i 1 --domain               # -> https://comfyui-1.example.com
-./services/comfyui.py up -i 2 --domain               # -> https://comfyui-2.example.com
-./services/qwen-flash.py up -i 2 --domain            # -> https://qwen-2.example.com
-./services/ollama.py up -i 2 --domain                # -> https://ollama-2.example.com
-./services/unsloth-studio.py up -i 2 --domain        # -> https://unsloth-studio-2.example.com
-./services/nemotron-transcribe.py up -i 2 --domain   # -> https://transcribe-2.example.com
+colabllm comfyui up -i 1 --domain               # -> https://comfyui-1.example.com
+colabllm comfyui up -i 2 --domain               # -> https://comfyui-2.example.com
+colabllm qwen-flash up -i 2 --domain            # -> https://qwen-2.example.com
+colabllm ollama up -i 2 --domain                # -> https://ollama-2.example.com
+colabllm unsloth-studio up -i 2 --domain        # -> https://unsloth-studio-2.example.com
+colabllm nemotron-transcribe up -i 2 --domain   # -> https://transcribe-2.example.com
 
 # 列出某个服务的所有实例状态、URL 与 API Token
-./services/<name>.py ps
+colabllm <name> ps
 
 # 查看指定实例的详情 / 日志 / 状态
-./services/<name>.py info -i 2
-./services/<name>.py logs -i 2 -f
-./services/<name>.py status -i 2
+colabllm <name> info -i 2
+colabllm <name> logs -i 2 -f
+colabllm <name> status -i 2
 
 # 停止指定实例，或使用 --all 一键停止该服务的所有实例
-./services/<name>.py down -i 2
-./services/<name>.py down --all
+colabllm <name> down -i 2
+colabllm <name> down --all
 ```
 
 ## 新增一个大模型服务
 
 1. 复制模板：
    ```bash
-   cp templates/service.py services/<name>.py
-   cp templates/service.ipynb services/<name>.ipynb
-   chmod +x services/<name>.py
+   cp templates/service.py src/colabllm/services/<name>.py
+   cp templates/service.ipynb src/colabllm/services/<name>.ipynb
+   chmod +x src/colabllm/services/<name>.py
    ```
-2. 修改 `services/<name>.py` 中的 `Service(...)` 配置（端口、`auth="caddy"` 或 `"builtin"`、GPU 类型）。
-3. 修改 `services/<name>.ipynb` 的 **Cell 1（安装）** 和 **Cell 2（启动服务，绑定 `127.0.0.1`）**。
-4. 先运行 `./services/<name>.py up --dry-run` 检查执行计划，再正式运行 `up`。
+2. 修改 `src/colabllm/services/<name>.py` 中的 `Service(...)` 配置（端口、`auth="caddy"` 或 `"builtin"`、GPU 类型）。
+3. 修改 `src/colabllm/services/<name>.ipynb` 的 **Cell 1（安装）** 和 **Cell 2（启动服务，绑定 `127.0.0.1`）**。
+4. 先运行 `colabllm <name> up --dry-run` 检查执行计划，再正式运行 `up`。
 
 详细规范与排错指南见 [`.agents/skills/colab-llm-service/SKILL.md`](.agents/skills/colab-llm-service/SKILL.md)。

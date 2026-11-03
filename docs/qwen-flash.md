@@ -1,10 +1,10 @@
 # Qwen3.8-Flash-Next (G4 / 800K / Vision) 运行时使用说明
 
-> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `./colabctl.py tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
+> Tunnel 域名说明：以下固定域名示例需先设置主域名，例如 `colabllm tunnel-config --base-domain example.com`（所有服务共享）。未配置时使用动态 URL；`up --base-domain example.com` 可单次覆盖，`up --quick-tunnel` 强制动态。详见 [Tunnel 配置](../README.md#cloudflare-tunnel-配置)。
 
 对应文件：
-- 执行脚本：[services/qwen-flash.py](services/qwen-flash.py)
-- 远端 Notebook：[services/qwen-flash.ipynb](services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
+- 执行脚本：[src/colabllm/services/qwen-flash.py](services/qwen-flash.py)
+- 远端 Notebook：[src/colabllm/services/qwen-flash.ipynb](services/qwen-flash.ipynb)（由 [templates/build_notebooks.py](templates/build_notebooks.py) 生成）
 
 ---
 
@@ -27,25 +27,25 @@
 
 ```bash
 # 1. 启动服务并绑定默认域名 https://qwen.example.com（自动申请 G4 GPU）
-./services/qwen-flash.py up --domain
+colabllm qwen-flash up --domain
 
 # 2. 使用临时 *.trycloudflare.com 域名启动
-./services/qwen-flash.py up --quick-tunnel
+colabllm qwen-flash up --quick-tunnel
 
 # 3. 查看访问地址与 Bearer API Token
-./services/qwen-flash.py info
+colabllm qwen-flash info
 
 # 4. 查看实时准备进度（HF 下载 / llama.cpp 编译 / 模型加载心跳）
-./services/qwen-flash.py logs -f
+colabllm qwen-flash logs -f
 
 # 5. 检查 Colab 会话状态与 /v1/models 连通性探测
-./services/qwen-flash.py status
+colabllm qwen-flash status
 
 # 6. 轮换生成新的 API Key
-./services/qwen-flash.py up --domain --new-credentials
+colabllm qwen-flash up --domain --new-credentials
 
 # 7. 停止服务并释放 G4 实例
-./services/qwen-flash.py down
+colabllm qwen-flash down
 ```
 
 ### 2.1 多实例（多会话）并发运行
@@ -54,27 +54,27 @@
 
 ```bash
 # 启动第 2 个实例（自动分配会话 qwen-flash-2，绑定 https://qwen-2.example.com）
-./services/qwen-flash.py up -i 2 --domain
+colabllm qwen-flash up -i 2 --domain
 
 # 查看所有实例状态、URL 与 API Token
-./services/qwen-flash.py ps
+colabllm qwen-flash ps
 
 # 查看第 2 个实例的日志或状态
-./services/qwen-flash.py logs -i 2 -f
-./services/qwen-flash.py status -i 2
+colabllm qwen-flash logs -i 2 -f
+colabllm qwen-flash status -i 2
 
 # 停止第 2 个实例，或停止所有实例
-./services/qwen-flash.py down -i 2
-./services/qwen-flash.py down --all
+colabllm qwen-flash down -i 2
+colabllm qwen-flash down --all
 ```
 
-> **提示**：首次启动时需将 ~85 GB 模型分片下载到本地 SSD 并加载进显存/内存，耗时约 5~15 分钟，可通过 `./services/qwen-flash.py logs -f` 查看实时进度。
+> **提示**：首次启动时需将 ~85 GB 模型分片下载到本地 SSD 并加载进显存/内存，耗时约 5~15 分钟，可通过 `colabllm qwen-flash logs -f` 查看实时进度。
 
 ---
 
 ## 3. OpenAI 兼容 API 调用示例
 
-先通过 `./services/qwen-flash.py info` 获取 `API_TOKEN`：
+先通过 `colabllm qwen-flash info` 获取 `API_TOKEN`：
 
 ### 3.1 查看模型列表 (`/v1/models`)
 
@@ -124,7 +124,7 @@ curl -s https://qwen.example.com/v1/chat/completions \
 
 ## 4. 可选环境变量覆盖
 
-如需调整上下文长度或量化版本，可在 [`services/qwen-flash.py`](services/qwen-flash.py) 的 `SERVICE.env` 中修改：
+如需调整上下文长度或量化版本，可在 [`src/colabllm/services/qwen-flash.py`](services/qwen-flash.py) 的 `SERVICE.env` 中修改：
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |

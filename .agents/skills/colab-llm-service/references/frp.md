@@ -2,7 +2,7 @@
 
 Use the project CLI and shared backend; commands and prerequisites are in
 [docs/frp.md](../../../../docs/frp.md). Implementation sources are
-`lib/frp_backend.py`, `lib/frp_server.py` and `templates/tunnel_client.py`.
+`src/colabllm/lib/frp_backend.py`, `src/colabllm/lib/frp_server.py` and `templates/tunnel_client.py`.
 Keep changes there and regenerate notebooks through `templates/build_notebooks.py`.
 
 ```bash
@@ -58,7 +58,7 @@ Every runtime keeps its own resource record for cleanup even after global settin
 
 `colabllm frp-status` reports the actual unit names and reuse status. Check those units'
 journals rather than assuming `colabsvc-frps`. Client logs are `/content/ct/frpc.log`.
-Credentials are private `.state/frp/*.json`; inspect metadata without printing Tokens.
+Credentials are private `~/.colabllm/frp/*.json`; inspect metadata without printing Tokens.
 
 For an adoption change, verify compatible original credentials, unchanged running PIDs,
 and a real TLS request round trip. Registration alone does not verify public DNS/ACME
