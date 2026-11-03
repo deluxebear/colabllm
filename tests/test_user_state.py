@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src/colabllm/lib'))
 import colabsvc as svc
+import processes
 from paths import user_home
 
 
@@ -21,7 +22,7 @@ class UserStateTest(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'home', return_value=Path('/users/test')):
             self.assertEqual(user_home(), Path('/users/test/.colabllm'))
             with patch.dict(os.environ, {'COLABLLM_HOME': '/tmp/profile'}):
-                self.assertEqual(user_home(), Path('/tmp/profile'))
+                self.assertEqual(user_home(), Path('/tmp/profile').resolve())
 
     def test_private_state_and_instance_discovery(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(svc, 'STATE_ROOT', Path(temp) / 'profile'):
@@ -59,6 +60,7 @@ class UserStateTest(unittest.TestCase):
             stack.enter_context(patch.object(svc.shutil, 'which', return_value='/bin/colab'))
             stack.enter_context(patch.object(svc, 'ensure_session'))
             stack.enter_context(patch.object(svc, 'process_identity', return_value='test-start'))
+            stack.enter_context(patch.object(processes, 'process_identity', return_value='test-start'))
             stack.enter_context(patch.object(svc, 'probe', return_value='200'))
             stack.enter_context(patch.object(svc.subprocess, 'Popen', side_effect=launch))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))

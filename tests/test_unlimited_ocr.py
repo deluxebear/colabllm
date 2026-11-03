@@ -31,7 +31,7 @@ class FakeEngine:
 class DriveJobsTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.patch = patch.object(app, 'DRIVE', self.root)
         self.patch.start()
         self.engine = FakeEngine()
@@ -159,7 +159,7 @@ class LocalTransferTest(unittest.TestCase):
     def test_chunk_upload_checksum_and_result_download(self):
         import base64
         import hashlib
-        with tempfile.TemporaryDirectory() as d, patch.object(app, 'DRIVE', Path(d)), patch.object(app, 'DATA', Path(d) / 'svc'):
+        with tempfile.TemporaryDirectory() as d, patch.object(app, 'DRIVE', Path(d).resolve()), patch.object(app, 'DATA', Path(d).resolve() / 'svc'):
             content = b'pdf contents' * 100
             body = dict(sha256=hashlib.sha256(content).hexdigest(), name='合同.pdf', offset=0,
                         data=base64.b64encode(content[:100]).decode(), final=False)

@@ -5,7 +5,7 @@ from longcat_avatar_drive import resolve_drive,resolve_input,list_drive
 
 class DriveTest(unittest.TestCase):
     def setUp(self):
-        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)/'MyDrive';self.root.mkdir()
+        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name).resolve()/'MyDrive';self.root.mkdir()
         (self.root/'素材').mkdir();(self.root/'素材/声音.wav').write_bytes(b'voice')
     def tearDown(self):self.temp.cleanup()
     def test_drive_paths_unicode_and_absolute(self):

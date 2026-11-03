@@ -31,6 +31,8 @@ class FrpTest(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ,{},clear=True))
         self.stack.enter_context(patch.object(server,'discover_frps',return_value=None))
         self.stack.enter_context(patch.object(server,'discover_caddy',return_value=None))
+        # provision executes on a remote Linux server, regardless of the CLI host.
+        self.stack.enter_context(patch.object(server.platform,'machine',return_value='x86_64'))
         self.svc=colabsvc.Service('avatar','avatar.ipynb',7860)
 
     def args(self,**kw):

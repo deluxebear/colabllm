@@ -29,7 +29,7 @@ class SkillBundleTest(unittest.TestCase):
     def test_export_copies_references_and_refuses_existing_target(self):
         with tempfile.TemporaryDirectory() as temp:
             target = export_skill(Path(temp)/'skills')
-            self.assertEqual(target, Path(temp)/'skills/colabllm')
+            self.assertEqual(target, Path(temp).resolve()/'skills/colabllm')
             self.assertEqual((target/'SKILL.md').read_bytes(), (bundle_root()/'SKILL.md').read_bytes())
             self.assertEqual(
                 {p.name for p in (target/'references').glob('*.md')},

@@ -24,7 +24,7 @@ def check(wheel):
         assert not any('/.state/' in n or n.endswith('state.json') for n in names)
 
     with tempfile.TemporaryDirectory(prefix='colabllm-wheel-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         home = root / 'home'
         home.mkdir()
         env = {**os.environ, 'HOME': str(home), 'UV_TOOL_DIR': str(root / 'tools'),
