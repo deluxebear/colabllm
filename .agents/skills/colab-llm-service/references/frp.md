@@ -7,10 +7,10 @@ Keep changes there and regenerate notebooks through `templates/build_notebooks.p
 
 ```bash
 # Example values; substitute the user's actual server and domain.
-./colabctl.py frp-config --server-ip 203.0.113.10 --ssh root@frpip --base-domain example.com
-./colabctl.py frp-status
-./services/<name>.py up
-./colabctl.py frp-config --disable
+colabllm frp-config --server-ip 203.0.113.10 --ssh root@frpip --base-domain example.com
+colabllm frp-status
+colabllm <name> up
+colabllm frp-config --disable
 ```
 
 The configuration command validates Cloudflare Zone access, then manages the server
@@ -56,7 +56,7 @@ Every runtime keeps its own resource record for cleanup even after global settin
 
 ## Verification and diagnostics
 
-`./colabctl.py frp-status` reports the actual unit names and reuse status. Check those units'
+`colabllm frp-status` reports the actual unit names and reuse status. Check those units'
 journals rather than assuming `colabsvc-frps`. Client logs are `/content/ct/frpc.log`.
 Credentials are private `.state/frp/*.json`; inspect metadata without printing Tokens.
 

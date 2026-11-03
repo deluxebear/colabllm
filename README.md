@@ -3,6 +3,37 @@
 在 Google Colab GPU 上运行大模型服务，通过 Cloudflare Tunnel（默认）或 FRP + Caddy 提供公网访问。
 遵循 **“一个服务 = 一个 notebook (`services/<name>.ipynb`) + 一个执行脚本 (`services/<name>.py`)”** 的约定。
 
+## 统一命令入口
+
+在项目目录执行一次安装（无额外 Python 依赖、无需 sudo）：
+
+```bash
+./colabllm install
+# 默认链接到 ~/.local/bin/colabllm；若目录不在 PATH，按安装输出设置 PATH
+```
+
+之后可以在任意目录使用 `colabllm <运行时名称> <命令> [参数...]`：
+
+```bash
+colabllm services                       # 列出全部运行时
+colabllm unlimited-ocr up                # 默认 A100
+colabllm unlimited-ocr ocr ./documents -O ./results
+colabllm unlimited-ocr resume JOB_ID --wait
+colabllm qwen3-tts up -i 2
+colabllm comfyui up
+colabllm ollama up --dry-run
+colabllm unlimited-ocr --help
+
+# 项目级配置也使用同一入口
+colabllm tunnel-config
+colabllm frp-config --help
+colabllm frp-status
+```
+
+适用于所有 `services/` 中的运行时，现有参数直接透传，包含各服务专用命令和 `-i` 多实例参数。原 `./services/<名称>.py ...` 和 `./colabctl.py ...` 仍可使用。新命令使用当前 checkout 的脚本、notebook 和 `.state/`；本地相对文件路径按调用时所在目录解析。
+
+安装链接指向当前项目目录；部署到其他机器时克隆项目、准备下文的 Colab/Drive/隧道依赖，再执行 `./colabllm install`。更新当前 checkout 后命令立即使用新代码，无需重新安装。项目移动后重新安装；已有同名命令会被保护，可用 `./colabllm install --force` 显式替换，或使用 `--bin-dir /path/to/bin` 指定安装目录。删除安装链接即可卸载入口，项目文件和运行时不受影响。
+
 ## 架构与职责
 
 | 阶段 / 职责 | 执行位置 | 说明 |
@@ -23,6 +54,7 @@
 | **NVIDIA-Nemotron-3.5-Transcribe-30B-A4B** | `G4` | `vLLM` Bearer API Key (`builtin`) | `https://transcribe.example.com` | [docs/nemotron-transcribe.md](docs/nemotron-transcribe.md) |
 | **Qwen3-TTS** | `L4` | Bearer API Key (`builtin`) | `https://qwen3-tts.example.com` | [docs/qwen3-tts.md](docs/qwen3-tts.md) |
 | **IndexTTS-2.5** | `L4` | Bearer API Key (`builtin`) | `https://indextts.example.com` | [docs/indextts.md](docs/indextts.md) |
+| **Unlimited-OCR 2** | `A100` | Caddy (Basic Auth + Bearer) | `https://unlimited-ocr.example.com` | [docs/unlimited-ocr.md](docs/unlimited-ocr.md) |
 | **LongCat-Video-Avatar 1.5** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-avatar.example.com` | [docs/longcat-avatar.md](docs/longcat-avatar.md) |
 | **LongCat-Video** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-video.example.com` | [docs/longcat-video.md](docs/longcat-video.md) |
 | **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](docs/comfyui.md) |

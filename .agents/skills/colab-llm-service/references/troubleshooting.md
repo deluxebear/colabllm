@@ -17,13 +17,13 @@
 | `cf` errors about auth | Not logged in / wrong profile | `cf auth whoami`, `cf auth login` |
 | Fixed domain shows Cloudflare error 1033 | Tunnel has no connector (VM down or cloudflared died) | `status`; watchdog restarts cloudflared; otherwise `up` again |
 | Fixed domain shows 502 | Public proxy responds but the model is loading or the backend service is down | Check actual transport and model logs; a valid HTTPS response is transport readiness, not `CT_READY` |
-| `up` unexpectedly uses a fixed URL or FRP | Project domain/FRP settings or an environment override are active | Read `./colabctl.py tunnel-config`; use one-launch `--transport cloudflare` or `--quick-tunnel` if requested |
+| `up` unexpectedly uses a fixed URL or FRP | Project domain/FRP settings or an environment override are active | Read `colabllm tunnel-config`; use one-launch `--transport cloudflare` or `--quick-tunnel` if requested |
 | FRP setup finds 7000 occupied | Could be an existing frps rather than a conflict | Discover the listener, config and unit, then reuse compatible frps/Caddy; see [FRP adoption](frp.md#discover-before-installing) |
 | frpc rejects login/TLS | Server version, Token, scopes or certificate name differs from the client | Use discovered server metadata, preserve credentials and verify TLS SAN; see [FRP compatibility](frp.md#client-compatibility-and-routing) |
 | `colab new` fails for a GPU | Quota / tier / availability | Try another `--gpu`, check `colab usage` |
 
 Useful commands: `colab sessions`, `colab status -s <name>`, `colab usage`, `colab log -s <name>`,
-`./colabctl.py tunnel-config`, `./colabctl.py frp-status`,
+`colabllm tunnel-config`, `colabllm frp-status`,
 `cf tunnels list --name colab-<name>` (Cloudflare), `cf dns records list -z <zone-id> --name <host>`.
 Remote logs live in `/content/ct/<process>.log` on the VM (readable only while the kernel is free,
 or via `colab download -s <name> /content/ct/caddy.log ./caddy.log`).

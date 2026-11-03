@@ -1,6 +1,6 @@
 # Cloudflare backend and global domains
 
-Read the current configuration with `./colabctl.py tunnel-config`. The shared file is
+Read the current configuration with `colabllm tunnel-config`. The shared file is
 `.state/tunnel-config.json`; changing it does not move existing runtime connections.
 FRP enabled there makes FRP the default. To operate Cloudflare for one launch, pass
 `--transport cloudflare`, or `--quick-tunnel` for a dynamic URL regardless of saved domains.
@@ -13,7 +13,7 @@ Service aliases and instance suffixes are retained, e.g. `qwen-2.example.com`.
 
 Global configuration commands are documented in
 [README.md](../../../../README.md#cloudflare-tunnel-配置).
-Use `./colabctl.py tunnel-config --clear` to clear the saved domain; if FRP is enabled,
+Use `colabllm tunnel-config --clear` to clear the saved domain; if FRP is enabled,
 disable it first because FRP requires a hostname. Environment overrides still apply.
 
 ## Named tunnel versus Quick Tunnel

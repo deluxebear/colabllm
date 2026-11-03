@@ -2,7 +2,7 @@
 name: colab-llm-service
 description: >-
   Deploy and operate large-model services on Google Colab through this repository's
-  one-notebook/one-script convention. Use for service setup, lifecycle, project-global
+  one-notebook/one-script convention and unified colabllm CLI. Use for service setup, lifecycle, project-global
   domains, Cloudflare Tunnel or SSH-managed FRP/Caddy, authentication, and session or
   tunnel troubleshooting.
 ---
@@ -12,6 +12,7 @@ description: >-
 Every model service in this repo is a pair of files in `services/`, sharing one library:
 
 ```
+colabllm                unified CLI: service dispatch, project configuration, PATH installation
 services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
 services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
 lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
@@ -35,9 +36,26 @@ domain alias `indextts`, zero-shot voice cloning, persistent Drive voices, nativ
 multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`),
 `qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, domain alias `qwen3-tts`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
 
+## Unified CLI convention
+
+Use `colabllm <name> <command> [args...]` for runtime operations and user-facing examples.
+Use `colabllm tunnel-config`, `colabllm frp-config`, and `colabllm frp-status` for project configuration.
+Run `colabllm services` to discover runtimes and `colabllm <name> --help` for their commands.
+
+On a new machine, clone the project, prepare the Colab/Drive/tunnel prerequisites, then run
+`./colabllm install` from the checkout to link `~/.local/bin/colabllm`. Follow its PATH output;
+`./colabllm <name> ...` also works before PATH setup. The link uses this checkout's code and
+`.state/`; moving the checkout requires installing the link again. Local relative input/output
+paths remain relative to the caller's working directory.
+
+Keep `services/<name>.py` and its matching notebook as the implementation pair; the dispatcher
+executes the real script so its detached `_exec` runner keeps the correct script path. Legacy
+`./services/<name>.py ...` and `./colabctl.py ...` remain supported. New matching service pairs
+are discovered automatically, with all service-specific commands and instance flags forwarded.
+
 ## Daily use and transport selection
 
-Read `./colabctl.py tunnel-config` before choosing a public URL. It reports project-wide
+Read `colabllm tunnel-config` before choosing a public URL. It reports project-wide
 settings, not settings for one runtime. `up` follows these settings:
 
 - FRP enabled: use FRP and the configured base domain.
@@ -49,14 +67,14 @@ settings, not settings for one runtime. `up` follows these settings:
   `Service.zone` / `default_hostname` values retain aliases, not an implicit `example.com` deployment.
 
 ```bash
-./colabctl.py tunnel-config
-./colabctl.py tunnel-config --base-domain example.com  # shared by all services/instances
-./services/<name>.py up                                # selected global backend
-./services/<name>.py up --quick-tunnel
-./services/<name>.py up --transport cloudflare --domain llm.example.com --gpu A100
-./services/<name>.py info               # prints credentials; avoid echoing them in tool output
-./services/<name>.py logs -f
-./services/<name>.py down               # stop runner + VM; --delete-tunnel cleans this instance's resources
+colabllm tunnel-config
+colabllm tunnel-config --base-domain example.com  # shared by all services/instances
+colabllm <name> up                                # selected global backend
+colabllm <name> up --quick-tunnel
+colabllm <name> up --transport cloudflare --domain llm.example.com --gpu A100
+colabllm <name> info               # prints credentials; avoid echoing them in tool output
+colabllm <name> logs -f
+colabllm <name> down               # stop runner + VM; --delete-tunnel cleans this instance's resources
 ```
 
 For **Cloudflare setup, DNS ownership or cleanup**, read [references/cf-tunnel.md](references/cf-tunnel.md).
@@ -165,7 +183,8 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
    For a reusable recipe add it to `templates/build_notebooks.py` instead and regenerate.
 4. Pick auth -- see [references/auth.md](references/auth.md). Rule: **never expose a service without
    auth**; if it has none, `auth="caddy"`.
-5. `./services/<name>.py up --dry-run`, then a real `up` (CPU `--gpu none` for wiring tests), check
+5. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
+   Run `colabllm <name> up --dry-run`, then a real `up` (CPU `--gpu none` for wiring tests), check
    `status` (unauthenticated probe must be 401 for Caddy services), then `down`.
 
 ## References

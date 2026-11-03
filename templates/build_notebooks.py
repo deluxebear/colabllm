@@ -5767,7 +5767,35 @@ LONGCAT_AVATAR_SERVICE = LONGCAT_AVATAR_SERVICE.replace(
     'def start_service():',
     '(LC_WORK / "avatar_sampling.py").write_text(' + repr((ROOT / 'lib/avatar_sampling.py').read_text()) + ', encoding="utf-8")\n\ndef start_service():', 1)
 
+# Unlimited-OCR: source files are embedded to keep the notebook self-contained.
+UNLIMITED_OCR_CFG = dict(name="unlimited-ocr", service_port=8000, auth="caddy", public_port=18080,
+                         health_path="/health", ready_timeout=5400)
+UNLIMITED_OCR_SETUP = ("OCR_CACHE_SOURCE = " + repr((ROOT / "templates/colab_cache.py").read_text()) + "\n"
+                       + (ROOT / "templates/unlimited_ocr_setup.py").read_text())
+UNLIMITED_OCR_SERVICE = ("# @title 2. Unlimited-OCR Drive job service\n"
+    + "(OCR_WORK / 'ocr_parameters.py').write_text(" + repr((ROOT / "lib/ocr_parameters.py").read_text()) + ", encoding='utf-8')\n"
+    + "(OCR_WORK / 'unlimited_ocr_app.py').write_text(" + repr((ROOT / "templates/unlimited_ocr_app.py").read_text()) + ", encoding='utf-8')\n"
+    + """def start_service():
+    return ct_spawn("service", [OCR_PY, str(OCR_WORK / 'unlimited_ocr_app.py')], cwd=str(OCR_WORK),
+                    env={"CT_SERVICE_PORT": str(SERVICE_PORT), "CT_DATA_DIR": DATA_DIR,
+                         "CT_OCR_MODEL_DIR": str(OCR_MODEL),
+                         "TRITON_CACHE_DIR": str(OCR_WORK / 'triton-cache'),
+                         "TORCHINDUCTOR_CACHE_DIR": str(OCR_WORK / 'inductor-cache'),
+                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+PROCS["service"] = (start_service(), start_service)
+""")
+UNLIMITED_OCR_KEEPALIVE = (KEEPALIVE % UNLIMITED_OCR_CFG).replace(
+    'print("CT_READY", flush=True)',
+    """for local in OCR_CACHE_PAIRS:
+    save_cache(local, Path(DATA_DIR) / 'kernel-archives', OCR_CACHE_KEY)
+print("CT_READY", flush=True)""")
+
 if __name__ == "__main__":
+    write(ROOT / "services/unlimited-ocr.ipynb",
+          notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR; official Transformers backend, "
+                   "local SSD model and kernels, persistent Drive results, Caddy auth and asynchronous CLI jobs.",
+                   UNLIMITED_OCR_CFG, UNLIMITED_OCR_SETUP, UNLIMITED_OCR_SERVICE,
+                   keepalive=UNLIMITED_OCR_KEEPALIVE))
     write(ROOT / "services/longcat-avatar.ipynb",
           notebook("LongCat-Video-Avatar 1.5 (G4)",
                    "Audio-driven single-person video, BF16 + Whisper + 8-step DMD; outputs on Drive.",
