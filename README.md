@@ -5,7 +5,7 @@
 
 ## 统一命令入口
 
-用户通过分发包安装，无需克隆源码。尚未上传包索引时，可直接安装发布者提供的 wheel：
+用户通过分发包安装，无需克隆源码。从 [GitHub Releases](https://github.com/deluxebear/colabllm/releases) 下载 wheel 后安装（私有仓库需要相应访问权限）：
 
 ```bash
 uv tool install ./colabllm-0.1.0-py3-none-any.whl
@@ -13,7 +13,7 @@ uv tool install ./colabllm-0.1.0-py3-none-any.whl
 uv tool update-shell
 ```
 
-发布到 PyPI 后（需先确认包名可用）：
+版本发布到 PyPI 后，也可以直接安装和升级：
 
 ```bash
 uv tool install colabllm
@@ -109,14 +109,40 @@ uv build --no-sources
 
 # 验证 wheel 在隔离环境中的安装与运行
 python tools/check_distribution.py dist/colabllm-0.1.0-py3-none-any.whl
-
-# 发布新版本时先修改版本号、重新构建，再上传对应版本
-uv version 0.1.1
-uv build --no-sources
-uv publish dist/colabllm-0.1.1-py3-none-any.whl dist/colabllm-0.1.1.tar.gz
 ```
 
-上传需要自行配置 PyPI 身份认证并选择项目许可证。版本号以 `pyproject.toml` 为准。
+版本号以 `pyproject.toml` 为唯一来源，CLI 从已安装包元数据读取版本。
+采用 `MAJOR.MINOR.PATCH`：修复递增 PATCH、新功能递增 MINOR、不兼容变更递增 MAJOR；
+在 `0.x` 开发阶段，不兼容变更递增 MINOR，并在 [CHANGELOG.md](CHANGELOG.md) 中说明。
+当前首发版本为 `0.1.0`，对应 Git 标签 `v0.1.0`；后续发布示例：
+
+```bash
+uv version --bump patch
+# 将 CHANGELOG.md 的 Unreleased 内容整理到本次版本的日期条目
+python tools/check_release.py --tag v0.1.1
+git add pyproject.toml CHANGELOG.md
+git commit -m "chore: release 0.1.1"
+git tag -a v0.1.1 -m "Release 0.1.1"
+git push origin master
+git push origin v0.1.1
+```
+
+推送 `v*` 标签触发 [release.yml](.github/workflows/release.yml)：
+
+1. 验证标签、包版本和变更记录一致，复用 Linux/macOS × Python 3.12–3.14 CI。
+2. 构建 wheel 和 sdist，验证隔离安装，生成 SHA256SUMS 并保存 Actions artifact。
+3. 发布 GitHub Release，附带安装包及校验文件，发布说明取自当前版本的 CHANGELOG 条目。
+4. 将同一组已验证的包通过 Trusted Publishing 上传 PyPI。
+
+首次启用 PyPI 需要项目所有者在 [PyPI Publishing](https://pypi.org/manage/account/publishing/)
+添加 Pending Publisher：项目 `colabllm`、Owner `deluxebear`、Repository `colabllm`、
+Workflow `release.yml`、Environment `pypi`。已有 PyPI 项目则在项目 Publishing 设置添加同样的发布者。
+Actions 使用 `pypi` environment 和 OIDC，无需配置长期 PyPI API Token。
+参考 [PyPI Trusted Publisher 说明](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)。
+
+PyPI 上传失败时，GitHub Release 仍可下载；修复身份配置后在 Actions 选择 **Re-run failed jobs**。
+也可以针对已有标签手动运行 release workflow；已发布的 GitHub Release 会拒绝被覆盖，应优先只重跑失败任务。
+已发布版本不移动标签或替换安装包，修复后发布新版本。
 通过本地 wheel 安装的用户可安装新 wheel 更新；通过 PyPI 安装的用户使用 `uv tool upgrade colabllm`。
 
 ## CLI 行为约定

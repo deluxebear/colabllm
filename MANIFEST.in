@@ -1,4 +1,5 @@
 include README.md
+include CHANGELOG.md
 include colabllm
 recursive-include src/colabllm *.py *.ipynb
 recursive-include templates *.py *.ipynb
@@ -6,6 +7,7 @@ recursive-include tests *.py
 recursive-include tests_colab *.py
 include tools/check_distribution.py
 include tools/sync_runtime_docs.py
+include tools/check_release.py
 recursive-include docs *.md
 global-exclude *.pyc
 prune .state

@@ -2,8 +2,10 @@ name: CLI tests and distributions
 
 on:
   push:
+    branches: ['**']
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
