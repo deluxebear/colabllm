@@ -47,7 +47,7 @@ class TunnelConfigTest(unittest.TestCase):
 
     def test_precedence_and_alias_instance(self):
         (self.root/'tunnel-config.json').write_text(json.dumps({'base_domain':'saved.example'}))
-        service=svc.Service('qwen-flash','qwen.ipynb',8000,default_hostname='qwen.example.com')
+        service=svc.Service('qwen-flash','qwen.ipynb',8000,default_hostname='qwen.legacy.example')
         svc.apply_instance(service,'2')
         args=self.args()
         self.assertEqual(svc.tunnel_hostname(service,args),'qwen-2.saved.example')

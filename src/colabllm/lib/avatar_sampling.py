@@ -26,3 +26,23 @@ def apply_sampling_mode(pipe, settings):
         pipe.dit.enable_loras(['dmd'])
     else:
         pipe.dit.disable_all_loras()
+
+
+def plan_segments(audio_seconds, frames=93, segments=1, auto_duration=True):
+    if not auto_duration:
+        total = frames + (segments - 1) * (frames - 13)
+        return [frames] * segments, total, total / 25
+    if not math.isfinite(audio_seconds) or audio_seconds <= 0:
+        raise ValueError('音频时长无效')
+    target = max(1, math.ceil(round(audio_seconds * 25, 8)))
+    # Each model call needs 4n+1 frames; subsequent calls include 13
+    # overlapping conditioning frames. Shorten the final call and trim padding.
+    parts = [max(17, 1 + 4 * math.ceil((min(target, 93) - 1) / 4))]
+    covered = parts[0]
+    while covered < target:
+        count = min(93, max(17, 13 + 4 * math.ceil((target - covered) / 4)))
+        parts.append(count)
+        covered += count - 13
+        if len(parts) > 100:
+            raise ValueError('音频过长，请分成不超过 5 分钟的音频后生成')
+    return parts, target, audio_seconds

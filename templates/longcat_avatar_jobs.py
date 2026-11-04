@@ -25,10 +25,13 @@ class JobQueue:
         self.shutdown_ready = threading.Event()
         self.stop = threading.Event()
         for path in self.root.glob('*/status.json'):
-            value = json.loads(path.read_text())
-            if value['status']=='running':
-                value.update(status='queued', message='恢复中断的任务，将从最近检查点继续')
-                write_json(path,value)
+            try:
+                value = json.loads(path.read_text())
+                if value.get('status')=='running':
+                    value.update(status='queued', message='恢复中断的任务，将从最近检查点继续')
+                    write_json(path,value)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                print(f'Warning: skipping unreadable job status {path}: {error}', flush=True)
 
     def submit(self, request, audio, image=None):
         with self.lock:
@@ -77,10 +80,10 @@ class JobQueue:
                 pending=[]
                 for job in reversed(self.recent()):
                     try:
-                        if self.get(job)['status']=='queued':pending.append(job)
-                    except FileNotFoundError:
+                        if self.get(job).get('status')=='queued':pending.append(job)
+                    except (FileNotFoundError, OSError, ValueError, KeyError, TypeError):
                         # Completed validation/history folders may be archived
-                        # while the worker is scanning the shared Drive.
+                        # or unreadable while scanning the shared Drive.
                         continue
                 if not pending:
                     if self.draining:

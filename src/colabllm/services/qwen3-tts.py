@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import resolve_endpoint, safe_urlopen
+from cli_support import http_timeout, nonnegative_seconds, resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -65,7 +65,7 @@ SERVICE = Service(
     public_port=8000,
     gpu="L4",
     high_mem=False,
-    default_hostname="qwen3-tts.example.com",
+    default_hostname="qwen3-tts",
     ready_timeout=3600,
     env={
         "CT_QWEN3_TTS_VARIANT": "customvoice",
@@ -267,7 +267,7 @@ def cmd_design_voice(args: argparse.Namespace) -> int:
         payload["save_to_drive"] = args.save_drive
 
     t0 = time.monotonic()
-    code, data = _http_json(f"{base_url}/api/ct/design-voice", token, payload=payload, timeout=args.timeout)
+    code, data = _http_json(f"{base_url}/api/ct/design-voice", token, payload=payload, timeout=http_timeout(args.timeout))
     elapsed = time.monotonic() - t0
     if code != 200:
         print(json.dumps(data, indent=2, ensure_ascii=False), file=sys.stderr)
@@ -351,7 +351,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
     )
     t0 = time.monotonic()
     try:
-        with safe_urlopen(req, timeout=args.timeout) as resp:
+        with safe_urlopen(req, timeout=http_timeout(args.timeout)) as resp:
             audio_bytes = resp.read()
             elapsed = time.monotonic() - t0
             saved_drive = resp.headers.get("X-Saved-Drive-Path")
@@ -425,7 +425,7 @@ def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
         sp.add_argument("--seed", type=int, help="Random seed for reproducible generation")
         sp.add_argument("--save-drive", nargs="?", const="auto", help="Also save output audio to Google Drive (optional path or 'auto' for colab-llm/qwen3-tts/outputs/)")
         sp.add_argument("--model", default="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", help="Model name")
-        sp.add_argument("--timeout", type=int, default=300, help="HTTP request timeout in seconds (default: 300)")
+        sp.add_argument("--timeout", type=nonnegative_seconds, default=300, help="HTTP request timeout in seconds; 0 = unlimited (default: 300)")
         _add_endpoint_flags(sp)
 
     dvp = sub.add_parser(
@@ -438,7 +438,7 @@ def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
     dvp.add_argument("--name", help="Register the designed voice under this name for reuse with `tts --voice <name>`")
     dvp.add_argument("-o", "--output", default=None, help="Local output path for the designed reference WAV")
     dvp.add_argument("--save-drive", nargs="?", const="auto", help="Also save designed audio to Google Drive")
-    dvp.add_argument("--timeout", type=int, default=300, help="HTTP request timeout in seconds (default: 300)")
+    dvp.add_argument("--timeout", type=nonnegative_seconds, default=300, help="HTTP request timeout in seconds; 0 = unlimited (default: 300)")
     _add_endpoint_flags(dvp)
 
     vp = sub.add_parser("voices", help="List built-in CustomVoice speakers and uploaded/designed voices (/v1/audio/voices)")
@@ -474,10 +474,23 @@ CUSTOM_CMDS = {"tts", "speak", "design-voice", "voices", "upload-voice", "delete
 def configure_cli(parser, commands, up):
     _build_custom_parser(parser, commands)
     for flag, env in UP_ENV_FLAGS.items():
-        up.add_argument(flag, dest="up_" + env, help=f"override {env}")
+        if flag == "--variant":
+            up.add_argument(flag, dest="up_" + env, type=str.lower, choices=tuple(VARIANT_REPOS),
+                            help=f"override {env}")
+        elif flag == "--preload-all":
+            up.add_argument(flag, dest="up_" + env, nargs="?", const="1", choices=("0", "1"),
+                            help=f"override {env} (bare flag = 1)")
+        else:
+            up.add_argument(flag, dest="up_" + env, help=f"override {env}")
+
+
+_BASE_ENV = dict(SERVICE.env)
 
 
 def prepare_up(args):
+    # Start from the baseline defaults on every call so overrides never leak between invocations.
+    SERVICE.env.clear()
+    SERVICE.env.update(_BASE_ENV)
     variant = getattr(args, "up_CT_QWEN3_TTS_VARIANT")
     if variant:
         if variant.lower() not in VARIANT_REPOS:

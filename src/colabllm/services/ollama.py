@@ -32,7 +32,13 @@ def configure_cli(parser, commands, up):
     up.add_argument("--models", "--model", "-m", action="append", help="models to preload; repeat or separate with commas")
 
 
+_BASE_ENV = dict(SERVICE.env)
+
+
 def prepare_up(args):
+    # Start from the baseline defaults on every call so overrides never leak between invocations.
+    SERVICE.env.clear()
+    SERVICE.env.update(_BASE_ENV)
     if args.models:
         SERVICE.env["CT_MODELS"] = ",".join(args.models)
 

@@ -40,13 +40,17 @@ jobs:
           else
             brew install fish
           fi
+      - name: Check synchronized runtime guides
+        run: python tools/sync_runtime_docs.py --check
       - name: Run local tests without model dependencies
         run: python -m unittest discover -s tests
       - name: Build wheel and source distribution
         run: uv build --no-sources --quiet
+      - name: Validate package metadata
+        run: uvx --from twine==6.2.0 twine check dist/*.whl dist/*.tar.gz
       - name: Verify isolated tool installation
         shell: bash
         run: |
-          for wheel in dist/*.whl; do
-            python tools/check_distribution.py "$wheel"
+          for artifact in dist/*.whl dist/*.tar.gz; do
+            python tools/check_distribution.py "$artifact"
           done

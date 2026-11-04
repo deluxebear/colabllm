@@ -54,6 +54,13 @@ def command_timeout(default=300):
         raise UsageError('COLABLLM_COMMAND_TIMEOUT 必须是大于 0 的有限秒数') from None
 
 
+def http_timeout(timeout=None, default=120):
+    if timeout is None:
+        return command_timeout(default)
+    seconds = nonnegative_seconds(timeout)
+    return None if seconds == 0 else seconds
+
+
 class Deadline:
     def __init__(self, timeout=0, message='等待超时；后台任务继续运行，可稍后查询'):
         timeout = nonnegative_seconds(timeout)
@@ -74,9 +81,13 @@ class Deadline:
 
 def origin(url):
     parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise CliError('服务 URL 端口格式无效') from None
     if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
         raise CliError('服务 URL 必须是无内嵌账号密码的 HTTP(S) 地址')
-    return (parsed.scheme.lower(), parsed.hostname.lower(), parsed.port or (443 if parsed.scheme == 'https' else 80))
+    return (parsed.scheme.lower(), parsed.hostname.lower(), port or (443 if parsed.scheme == 'https' else 80))
 
 
 def resolve_endpoint(state, url=None, token=None, *, url_env=None, token_env=None):
@@ -154,5 +165,9 @@ def run_cli(action):
                 message = f'HTTP {error.code}: {error.reason}'
             # Errors remain visible in quiet mode.
             print(f'colabllm: {message}', file=sys.stderr)
-        code = error.code if isinstance(error, (CliError, UsageError)) else (124 if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) else 1)
+        is_timeout = isinstance(error, (TimeoutError, subprocess.TimeoutExpired)) or (
+            isinstance(error, urllib.error.URLError)
+            and isinstance(getattr(error, 'reason', None), TimeoutError)
+        )
+        code = error.code if isinstance(error, (CliError, UsageError)) else (124 if is_timeout else 1)
         raise SystemExit(code) from None

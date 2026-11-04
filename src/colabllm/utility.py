@@ -10,7 +10,11 @@ from doctor import diagnose
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog='colabllm')
+    parser = argparse.ArgumentParser(prog='colabllm', allow_abbrev=False)
+    parser.add_argument('--command-timeout', type=positive_seconds, help='外部命令超时秒数')
+    parser.add_argument('--debug', action='store_true', help='输出异常堆栈')
+    parser.add_argument('--quiet', action='store_true', help='静默诊断输出')
+    parser.add_argument('--no-color', action='store_true', help='关闭彩色诊断输出')
     commands = parser.add_subparsers(dest='command', required=True)
     doctor = commands.add_parser('doctor', help='检查本地依赖、配置及授权')
     doctor.add_argument('--json', action='store_true', help='输出 JSON 检查结果')

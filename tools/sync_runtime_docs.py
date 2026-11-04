@@ -6,6 +6,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMON = 'runtime-common'
+GENERATED_PREFIX = '<!-- Generated from docs/'
 
 
 def runtime_names():
@@ -15,19 +16,31 @@ def runtime_names():
 
 def synchronize(check=False):
     failures = []
+    expected_names = {f'{name}.md' for name in (COMMON, *runtime_names())}
+    refs_dir = ROOT / 'skills/colabllm/references'
     for name in [COMMON, *runtime_names()]:
         source = ROOT/'docs'/(name+'.md')
-        target = ROOT/'skills/colabllm/references'/(name+'.md')
+        target = refs_dir/(name+'.md')
         if not source.is_file():
             failures.append(f'Missing runtime guide: {source.relative_to(ROOT)}')
             continue
-        content = '<!-- Generated from docs/' + name + '.md; edit the source and run tools/sync_runtime_docs.py. -->\n\n' + source.read_text(encoding='utf-8')
+        content = GENERATED_PREFIX + name + '.md; edit the source and run tools/sync_runtime_docs.py. -->\n\n' + source.read_text(encoding='utf-8')
         if check:
             if not target.is_file() or target.read_text(encoding='utf-8') != content:
                 failures.append(f'Outdated skill reference: {target.relative_to(ROOT)}')
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding='utf-8')
+    if refs_dir.is_dir():
+        for existing in sorted(refs_dir.glob('*.md')):
+            if existing.name in expected_names:
+                continue
+            head = existing.read_text(encoding='utf-8', errors='replace')[:120]
+            if head.startswith(GENERATED_PREFIX):
+                if check:
+                    failures.append(f'Orphaned generated skill reference: {existing.relative_to(ROOT)}')
+                else:
+                    existing.unlink()
     if failures:
         raise RuntimeError('\n'.join(failures))
     return len(runtime_names())

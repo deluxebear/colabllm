@@ -112,17 +112,42 @@ def read_frps_config(path):
         return tomllib.load(source)
 
 
+def is_managed_frps(info):
+    if not info:
+        return False
+    if info.get('unit') in ('colabsvc-frps', 'colabsvc-frps.service'):
+        return True
+    cfg = info.get('config')
+    return bool(cfg and Path(cfg).resolve(strict=False) == (ETC / 'frps.toml').resolve(strict=False))
+
+
+def is_managed_caddy(info):
+    if not info:
+        return False
+    if info.get('unit') in ('colabsvc-caddy', 'colabsvc-caddy.service'):
+        return True
+    cfg = info.get('config')
+    return bool(cfg and Path(cfg).resolve(strict=False) == (ETC / 'Caddyfile').resolve(strict=False))
+
+
 def discover_frps(port):
     if not port_free(port):
         info=listening_process(port)
+        if is_managed_frps(info):
+            return None
         if not info or not Path(info['binary']).name.endswith('frps') or not info.get('config'):
             raise ValueError(f'Port {port} is occupied by a non-FRP or unidentifiable process')
         return info
     candidates=[]
     for info in installed_services('frp'):
+        if is_managed_frps(info):
+            continue
         if Path(info['binary']).name.endswith('frps') and info.get('config'):
-            if read_frps_config(info['config']).get('bindPort',7000)==port:
-                candidates.append(info)
+            try:
+                if read_frps_config(info['config']).get('bindPort',7000)==port:
+                    candidates.append(info)
+            except (OSError, ValueError, KeyError):
+                continue
     if len(candidates)>1:
         raise ValueError('Multiple installed frps services match the requested port')
     return candidates[0] if candidates else None
@@ -189,11 +214,13 @@ def discover_caddy():
     for port in (443,80):
         if not port_free(port):
             info=listening_process(port)
+            if is_managed_caddy(info):
+                continue
             if not info or not Path(info['binary']).name.endswith('caddy'):
                 raise ValueError(f'Port {port} is occupied by a non-Caddy process')
             if not any(existing.get('pid')==info.get('pid') for existing in found):found.append(info)
     if not found:
-        found=[info for info in installed_services('caddy') if info.get('config')]
+        found=[info for info in installed_services('caddy') if info.get('config') and not is_managed_caddy(info)]
     if len(found)>1:
         raise ValueError('Multiple existing Caddy services found; automatic integration is ambiguous')
     return found[0] if found else None
@@ -227,7 +254,8 @@ def download_binary(repo, version, asset, checksum_asset, members):
     base = f'https://github.com/{repo}/releases/download/v{version}/'
     with tempfile.TemporaryDirectory() as tmp:
         archive = Path(tmp)/asset
-        urllib.request.urlretrieve(base+asset, archive)
+        with urllib.request.urlopen(base+asset, timeout=60) as src, open(archive, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
         checks = urllib.request.urlopen(base+checksum_asset, timeout=60).read().decode()
         expected = next((line.split()[0] for line in checks.splitlines()
                          if line.split() and line.split()[-1].lstrip('*') == asset), None)
@@ -251,12 +279,21 @@ def download_binary(repo, version, asset, checksum_asset, members):
 
 
 def port_free(port):
-    with socket.socket() as sock:
+    for family, addr in ((socket.AF_INET, '0.0.0.0'), (socket.AF_INET6, '::')):
         try:
-            sock.bind(('0.0.0.0', port))
-            return True
+            sock = socket.socket(family, socket.SOCK_STREAM)
         except OSError:
-            return False
+            continue
+        with sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6 and hasattr(socket, 'IPV6_V6ONLY'):
+                with contextlib.suppress(OSError):
+                    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                sock.bind((addr, port))
+            except OSError:
+                return False
+    return True
 
 
 def server_toml(ip, token, port):

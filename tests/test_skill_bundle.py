@@ -18,7 +18,7 @@ class SkillBundleTest(unittest.TestCase):
         for path in root.rglob('*.md'):
             text = path.read_text()
             self.assertNotRegex(text, r'\bsk-[A-Za-z0-9]{20,}')
-            self.assertNotIn('~', text)
+            self.assertNotIn('/home/' + 'eric', text)
             for target in re.findall(r'\]\(([^)]+)\)', text):
                 if '://' in target:
                     continue

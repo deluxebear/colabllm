@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import resolve_endpoint, safe_urlopen
+from cli_support import http_timeout, nonnegative_seconds, resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -59,7 +59,7 @@ SERVICE = Service(
     public_port=8000,
     gpu="L4",
     high_mem=False,
-    default_hostname="indextts.example.com",
+    default_hostname="indextts",
     ready_timeout=3600,
     env={
         "CT_INDEXTTS_MODEL": "IndexTeam/IndexTTS-2.5",
@@ -367,7 +367,7 @@ def cmd_tts(args: argparse.Namespace) -> int:
     )
     t0 = time.monotonic()
     try:
-        with safe_urlopen(req, timeout=args.timeout) as resp:
+        with safe_urlopen(req, timeout=http_timeout(args.timeout)) as resp:
             audio_bytes = resp.read()
             elapsed = time.monotonic() - t0
             saved_drive = resp.headers.get("X-Saved-Drive-Path")
@@ -422,9 +422,9 @@ def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
         sp.add_argument("--use-random", action="store_true", help="Enable stochastic speaker/emotion sampling")
         sp.add_argument("--max-new-tokens", type=int, help="Maximum codec tokens to generate")
         sp.add_argument("--seed", type=int, help="Random seed for reproducible generation")
-        sp.add_argument("--save-drive", nargs="?", const="auto", help="Also save output audio to Google Drive (optional path or 'auto' for colab-data/indextts/outputs/)")
+        sp.add_argument("--save-drive", nargs="?", const="auto", help="Also save output audio to Google Drive (optional path or 'auto' for colab-llm/indextts/outputs/)")
         sp.add_argument("--model", default="IndexTeam/IndexTTS-2.5", help="Model name (default: IndexTeam/IndexTTS-2.5)")
-        sp.add_argument("--timeout", type=int, default=300, help="HTTP request timeout in seconds (default: 300)")
+        sp.add_argument("--timeout", type=nonnegative_seconds, default=300, help="HTTP request timeout in seconds; 0 = unlimited (default: 300)")
         _add_endpoint_flags(sp)
 
     vp = sub.add_parser("voices", help="List available and uploaded voices (/v1/audio/voices)")
@@ -434,7 +434,7 @@ def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
     upv = sub.add_parser("upload-voice", help="Register a persistent named voice from local or Google Drive audio")
     upv.add_argument("--name", required=True, help="Voice identifier (e.g. narrator, alice)")
     upv.add_argument("--audio", help="Local audio file path (or drive:// path)")
-    upv.add_argument("--drive", help="Google Drive audio path (relative to colab-data/indextts/voices/ or MyDrive)")
+    upv.add_argument("--drive", help="Google Drive audio path (relative to colab-llm/indextts/voices/ or MyDrive)")
     upv.add_argument("--consent", default="owner-consent", help="Consent tag (default: owner-consent)")
     upv.add_argument("--ref-text", help="Optional transcript of the reference audio")
     upv.add_argument("--description", help="Optional description of the speaker voice")
@@ -445,7 +445,7 @@ def _build_custom_parser(parser=None, commands=None) -> argparse.ArgumentParser:
     _add_endpoint_flags(delv)
 
     lsd = sub.add_parser("ls-drive", help="List audio files on Google Drive")
-    lsd.add_argument("path", nargs="?", default="", help="Drive folder or glob pattern (default: colab-data/indextts/voices)")
+    lsd.add_argument("path", nargs="?", default="", help="Drive folder or glob pattern (default: colab-llm/indextts/voices)")
     lsd.add_argument("--no-recursive", action="store_true", help="Do not recurse into subdirectories")
     lsd.add_argument("--json", action="store_true", help="Output raw JSON")
     _add_endpoint_flags(lsd)
@@ -463,7 +463,13 @@ def configure_cli(parser, commands, up):
         up.add_argument(flag, dest="up_" + env, help=f"override {env}")
 
 
+_BASE_ENV = dict(SERVICE.env)
+
+
 def prepare_up(args):
+    # Start from the baseline defaults on every call so overrides never leak between invocations.
+    SERVICE.env.clear()
+    SERVICE.env.update(_BASE_ENV)
     for flag, env in UP_ENV_FLAGS.items():
         value = getattr(args, "up_" + env)
         if value is not None:

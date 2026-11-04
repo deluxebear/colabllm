@@ -49,6 +49,7 @@ import csv
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -61,7 +62,7 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import command_timeout, resolve_endpoint, safe_urlopen
+from cli_support import CliError, UsageError, command_timeout, diagnostic, http_timeout, nonnegative_seconds, resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -220,7 +221,7 @@ SERVICE = Service(
     public_port=8000,
     gpu="G4",                         # Colab G4 (RTX PRO 6000 Blackwell ~96 GB VRAM), without --high-mem
     high_mem=False,
-    default_hostname="transcribe.example.com",
+    default_hostname="transcribe",
     ready_timeout=3600,
     env={
         "CT_NEMOTRON_PRECISION": "bf16",
@@ -451,14 +452,18 @@ def _download_media_locally_and_upload_to_drive(
     if fmt not in ("mp3", "m4a", "wav", "opus", "flac"):
         fmt = "mp3"
 
-    # Ensure remote directory exists on mounted Google Drive
-    subprocess.run(
-        ["colab", "exec", "-s", session_name, "-c", f"mkdir -p '{target_drive_dir}'"],
-        capture_output=True,
-        text=True,
-        timeout=command_timeout(30),
-        check=False,
-    )
+    # Ensure remote directory exists on mounted Google Drive. The kernel is busy (blocked in the
+    # keep-alive cell) while the service runs, so this is best effort and must never hang the CLI.
+    try:
+        subprocess.run(
+            ["colab", "exec", "-s", session_name, "-c", f"mkdir -p {shlex.quote(target_drive_dir)}"],
+            capture_output=True,
+            text=True,
+            timeout=command_timeout(30),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        diagnostic(f"[nemotron] 远端 mkdir 超时（内核可能正忙），继续直接上传到 {target_drive_dir}")
 
     with tempfile.TemporaryDirectory(prefix="nemotron-ytdlp-") as stage_str:
         stage_dir = Path(stage_str)
@@ -831,7 +836,7 @@ def _expand_tasks(cli_args: argparse.Namespace, base_url: str, token: str) -> li
                                 "download_video": dl_video,
                                 "save_media_to_drive": save_media_drive,
                             },
-                            timeout=max(cli_args.timeout, 900),
+                            timeout=None if not cli_args.timeout else max(cli_args.timeout, 900),
                         )
                         downloaded_files = dl_res.get("files") or []
                     except Exception as e:
@@ -1112,7 +1117,7 @@ def _run_one_task(
         if cfg["max_tokens"] is not None:
             body["max_tokens"] = cfg["max_tokens"]
         try:
-            res = _http_request(f"{base_url}/api/ct/drive-transcribe", token, payload=body, timeout=cli_args.timeout)
+            res = _http_request(f"{base_url}/api/ct/drive-transcribe", token, payload=body, timeout=http_timeout(cli_args.timeout))
         except Exception as e:
             # Automatic fallback: if remote Colab yt-dlp was blocked or endpoint not updated yet,
             # download locally via yt-dlp, upload to Google Drive via `colab upload`, and transcribe!
@@ -1131,7 +1136,7 @@ def _run_one_task(
                 first_up = uploaded[0]
                 body.pop("url", None)
                 body["drive_path"] = first_up["drive_path"]
-                res = _http_request(f"{base_url}/api/ct/drive-transcribe", token, payload=body, timeout=cli_args.timeout)
+                res = _http_request(f"{base_url}/api/ct/drive-transcribe", token, payload=body, timeout=http_timeout(cli_args.timeout))
                 res["source_url"] = task["url"]
                 res["media_info"] = first_up
             else:
@@ -1194,14 +1199,14 @@ def _run_one_task(
             ],
         })
         payload = {
-            "model": SERVICE.env["CT_NEMOTRON_REPO"],
+            "model": SERVICE.env.get("CT_NEMOTRON_ALIAS", "nemotron-transcribe"),
             "messages": messages,
             "temperature": float(cfg["temperature"]) if cfg["temperature"] is not None else (0.6 if reasoning else 0.0),
             "top_p": 0.95 if reasoning else 1.0,
             "max_tokens": int(cfg["max_tokens"]) if cfg["max_tokens"] is not None else (20480 if reasoning else 16384),
             **extra_body,
         }
-        completion = _http_request(f"{base_url}/v1/chat/completions", token, payload=payload, timeout=cli_args.timeout)
+        completion = _http_request(f"{base_url}/v1/chat/completions", token, payload=payload, timeout=http_timeout(cli_args.timeout))
         choice = (completion.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         c_text = (msg.get("content") or "").strip()
@@ -1354,7 +1359,7 @@ def _cmd_download(argv) -> None:
     if not use_local:
         try:
             base_url, token = _get_endpoint(a.url, a.api_token)
-        except SystemExit:
+        except CliError:
             use_local = True
 
     for u in a.urls:
@@ -1500,7 +1505,7 @@ def _build_transcribe_parser(parser=None):
     )
     p.add_argument("--temperature", type=float, help="覆盖采样温度（默认: 转写 0.0 / 推理 0.6）")
     p.add_argument("--max-tokens", type=int, help="覆盖最大生成 token 数（默认: 转写 16384 / 推理 20480）")
-    p.add_argument("--timeout", type=int, default=3600, help="单个音频任务请求超时时间（秒，默认: 3600）")
+    p.add_argument("--timeout", type=nonnegative_seconds, default=3600, help="单个音频任务请求超时时间（秒，0 为不限，默认: 3600）")
     p.add_argument("-i", "--instance", metavar="ID", help="指定使用某个实例（如 -i 1 或 -i 2）")
     p.add_argument("--instances", metavar="ID1,ID2", help="指定多个实例并行分摊批量任务（如 --instances 1,2,3）")
     p.add_argument("-A", "--all-instances", action="store_true", help="自动发现所有运行中的实例并并行分摊批量任务")
@@ -1518,6 +1523,11 @@ def _cmd_transcribe(argv) -> None:
         apply_instance(SERVICE, a.instance)
     if a.prompt_file:
         a.prompt = Path(a.prompt_file).read_text(encoding="utf-8").strip()
+    if a.output and Path(a.output).suffix.lower() == ".srt" and not a.timestamps:
+        if a.timestamps is False:
+            raise UsageError("导出 .srt 字幕需要开启 --timestamps（或使用 --preset speaker）")
+        a.timestamps = True
+        diagnostic("[nemotron] 输出为 .srt，已自动开启 --timestamps 词级时间戳")
 
     endpoints = _get_endpoint_pool(a)
     first_url, first_token = endpoints[0][1], endpoints[0][2]
@@ -1580,7 +1590,9 @@ def _cmd_transcribe(argv) -> None:
         if len(results) == 1 and out_file.suffix.lower() in (".txt", ".md"):
             txt = results[0].get("text") or ""
             out_file.write_text(txt + ("\n" if not txt.endswith("\n") else ""), encoding="utf-8")
-        elif len(results) == 1 and out_file.suffix.lower() == ".srt" and results[0].get("srt"):
+        elif out_file.suffix.lower() == ".srt":
+            if len(results) != 1 or not results[0].get("srt"):
+                die("无法写入 .srt：仅支持单个音频，且服务端需返回词级时间戳（--timestamps）")
             out_file.write_text(results[0]["srt"], encoding="utf-8")
         elif out_file.suffix.lower() == ".jsonl":
             with out_file.open("w", encoding="utf-8") as f:
@@ -1610,7 +1622,13 @@ def configure_cli(parser, commands, up):
     up.add_argument("--mtp", type=int, help="override MTP value")
 
 
+_BASE_ENV = dict(SERVICE.env)
+
+
 def prepare_up(args):
+    # Start from the baseline defaults on every call so overrides never leak between invocations.
+    SERVICE.env.clear()
+    SERVICE.env.update(_BASE_ENV)
     if args.precision:
         SERVICE.env.update(CT_NEMOTRON_PRECISION=args.precision, CT_NEMOTRON_REPO=PRECISION_REPOS[args.precision])
     if args.repo:

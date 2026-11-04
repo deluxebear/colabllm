@@ -18,8 +18,10 @@ src/colabllm/services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy
 src/colabllm/lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
 src/colabllm/control.py             project-global domain and FRP configuration
 src/colabllm/lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
-templates/tunnel_client.py  shared cloudflared/frpc implementation embedded in all notebooks
-templates/               service.py + service.ipynb to copy; build_notebooks.py regenerates notebooks
+templates/build_notebooks.py  generator of every .ipynb (never hand-edit generated notebooks)
+templates/*.py, *.js     modules embedded into notebooks: tunnel_client, colab_cache, colab_asgi_common,
+                         service middlewares/workers, ComfyUI helpers (locally unit-tested)
+templates/               also service.py + service.ipynb to copy for a new service
 ~/.colabllm/services/<name>/           private runtime state and resource identities (outside the checkout)
 ~/.colabllm/tunnel-config.json  shared base domain and optional FRP metadata
 ~/.colabllm/frp/             private per-server client credentials (0600)
@@ -101,7 +103,7 @@ settings, not settings for one runtime. `up` follows these settings:
   Cloudflare's dynamic URL and conflicts with `--transport frp`.
 - `--domain HOST` supplies a full hostname; `--base-domain` supplies a one-launch suffix.
   Bare `--domain` uses the configured suffix or a dynamic URL if none exists. Historical
-  `Service.zone` / `default_hostname` values retain aliases, not an implicit `example.com` deployment.
+  `Service.zone` / `default_hostname` values retain short aliases only (e.g. `qwen`, `transcribe`); there is no built-in personal deployment domain.
 
 ```bash
 colabllm tunnel-config
@@ -143,48 +145,20 @@ Fixed domains use the local `cf` login for DNS in either backend. FRP server man
    (`CT_READY`), never inferred from exit codes.
 8. **Each `colab exec` call starts in `/content`**; `%cd` only persists within one exec.
 9. **Secrets never go into the notebook**: the script generates them, stores them in `~/.colabllm/services/`
-   (0600) and injects them with `colab exec --env`.
+   (0600) and injects them through a private 0600 runtime notebook prelude (`os.environ.update`),
+   so they never appear in `colab exec` argv / `ps`; only `CT_SERVICE` is passed with `--env`.
 10. **`cf` (beta) quirk**: `cf tunnels config update --tunnel-config-ingress` demands unrelated Access
     flags -> send `--body '{"config":{"ingress":[...]}}'` instead.
-11. **vLLM services MUST use the two-tier JIT kernel precompilation cache (Local SSD $\leftrightarrow$ Google Drive)**:
-    vLLM compiles FlashInfer JIT (`fused_moe_<sm>`, etc.), Triton kernels, and TorchInductor/vLLM CUDA graphs on first startup (taking 5–10 minutes on Blackwell `sm_120` / Hopper `sm_90`). Never point compiler cache dirs directly at `/content/drive` (FUSE lockfile/rename bottlenecks slow down `ninja`/`nvcc`), and never leave them only in ephemeral `/root/.cache`. Always stage them on local NVMe SSD and sync with `DATA_DIR` on Google Drive (see **vLLM deployment standard** below).
-
-## vLLM deployment standard (precompiled JIT kernel cache & storage layout)
-
-Whenever deploying a model with **vLLM** (`vllm serve` or `vllm.LLM`), follow this unified storage and precompilation cache pattern (reference implementation: `NEMOTRON_TRANSCRIBE_*` in `templates/build_notebooks.py`):
-
-1. **Model weights on local NVMe SSD (`/content/<service>/model`), never on Google Drive**:
-   - Download weights directly from Hugging Face to `/content/<service>/model` with `HF_XET_CHUNK_CACHE_SIZE_BYTES="0"` (and delete `/root/.cache/huggingface/xet` afterwards) to avoid exhausting either the 15–100 GB Google Drive quota or the Colab SSD.
-2. **Two-tier JIT kernel cache (`flashinfer-cache`, `triton-cache`, `vllm-cache`)**:
-   - **Why multi-GPU safe**: FlashInfer (`*_120`, `*_90`, `*_80`), Triton, and vLLM/TorchInductor automatically namespace/hash compiled `.so`/`.cubin` artifacts by GPU compute capability (`sm_120` for G4, `sm_90` for H100, `sm_80` for A100). Different GPU types coexist in the same Drive cache directory without overwriting each other.
-   - **Step A — Cell 1 (`Setup`)**: Restore cached kernels from Google Drive (`DATA_DIR`) to local NVMe SSD before starting `vllm`:
-     ```python
-     WORK_DIR = Path(f"/content/{SERVICE}")
-     FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR = Path(DATA_DIR) / "flashinfer-cache", WORK_DIR / "flashinfer-cache"
-     TRITON_DRIVE_DIR,     TRITON_CACHE_DIR     = Path(DATA_DIR) / "triton-cache",     WORK_DIR / "triton-cache"
-     VLLM_DRIVE_DIR,       VLLM_CACHE_DIR       = Path(DATA_DIR) / "vllm-cache",       WORK_DIR / "vllm-cache"
-     for d in (FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR, TRITON_DRIVE_DIR, TRITON_CACHE_DIR, VLLM_DRIVE_DIR, VLLM_CACHE_DIR):
-         d.mkdir(parents=True, exist_ok=True)
-     for src_d, dst_d in ((FLASHINFER_DRIVE_DIR, FLASHINFER_CACHE_DIR), (TRITON_DRIVE_DIR, TRITON_CACHE_DIR), (VLLM_DRIVE_DIR, VLLM_CACHE_DIR)):
-         if any(src_d.iterdir()):
-             subprocess.run(["cp", "-rn", f"{src_d}/.", f"{dst_d}/"], check=False)
-     ```
-   - **Step B — Cell 2 (`Service`)**: Inject the local SSD cache paths into `vllm serve`'s environment:
-     ```python
-     VLLM_ENV = {
-         **os.environ,
-         "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
-         "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
-         "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
-         "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
-     }
-     ```
-   - **Step C — Cell 5 (`Ready + keep-alive`)**: Once `/health` returns `200` (all JIT warmup compilations complete), incrementally merge (`cp -ru`) the local SSD cache back to Google Drive so all future sessions (and parallel instances `-i 1`, `-i 2`, or different `--gpu` architectures) reuse the compiled binaries:
-     ```python
-     for local_c, drive_c in ((FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR), (TRITON_CACHE_DIR, TRITON_DRIVE_DIR), (VLLM_CACHE_DIR, VLLM_DRIVE_DIR)):
-         if local_c.is_dir() and drive_c.is_dir():
-             subprocess.run(["cp", "-ru", f"{local_c}/.", f"{drive_c}/"], check=False)
-     ```
+11. **Compiler caches (FlashInfer/Triton/Inductor/vLLM) live on local NVMe SSD and persist to Drive as
+    archives via `templates/colab_cache.py`** (one tar per cache dir, keyed by environment + GPU).
+    Never point compiler caches at `/content/drive` (FUSE lock/rename bottlenecks) and never leave them
+    only in `/root/.cache`. Model weights stay on local SSD (`/content/<service>/model`), downloaded with
+    `HF_XET_CHUNK_CACHE_SIZE_BYTES=0`. Full pattern: [references/notebooks.md](references/notebooks.md#compiler-cache-standard-colab_cachepy).
+12. **Notebooks are generated.** Edit `templates/build_notebooks.py` or the embedded modules, run
+    `python3 templates/build_notebooks.py`, and commit generator, modules and regenerated `.ipynb`
+    together; `tests/test_notebooks_sync.py` fails on drift. Embedded middlewares must use
+    `colab_asgi_common` (fail-closed Bearer auth, Drive path containment, voice-name and multipart
+    sanitization). Build and security rules: [references/notebooks.md](references/notebooks.md).
 
 ## Notebook contract
 
@@ -200,6 +174,7 @@ Env injected by the script (`CT_*`), defaults let the notebook also run pasted i
 | `CT_TUNNEL_TOKEN`, `CT_PUBLIC_HOSTNAME` | Cloudflare named-tunnel token, and public hostname for either fixed-domain backend |
 | `CT_FRP_*` | server, token, CA, TLS name, scopes, client version and proxy identity; runner supplies these privately |
 | `CT_DATA_DIR` | `/content/drive/MyDrive/colab-llm/<name>` -- cache models/outputs here |
+| `CT_MOUNT_DRIVE` | `0` with `up --no-drive`: Drive is not mounted and `DATA_DIR` falls back to `/content/data/<name>` |
 
 Markers the notebook prints (parsed by `colabsvc`): `CT_PUBLIC_URL=<url>`,
 `CT_CREDENTIALS user=<u> pass=<p>` (app's own login, e.g. Unsloth), `CT_READY`.
@@ -208,6 +183,9 @@ Standard cell order (generated by `templates/build_notebooks.py`):
 `0 config` → `1 setup (idempotent)` → `2 service: def start_service(); PROCS["service"]=...` →
 `3 Caddy auth` → `4 shared transport (cloudflared or frpc)` → `5 CT_READY + watchdog loop`.
 Use `TUNNEL_PROCESS_KEY` to access the active transport in `PROCS`; its key is `cloudflared` or `frpc`.
+Cell 0 provides `ct_spawn`, `ct_stop_proc`, `ct_gpu_stat`, `ct_public_gate` and `ct_watchdog`; custom
+keep-alive cells must use them (auth failure or public timeout must raise, never print `CT_READY`).
+Secrets reach the kernel through a 0600 runtime notebook prelude, not `colab exec --env` argv.
 The runner clears unused backend variables when reusing a Colab kernel. A registered tunnel or
 HTTPS 502 during model loading is not service readiness; keep the service health/warmup gate before `CT_READY`.
 Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
@@ -217,9 +195,11 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 1. Copy the pair: `cp templates/service.py src/colabllm/services/<name>.py; cp templates/service.ipynb src/colabllm/services/<name>.ipynb`
    (`<name>` = file name = Colab session; hostname uses the project base domain).
 2. Edit `src/colabllm/services/<name>.py`: `name`, `notebook`, `service_port`, `auth`, `gpu`, extra `env`.
-3. Edit the notebook's **cell 1 (setup)** and **cell 2 (`start_service`)** only; bind to `127.0.0.1`.
-   Cache large downloads in `DATA_DIR`. Adjust the health path in cell 5 if `/` is not a good probe.
-   For a reusable recipe add it to `templates/build_notebooks.py` instead and regenerate.
+3. Add the service's `*_CFG`, setup and service cells to `templates/build_notebooks.py` (plus a
+   `write(...)` call in `__main__`), keep larger logic in a module under `templates/`, bind to
+   `127.0.0.1`, put large downloads on local SSD and durable data in `DATA_DIR`, then run
+   `python3 templates/build_notebooks.py`. Do not hand-edit the generated `.ipynb`.
+   See [references/notebooks.md](references/notebooks.md).
 4. Pick auth -- see [references/auth.md](references/auth.md). Rule: **never expose a service without
    auth**; if it has none, `auth="caddy"`.
 5. Update the distributed user skill in `skills/colabllm/` in the same change. Add the runtime to
@@ -243,6 +223,7 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 
 ## References
 
+- [references/notebooks.md](references/notebooks.md) -- notebook generator, embedded modules, CONFIG helpers, middleware security, cache archives
 - [references/auth.md](references/auth.md) -- choosing builtin vs Caddy, client usage, hardening
 - [references/cf-tunnel.md](references/cf-tunnel.md) -- Cloudflare quick/named tunnels and project-domain selection
 - [references/frp.md](references/frp.md) -- FRP provisioning/adoption, credentials, DNS, diagnostics and cleanup

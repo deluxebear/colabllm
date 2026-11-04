@@ -51,7 +51,7 @@ def stop_owned_process(pid, identity, *, group=False, timeout=5):
                     os.killpg(pid, sig)
                 else:
                     os.kill(pid, sig)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
     send(signal.SIGTERM)
     deadline = time.monotonic() + timeout

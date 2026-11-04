@@ -3,10 +3,13 @@ import hashlib
 import json
 import os
 import platform
+import re
+import shutil
 import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -41,14 +44,14 @@ def install_frpc(destination, version):
     arch={'x86_64':'amd64','aarch64':'arm64'}.get(platform.machine())
     if not arch:
         raise ValueError('Unsupported FRP client architecture')
-    import re
     if not re.fullmatch(r'\d+\.\d+\.\d+',version) or tuple(map(int,version.split('.')))<(0,61,0):
         raise ValueError('Unsupported FRP client version; expected stable >= 0.61.0')
     asset=f'frp_{version}_linux_{arch}.tar.gz'
     base=f'https://github.com/fatedier/frp/releases/download/v{version}/'
     with tempfile.TemporaryDirectory() as tmp:
         archive=Path(tmp)/asset
-        urllib.request.urlretrieve(base+asset,archive)
+        with urllib.request.urlopen(base+asset,timeout=60) as response, open(archive,'wb') as out:
+            shutil.copyfileobj(response,out)
         checks=urllib.request.urlopen(base+'frp_sha256_checksums.txt',timeout=60).read().decode()
         expected=next((line.split()[0] for line in checks.splitlines()
                        if line.split() and line.split()[-1].lstrip('*')==asset),None)
@@ -117,22 +120,40 @@ def run_tunnel(ctx):
             return spawn('frpc',[binary,'-c',str(config_path)])
         key='frpc'
     else:
+        cf_arch={'x86_64':'amd64','aarch64':'arm64'}.get(platform.machine(),'amd64')
         binary=ctx['ct_fetch_binary']('/usr/local/bin/cloudflared',
-            'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64')
+            f'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-{cf_arch}')
+        def refresh_quick_url(proc_ref, wait_seconds=60):
+            deadline_q=time.monotonic()+wait_seconds
+            while time.monotonic()<deadline_q:
+                if proc_ref.poll() is not None:
+                    return None
+                match_q=re.search(r'https://[a-z0-9-]+\.trycloudflare\.com',ctx['ct_tail']('cloudflared',100))
+                if match_q:
+                    new_url=match_q.group(0)
+                    if new_url!=ctx.get('PUBLIC_URL'):
+                        ctx['PUBLIC_URL']=new_url
+                        print(f'CT_PUBLIC_URL={new_url}',flush=True)
+                    return new_url
+                time.sleep(1)
+            return None
+        ctx['ct_refresh_public_url']=refresh_quick_url
         def start():
             args=[binary,'tunnel','--no-autoupdate','--protocol','http2']
             if ctx['TUNNEL_TOKEN']:
                 args+=['run','--token',ctx['TUNNEL_TOKEN']]
             else:
                 args+=['--url',f'http://127.0.0.1:{ctx["PUBLIC_PORT"]}']
-            return spawn('cloudflared',args)
+            proc_new=spawn('cloudflared',args)
+            if not ctx['TUNNEL_TOKEN'] and ctx.get('PUBLIC_URL'):
+                threading.Thread(target=refresh_quick_url,args=(proc_new,),daemon=True).start()
+            return proc_new
         key='cloudflared'
     proc=start()
     ctx['PROCS'][key]=(proc,start)
     ctx['TUNNEL_PROCESS_KEY']=key
     deadline=time.monotonic()+180
     registered=False
-    import re
     while time.monotonic()<deadline:
         if proc.poll() is not None:
             raise RuntimeError(f'{key} exited before registration; see /content/ct/{key}.log')

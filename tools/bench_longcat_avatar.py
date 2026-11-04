@@ -12,22 +12,24 @@ os.environ['TRITON_CACHE_DIR']='/content/longcat-avatar/speed-bench-triton'
 sys.path.insert(0,'/content/longcat-avatar')
 sys.path.insert(0,'/content/longcat-avatar/repo')
 import urllib.request
+import urllib.error
+PORT=int(os.environ.get('CT_SERVICE_PORT','7860'))
 try:
- health=json.load(urllib.request.urlopen('http://127.0.0.1:7860/health',timeout=3))
- if health.get('active_job') is not None:raise RuntimeError('Run this benchmark only when Avatar has no active job')
-except OSError:
- pass
+ with urllib.request.urlopen(f'http://127.0.0.1:{PORT}/health',timeout=3) as response:health=json.load(response)
+except urllib.error.URLError as error:
+ # Only "service not running" is acceptable; HTTP errors and timeouts abort to protect active jobs.
+ if isinstance(error,urllib.error.HTTPError) or not isinstance(error.reason,ConnectionRefusedError):raise
+ health={}
+except ConnectionRefusedError:
+ health={}
+if health.get('active_job') is not None:raise RuntimeError('Run this benchmark only when Avatar has no active job')
 import torch
 from safetensors import safe_open
 from longcat_avatar_app import install_avatar_sdpa
 from longcat_video.modules.avatar.longcat_video_dit_avatar import LongCatAvatarSingleStreamBlock,LongCatVideoAvatarTransformer3DModel
 from longcat_video.modules.lora_utils import create_lora_network
 install_avatar_sdpa()
-from longcat_avatar_app import flash_attn_func
-from longcat_video.modules.avatar import attention as avatar_attention
-avatar_attention._avatar_sdpa = flash_attn_func
 root=Path('/content/longcat-avatar/model/LongCat-Video-Avatar-1.5')
-config=json.loads((root/'base_model/config.json').read_text())
 index=json.loads((root/'base_model/diffusion_pytorch_model.safetensors.index.json').read_text())['weight_map']
 block=LongCatAvatarSingleStreamBlock(4096,32,4,512,enable_flashattn2=True,cp_split_hw=[1,1],audio_prenorm=False)
 state={}

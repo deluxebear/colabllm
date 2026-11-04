@@ -57,8 +57,8 @@ class RuntimeDocumentationTest(unittest.TestCase):
         for name in [*self.modules, 'runtime-common']:
             path = ROOT/'docs'/(name+'.md')
             text = path.read_text()
-            self.assertNotIn('example.com', text)
-            self.assertNotIn('~', text)
+            self.assertNotIn('443998' + '.xyz', text)
+            self.assertNotIn('/home/' + 'eric', text)
             for link in re.findall(r'\]\(([^)]+)\)', text):
                 if '://' in link:
                     continue

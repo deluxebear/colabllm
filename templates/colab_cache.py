@@ -85,12 +85,15 @@ def restore_cache(local, legacy, archive_dir, key, log=print):
         except (OSError, ValueError, tarfile.TarError) as error:
             log(f'{local.name}: 归档不可用，回退旧缓存（{error}）')
     if legacy.is_dir():
-        def migrate():
-            shutil.copytree(legacy, local, dirs_exist_ok=True, symlinks=True)
-        _progress(log, f'{local.name}: 首次迁移旧版网盘缓存（小文件较多时耗时较长）', migrate)
-        if _files(local):
-            save_cache(local, archive_dir, key, log)
-            return 'legacy'
+        try:
+            def migrate():
+                shutil.copytree(legacy, local, dirs_exist_ok=True, symlinks=True)
+            _progress(log, f'{local.name}: 首次迁移旧版网盘缓存（小文件较多时耗时较长）', migrate)
+            if _files(local):
+                save_cache(local, archive_dir, key, log)
+                return 'legacy'
+        except (OSError, ValueError, tarfile.TarError) as error:
+            log(f'{local.name}: 旧缓存迁移失败，回退按需生成（{error}）')
     log(f'{local.name}: 无持久缓存，将由服务按需生成')
     return 'miss'
 

@@ -107,6 +107,9 @@ def extract_instance_arg(argv: list[str] | None = None) -> tuple[str | None, lis
         elif a.startswith("--instance="):
             inst = validate_instance(a.split("=", 1)[1])
             i += 1
+        elif a.startswith("-i") and not a.startswith("--") and len(a) > 2:
+            inst = validate_instance(a[2:])
+            i += 1
         else:
             cleaned.append(a)
             i += 1
@@ -215,8 +218,8 @@ def tunnel_hostname(svc: Service, args) -> str | None:
     # Keep service aliases (qwen, transcribe, etc.) and instance suffixes,
     # replacing only their historical base domain.
     alias = svc.default_hostname or svc.name
-    if alias.endswith('.' + svc.zone):
-        alias = alias[:-(len(svc.zone) + 1)]
+    if '.' in alias:
+        alias = alias.split('.', 1)[0]
     return validate_domain(f'{alias}.{base}')
 
 
@@ -239,11 +242,19 @@ def cmd_tunnel_config(args) -> None:
                       'config_file': str(path)}, ensure_ascii=False, indent=2))
 
 
+def _known_service_names() -> set[str]:
+    services_dir = Path(__file__).resolve().parents[1] / "services"
+    if not services_dir.is_dir():
+        return set()
+    return {p.stem for p in services_dir.glob("*.py") if p.with_suffix(".ipynb").is_file()}
+
+
 def list_service_instances(base_name: str) -> list[dict]:
     """Return status dicts for the default instance and all `<base_name>-<id>` instances found in `~/.colabllm/services/`."""
     directory = STATE_ROOT / "services"
     if not directory.is_dir():
         return []
+    longer_services = {name for name in _known_service_names() if len(name) > len(base_name) and name.startswith(base_name + "-")}
     items: list[dict] = []
     for d in sorted(directory.iterdir()):
         if not d.is_dir():
@@ -260,6 +271,12 @@ def list_service_instances(base_name: str) -> list[dict]:
         try:
             st = json.loads(sp.read_text())
         except Exception:
+            continue
+        recorded_base = st.get("base_service")
+        if recorded_base is not None:
+            if recorded_base != base_name:
+                continue
+        elif any(d.name == other or d.name.startswith(other + "-") for other in longer_services):
             continue
         alive = runner_alive(st)
         items.append({
@@ -289,8 +306,7 @@ def warn(msg: str) -> None:
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"[colabsvc] {msg}", file=sys.stderr, flush=True)
-    sys.exit(code)
+    raise CliError(msg, code)
 
 
 def banner(lines: list[str]) -> None:
@@ -478,21 +494,61 @@ def ensure_named_tunnel(svc: Service, hostname: str) -> dict:
     else:
         die(f"{hostname} already has a {records[0]['type']} record; refusing to overwrite it")
 
+    prev_cf = State(svc).load().get("cloudflare_route") or {}
+    old_host, old_zone = prev_cf.get("hostname"), prev_cf.get("zone_id")
+    if old_host and old_zone and old_host != hostname:
+        for old_rec in cf_json("dns", "records", "list", "-z", old_zone, "--name", old_host):
+            if (
+                old_rec.get("type") == "CNAME"
+                and old_rec.get("content") == target
+                and old_rec.get("comment") == f"colabsvc {svc.name}"
+            ):
+                run(["cf", "dns", "records", "delete", old_rec["id"], "-z", old_zone, "--force"], capture=True)
+                log(f"cf: removed previous DNS CNAME {old_host}")
+
     token = cf_json("tunnels", "token", "get", tid)
     return {"tunnel_id": tid, "tunnel_name": name, "zone_id": zone["id"], "hostname": hostname, "token": token}
 
 
 def delete_named_tunnel(st: dict) -> None:
     host, tid = st.get("hostname"), st.get("tunnel_id")
-    if host and st.get("zone_id"):
+    if host and tid and st.get("zone_id"):
         for r in cf_json("dns", "records", "list", "-z", st["zone_id"], "--name", host):
-            if r["type"] == "CNAME" and r["content"].startswith(tid):
+            if r.get("type") == "CNAME" and r.get("content", "").startswith(tid):
                 run(["cf", "dns", "records", "delete", r["id"], "-z", st["zone_id"], "--force"], capture=True)
                 log(f"cf: deleted DNS record {host}")
     if tid:
         run(["cf", "tunnels", "connections", "cleanup", tid, "--force"], capture=True, check=False)
         run(["cf", "tunnels", "delete", tid, "--force"], capture=True)
         log(f"cf: deleted tunnel {st.get('tunnel_name')}")
+
+
+def _write_private_notebook(nb_path: Path, built: dict, env: dict | None = None) -> None:
+    notebook_copy = dict(built)
+    cells = [dict(c) for c in built.get("cells", [])]
+    if env and cells:
+        env_inject = (
+            "# [colabsvc] private runtime environment (injected locally via 0600 notebook; never exposed on ps argv)\n"
+            f"import json as _ct_json, os as _ct_os\n"
+            f"_ct_os.environ.update(_ct_json.loads({json.dumps(env, ensure_ascii=False)!r}))\n"
+        )
+        src0 = cells[0].get("source", "")
+        if isinstance(src0, list):
+            src0 = "".join(src0)
+        if "_ct_os.environ.update(" not in src0:
+            cells[0]["source"] = env_inject + src0
+    notebook_copy["cells"] = cells
+    fd, tmp_name = tempfile.mkstemp(prefix=".nb-", suffix=".tmp", dir=nb_path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        os.chmod(tmp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(notebook_copy, handle, indent=1, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(nb_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- runner (attached `colab exec`)
@@ -511,9 +567,18 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     st = state.load()
     pid, identity = os.getpid(), process_identity(os.getpid())
     state.save(runner_pid=pid, runner_identity=identity)
-    cmd = ["colab", "exec", "-s", svc.name, "-f", str(nb_path), "--timeout", str(7 * 24 * 3600)]
-    for key, value in st.get("env", {}).items():
-        cmd += ["--env", f"{key}={value}"]
+    if nb_path.is_file() and st.get("env"):
+        try:
+            current_nb = json.loads(nb_path.read_text(encoding="utf-8"))
+            _write_private_notebook(nb_path, current_nb, st["env"])
+        except (OSError, ValueError):
+            pass
+    # Keep credentials out of argv (`ps aux`); secrets live in the 0600 runtime notebook prelude.
+    cmd = [
+        "colab", "exec", "-s", svc.name, "-f", str(nb_path),
+        "--timeout", str(7 * 24 * 3600),
+        "--env", f"CT_SERVICE={svc.name}",
+    ]
     proc = None
     child_identity = None
     old_handler = signal.getsignal(signal.SIGTERM)
@@ -592,7 +657,8 @@ def cmd_up(svc: Service, script: Path, a) -> None:
         try:
             raise SystemExit(exec_runner(svc, launched))
         finally:
-            finish_runner(state, os.getpid(), process_identity(os.getpid()))
+            if state.load().get("exec_pid") is None:
+                finish_runner(state, os.getpid(), process_identity(os.getpid()))
     if getattr(a, "detach", False):
         show_info(svc, reveal=False)
         return
@@ -635,7 +701,6 @@ def _start_up(svc: Service, script: Path, a):
     private_dir(state.dir.parent)
     private_dir(state.dir)
     nb_path = state.dir / nb_src.name
-    nb_path.write_text(json.dumps(built, indent=1, ensure_ascii=False), encoding="utf-8")
 
     # credentials: stable across restarts, regenerated with --new-credentials
     if a.new_credentials or not st.get("auth_pass"):
@@ -644,20 +709,34 @@ def _start_up(svc: Service, script: Path, a):
     env = {"CT_SERVICE": svc.name, "CT_SERVICE_PORT": str(svc.service_port),
            "CT_PUBLIC_PORT": str(svc.tunnel_port), "CT_AUTH": svc.auth,
            "CT_API_TOKEN": st["api_token"],
-           "CT_DATA_DIR": f"/content/drive/MyDrive/colab-llm/{svc.base_name or svc.name}", **svc.env}
+           "CT_MOUNT_DRIVE": "0" if a.no_drive else "1",
+           "CT_DATA_DIR": (
+               f"/content/local-data/{svc.base_name or svc.name}"
+               if a.no_drive else f"/content/drive/MyDrive/colab-llm/{svc.base_name or svc.name}"
+           ),
+           **svc.env}
     # Explicitly clear previous notebook-kernel values when switching to quick
     # tunnels; reused Colab kernels retain env vars from earlier executions.
     env.update(CT_TRANSPORT=transport,CT_TUNNEL_TOKEN="", CT_PUBLIC_HOSTNAME="")
     for key in ('SERVER_IP','SERVER_PORT','REMOTE_PORT','PROXY_NAME','TOKEN','CA_CERT','VERSION','SERVER_NAME','AUTH_SCOPES'):
         env['CT_FRP_'+key]=''
-    hf_tok = a.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or st.get("hf_token")
-    if not hf_tok:
-        for p in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
-            if p.is_file() and p.read_text().strip():
-                hf_tok = p.read_text().strip()
-                break
+    host_hf_tok = None
+    for p in (Path.home() / ".cache/huggingface/token", Path.home() / ".huggingface/token"):
+        if p.is_file() and p.read_text().strip():
+            host_hf_tok = p.read_text().strip()
+            break
+    hf_tok = (
+        a.hf_token
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        or host_hf_tok
+        or (None if a.new_credentials else st.get("hf_token"))
+    )
+    if a.hf_token:
+        st = state.save(hf_token=a.hf_token)
+    elif a.new_credentials and "hf_token" in st:
+        st = state.update(lambda current: {k: v for k, v in current.items() if k != "hf_token"})
     if hf_tok:
-        st = state.save(hf_token=hf_tok)
         env.update(HF_TOKEN=hf_tok, HUGGING_FACE_HUB_TOKEN=hf_tok)
     if svc.auth == "caddy":
         env.update(CT_AUTH_USER=st["auth_user"], CT_AUTH_PASS=st["auth_pass"])
@@ -680,13 +759,18 @@ def _start_up(svc: Service, script: Path, a):
         st = state.save(transport=transport,cloudflare_route=route,**route)
     else:
         st=state.save(transport=transport)
+    _write_private_notebook(nb_path, built, env)
     # 2. session + 3. Drive
     ensure_session(svc)
     if not a.no_drive:
         log("colab dfs mount")
         run(["colab", "dfs", "mount", "-s", svc.name])
-    st = state.save(env=env, url=None, ready=False, last_cell_started=False, login_user=None, login_pass=None,
-                    runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout, started=time.strftime("%Y-%m-%d %H:%M:%S"))
+    st = state.save(
+        base_service=svc.base_name or svc.name,
+        env=env, url=None, ready=False, last_cell_started=False, login_user=None, login_pass=None,
+        runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout,
+        started=time.strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
     # 4. notebook through an attached `colab exec` (keep-alive)
     if a.foreground:
@@ -710,19 +794,30 @@ def _wait_ready(svc, proc, timeout=None):
     log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path}")
     log("streaming progress until the service reports CT_READY (Ctrl-C only stops watching)")
     offset, deadline = 0, time.monotonic() + (svc.ready_timeout if timeout is None else timeout)
+
+    def _flush_log():
+        nonlocal offset
+        if not state.log_path.is_file():
+            return
+        with open(state.log_path, "rb") as f:
+            f.seek(offset)
+            data = f.read()
+        offset += len(data)
+        if data:
+            sys.stdout.buffer.write(data)
+            sys.stdout.flush()
+
     try:
         while time.monotonic() < deadline:
-            with open(state.log_path, "rb") as f:
-                f.seek(offset)
-                data = f.read()
-            offset += len(data)
-            if data:
-                sys.stdout.buffer.write(data)
-                sys.stdout.flush()
+            _flush_log()
             st = state.load()
             if st.get("ready") and st.get("url"):
                 break
             if proc.poll() is not None:
+                _flush_log()
+                st = state.load()
+                if st.get("ready") and st.get("url"):
+                    break
                 die(f"runner exited early (code {proc.returncode}); see {state.log_path}")
             time.sleep(min(1, max(0, deadline - time.monotonic())))
         else:
@@ -805,11 +900,19 @@ def show_instances(svc: Service, reveal=False, output_json=False):
 def cmd_down(svc: Service, a) -> None:
     if getattr(a, "all", False):
         items = list_service_instances(svc.base_name or svc.name)
+        errors: list[tuple[str, Exception]] = []
         for it in items:
             sub_svc = dataclasses.replace(svc)
             apply_instance(sub_svc, it["instance_arg"] or None)
             sub_a = argparse.Namespace(delete_tunnel=a.delete_tunnel, all=False)
-            cmd_down(sub_svc, sub_a)
+            try:
+                cmd_down(sub_svc, sub_a)
+            except (CliError, RuntimeError, OSError) as err:
+                errors.append((sub_svc.name, err))
+        if errors:
+            summary = "; ".join(f"{name}: {err}" for name, err in errors)
+            code = errors[0][1].code if isinstance(errors[0][1], CliError) else 1
+            raise CliError(f"部分实例停止失败：{summary}", code)
         return
     state = State(svc)
     with state.lock("operation", blocking=False):
@@ -824,19 +927,25 @@ def cmd_down(svc: Service, a) -> None:
             from frp_backend import remove_route
             remove_route(st['frp_route'],svc.name)
             st.pop('frp_route',None)
+            if not (st.get("tunnel_id") or st.get("cloudflare_route")):
+                st.pop("hostname", None)
+                st.pop("transport", None)
         if a.delete_tunnel and (st.get("tunnel_id") or st.get('cloudflare_route')):
             delete_named_tunnel(st.get('cloudflare_route') or st)
             st.pop('cloudflare_route',None)
-            st = {k: v for k, v in st.items() if k not in ("tunnel_id", "tunnel_name", "zone_id", "hostname")}
-        keys = ("auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
+            drop = {"tunnel_id", "tunnel_name", "zone_id"}
+            if not st.get("frp_route"):
+                drop.update({"hostname", "transport"})
+            st = {k: v for k, v in st.items() if k not in drop}
+        keys = ("base_service", "auth_user", "auth_pass", "api_token", "hf_token", "tunnel_id", "tunnel_name",
                 "zone_id", "hostname", "transport", "frp_route", "cloudflare_route")
         state.update(lambda current: {k: st[k] for k in keys if k in st})
 
 
 def build_parser(svc: Service, configure=None):
     p = argparse.ArgumentParser(prog=f"colabllm {svc.base_name}", description=(sys.modules["__main__"].__doc__ or "").strip(),
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-i", "--instance", metavar="ID",
+                                formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
+    p.add_argument("-i", "--instance", metavar="ID", type=validate_instance,
                    help="instance ID to create/manage multiple parallel instances (e.g. -i 1, -i 2)")
     sub = p.add_subparsers(dest="cmd", required=True)
     u = sub.add_parser("up", help="session -> Drive -> (cf tunnel) -> run notebook, keep it alive")
@@ -891,6 +1000,8 @@ def main(svc: Service, *, configure=None, handlers=None, prepare_up=None) -> Non
     apply_instance(svc, inst)
     p = build_parser(svc, configure)
     a = p.parse_args(cleaned_argv)
+    if getattr(a, "instance", None):
+        apply_instance(svc, a.instance)
     if handlers and a.cmd in handlers:
         code = handlers[a.cmd](a)
         if isinstance(code, int) and code:

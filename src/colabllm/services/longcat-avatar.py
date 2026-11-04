@@ -196,15 +196,16 @@ def custom_parser(parser=None, commands=None):
         command.add_argument("--timeout", type=nonnegative_seconds, default=0, help="最长等待秒数；0 为不限")
     for command in (generate, job, download, listing):
         command.add_argument("--url", help="覆盖服务地址；也可设置 LONGCAT_AVATAR_URL")
-        command.add_argument("--token", help="API Token；也可设置 LONGCAT_AVATAR_TOKEN")
+        command.add_argument("--api-token", "--token", dest="token", help="API Token；也可设置 LONGCAT_AVATAR_API_TOKEN 或 LONGCAT_AVATAR_TOKEN")
     return parser
 
 
 def run_custom(args):
     if getattr(args, "poll", 3) <= 0 or getattr(args, "timeout", 0) < 0:
         raise ValueError("--poll 须大于 0，--timeout 不能为负数")
-    url, token = resolve_endpoint(State(SERVICE).load(), args.url, args.token,
-                                  url_env='LONGCAT_AVATAR_URL', token_env='LONGCAT_AVATAR_TOKEN')
+    explicit_token = args.token or os.environ.get('LONGCAT_AVATAR_API_TOKEN') or os.environ.get('LONGCAT_AVATAR_TOKEN')
+    url, token = resolve_endpoint(State(SERVICE).load(), args.url, explicit_token,
+                                  url_env='LONGCAT_AVATAR_URL')
     client = AvatarClient(url, token)
     if args.cmd == "ls-drive":
         print(json.dumps(client.list_drive(args.path), ensure_ascii=False, indent=2))

@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from longcat_video_app import install_sdpa
-from avatar_sampling import sampling_settings, apply_sampling_mode
+from avatar_sampling import sampling_settings, apply_sampling_mode, plan_segments
 
 
 def flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None):
@@ -79,26 +79,6 @@ def window_audio(embeddings, start, frames):
     offsets = torch.arange(5, device=embeddings.device) - 2
     indices = torch.arange(start, start + frames, device=embeddings.device)[:, None] + offsets[None]
     return embeddings[indices.clamp(0, len(embeddings)-1)][None].cuda()
-
-
-def plan_segments(audio_seconds, frames=93, segments=1, auto_duration=True):
-    if not auto_duration:
-        total = frames + (segments-1)*(frames-13)
-        return [frames]*segments, total, total/25
-    if not math.isfinite(audio_seconds) or audio_seconds <= 0:
-        raise ValueError('音频时长无效')
-    target = max(1, math.ceil(round(audio_seconds*25, 8)))
-    # Each model call needs 4n+1 frames; subsequent calls include 13
-    # overlapping conditioning frames. Shorten the final call and trim padding.
-    parts = [max(17, 1+4*math.ceil((min(target,93)-1)/4))]
-    covered = parts[0]
-    while covered < target:
-        count = min(93, max(17, 13+4*math.ceil((target-covered)/4)))
-        parts.append(count)
-        covered += count-13
-        if len(parts) > 100:
-            raise ValueError('音频过长，请分成不超过 5 分钟的音频后生成')
-    return parts, target, audio_seconds
 
 
 def main():
@@ -290,7 +270,10 @@ def main():
         except (ValueError,FileNotFoundError):return '未找到该任务',gr.skip(),gr.skip(),gr.skip()
         if state['status']=='completed':
             result=state['result']
-            published=display_path(state)
+            try:
+                published=display_path(state)
+            except (OSError,ValueError,KeyError) as error:
+                return f'输出文件不可用：{error}',gr.skip(),gr.skip(),result.get('metadata')
             return '生成完成',published,published,result['metadata']
         progress=state.get('message',state['status'])
         if state['status']=='failed':progress='任务失败：'+progress

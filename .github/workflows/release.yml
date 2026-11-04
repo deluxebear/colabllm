@@ -78,12 +78,18 @@ jobs:
         run: |
           (cd dist && sha256sum --check SHA256SUMS)
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+            if [ "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = "true" ]; then
+              gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file release-notes.md
+              gh release upload "$RELEASE_TAG" dist/* --clobber
+              gh release edit "$RELEASE_TAG" --draft=false
+            else
+              echo "GitHub Release $RELEASE_TAG is already published; skipping asset mutation."
+            fi
           else
             gh release create "$RELEASE_TAG" --verify-tag --draft --title "$RELEASE_TAG" --notes-file release-notes.md
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+            gh release edit "$RELEASE_TAG" --draft=false
           fi
-          gh release upload "$RELEASE_TAG" dist/* --clobber
-          gh release edit "$RELEASE_TAG" --draft=false
 
   pypi:
     needs: github-release

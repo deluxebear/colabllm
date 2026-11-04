@@ -25,17 +25,32 @@ snapshot_download('baidu/Unlimited-OCR-2', revision='0480966938291445591f69f08a1
 shutil.rmtree('/root/.cache/huggingface/xet', ignore_errors=True)
 OCR_POSTPROCESS = OCR_WORK / 'process_unlimitedOCR2.py'
 if not OCR_POSTPROCESS.exists():
-    urllib.request.urlretrieve('https://raw.githubusercontent.com/baidu/Unlimited-OCR/'
-        'ea42e6d15ff93fdd0e8041fc0ac70880513453d3/utils/process_unlimitedOCR2.py', OCR_POSTPROCESS)
+    with urllib.request.urlopen(
+        'https://raw.githubusercontent.com/baidu/Unlimited-OCR/'
+        'ea42e6d15ff93fdd0e8041fc0ac70880513453d3/utils/process_unlimitedOCR2.py',
+        timeout=60,
+    ) as _src, open(OCR_POSTPROCESS, 'wb') as _dst:
+        shutil.copyfileobj(_src, _dst)
 # Triton / Inductor compile on SSD; restore and persist caches by GPU and environment.
 (OCR_WORK / 'colab_cache.py').write_text(OCR_CACHE_SOURCE)
 sys.path.insert(0, str(OCR_WORK))
 from colab_cache import restore_cache, save_cache
-OCR_GPU = subprocess.check_output(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], text=True).strip().replace(' ', '_')
+try:
+    OCR_GPU = (
+        subprocess.check_output(['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], text=True)
+        .splitlines()[0]
+        .strip()
+        .replace(' ', '_')
+    )
+except (OSError, subprocess.SubprocessError, IndexError):
+    OCR_GPU = 'cpu'
 OCR_CACHE_KEY = 'torch213-uocr2-04809669-' + OCR_GPU
 OCR_CACHE_PAIRS = []
 for name in ('triton-cache', 'inductor-cache'):
     local = OCR_WORK / name
-    restore_cache(local, Path(DATA_DIR) / name, Path(DATA_DIR) / 'kernel-archives', OCR_CACHE_KEY)
+    try:
+        restore_cache(local, Path(DATA_DIR) / name, Path(DATA_DIR) / 'kernel-archives', OCR_CACHE_KEY)
+    except (OSError, ValueError) as _cache_err:
+        print(f'Warning: cache restore skipped for {name}: {_cache_err}', flush=True)
     OCR_CACHE_PAIRS.append(local)
 print('Unlimited-OCR 2 setup complete', flush=True)

@@ -21,13 +21,42 @@ def instance_ids(service):
     directory = user_home() / 'services'
     if not directory.is_dir():
         return []
+    scripts = service_scripts()
+    longer = {name for name in scripts if len(name) > len(service) and name.startswith(service + '-')}
     prefix = service + '-'
-    return sorted(p.name[len(prefix):] for p in directory.iterdir()
-                  if p.is_dir() and p.name.startswith(prefix) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}', p.name[len(prefix):]))
+    results = []
+    for p in directory.iterdir():
+        if not p.is_dir() or not p.name.startswith(prefix):
+            continue
+        if any(p.name == other or p.name.startswith(other + '-') for other in longer):
+            continue
+        inst = p.name[len(prefix):]
+        if re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}', inst):
+            results.append(inst)
+    return sorted(results)
+
+
+def _normalize_wordbreaks(words):
+    """Rejoin ['--flag', '=', 'val'] or ['--flag', '='] produced by Bash COMP_WORDBREAKS."""
+    merged = []
+    idx = 0
+    while idx < len(words):
+        tok = words[idx]
+        if tok == '=' and merged and merged[-1].startswith('-'):
+            if idx + 1 < len(words):
+                merged[-1] = merged[-1] + '=' + words[idx + 1]
+                idx += 2
+                continue
+            merged[-1] = merged[-1] + '='
+            idx += 1
+            continue
+        merged.append(tok)
+        idx += 1
+    return merged
 
 
 def candidates(words):
-    words = list(words) or ['']
+    words = _normalize_wordbreaks(list(words) or [''])
     if words[0] == 'help' and len(words) > 1:
         words = words[1:]
     prefix, done = words[-1], words[:-1]
@@ -61,8 +90,11 @@ def candidates(words):
         if token == '--':
             return []
         if expected is not None:
-            expected = None
-            continue
+            if expected.nargs == '?' and token.startswith('-'):
+                expected = None
+            else:
+                expected = None
+                continue
         options = {**root_options, **{flag: action for action in parser._actions for flag in action.option_strings}}
         if token.split('=', 1)[0] in options:
             action = options[token.split('=', 1)[0]]
@@ -79,7 +111,7 @@ def candidates(words):
         flag, prefix = prefix.split('=', 1)
         expected = options[flag]
         flag_prefix = flag + '='
-    if expected is not None:
+    if expected is not None and not (expected.nargs == '?' and prefix.startswith('-') and not flag_prefix):
         if expected.dest == 'instance':
             values = instance_ids(service)
         else:
@@ -98,16 +130,18 @@ _colabllm_complete() {
     local candidate
     COMPREPLY=()
     while IFS= read -r candidate; do
-        COMPREPLY+=("$candidate")
+        [[ -n "$candidate" ]] && COMPREPLY+=("$candidate")
     done < <(command colabllm _complete -- "${COMP_WORDS[@]:1:COMP_CWORD}" 2>/dev/null)
 }
 complete -o default -F _colabllm_complete colabllm
 ''',
     'zsh': r'''#compdef colabllm
 _colabllm_complete() {
+    local out
     local -a candidates
-    candidates=("${(@f)$(command colabllm _complete -- "${words[@]:1:$((CURRENT-1))}" 2>/dev/null)}")
-    _describe 'colabllm' candidates || _files
+    out="$(command colabllm _complete -- "${words[@]:1:$((CURRENT-1))}" 2>/dev/null)"
+    candidates=(${(f)out})
+    (( ${#candidates[@]} )) && _describe 'colabllm' candidates || _files
 }
 compdef _colabllm_complete colabllm
 ''',
@@ -116,7 +150,7 @@ compdef _colabllm_complete colabllm
     set -l current (commandline -ct)
     command colabllm _complete -- $words[2..-1] "$current" 2>/dev/null
 end
-complete -c colabllm -a '(__colabllm_candidates)'
+complete -c colabllm -f -a '(__colabllm_candidates)'
 ''',
 }
 

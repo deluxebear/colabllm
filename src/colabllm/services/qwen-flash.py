@@ -36,7 +36,7 @@ SERVICE = Service(
     public_port=8000,
     gpu="G4",                         # G4 without --high-mem (high_mem=False)
     high_mem=False,
-    default_hostname="qwen.example.com",
+    default_hostname="qwen",
     ready_timeout=3600,               # first-time 84 GB staging + load can take ~15-25 min
     env={
         "CT_QWEN_REPO": "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",

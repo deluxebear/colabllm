@@ -29,7 +29,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
-from cli_support import CliError, Deadline, positive_seconds, nonnegative_seconds, safe_urlopen
+from cli_support import CliError, Deadline, diagnostic, positive_seconds, nonnegative_seconds, resolve_endpoint, safe_urlopen
 from colabsvc import (  # noqa: E402
     Service,
     State,
@@ -72,6 +72,8 @@ def _resolve_target_services(all_instances: bool = False, instances_csv: str = "
             s.base_name = base_name
             if inst and inst not in ("default", "0", base_name):
                 apply_instance(s, inst)
+            else:
+                s.default_hostname = getattr(SERVICE, "base_default_hostname", None) or SERVICE.default_hostname
             targets.append(s)
         if targets:
             return targets
@@ -89,14 +91,12 @@ def _resolve_target_services(all_instances: bool = False, instances_csv: str = "
     return [SERVICE]
 
 
-def _run_remote_pull_job(body_dict: dict, svc: Service | None = None, *, timeout=0, poll=2) -> None:
+def _run_remote_pull_job(body_dict: dict, svc: Service | None = None, *, timeout=0, poll=2,
+                         url_override=None, token_override=None) -> None:
     deadline = Deadline(timeout)
     svc = svc or SERVICE
-    st = State(svc).load()
-    url = (st.get("url") or "").rstrip("/")
-    token = st.get("api_token")
-    if not url or not token:
-        die(f"{svc.name} is not running (no URL/token in {State(svc).path}); run `up` first")
+    url, token = resolve_endpoint(State(svc).load(), url_override, token_override,
+                                  url_env="COMFYUI_URL", token_env="COMFYUI_API_TOKEN")
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -119,7 +119,7 @@ def _run_remote_pull_job(body_dict: dict, svc: Service | None = None, *, timeout
     while True:
         deadline.remaining()
         for line in res.get("logs", [])[seen_logs:]:
-            print(f"[{svc.name}] {line}", flush=True)
+            diagnostic(f"[{svc.name}] {line}")
             seen_logs += 1
         status = res.get("status")
         if status == "done":
@@ -149,10 +149,12 @@ def _cmd_pull_workflow(raw_args: list[str]) -> None:
     if not wf_specs:
         die("usage: colabllm comfyui pull-workflow [-i ID | -A | --instances 1,2] <workflow-url-or-template-name> [...]")
     targets = _resolve_target_services(all_instances=all_instances, instances_csv=instances_csv)
+    _check_explicit_endpoint(args, targets)
     for svc in targets:
         for spec in wf_specs:
             log(f"[{svc.name}] requesting live SSD model download for workflow: {spec}")
-            _run_remote_pull_job({"workflow": spec}, svc=svc, timeout=args.timeout, poll=args.poll)
+            _run_remote_pull_job({"workflow": spec}, svc=svc, timeout=args.timeout, poll=args.poll,
+                                 url_override=args.url, token_override=args.api_token)
 
 
 def _cmd_pull_model(raw_args: list[str]) -> None:
@@ -174,7 +176,10 @@ def _cmd_pull_model(raw_args: list[str]) -> None:
         die("could not auto-detect target directory from URL; please specify `--dir <directory>` (e.g. --dir loras, --dir diffusion_models)")
     if not filename:
         die("could not auto-detect filename from URL; please specify `--name <filename>`")
+    if ".." in Path(target_dir).parts or ".." in Path(filename).parts or "/" in filename:
+        die("model directory/filename must not contain '..' and filename must not contain '/'")
     targets = _resolve_target_services(all_instances=all_instances, instances_csv=instances_csv)
+    _check_explicit_endpoint(args, targets)
     for svc in targets:
         log(f"[{svc.name}] requesting live SSD model download: {model_url} -> models/{target_dir}/{filename}")
         _run_remote_pull_job({
@@ -187,12 +192,19 @@ def _cmd_pull_model(raw_args: list[str]) -> None:
                     "models": [{"url": model_url, "directory": target_dir, "name": filename}],
                 }
             },
-        }, svc=svc, timeout=args.timeout, poll=args.poll)
+        }, svc=svc, timeout=args.timeout, poll=args.poll, url_override=args.url, token_override=args.api_token)
 
+
+
+def _check_explicit_endpoint(args, targets) -> None:
+    if args.url and len(targets) > 1:
+        die("--url targets a single endpoint; do not combine it with -A/--instances listing several instances")
 
 
 def pull_parser(name, parser=None):
     parser = parser or argparse.ArgumentParser(prog=f"colabllm comfyui {name}")
+    parser.add_argument("--url", help="service URL (default: saved instance URL or $COMFYUI_URL)")
+    parser.add_argument("--api-token", help="Bearer token (default: saved token or $COMFYUI_API_TOKEN)")
     parser.add_argument("--timeout", type=nonnegative_seconds, default=0, help="total wait seconds; 0 means unlimited")
     parser.add_argument("--poll", type=positive_seconds, default=2, help="poll interval seconds")
     targets = parser.add_mutually_exclusive_group()
@@ -214,7 +226,13 @@ def configure_cli(parser, commands, up):
         pull_parser(name, commands.add_parser(name, help="download workflow models" if name == "pull-workflow" else "download a model"))
 
 
+_BASE_ENV = dict(SERVICE.env)
+
+
 def prepare_up(args):
+    # Start from the baseline defaults on every call so overrides never leak between invocations.
+    SERVICE.env.clear()
+    SERVICE.env.update(_BASE_ENV)
     if args.workflow:
         SERVICE.env["CT_WORKFLOW"] = ",".join(args.workflow)
 

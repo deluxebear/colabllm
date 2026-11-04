@@ -1,29 +1,77 @@
 #!/usr/bin/env python3
-"""Verify a built wheel with uv tool install, without touching the user's installation."""
+"""Verify a built wheel or sdist with uv tool install, without touching the user's installation."""
 import json
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 
+ROOT = Path(__file__).resolve().parents[1]
 
-def check(wheel):
-    wheel = Path(wheel).resolve(strict=True)
+
+def _inspect_wheel(wheel: Path) -> list[str]:
     with zipfile.ZipFile(wheel) as archive:
         names = archive.namelist()
         services = sorted(Path(n).stem for n in names if n.startswith('colabllm/services/') and n.endswith('.py'))
+        notebooks = sorted(Path(n).stem for n in names if n.startswith('colabllm/services/') and n.endswith('.ipynb'))
         assert services, 'Wheel contains no services'
+        assert services == notebooks, f'Service script/notebook mismatch: {services} != {notebooks}'
         assert 'colabllm/lib/frp_server.py' in names, 'Missing SSH provisioning source'
+        assert any(n.endswith('/licenses/LICENSE') or n.endswith('/LICENSE') for n in names), 'Missing LICENSE in wheel'
+        meta_files = [n for n in names if n.endswith('.dist-info/METADATA')]
+        assert meta_files, 'Missing METADATA in wheel'
+        metadata = archive.read(meta_files[0]).decode('utf-8')
+        assert 'License-Expression: MIT' in metadata, 'Missing MIT License-Expression in wheel METADATA'
         for service in services:
             notebook = json.loads(archive.read(f'colabllm/services/{service}.ipynb'))
             assert notebook['cells'], f'Empty notebook: {service}'
             assert all(not cell.get('outputs') for cell in notebook['cells']), f'Notebook outputs: {service}'
         assert not any('/.state/' in n or n.endswith('state.json') for n in names)
+        return services
 
-    with tempfile.TemporaryDirectory(prefix='colabllm-wheel-') as temp:
+
+def _inspect_sdist(sdist: Path) -> list[str]:
+    with tarfile.open(sdist, 'r:gz') as archive:
+        members = {m.name: m for m in archive.getmembers() if m.isfile()}
+        names = sorted(members)
+        services = sorted(Path(n).stem for n in names if '/src/colabllm/services/' in n and n.endswith('.py'))
+        notebooks = sorted(Path(n).stem for n in names if '/src/colabllm/services/' in n and n.endswith('.ipynb'))
+        assert services, 'Source distribution contains no services'
+        assert services == notebooks, f'Service script/notebook mismatch in sdist: {services} != {notebooks}'
+        assert any(n.endswith('/src/colabllm/lib/frp_server.py') for n in names), 'Missing SSH provisioning source in sdist'
+        assert any(n.endswith('/LICENSE') for n in names), 'Missing LICENSE in sdist'
+        pkg_infos = [n for n in names if n.endswith('/PKG-INFO')]
+        assert pkg_infos, 'Missing PKG-INFO in sdist'
+        pkg_info = archive.extractfile(members[pkg_infos[0]]).read().decode('utf-8')
+        assert 'License-Expression: MIT' in pkg_info, 'Missing MIT License-Expression in sdist PKG-INFO'
+        for name in names:
+            if '/src/colabllm/services/' in name and name.endswith('.ipynb'):
+                notebook = json.loads(archive.extractfile(members[name]).read())
+                assert notebook['cells'], f'Empty notebook in sdist: {name}'
+                assert all(not cell.get('outputs') for cell in notebook['cells']), f'Notebook outputs in sdist: {name}'
+        assert not any('/.state/' in n or n.endswith('state.json') for n in names)
+        return services
+
+
+def check(artifact):
+    artifact = Path(artifact).resolve(strict=True)
+    if artifact.name.endswith('.whl'):
+        services = _inspect_wheel(artifact)
+    elif artifact.name.endswith('.tar.gz'):
+        services = _inspect_sdist(artifact)
+    else:
+        raise ValueError(f'Unsupported distribution artifact: {artifact}')
+
+    repo_services_dir = ROOT / 'src/colabllm/services'
+    if repo_services_dir.is_dir():
+        expected = sorted(p.stem for p in repo_services_dir.glob('*.py') if p.with_suffix('.ipynb').is_file())
+        assert services == expected, f'Packaged services {services} do not match checkout {expected}'
+
+    with tempfile.TemporaryDirectory(prefix='colabllm-dist-') as temp:
         root = Path(temp).resolve()
         home = root / 'home'
         home.mkdir()
@@ -33,6 +81,7 @@ def check(wheel):
         env.pop('PYTHONPATH', None)
         env.pop('COLABSVC_BASE_DOMAIN', None)
         env.pop('CT_INSTANCE', None)
+
         # All subprocesses run outside the source checkout.
         def run(args):
             result = subprocess.run(args, env=env, cwd=root, text=True, capture_output=True, timeout=120)
@@ -40,7 +89,7 @@ def check(wheel):
                 raise RuntimeError(f'{args}:\n{result.stdout}\n{result.stderr}')
             return result.stdout
 
-        run(['uv', 'tool', 'install', '--python', sys.executable, str(wheel)])
+        run(['uv', 'tool', 'install', '--python', sys.executable, str(artifact)])
         command = str(root / 'bin/colabllm')
         assert run([command, '--version']).startswith('colabllm ')
         assert run([command, 'services']).splitlines() == services
@@ -91,10 +140,11 @@ def check(wheel):
         for service in services:
             run([command, service, 'up', '--dry-run', '--quick-tunnel', '-i', 'check'])
         assert not override.exists(), 'Dry-run unexpectedly wrote state'
-    print(f'Wheel verified: {len(services)} services; isolated uv installation, notebook resources, user config and dry-runs passed.')
+    kind = 'Wheel' if artifact.name.endswith('.whl') else 'Source distribution'
+    print(f'{kind} verified: {len(services)} services; isolated uv installation, LICENSE, notebook resources, user config and dry-runs passed.')
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
-        raise SystemExit('Usage: python tools/check_distribution.py path/to/colabllm-VERSION-py3-none-any.whl')
+        raise SystemExit('Usage: python tools/check_distribution.py path/to/colabllm-VERSION.(whl|tar.gz)')
     check(sys.argv[1])

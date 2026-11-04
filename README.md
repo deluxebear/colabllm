@@ -57,7 +57,7 @@ colabllm frp-status
 ## 运行时使用指南
 
 每个运行时的具体命令、API/UI 工作流、输入输出及恢复语义见下方“各运行时使用文档”表。
-共享规则集中在 [运行时通用操作](docs/runtime-common.md)，可先阅读以理解认证、Drive 路径、超时和多实例。
+共享规则集中在 [运行时通用操作](https://github.com/deluxebear/colabllm/blob/master/docs/runtime-common.md)，可先阅读以理解认证、Drive 路径、超时和多实例。
 `docs/<运行时>.md` 是用法说明的维护来源，用户技能内的对应参考由同步工具生成：
 
 ```bash
@@ -69,7 +69,7 @@ python tools/sync_runtime_docs.py --check
 
 ## 安装 Agent Skill
 
-根目录 [skills/colabllm](skills/colabllm/SKILL.md) 提供面向使用者的独立技能，覆盖本项目所有运行时。
+根目录 [skills/colabllm](https://github.com/deluxebear/colabllm/blob/master/skills/colabllm/SKILL.md) 提供面向使用者的独立技能，覆盖本项目所有运行时。
 它包含按任务加载的 OCR、语音、推理、媒体和排错参考，不依赖源码仓库或个人部署配置。
 
 wheel 和源码包均包含完整技能，安装 CLI 后即可导出：
@@ -113,7 +113,7 @@ python tools/check_distribution.py dist/colabllm-0.1.0-py3-none-any.whl
 
 版本号以 `pyproject.toml` 为唯一来源，CLI 从已安装包元数据读取版本。
 采用 `MAJOR.MINOR.PATCH`：修复递增 PATCH、新功能递增 MINOR、不兼容变更递增 MAJOR；
-在 `0.x` 开发阶段，不兼容变更递增 MINOR，并在 [CHANGELOG.md](CHANGELOG.md) 中说明。
+在 `0.x` 开发阶段，不兼容变更递增 MINOR，并在 [CHANGELOG.md](https://github.com/deluxebear/colabllm/blob/master/CHANGELOG.md) 中说明。
 当前首发版本为 `0.1.0`，对应 Git 标签 `v0.1.0`；后续发布示例：
 
 ```bash
@@ -127,7 +127,7 @@ git push origin master
 git push origin v0.1.1
 ```
 
-推送 `v*` 标签触发 [release.yml](.github/workflows/release.yml)：
+推送 `v*` 标签触发 [release.yml](https://github.com/deluxebear/colabllm/blob/master/.github/workflows/release.yml)：
 
 1. 验证标签、包版本和变更记录一致，复用 Linux/macOS × Python 3.12–3.14 CI。
 2. 构建 wheel 和 sdist，验证隔离安装，生成 SHA256SUMS 并保存 Actions artifact。
@@ -217,6 +217,7 @@ python -m unittest discover -s tests
 在该环境中，将项目源码放入 VM 后执行：
 
 ```bash
+# LongCat-Video VM 使用 /content/longcat-video/repo；Avatar VM 使用 /content/longcat-avatar/repo
 PYTHONPATH=/content/longcat-video/repo python -m unittest discover -s tests_colab
 ```
 
@@ -242,27 +243,32 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 
 | 服务名称 | 默认 GPU | 认证方式 | 固定域名示例（主域名配置为 `example.com`） | 详细使用说明 |
 | --- | --- | --- | --- | --- |
-| **NVIDIA-Nemotron-3.5-Transcribe-30B-A4B** | `G4` | `vLLM` Bearer API Key (`builtin`) | `https://transcribe.example.com` | [docs/nemotron-transcribe.md](docs/nemotron-transcribe.md) |
-| **Qwen3-TTS** | `L4` | Bearer API Key (`builtin`) | `https://qwen3-tts.example.com` | [docs/qwen3-tts.md](docs/qwen3-tts.md) |
-| **IndexTTS-2.5** | `L4` | Bearer API Key (`builtin`) | `https://indextts.example.com` | [docs/indextts.md](docs/indextts.md) |
-| **Unlimited-OCR 2** | `A100` | Caddy (Basic Auth + Bearer) | `https://unlimited-ocr.example.com` | [docs/unlimited-ocr.md](docs/unlimited-ocr.md) |
-| **LongCat-Video-Avatar 1.5** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-avatar.example.com` | [docs/longcat-avatar.md](docs/longcat-avatar.md) |
-| **LongCat-Video** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-video.example.com` | [docs/longcat-video.md](docs/longcat-video.md) |
-| **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](docs/comfyui.md) |
-| **Qwen3.8-Flash-Next (800K + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](docs/qwen-flash.md) |
-| **Ollama** | `T4` | Caddy (Basic Auth + Bearer) | `https://ollama.example.com` | [docs/ollama.md](docs/ollama.md) |
-| **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](docs/unsloth-studio.md) |
+| **NVIDIA-Nemotron-3.5-Transcribe-30B-A4B** | `G4` | `vLLM` Bearer API Key (`builtin`) | `https://transcribe.example.com` | [docs/nemotron-transcribe.md](https://github.com/deluxebear/colabllm/blob/master/docs/nemotron-transcribe.md) |
+| **Qwen3-TTS** | `L4` | Bearer API Key (`builtin`) | `https://qwen3-tts.example.com` | [docs/qwen3-tts.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen3-tts.md) |
+| **IndexTTS-2.5** | `L4` | Bearer API Key (`builtin`) | `https://indextts.example.com` | [docs/indextts.md](https://github.com/deluxebear/colabllm/blob/master/docs/indextts.md) |
+| **Unlimited-OCR 2** | `A100` | Caddy (Basic Auth + Bearer) | `https://unlimited-ocr.example.com` | [docs/unlimited-ocr.md](https://github.com/deluxebear/colabllm/blob/master/docs/unlimited-ocr.md) |
+| **LongCat-Video-Avatar 1.5** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-avatar.example.com` | [docs/longcat-avatar.md](https://github.com/deluxebear/colabllm/blob/master/docs/longcat-avatar.md) |
+| **LongCat-Video** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-video.example.com` | [docs/longcat-video.md](https://github.com/deluxebear/colabllm/blob/master/docs/longcat-video.md) |
+| **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](https://github.com/deluxebear/colabllm/blob/master/docs/comfyui.md) |
+| **Qwen3.8-Flash-Next (800K + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-flash.md) |
+| **Ollama** | `T4` | Caddy (Basic Auth + Bearer) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
+| **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](https://github.com/deluxebear/colabllm/blob/master/docs/unsloth-studio.md) |
 
 ## 目录结构
 
 ```text
+LICENSE                        # MIT 开源许可证
 pyproject.toml                 # 包元数据、版本、colabllm 命令入口
 src/colabllm/
 ├── cli.py                     # 统一命令分发
 ├── control.py                 # 全局域名与 FRP 管理
-├── lib/                       # 本地共享 runner、状态与 FRP 实现
+├── utility.py                 # 通用工具子命令
+├── lib/                       # 本地共享 runner、状态、HTTP/音频工具与 FRP 实现
 └── services/                  # <name>.py + <name>.ipynb；随包安装
-templates/                     # 开发用 notebook 生成器与模板
+templates/                     # notebook 生成器 build_notebooks.py 与嵌入 notebook 的独立模块
+docs/                          # 各运行时与 FRP/通用操作文档
+skills/colabllm/               # 随包分发的用户 Agent Skill（references 由 docs 同步生成）
+tools/                         # 文档同步、分发包校验、基准测试等开发工具
 tests/                         # 本地测试（Python 标准库）
 tests_colab/                   # 仅在 Colab 模型环境运行的回归测试
 ```
@@ -361,7 +367,7 @@ ssh -V
 ssh -o BatchMode=yes root@frpip 'id -u'
 ```
 
-`root@frpip` 是示例，替换为实际 SSH 目标；首次连接应先核实服务器主机指纹。服务器需要 Linux、systemd、Python 3，以及 root 或免密 sudo；读取既有 FRP TOML 配置需要服务器 Python 3.11+。服务端需允许公网 TCP 7000、80 和 443。配置命令会安装或复用服务器上的 frps/Caddy，本机不需要预先安装它们，详见 [FRP 操作说明](docs/frp.md)。
+`root@frpip` 是示例，替换为实际 SSH 目标；首次连接应先核实服务器主机指纹。服务器需要 Linux、systemd、Python 3，以及 root 或免密 sudo；读取既有 FRP TOML 配置需要服务器 Python 3.11+。服务端需允许公网 TCP 7000、80 和 443。配置命令会安装或复用服务器上的 frps/Caddy，本机不需要预先安装它们，详见 [FRP 操作说明](https://github.com/deluxebear/colabllm/blob/master/docs/frp.md)。
 
 ### 启动前自检
 
@@ -429,7 +435,7 @@ colabllm indextts up --quick-tunnel
 colabllm frp-config --disable
 ```
 
-FRP 服务端默认 TCP 7000，Caddy 使用 80/443；DNS 经本机 `cf` 自动配置为 DNS only。配置、自动安装、认证及清理说明见 [FRP 操作说明](docs/frp.md)。现有运行时不会自动切换。
+FRP 服务端默认 TCP 7000，Caddy 使用 80/443；DNS 经本机 `cf` 自动配置为 DNS only。配置、自动安装、认证及清理说明见 [FRP 操作说明](https://github.com/deluxebear/colabllm/blob/master/docs/frp.md)。现有运行时不会自动切换。
 
 ## 常用命令
 
@@ -502,4 +508,15 @@ colabllm <name> down --all
 5. 同一变更中更新 `docs/<name>.md`，运行 `python tools/sync_runtime_docs.py` 生成对应的技能参考文档，并更新 `skills/colabllm/SKILL.md` 的运行时索引，覆盖启动、调用、输入输出、认证和任务恢复。新增、删除运行时或修改命令行为都需要同步维护用户技能。
 6. 核对技能示例与实际 CLI 参数一致，构建分发包，并用 `tools/check_distribution.py` 验证安装、运行时发现和完整技能导出；新增文件类型时同步调整打包规则。运行时及其用户技能均可从安装包使用后，才算完成新增流程。
 
-详细规范与排错指南见 [`.agents/skills/colab-llm-service/SKILL.md`](.agents/skills/colab-llm-service/SKILL.md)。
+详细规范与排错指南见 [`.agents/skills/colab-llm-service/SKILL.md`](https://github.com/deluxebear/colabllm/blob/master/.agents/skills/colab-llm-service/SKILL.md)。
+
+## 修改 notebook
+
+`src/colabllm/services/*.ipynb` 与 `templates/service.ipynb` 由 `templates/build_notebooks.py` 生成，请勿直接手改。
+中间件、缓存、隧道等逻辑以独立模块保存在 `templates/`（如 `colab_asgi_common.py`、`colab_cache.py`、`tunnel_client.py`），
+可在本地单元测试；修改后运行 `python3 templates/build_notebooks.py` 重新生成，测试会校验生成结果与提交内容一致。
+
+## License
+
+本项目基于 [MIT License](https://github.com/deluxebear/colabllm/blob/master/LICENSE) 开源。
+各运行时下载的第三方模型、镜像与软件遵循其各自的许可证与使用条款，请在使用前自行确认。

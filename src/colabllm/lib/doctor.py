@@ -32,15 +32,24 @@ def diagnose(*, transport=None, no_drive=False, online=False, timeout=10):
         add('config', 'pass', str(STATE_ROOT / 'tunnel-config.json'))
     except (OSError, ValueError, RuntimeError):
         add('config', 'fail', '无法读取配置；请检查 tunnel-config.json 格式及权限')
-    selected = transport or ('frp' if (config.get('frp') or {}).get('enabled') else ('cloudflare' if config.get('base_domain') else 'quick'))
-    required = ['colab'] + (['cf'] if selected == 'frp' or (selected == 'cloudflare' and config.get('base_domain')) else []) + (['ssh'] if selected == 'frp' else [])
+    effective_domain = os.environ.get('COLABSVC_BASE_DOMAIN') or config.get('base_domain')
+    selected = transport or ('frp' if (config.get('frp') or {}).get('enabled') else ('cloudflare' if effective_domain else 'quick'))
+    needs_cf = selected == 'frp' or (selected == 'cloudflare' and bool(transport == 'cloudflare' or effective_domain))
+    required = ['colab'] + (['cf'] if needs_cf else []) + (['ssh'] if selected == 'frp' else [])
     for executable in required:
         add(executable, 'pass' if shutil.which(executable) else 'fail',
             '已找到' if shutil.which(executable) else f'未找到 {executable}；请按 README 安装并加入 PATH')
     if selected == 'frp':
+        from frp_backend import credentials_path
         frp = config.get('frp') or {}
-        add('frp-config', 'pass' if frp.get('server_ip') and frp.get('ssh') and config.get('base_domain') else 'fail',
-            'FRP 需要 server_ip、ssh 和 base_domain；使用 colabllm frp-config 配置')
+        has_cfg = bool(frp.get('server_ip') and frp.get('ssh') and effective_domain)
+        has_creds = bool(has_cfg and credentials_path(STATE_ROOT, frp).is_file())
+        if has_cfg and has_creds:
+            add('frp-config', 'pass', 'FRP 配置与本地凭据就绪')
+        elif has_cfg:
+            add('frp-config', 'fail', '缺少本地 FRP 凭据文件；请重新执行 colabllm frp-config')
+        else:
+            add('frp-config', 'fail', 'FRP 需要 server_ip、ssh 和 base_domain；使用 colabllm frp-config 配置')
     if shutil.which('colab'):
         command('colab-version', ['colab', 'version'], '无法运行 colab version；请检查 Colab CLI 安装')
         if not no_drive:

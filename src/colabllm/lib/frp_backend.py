@@ -14,9 +14,11 @@ from pathlib import Path
 def validate_config(config):
     if not isinstance(config,dict) or not isinstance(config.get('enabled',False),bool):
         raise ValueError('frp configuration must be an object with a boolean enabled field')
-    if not config.get('enabled'):
+    enabled=bool(config.get('enabled'))
+    has_endpoint_fields=any(k in config for k in ('server_ip','ssh','server_port','project_id'))
+    if not enabled and not has_endpoint_fields:
         return {**config,'enabled':False}
-    result=dict(config)
+    result=dict(config,enabled=enabled)
     result['server_ip']=str(ipaddress.ip_address(config.get('server_ip','')))
     target=config.get('ssh','')
     if not isinstance(target,str) or target.startswith('-') or not re.fullmatch(r'[A-Za-z0-9_.:@\[\]-]+',target):

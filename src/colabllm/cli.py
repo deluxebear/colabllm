@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Unified CLI for packaged Colab model services (Python standard library only)."""
+import math
 import os
 from pathlib import Path
 import sys
@@ -15,16 +16,42 @@ def services():
             if p.with_suffix('.ipynb').is_file()}
 
 
+def _valid_timeout(raw):
+    try:
+        val = float(raw)
+        return math.isfinite(val) and val > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _package_version():
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version('colabllm')
+    except PackageNotFoundError:
+        pyproject = ROOT.parents[1] / 'pyproject.toml'
+        if pyproject.is_file():
+            import tomllib
+            return tomllib.loads(pyproject.read_text(encoding='utf-8'))['project']['version']
+        raise
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     flags = []
     while argv:
-        if argv[0] in ('--debug', '--quiet', '--no-color') or argv[0].startswith('--command-timeout='):
+        if argv[0] in ('--debug', '--quiet', '--no-color'):
             flags.append(argv.pop(0))
+        elif argv[0].startswith('--command-timeout='):
+            arg = argv.pop(0)
+            if not _valid_timeout(arg.split('=', 1)[1]):
+                print('colabllm: --command-timeout 需要大于 0 的有限秒数', file=sys.stderr)
+                return 2
+            flags.append(arg)
         elif argv[0] == '--command-timeout':
             flags.append(argv.pop(0))
-            if not argv:
-                print('--command-timeout 需要秒数', file=sys.stderr)
+            if not argv or not _valid_timeout(argv[0]):
+                print('colabllm: --command-timeout 需要大于 0 的有限秒数', file=sys.stderr)
                 return 2
             flags.append(argv.pop(0))
         else:
@@ -47,12 +74,12 @@ def main(argv=None):
               'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
         return 0
     if argv == ['--version']:
-        from importlib.metadata import version
-        print('colabllm ' + version('colabllm'))
+        print('colabllm ' + _package_version())
         return 0
     command, *remaining = argv
     if command in ('services', '--list'):
-        if remaining:
+        extra = [x for x in remaining if x not in ('--debug', '--quiet', '--no-color')]
+        if extra:
             print('用法: colabllm services', file=sys.stderr)
             return 2
         print('\n'.join(available))
