@@ -3,21 +3,28 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 NODE_VERSION = "22.14.0"
 PROXY_VERSION = "0.1.6"
+DEFAULT_OPENJUTSU_REPO = "https://github.com/deluxebear/colab_openjutsu.git"
+HF_RESOLVE_URL_RE = re.compile(r"^https?://huggingface\.co/([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/(.+?)(?:\?.*)?$")
 
 CUSTOM_NODES: tuple[tuple[str, str], ...] = (
     ("ComfyUI-MiniMaxH3-Context-Loop", "https://github.com/ethanfel/ComfyUI-MiniMaxH3-Context-Loop.git"),
@@ -39,6 +46,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "diffusion_models",
         "name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+        "approx_gb": 20.0,
         "urls": (
             "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
         ),
@@ -46,6 +54,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "text_encoders",
         "name": "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+        "approx_gb": 15.0,
         "urls": (
             "https://huggingface.co/Merserk/MiniMax-H3-INT4-ConvRot/resolve/main/qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
             "https://huggingface.co/Abiray/MiniMax-H3-GGUF/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
@@ -54,6 +63,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "text_encoders",
         "name": "qwen3vl_8b_int8_convrot.safetensors",
+        "approx_gb": 8.9,
         "urls": (
             "https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
         ),
@@ -61,6 +71,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "vae",
         "name": "minimax_h3_video_vae_int8_convrot.safetensors",
+        "approx_gb": 2.8,
         "urls": (
             "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
         ),
@@ -68,6 +79,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "vae",
         "name": "minimax_h3_audio_vae_fp32.safetensors",
+        "approx_gb": 0.6,
         "urls": (
             "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_audio_vae_fp32.safetensors",
         ),
@@ -75,6 +87,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "loras",
         "name": "minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors",
+        "approx_gb": 0.55,
         "urls": (
             "https://huggingface.co/Kijai/MiniMax-H3-experimental/resolve/main/loras/minimax_h3_DMAD_4step_full_lora_avg_rank_39_bf16.safetensors",
         ),
@@ -82,6 +95,7 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "checkpoints",
         "name": "sam3.1_multiplex_fp16.safetensors",
+        "approx_gb": 1.7,
         "urls": (
             "https://huggingface.co/Comfy-Org/sam3.1/resolve/main/checkpoints/sam3.1_multiplex_fp16.safetensors",
         ),
@@ -90,30 +104,18 @@ CORE_MODELS: tuple[dict[str, object], ...] = (
 
 EXTRA_FULL_MODELS: tuple[dict[str, object], ...] = (
     {
-        "directory": "ultralytics/bbox",
-        "name": "face_yolov8m.pt",
+        "directory": "text_encoders",
+        "name": "qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
+        "approx_gb": 9.8,
         "urls": (
-            "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt",
-        ),
-    },
-    {
-        "directory": "ultralytics/segm",
-        "name": "person_yolov8m-seg.pt",
-        "urls": (
-            "https://huggingface.co/Bingsu/adetailer/resolve/main/person_yolov8m-seg.pt",
-        ),
-    },
-    {
-        "directory": "sams",
-        "name": "sam_vit_b_01ec64.pth",
-        "urls": (
-            "https://huggingface.co/comfyuistudio/sam_vit_b_01ec64.pth/resolve/main/sam_vit_b_01ec64.pth",
-            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+            "https://huggingface.co/ml-resources/flux-3-image-klein-comfy/resolve/main/text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
+            "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/resolve/main/text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
         ),
     },
     {
         "directory": "diffusion_models",
         "name": "flux3_image_klein_sd_int8_convrot.safetensors",
+        "approx_gb": 9.4,
         "urls": (
             "https://huggingface.co/ml-resources/flux-3-image-klein-comfy/resolve/main/diffusion_models/flux3-image-klein-int8-convrot.safetensors",
             "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/resolve/main/diffusion_models/flux3-image-klein-int8-convrot.safetensors",
@@ -121,30 +123,16 @@ EXTRA_FULL_MODELS: tuple[dict[str, object], ...] = (
     },
     {
         "directory": "text_encoders",
-        "name": "qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
-        "urls": (
-            "https://huggingface.co/ml-resources/flux-3-image-klein-comfy/resolve/main/text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
-            "https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/resolve/main/text_encoders/qwen3.5_9b_flux3_prompt_upsampler_int8_convrot.safetensors",
-        ),
-    },
-    {
-        "directory": "text_encoders",
         "name": "qwen3vl_4b_fp8_scaled.safetensors",
+        "approx_gb": 5.24,
         "urls": (
             "https://huggingface.co/Comfy-Org/Qwen3-VL/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
         ),
     },
     {
-        "directory": "vae",
-        "name": "flux2-vae.safetensors",
-        "urls": (
-            "https://huggingface.co/Comfy-Org/Flux-2-Klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors",
-            "https://huggingface.co/ml-resources/flux-3-image-klein-comfy/resolve/main/vae/flux2-vae.safetensors",
-        ),
-    },
-    {
         "directory": "loras",
         "name": "solarrenderer_4step_lora.safetensors",
+        "approx_gb": 4.15,
         "urls": (
             "https://huggingface.co/Enderfga/SolarRenderer/resolve/main/solarrenderer_4step_lora.safetensors",
         ),
@@ -152,8 +140,43 @@ EXTRA_FULL_MODELS: tuple[dict[str, object], ...] = (
     {
         "directory": "loras",
         "name": "solarrenderer_control_lora.safetensors",
+        "approx_gb": 4.15,
         "urls": (
             "https://huggingface.co/Enderfga/SolarRenderer/resolve/main/solarrenderer_control_lora.safetensors",
+        ),
+    },
+    {
+        "directory": "sams",
+        "name": "sam_vit_b_01ec64.pth",
+        "approx_gb": 0.38,
+        "urls": (
+            "https://huggingface.co/comfyuistudio/sam_vit_b_01ec64.pth/resolve/main/sam_vit_b_01ec64.pth",
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+        ),
+    },
+    {
+        "directory": "vae",
+        "name": "flux2-vae.safetensors",
+        "approx_gb": 0.34,
+        "urls": (
+            "https://huggingface.co/Comfy-Org/Flux-2-Klein-9B/resolve/main/split_files/vae/flux2-vae.safetensors",
+            "https://huggingface.co/ml-resources/flux-3-image-klein-comfy/resolve/main/vae/flux2-vae.safetensors",
+        ),
+    },
+    {
+        "directory": "ultralytics/segm",
+        "name": "person_yolov8m-seg.pt",
+        "approx_gb": 0.06,
+        "urls": (
+            "https://huggingface.co/Bingsu/adetailer/resolve/main/person_yolov8m-seg.pt",
+        ),
+    },
+    {
+        "directory": "ultralytics/bbox",
+        "name": "face_yolov8m.pt",
+        "approx_gb": 0.05,
+        "urls": (
+            "https://huggingface.co/Bingsu/adetailer/resolve/main/face_yolov8m.pt",
         ),
     },
 )
@@ -419,6 +442,67 @@ def prepare_comfy_tree(work_dir: Path, comfy_dir: Path, data_dir: Path) -> Path:
     return extra_paths_file
 
 
+def _normalize_git_url(url: str) -> str:
+    return url.strip().rstrip("/").removesuffix(".git")
+
+
+def sync_app_checkout(app_dir: Path, app_repo: str, env_log: Path) -> None:
+    repo = (app_repo or DEFAULT_OPENJUTSU_REPO).strip() or DEFAULT_OPENJUTSU_REPO
+    if (app_dir / ".git").is_dir():
+        origin_res = subprocess.run(
+            ["git", "-C", str(app_dir), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        current_origin = origin_res.stdout.strip() if origin_res.returncode == 0 else ""
+        if current_origin and _normalize_git_url(current_origin) == _normalize_git_url(repo):
+            run_logged(["git", "-C", str(app_dir), "pull", "--ff-only"], env_log, check=False, timeout=300)
+            return
+        olog(f"Switching Openjutsu checkout ({current_origin or 'unknown'}) -> {repo}")
+        shutil.rmtree(app_dir)
+    elif app_dir.exists():
+        shutil.rmtree(app_dir)
+    olog(f"Cloning Openjutsu ({repo}) -> {app_dir}")
+    run_logged(["git", "clone", "--depth", "1", repo, str(app_dir)], env_log, timeout=300)
+
+
+def torch_supports_sm120(version_file: Path | None = None) -> bool:
+    """Check Blackwell sm_120 support via `torch/version.py` without cold-loading 2.5 GB of CUDA `.so`s
+    while `hf_xet` saturates NVMe disk writes; falls back to a 180s subprocess check if needed.
+    """
+    vf = version_file
+    if vf is None:
+        importlib.invalidate_caches()
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.origin:
+            return False
+        vf = Path(spec.origin).parent / "version.py"
+    if vf.is_file():
+        text = vf.read_text(encoding="utf-8", errors="replace")
+        if re.search(r"^\s*cuda(?:\s*:\s*[^=]+)?\s*=\s*None\b", text, flags=re.MULTILINE):
+            return False
+        m = re.search(r"""^\s*cuda(?:\s*:\s*[^=]+)?\s*=\s*['"](\d+)\.(\d+)""", text, flags=re.MULTILINE)
+        if m:
+            return (int(m.group(1)), int(m.group(2))) >= (12, 8)
+    try:
+        arch_check = subprocess.run(
+            [sys.executable, "-c", "import sys, torch; sys.exit(0 if 'sm_120' in torch.cuda.get_arch_list() else 1)"],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        return arch_check.returncode == 0
+    except subprocess.TimeoutExpired:
+        olog("[warn] Timed out probing torch.cuda.get_arch_list() after 180s; treating sm_120 as unsupported")
+        return False
+
+
+def _modules_installed(*names: str) -> bool:
+    importlib.invalidate_caches()
+    return all(importlib.util.find_spec(name) is not None for name in names)
+
+
 def setup_environment(work_dir: Path, comfy_dir: Path, data_dir: Path) -> dict[str, str]:
     env_log = work_dir / "env-setup.log"
     extra_paths_file = work_dir / "extra_model_paths.yaml"
@@ -439,27 +523,18 @@ def setup_environment(work_dir: Path, comfy_dir: Path, data_dir: Path) -> dict[s
         ).splitlines()[0].strip()
     except Exception:
         cap = ""
-    if cap.startswith("12."):
-        arch_check = subprocess.run(
-            [sys.executable, "-c", "import sys, torch; sys.exit(0 if 'sm_120' in torch.cuda.get_arch_list() else 1)"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if arch_check.returncode != 0:
-            olog("Upgrading PyTorch to CUDA 13.0 build for Blackwell sm_120...")
-            run_logged([
-                uv_bin, "pip", "install", "--system", "-U",
-                "torch", "torchvision", "torchaudio",
-                "--index-url", "https://download.pytorch.org/whl/cu130",
-            ], env_log, timeout=900)
+    if cap.startswith("12.") and not torch_supports_sm120():
+        olog("Upgrading PyTorch to CUDA 13.0 build for Blackwell sm_120...")
+        run_logged([
+            uv_bin, "pip", "install", "--system", "-U",
+            "torch", "torchvision", "torchaudio",
+            "--index-url", "https://download.pytorch.org/whl/cu130",
+        ], env_log, timeout=900)
 
     # 3. Clone Openjutsu repo + Node.js 22 + build production Next.js app
     app_dir = work_dir / "app"
-    app_repo = os.environ.get("CT_OPENJUTSU_REPO", "https://github.com/D3voz/openjutsu.git")
-    if not (app_dir / ".git").is_dir():
-        olog(f"Cloning Openjutsu -> {app_dir}")
-        run_logged(["git", "clone", "--depth", "1", app_repo, str(app_dir)], env_log, timeout=300)
-    else:
-        run_logged(["git", "-C", str(app_dir), "pull", "--ff-only"], env_log, check=False, timeout=300)
+    app_repo = (os.environ.get("CT_OPENJUTSU_REPO") or DEFAULT_OPENJUTSU_REPO).strip()
+    sync_app_checkout(app_dir, app_repo, env_log)
 
     patched_wfs = normalize_linux_workflows(app_dir)
     if patched_wfs:
@@ -490,23 +565,18 @@ def setup_environment(work_dir: Path, comfy_dir: Path, data_dir: Path) -> dict[s
 
     # 5. Install Python dependencies for ComfyUI + all custom nodes
     deps_marker = work_dir / ".comfy_nodes_deps_v1.ok"
-    pkg_probe = subprocess.run(
-        [sys.executable, "-c", "import comfy_kitchen, insightface, ultralytics, segment_anything, color_matcher"],
-        capture_output=True, timeout=30,
-    )
-    if not deps_marker.is_file() or pkg_probe.returncode != 0:
+    required_mods = ("comfy_kitchen", "insightface", "ultralytics", "segment_anything", "color_matcher")
+    if not deps_marker.is_file() or not _modules_installed(*required_mods):
         olog("Installing ComfyUI and custom-node Python dependencies via uv...")
         run_logged([uv_bin, "pip", "install", "--system", "-r", str(comfy_dir / "requirements.txt")],
                    env_log, timeout=900)
         run_logged([uv_bin, "pip", "install", "--system", *EXTRA_NODE_PACKAGES], env_log, timeout=900)
         # sam2 for Impact-Pack (if not already importable)
-        sam2_chk = subprocess.run([sys.executable, "-c", "import sam2"], capture_output=True, timeout=20)
-        if sam2_chk.returncode != 0:
+        if not _modules_installed("sam2"):
             sam2_env = {**os.environ, "SAM2_BUILD_CUDA": "0"}
             run_logged([uv_bin, "pip", "install", "--system", "sam2", "--no-build-isolation"],
                        env_log, env=sam2_env, check=False, timeout=300)
-            sam2_chk2 = subprocess.run([sys.executable, "-c", "import sam2"], capture_output=True, timeout=20)
-            if sam2_chk2.returncode != 0:
+            if not _modules_installed("sam2"):
                 run_logged([uv_bin, "pip", "install", "--system", "--no-build-isolation",
                             "git+https://github.com/facebookresearch/sam2"],
                            env_log, env=sam2_env, check=False, timeout=600)
@@ -555,7 +625,253 @@ def setup_environment(work_dir: Path, comfy_dir: Path, data_dir: Path) -> dict[s
     }
 
 
-def _download_single_model(item: dict[str, object], comfy_dir: Path) -> dict[str, object]:
+def parse_hf_resolve_url(url: str) -> tuple[str, str, str] | None:
+    """Parse `https://huggingface.co/<repo_id>/(resolve|blob)/<revision>/<filename>`."""
+    m = HF_RESOLVE_URL_RE.match((url or "").strip())
+    if not m:
+        return None
+    return m.group(1), m.group(2), urllib.parse.unquote(m.group(3))
+
+
+def _detect_system_ram_gib() -> float:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / (1024.0 * 1024.0)
+    except OSError:
+        pass
+    return 0.0
+
+
+def ensure_hf_downloader(work_dir: Path) -> str | None:
+    """Provision an isolated venv with `huggingface_hub` + `hf_xet` so parallel model downloads
+    saturate multi-Gbps links from t=0 without racing concurrent `--system` package installs.
+    """
+    if os.environ.get("CT_OPENJUTSU_DISABLE_XET") == "1":
+        return None
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dl_venv = work_dir / "venv-hf-dl"
+    dl_py = dl_venv / "bin" / "python"
+    env_log = work_dir / "hf-dl-setup.log"
+    if dl_py.is_file():
+        chk = subprocess.run([str(dl_py), "-c", "import huggingface_hub, hf_xet"], capture_output=True, timeout=20)
+        if chk.returncode == 0:
+            return str(dl_py)
+    uv_bin = shutil.which("uv")
+    try:
+        if uv_bin:
+            if not dl_py.is_file():
+                run_logged([uv_bin, "venv", "--python", sys.executable, str(dl_venv)], env_log, timeout=120)
+            run_logged([uv_bin, "pip", "install", "--python", str(dl_py), "-U", "huggingface_hub", "hf_xet"],
+                       env_log, timeout=180)
+        else:
+            if not dl_py.is_file():
+                run_logged([sys.executable, "-m", "venv", str(dl_venv)], env_log, timeout=120)
+            run_logged([str(dl_py), "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"],
+                       env_log, timeout=300)
+        return str(dl_py)
+    except Exception as err:
+        olog(f"[model] Isolated hf_xet venv unavailable ({err}); checking system Python...")
+        chk = subprocess.run([sys.executable, "-c", "import huggingface_hub, hf_xet"], capture_output=True, timeout=20)
+        return sys.executable if chk.returncode == 0 else None
+
+
+def _stage_dir_progress_bytes(stage_dir: Path) -> int:
+    best = 0
+    if not stage_dir.is_dir():
+        return 0
+    for p in stage_dir.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                best = max(best, p.stat().st_size)
+        except OSError:
+            continue
+    return best
+
+
+def _download_via_hf_xet(url: str, dest: Path, name: str, dl_python: str, hf_tok: str | None) -> int:
+    parsed = parse_hf_resolve_url(url)
+    if not parsed:
+        raise ValueError(f"Not a Hugging Face resolve URL: {url}")
+    repo_id, revision, filename = parsed
+    stage_dir = dest.parent / f".hf-stage-{dest.name}"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    dl_env = {
+        **os.environ,
+        "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    }
+    high_perf = os.environ.get("CT_HF_XET_HIGH_PERFORMANCE")
+    if high_perf == "1" or (high_perf != "0" and _detect_system_ram_gib() >= 24.0):
+        dl_env["HF_XET_HIGH_PERFORMANCE"] = "1"
+    else:
+        dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+    if hf_tok:
+        dl_env["HF_TOKEN"] = hf_tok
+        dl_env["HUGGING_FACE_HUB_TOKEN"] = hf_tok
+
+    code = (
+        "import os, sys\n"
+        "from pathlib import Path\n"
+        "from huggingface_hub import hf_hub_download\n"
+        "repo_id, filename, revision, stage_dir, dest = sys.argv[1:6]\n"
+        "tok = os.environ.get('HF_TOKEN') or None\n"
+        "p = Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision, local_dir=stage_dir, token=tok)).resolve()\n"
+        "os.replace(p, dest)\n"
+    )
+    t0 = last_log = time.monotonic()
+    proc = subprocess.Popen(
+        [dl_python, "-c", code, repo_id, filename, revision, str(stage_dir), str(dest)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=dl_env,
+    )
+    try:
+        while proc.poll() is None:
+            now = time.monotonic()
+            if now - t0 > 1800:
+                proc.kill()
+                raise TimeoutError(f"hf_xet timed out after 1800s for {name}")
+            if now - last_log >= 15:
+                cur = _stage_dir_progress_bytes(stage_dir)
+                if cur > 0:
+                    mb_s = cur / 1e6 / max(now - t0, 0.1)
+                    olog(f"[model]   {name}: {cur/1e9:.2f} GB @ {mb_s:.0f} MB/s (hf_xet)")
+                last_log = now
+            time.sleep(1.0)
+        out = (proc.stdout.read() if proc.stdout else "").strip()
+        if proc.returncode != 0 or not (dest.is_file() and dest.stat().st_size > 0):
+            tail = out.splitlines()[-1] if out else f"exit code {proc.returncode}"
+            raise RuntimeError(f"hf_xet failed ({tail})")
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        return dest.stat().st_size
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def _probe_http_range(url: str, headers: dict[str, str]) -> tuple[int, bool]:
+    probe_headers = {**headers, "Range": "bytes=0-0"}
+    req = urllib.request.Request(url, headers=probe_headers)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if resp.status == 206:
+            cr = resp.headers.get("Content-Range") or ""
+            m = re.search(r"/(\d+)\s*$", cr)
+            if m:
+                return int(m.group(1)), True
+        total = int(resp.headers.get("Content-Length") or 0)
+        return total, False
+
+
+def _download_via_http(
+    url: str,
+    dest: Path,
+    headers: dict[str, str],
+    name: str,
+    *,
+    parallel_threshold: int = 32 * 1024 * 1024,
+    range_workers: int = 8,
+) -> int:
+    partial = dest.with_name(f".{dest.name}.{os.getpid()}.partial")
+    t0 = time.monotonic()
+
+    # Fast path 1: Multi-connection parallel HTTP Range (`os.pwrite`) for large files
+    if not partial.exists():
+        try:
+            total, supports_range = _probe_http_range(url, headers)
+        except Exception:
+            total, supports_range = 0, False
+        if supports_range and total >= parallel_threshold and range_workers > 1 and hasattr(os, "pwrite"):
+            fd = os.open(partial, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+            try:
+                os.ftruncate(fd, total)
+                part_size = (total + range_workers - 1) // range_workers
+                slices = [(i * part_size, min(total - 1, (i + 1) * part_size - 1))
+                          for i in range(range_workers) if i * part_size < total]
+                lock = threading.Lock()
+                progress = [0, t0]  # [copied_bytes, last_log_monotonic]
+
+                def _fetch_slice(bounds: tuple[int, int]) -> None:
+                    start, end = bounds
+                    cur = start
+                    for sub_try in range(1, 4):
+                        try:
+                            req = urllib.request.Request(url, headers={**headers, "Range": f"bytes={cur}-{end}"})
+                            with urllib.request.urlopen(req, timeout=120) as resp:
+                                if resp.status != 206:
+                                    raise IOError(f"Expected HTTP 206 for Range request, got {resp.status}")
+                                while cur <= end:
+                                    chunk = resp.read(min(4 * 1024 * 1024, end - cur + 1))
+                                    if not chunk:
+                                        break
+                                    os.pwrite(fd, chunk, cur)
+                                    cur += len(chunk)
+                                    with lock:
+                                        progress[0] += len(chunk)
+                                        now = time.monotonic()
+                                        if now - progress[1] >= 15:
+                                            mb_s = progress[0] / 1e6 / max(now - t0, 0.1)
+                                            olog(f"[model]   {name}: {progress[0]/1e9:.2f}/{total/1e9:.2f} GB "
+                                                 f"({progress[0]*100/total:.0f}%) @ {mb_s:.0f} MB/s (http-x{len(slices)})")
+                                            progress[1] = now
+                            if cur != end + 1:
+                                raise IOError(f"Incomplete Range slice {cur}/{end + 1}")
+                            return
+                        except Exception:
+                            if sub_try == 3:
+                                raise
+                            time.sleep(sub_try * 2)
+
+                with ThreadPoolExecutor(max_workers=len(slices)) as pool:
+                    futs = [pool.submit(_fetch_slice, b) for b in slices]
+                    for fut in as_completed(futs):
+                        fut.result()
+            except Exception:
+                os.close(fd)
+                partial.unlink(missing_ok=True)
+                raise
+            else:
+                os.close(fd)
+                partial.replace(dest)
+                return total
+
+    # Fast path 2: Resumable single-stream HTTP download (never discards partial progress on reset)
+    existing = partial.stat().st_size if partial.is_file() else 0
+    req_headers = {**headers, "Range": f"bytes={existing}-"} if existing > 0 else dict(headers)
+    req = urllib.request.Request(url, headers=req_headers)
+    last_log = t0
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        resumed = existing > 0 and resp.status == 206
+        mode = "ab" if resumed else "wb"
+        base_bytes = existing if resumed else 0
+        rem = int(resp.headers.get("Content-Length") or 0)
+        total = (base_bytes + rem) if rem > 0 else 0
+        copied = base_bytes
+        with partial.open(mode) as out:
+            while True:
+                chunk = resp.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                copied += len(chunk)
+                now = time.monotonic()
+                if now - last_log >= 15:
+                    mb_s = (copied - base_bytes) / 1e6 / max(now - t0, 0.1)
+                    pct = f" ({copied*100/total:.0f}%)" if total > 0 else ""
+                    olog(f"[model]   {name}: {copied/1e9:.2f}/{total/1e9:.2f} GB{pct} @ {mb_s:.0f} MB/s")
+                    last_log = now
+    if total > 0 and copied != total:
+        raise IOError(f"Incomplete read for {name}: got {copied} of {total} bytes")
+    if copied == 0:
+        raise IOError(f"Empty download for {name}")
+    partial.replace(dest)
+    return copied
+
+
+def _download_single_model(item: dict[str, object], comfy_dir: Path, dl_python: str | None = None) -> dict[str, object]:
     directory = str(item["directory"])
     name = str(item["name"])
     urls = tuple(str(u) for u in item["urls"])  # type: ignore[arg-type]
@@ -568,54 +884,59 @@ def _download_single_model(item: dict[str, object], comfy_dir: Path) -> dict[str
 
     hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     last_err: Exception | None = None
+    partial = dest.with_name(f".{dest.name}.{os.getpid()}.partial")
+    stage_dir = dest.parent / f".hf-stage-{dest.name}"
+
     for url in urls:
+        partial.unlink(missing_ok=True)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if hf_tok and "huggingface.co" in url:
+            headers["Authorization"] = f"Bearer {hf_tok}"
+        use_xet = bool(dl_python and parse_hf_resolve_url(url))
         for attempt in range(1, 4):
-            partial = dest.with_name(f".{dest.name}.{os.getpid()}.partial")
-            partial.unlink(missing_ok=True)
-            headers = {"User-Agent": "Mozilla/5.0"}
-            if hf_tok and "huggingface.co" in url:
-                headers["Authorization"] = f"Bearer {hf_tok}"
-            t0 = last_log = time.monotonic()
+            t0 = time.monotonic()
             try:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=120) as resp, partial.open("wb") as out:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                    copied = 0
-                    while True:
-                        chunk = resp.read(16 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        copied += len(chunk)
-                        now = time.monotonic()
-                        if now - last_log >= 20:
-                            mb_s = copied / 1e6 / max(now - t0, 0.1)
-                            pct = f" ({copied*100/total:.0f}%)" if total > 0 else ""
-                            olog(f"[model]   {name}: {copied/1e9:.2f}/{total/1e9:.2f} GB{pct} @ {mb_s:.0f} MB/s")
-                            last_log = now
-                if total > 0 and copied != total:
-                    raise IOError(f"Incomplete read for {name}: got {copied} of {total} bytes")
-                if copied == 0:
-                    raise IOError(f"Empty download for {name}")
-                partial.replace(dest)
+                if use_xet and attempt <= 2:
+                    assert dl_python is not None
+                    copied = _download_via_hf_xet(url, dest, name, dl_python, hf_tok)
+                    engine = "hf_xet"
+                else:
+                    copied = _download_via_http(url, dest, headers, name)
+                    engine = "http"
                 dt = max(time.monotonic() - t0, 0.1)
-                olog(f"[model] Downloaded ({copied/1e9:.2f} GB in {dt:.1f}s, {copied/1e6/dt:.0f} MB/s): {directory}/{name}")
+                olog(f"[model] Downloaded ({copied/1e9:.2f} GB in {dt:.1f}s, {copied/1e6/dt:.0f} MB/s, {engine}): {directory}/{name}")
                 return {"model": f"{directory}/{name}", "status": "downloaded", "size": copied}
             except Exception as err:
-                partial.unlink(missing_ok=True)
                 last_err = err
                 olog(f"[model] Attempt {attempt}/3 failed for {name} ({url}): {err}")
-                time.sleep(min(5 * attempt, 15))
+                time.sleep(min(3 * attempt, 10))
+        partial.unlink(missing_ok=True)
+        shutil.rmtree(stage_dir, ignore_errors=True)
     raise RuntimeError(f"Failed to download {directory}/{name}: {last_err}")
 
 
-def stage_models(comfy_dir: Path, profile: str = "full", workers: int = 3) -> list[dict[str, object]]:
-    items = models_for_profile(profile)
+def stage_models(
+    comfy_dir: Path,
+    profile: str = "full",
+    workers: int = 3,
+    work_dir: Path | None = None,
+) -> list[dict[str, object]]:
+    # Schedule largest multi-GB weights first (LPT) so tail stragglers never hold up readiness.
+    items = sorted(models_for_profile(profile), key=lambda m: float(m.get("approx_gb", 0.0)), reverse=True)  # type: ignore[arg-type]
     free_gb = shutil.disk_usage(comfy_dir.parent if not comfy_dir.exists() else comfy_dir).free / 1e9
     olog(f"Staging {len(items)} model files (profile={profile}, free SSD={free_gb:.1f} GB)...")
+
+    needs_hf = any(
+        not (validate_model_destination(str(m["directory"]), str(m["name"]), comfy_dir).is_file())
+        and any(parse_hf_resolve_url(str(u)) for u in m["urls"])  # type: ignore[attr-defined]
+        for m in items
+    )
+    dl_python = ensure_hf_downloader(work_dir or (comfy_dir.parent / "openjutsu")) if needs_hf else None
+
     results: list[dict[str, object]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_map = {pool.submit(_download_single_model, item, comfy_dir): item for item in items}
+        future_map = {pool.submit(_download_single_model, item, comfy_dir, dl_python): item for item in items}
         for fut in as_completed(future_map):
             results.append(fut.result())
     for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):

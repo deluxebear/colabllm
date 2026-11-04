@@ -2632,7 +2632,7 @@ OPENJUTSU_SETUP = (
     "olog(f'Starting parallel environment build and {OJ_PROFILE} model staging on {OJ_GPU_SIG}...')\n"
     "with ThreadPoolExecutor(max_workers=2) as _pool:\n"
     "    _f_env = _pool.submit(setup_environment, OJ_WORK, OJ_COMFY, Path(DATA_DIR))\n"
-    "    _f_models = _pool.submit(stage_models, OJ_COMFY, OJ_PROFILE, 3)\n"
+    "    _f_models = _pool.submit(stage_models, OJ_COMFY, OJ_PROFILE, 3, OJ_WORK)\n"
     "    while not (_f_env.done() and _f_models.done()):\n"
     "        for _fut in (_f_env, _f_models):\n"
     "            if _fut.done() and _fut.exception():\n"
@@ -2646,6 +2646,8 @@ OPENJUTSU_SETUP = (
 )
 
 OPENJUTSU_SERVICE = r'''# @title 2. Service -- ComfyUI (:8188) + patched comfy-api-proxy (:8189) + Openjutsu Next.js (:3000)
+if "OJ_META" not in globals():
+    raise RuntimeError("Openjutsu setup cell failed before completing environment build; see setup traceback above.")
 OJ_PROXY_STATE = OJ_WORK / "proxy-state"
 OJ_PROXY_STATE.mkdir(parents=True, exist_ok=True)
 
@@ -2746,6 +2748,9 @@ olog(f"Openjutsu Next.js server listening on 127.0.0.1:{SERVICE_PORT}")
 
 OPENJUTSU_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify /api/models, /api/setup & public Caddy auth before CT_READY
 import base64
+
+if "OJ_META" not in globals() or "service" not in PROCS:
+    raise RuntimeError("Openjutsu service did not start because an earlier notebook cell failed; see traceback above.")
 
 LOCAL_ORIGIN = f"http://127.0.0.1:{SERVICE_PORT}"
 
