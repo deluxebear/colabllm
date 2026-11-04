@@ -40,7 +40,8 @@ multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` /
 
 Also available: `unlimited-ocr` (A100, Caddy auth, persistent Drive OCR jobs),
 `longcat-avatar` (G4, Caddy auth, audio-driven avatar generation with job/download commands),
-and `longcat-video` (G4, Caddy auth, Gradio text/image-to-video and continuation UI).
+`longcat-video` (G4, Caddy auth, Gradio text/image-to-video and continuation UI),
+and `openjutsu` (G4, Caddy auth, co-located ComfyUI + patched `comfy-api-proxy` + Openjutsu Next.js 16 studio for MiniMax H3 motion transfer, object edit, face/colour post-processing & FLUX.3 picture prep; auto `--highvram` on `>=76 GiB` GPUs via `--vram-mode`, local NVMe SSD `h3_chains` bind-mount via `--chains-storage`, and full `swap`/`object`/`mask`/`face`/`color`/`job`/`download`/`cancel`/`check` CLI).
 For each runtime's current concrete usage, read `docs/<name>.md`; portable copies are bundled in
 `skills/colabllm/references/<name>.md`.
 

@@ -40,7 +40,7 @@ class CliRegressionTest(unittest.TestCase):
 
     def test_public_help_lists_business_commands(self):
         expected = {'qwen3-tts': 'tts', 'indextts': 'tts', 'unlimited-ocr': 'ocr',
-                    'longcat-avatar': 'generate', 'comfyui': 'pull-workflow',
+                    'longcat-avatar': 'generate', 'openjutsu': 'swap', 'comfyui': 'pull-workflow',
                     'nemotron-transcribe': 'transcribe'}
         with tempfile.TemporaryDirectory() as home:
             for service, command in expected.items():

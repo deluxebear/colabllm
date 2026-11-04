@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增 `openjutsu` 运行时（G4，Caddy Basic Auth + Bearer Token）：同机运行 ComfyUI（含 13 个自定义节点包与 Linux 路径补丁）、`comfy-api-proxy` 与 Openjutsu Next.js 16 生产工作台，支持 `--profile full|core` 按需缓存模型至本地 SSD、`--vram-mode auto`（在 `>=76 GiB` 显存上自动启用 `--highvram` 常驻显存）与 `--chains-storage ssd`（将 `h3_chains` 分段检查点通过 VFS `mount --bind` 挂载至本地 NVMe SSD），并提供完整命令行业务子命令（`swap`、`object`、`mask`、`face`、`color`、`job`、`download`、`cancel`、`check`）与实时 SSE 进度跟踪。
+
 ## [0.1.1] - 2026-11-04
 
 撤回 0.1.0（其构建产物包含旧部署示例配置），并修复安全与稳定性问题。

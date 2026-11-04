@@ -97,6 +97,7 @@ def check(artifact):
             'qwen3-tts': ('tts', 'voices', 'design-voice'),
             'indextts': ('tts', 'voices'),
             'comfyui': ('pull-workflow', 'pull-model'),
+            'openjutsu': ('check',),
             'unlimited-ocr': ('ocr', 'job', 'resume'),
             'longcat-avatar': ('generate', 'job', 'download'),
             'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),

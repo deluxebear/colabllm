@@ -39,6 +39,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Voice cloning, emotion and speed | `indextts` | [IndexTTS](references/indextts.md) |
 | Audio-driven avatar generation | `longcat-avatar` | [LongCat Avatar](references/longcat-avatar.md) |
 | Text/image-to-video and continuation UI | `longcat-video` | [LongCat Video](references/longcat-video.md) |
+| Motion transfer, object/face/color video CLI & UI | `openjutsu` | [Openjutsu](references/openjutsu.md) |
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
 

@@ -2588,6 +2588,261 @@ UNLIMITED_OCR_KEEPALIVE = render_keepalive(UNLIMITED_OCR_CFG, before_ready="""fo
     except (OSError, ValueError) as err:
         print(f'Cache archive save warning ({local.name}): {err}', flush=True)""")
 
+# --------------------------------------------------------------------------- openjutsu (G4, ComfyUI + comfy-api-proxy + Next.js behind Caddy)
+OPENJUTSU_CFG = dict(name="openjutsu", service_port=3000, auth="caddy", public_port=18080,
+                     health_path="/api/models", ready_timeout=3600)
+OPENJUTSU_CADDY = render_caddy_cell(
+    rewrite_host=True,
+    extra_proxy_lines="header_up -X-Forwarded-Host\nheader_up -X-Forwarded-Proto",
+)
+OPENJUTSU_SETUP = (
+    "# @title 1. Setup -- ComfyUI + 13 custom node packs + comfy-api-proxy + Openjutsu Next.js + local SSD models\n"
+    "from concurrent.futures import ThreadPoolExecutor\n"
+    "from pathlib import Path\n"
+    "import hashlib, platform\n\n"
+    "OJ_WORK = Path(os.environ.get('CT_OPENJUTSU_WORK_DIR', '/content/openjutsu'))\n"
+    "OJ_COMFY = Path(os.environ.get('CT_COMFY_DIR', '/content/ComfyUI'))\n"
+    "OJ_PROFILE = (os.environ.get('CT_OPENJUTSU_PROFILE', 'full').strip().lower() or 'full')\n"
+    "OJ_WORK.mkdir(parents=True, exist_ok=True)\n"
+    "(OJ_WORK / 'colab_cache.py').write_text("
+    + repr((ROOT / "templates/colab_cache.py").read_text())
+    + ", encoding='utf-8')\n"
+    "(OJ_WORK / 'openjutsu_runtime.py').write_text("
+    + repr((ROOT / "templates/openjutsu_runtime.py").read_text())
+    + ", encoding='utf-8')\n"
+    "if str(OJ_WORK) not in sys.path:\n"
+    "    sys.path.insert(0, str(OJ_WORK))\n"
+    "from colab_cache import restore_cache, save_cache\n"
+    "from openjutsu_runtime import (\n"
+    "    detect_gpu_vram_mib,\n"
+    "    olog,\n"
+    "    prepare_comfy_tree,\n"
+    "    select_comfy_vram_flags,\n"
+    "    setup_check_payloads,\n"
+    "    setup_environment,\n"
+    "    stage_models,\n"
+    ")\n\n"
+    "OJ_GPU_SIG = ct_gpu_stat('name,compute_cap')\n"
+    "OJ_CACHE_KEY = hashlib.sha256(f'{sys.version_info[:2]}:{platform.machine()}:{OJ_GPU_SIG}'.encode()).hexdigest()[:16]\n"
+    "OJ_CACHE_DIRS = [OJ_WORK / 'triton-cache', OJ_WORK / 'inductor-cache']\n"
+    "for _cache_dir in OJ_CACHE_DIRS:\n"
+    "    restore_cache(_cache_dir, Path(DATA_DIR) / 'legacy-caches' / _cache_dir.name,\n"
+    "                  Path(DATA_DIR) / 'kernel-archives', OJ_CACHE_KEY, log=olog)\n\n"
+    "prepare_comfy_tree(OJ_WORK, OJ_COMFY, Path(DATA_DIR))\n"
+    "olog(f'Starting parallel environment build and {OJ_PROFILE} model staging on {OJ_GPU_SIG}...')\n"
+    "with ThreadPoolExecutor(max_workers=2) as _pool:\n"
+    "    _f_env = _pool.submit(setup_environment, OJ_WORK, OJ_COMFY, Path(DATA_DIR))\n"
+    "    _f_models = _pool.submit(stage_models, OJ_COMFY, OJ_PROFILE, 3)\n"
+    "    while not (_f_env.done() and _f_models.done()):\n"
+    "        for _fut in (_f_env, _f_models):\n"
+    "            if _fut.done() and _fut.exception():\n"
+    "                raise _fut.exception()\n"
+    "        olog(f\"Setup heartbeat | env={'done' if _f_env.done() else 'running'} \"\n"
+    "             f\"models={'done' if _f_models.done() else 'running'} | gpu={ct_gpu_stat()}\")\n"
+    "        time.sleep(30)\n"
+    "    OJ_META = _f_env.result()\n"
+    "    OJ_MODELS = _f_models.result()\n"
+    "olog(f\"Setup complete: {len(OJ_MODELS)} models staged, app={OJ_META['app_dir']}\")\n"
+)
+
+OPENJUTSU_SERVICE = r'''# @title 2. Service -- ComfyUI (:8188) + patched comfy-api-proxy (:8189) + Openjutsu Next.js (:3000)
+OJ_PROXY_STATE = OJ_WORK / "proxy-state"
+OJ_PROXY_STATE.mkdir(parents=True, exist_ok=True)
+
+def _wait_proc_http(proc_key, url, timeout=600, ok=lambda c: c < 500):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        proc = PROCS[proc_key][0]
+        if proc.poll() is not None:
+            raise RuntimeError(f"{proc_key} exited early (code {proc.returncode}):\n{ct_tail(proc_key, 60)}")
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if ok(resp.status):
+                    return resp.status
+        except urllib.error.HTTPError as err:
+            if ok(err.code):
+                return err.code
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(f"{proc_key} ({url}) not ready after {timeout}s:\n{ct_tail(proc_key, 50)}")
+
+def start_comfyui():
+    subprocess.run(["pkill", "-f", f"{OJ_COMFY}/main.py"], check=False)
+    vram_flags = select_comfy_vram_flags(
+        detect_gpu_vram_mib(),
+        os.environ.get("CT_COMFY_VRAM_MODE", "auto"),
+    )
+    olog(f"Starting ComfyUI (VRAM flags={vram_flags or ['dynamic-default']})")
+    return ct_spawn(
+        "comfyui",
+        [
+            sys.executable,
+            str(OJ_COMFY / "main.py"),
+            "--listen", "127.0.0.1",
+            "--port", "8188",
+            "--extra-model-paths-config", OJ_META["extra_model_paths"],
+            *vram_flags,
+        ],
+        cwd=str(OJ_COMFY),
+        env={
+            "TRITON_CACHE_DIR": str(OJ_WORK / "triton-cache"),
+            "TORCHINDUCTOR_CACHE_DIR": str(OJ_WORK / "inductor-cache"),
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        },
+    )
+
+def start_comfy_proxy():
+    subprocess.run(["pkill", "-f", "comfy-api-proxy"], check=False)
+    return ct_spawn(
+        "comfy_proxy",
+        [
+            OJ_META["proxy_bin"],
+            "--comfyui", "http://127.0.0.1:8188",
+            "--host", "127.0.0.1",
+            "--port", "8189",
+            "--max-upload-mb", "500",
+            "--state-dir", str(OJ_PROXY_STATE),
+        ],
+        cwd=str(OJ_WORK),
+    )
+
+def start_service():
+    subprocess.run(["pkill", "-f", "next/dist/bin/next"], check=False)
+    return ct_spawn(
+        "service",
+        [
+            str(Path(OJ_META["app_dir"]) / "node_modules" / ".bin" / "next"),
+            "start",
+            "--hostname", "127.0.0.1",
+            "--port", str(SERVICE_PORT),
+        ],
+        cwd=OJ_META["app_dir"],
+        env={
+            "PATH": f"{OJ_META['node_bin_dir']}:{os.environ.get('PATH', '')}",
+            "NODE_ENV": "production",
+            "NEXT_TELEMETRY_DISABLED": "1",
+            "COMFY_BASE_URL": "http://127.0.0.1:8189",
+            "COMFY_API_KEY": "",
+            "COMFYUI_URL": "http://127.0.0.1:8188",
+            "OPENJUTSU_PASSWORD": "",
+        },
+    )
+
+PROCS["comfyui"] = (start_comfyui(), start_comfyui)
+_wait_proc_http("comfyui", "http://127.0.0.1:8188/system_stats", timeout=600, ok=lambda c: c == 200)
+_wait_proc_http("comfyui", "http://127.0.0.1:8188/websocket_reconnect_fix", timeout=60, ok=lambda c: c == 200)
+olog("ComfyUI + custom nodes listening on 127.0.0.1:8188")
+
+PROCS["comfy_proxy"] = (start_comfy_proxy(), start_comfy_proxy)
+_wait_proc_http("comfy_proxy", "http://127.0.0.1:8189/", timeout=120, ok=lambda c: c < 500)
+olog("Patched comfy-api-proxy listening on 127.0.0.1:8189")
+
+PROCS["service"] = (start_service(), start_service)
+_wait_proc_http("service", f"http://127.0.0.1:{SERVICE_PORT}/api/models", timeout=180, ok=lambda c: c == 200)
+olog(f"Openjutsu Next.js server listening on 127.0.0.1:{SERVICE_PORT}")
+'''
+
+OPENJUTSU_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify /api/models, /api/setup & public Caddy auth before CT_READY
+import base64
+
+LOCAL_ORIGIN = f"http://127.0.0.1:{SERVICE_PORT}"
+
+def _oj_local_json(path, payload=None, timeout=30):
+    headers = {"Origin": LOCAL_ORIGIN, "Accept": "application/json"}
+    data = None
+    method = "GET"
+    if payload is not None:
+        method = "POST"
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(LOCAL_ORIGIN + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+_, _models_info = _oj_local_json("/api/models", timeout=30)
+if _models_info.get("error") or not _models_info.get("models"):
+    raise RuntimeError(f"Openjutsu /api/models failed: {_models_info}\n{ct_tail('comfyui', 50)}")
+
+for _mode, _payload in setup_check_payloads(OJ_PROFILE).items():
+    _, _setup_res = _oj_local_json("/api/setup", payload=_payload, timeout=45)
+    if not _setup_res.get("ok"):
+        raise RuntimeError(
+            f"Openjutsu /api/setup check failed for mode={_mode!r}: {_setup_res}\n{ct_tail('comfyui', 60)}"
+        )
+olog(f"Verified Openjutsu /api/models and /api/setup for profile={OJ_PROFILE}")
+
+for _cache_dir in OJ_CACHE_DIRS:
+    try:
+        save_cache(_cache_dir, Path(DATA_DIR) / "kernel-archives", OJ_CACHE_KEY, log=olog)
+    except (OSError, ValueError) as _err:
+        olog(f"Cache archive save warning ({_cache_dir.name}): {_err}")
+
+def _public_bearer_probe():
+    req = urllib.request.Request(
+        PUBLIC_URL + "/api/models",
+        headers={"Authorization": f"Bearer {API_TOKEN}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+        if body.get("error"):
+            raise RuntimeError(f"Public /api/models returned error: {body}")
+        return resp.status
+
+def _verify_public_auth():
+    # 1. Unauthenticated request must return 401 and must NOT leak Set-Cookie
+    req_unauth = urllib.request.Request(PUBLIC_URL + "/", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req_unauth, timeout=15) as resp:
+            raise RuntimeError(f"Unauthenticated public request unexpectedly returned HTTP {resp.status}")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 without credentials, got HTTP {err.code}")
+        if err.headers.get("Set-Cookie"):
+            raise RuntimeError("Public 401 response leaked Set-Cookie")
+    # 2. Invalid Bearer token must return 401
+    req_bad = urllib.request.Request(
+        PUBLIC_URL + "/api/models",
+        headers={"Authorization": "Bearer invalid-probe-token", "User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urllib.request.urlopen(req_bad, timeout=15) as resp:
+            raise RuntimeError(f"Invalid Bearer token unexpectedly returned HTTP {resp.status}")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 for invalid Bearer token, got HTTP {err.code}")
+    # 3. Browser Basic Auth must return 200 and issue ct_session cookie
+    basic = base64.b64encode(f"{AUTH_USER}:{AUTH_PASS}".encode("utf-8")).decode("ascii")
+    req_basic = urllib.request.Request(
+        PUBLIC_URL + "/",
+        headers={"Authorization": f"Basic {basic}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req_basic, timeout=20) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"Basic Auth request returned HTTP {resp.status}")
+
+ct_public_gate(PUBLIC_URL, _public_bearer_probe, _verify_public_auth, olog, timeout=180)
+if AUTH == "caddy" and not CREDS_FROM_ENV:
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _oj_health():
+    if PROCS["comfyui"][0].poll() is not None or PROCS["comfy_proxy"][0].poll() is not None:
+        return False
+    req = urllib.request.Request(LOCAL_ORIGIN + "/", headers={"Host": f"127.0.0.1:{SERVICE_PORT}"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status == 200
+
+def _oj_heartbeat(uptime_s):
+    if uptime_s % 600 < 60:
+        states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
+        olog(f"[heartbeat] uptime={uptime_s}s {states} gpu={ct_gpu_stat()}")
+
+ct_watchdog(_oj_health, start_service, olog, interval=60, grace=900, heartbeat=_oj_heartbeat)
+'''
+
 if __name__ == "__main__":
     write(ROOT / "src/colabllm/services/unlimited-ocr.ipynb",
           notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR; official Transformers backend, "
@@ -2656,3 +2911,12 @@ if __name__ == "__main__":
                    "voice cloning, Voice-Design-then-Clone workflow, 10 languages, and Google Drive voice/output persistence.",
                    QWEN3_TTS_CFG, QWEN3_TTS_SETUP, QWEN3_TTS_SERVICE,
                    keepalive=QWEN3_TTS_KEEPALIVE))
+    write(ROOT / "src/colabllm/services/openjutsu.ipynb",
+          notebook("Openjutsu (G4 / MiniMax H3 Motion Transfer, Video Edit, Face & Colour Fix, FLUX.3 Picture Prep)",
+                   "Co-locates ComfyUI (`127.0.0.1:8188` + 13 custom node packs), patched `comfy-api-proxy` "
+                   "(`127.0.0.1:8189`), and Openjutsu's Next.js 16 web UI (`127.0.0.1:3000`) on a Colab G4 "
+                   "(RTX PRO 6000 Blackwell, 96 GB VRAM) behind Caddy Basic Auth + session cookie + Bearer token. "
+                   "Models live on fast local NVMe SSD (`/content/ComfyUI/models`); generated videos, clip "
+                   "checkpoints, inputs, and custom LoRAs persist on Google Drive.",
+                   OPENJUTSU_CFG, OPENJUTSU_SETUP, OPENJUTSU_SERVICE,
+                   keepalive=OPENJUTSU_KEEPALIVE, auth_cell=OPENJUTSU_CADDY))
