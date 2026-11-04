@@ -4,9 +4,12 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-04
+
 ### 新增
 
-- 新增 `openjutsu` 运行时（G4，Caddy Basic Auth + Bearer Token）：同机运行 ComfyUI（含 13 个自定义节点包与 Linux 路径补丁）、`comfy-api-proxy` 与 Openjutsu Next.js 16 生产工作台，支持 `--profile full|core` 按需缓存模型至本地 SSD、`--vram-mode auto`（在 `>=76 GiB` 显存上自动启用 `--highvram` 常驻显存）与 `--chains-storage ssd`（将 `h3_chains` 分段检查点通过 VFS `mount --bind` 挂载至本地 NVMe SSD），并提供完整命令行业务子命令（`swap`、`object`、`mask`、`face`、`color`、`job`、`download`、`cancel`、`check`）与实时 SSE 进度跟踪。
+- 新增 `openjutsu` 运行时（G4，Caddy Basic Auth + Bearer Token）：同机运行 ComfyUI（含 13 个自定义节点包与 Linux 路径补丁）、`comfy-api-proxy` 与基于 `colab_openjutsu` 的中文 Next.js 16 生产工作台，提供完整命令行业务子命令（`swap`、`object`、`mask`、`face`、`color`、`job`、`download`、`cancel`、`check`）与实时 SSE 进度跟踪。
+- `openjutsu` G4 运行与拉取优化：支持 `--profile full|core` 按需准备权重、独立环境原生 Rust `hf_xet` 高并发模型拉取（按体积从大到小 LPT 调度 + 多连接 HTTP `Range` 分片断点续传兜底）、免加载 CUDA 动态库的毫秒级 `sm_120` 架构/依赖探测、`--vram-mode auto`（在 `>=76 GiB` 显存上自动启用 `--highvram` 常驻显存）、ComfyUI `--cache-classic` 长视频递归分段系统内存即时回收，以及 `--chains-storage ssd` 本地 NVMe SSD 检查点绑定。
 
 ## [0.1.1] - 2026-11-04
 
