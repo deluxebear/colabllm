@@ -2682,6 +2682,7 @@ def start_comfyui():
             "--listen", "127.0.0.1",
             "--port", "8188",
             "--extra-model-paths-config", OJ_META["extra_model_paths"],
+            "--cache-classic",
             *vram_flags,
         ],
         cwd=str(OJ_COMFY),

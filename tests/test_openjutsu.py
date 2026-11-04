@@ -374,6 +374,7 @@ class OpenjutsuServiceCliTest(unittest.TestCase):
         svc_src = "".join(nb["cells"][3]["source"])
         self.assertIn("select_comfy_vram_flags", svc_src)
         self.assertIn("CT_COMFY_VRAM_MODE", svc_src)
+        self.assertIn("--cache-classic", svc_src)
         caddy_src = nb["cells"][4]["source"]
         text = "".join(caddy_src) if isinstance(caddy_src, list) else caddy_src
         self.assertIn("REWRITE_HOST = True", text)

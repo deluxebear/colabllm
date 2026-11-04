@@ -83,7 +83,7 @@ colabllm openjutsu color --video face_fixed.mp4 --detail -0.2 --tone-mode Reinha
 
 ## G4 性能调优、存储与断点续跑
 
-- **显存常驻策略（`--vram-mode auto|highvram|dynamic|gpu-only`，默认 `auto`）**：Openjutsu 单任务活跃模型总计约 48 GB（H3 20 GB + Qwen3-VL 32B/8B 23 GB + VAE 3.3 GB + SAM 3.1 1.7 GB）。`auto` 在显存 `>=76 GiB` 的 GPU（如 G4 96 GB）上自动向 ComfyUI 传入 `--highvram`，让权重全程常驻显存，省去每个分段约 8 秒的 DynamicVRAM 换页开销与约 50 秒冷启动拷贝。
+- **显存常驻与系统内存即时回收（`--vram-mode auto|highvram|dynamic|gpu-only`，默认 `auto`；ComfyUI 默认开启 `--cache-classic`）**：Openjutsu 单任务活跃模型总计约 48 GB（H3 20 GB + Qwen3-VL 32B/8B 23 GB + VAE 3.3 GB + SAM 3.1 1.7 GB）。`auto` 在显存 `>=76 GiB` 的 GPU（如 G4 96 GB）上自动向 ComfyUI 传入 `--highvram`，让权重全程常驻显存，省去每个分段约 8 秒的 DynamicVRAM 换页开销与约 50 秒冷启动拷贝；同时传入 `--cache-classic` 让每个 `Context-Loop` 递归分段结束后立即释放 CPU 中间图像张量，避免 ComfyUI 0.44 默认 `--cache-ram` 在长视频或 `10s` 分段 + Spectrum 加速下跨分段累积系统内存导致 VM cgroup OOM。
 - **分段检查点 SSD 加速（`--chains-storage ssd|drive`，默认 `ssd`）**：`MiniMaxH3-Context-Loop` 每生成一段会写出约 450 MB `.safetensors` 潜空间检查点（3 分钟视频约 14 GB）。默认 `ssd` 通过 Linux VFS `mount --bind` 将 `output/h3_chains` 绑定至本地 NVMe SSD（`/content/openjutsu/h3_chains`），既满足节点路径沙箱校验并保留同一 VM 内的断点续跑，又避免每段 Google Drive FUSE 同步写盘阻塞与网盘配额膨胀；**最终拼接成片仍直接保存在 Google Drive**（`output/h3_oneclick_swap/`、`h3_oneclick_edit/`、`openjutsu_color/`、`openjutsu_face/` 等）。若需跨不同 Colab VM 续跑超长任务，可传 `--chains-storage drive`。
 - **网页参数提速建议**：长视频在 G4 96 GB 显存下可将高级设置中的 **Clip length** 从默认 `6s` 调至 `9s–10s`（减少相邻分段固定 39 帧重叠区的重复采样比例），追求速度时可将 **Steps** 从 `6` 调为 `4`（匹配默认挂载的 DMAD 4-step LoRA）。
 - **本地高速 NVMe SSD**：`/content/ComfyUI/models`（模型权重）、`/content/ComfyUI/custom_nodes`、`/content/openjutsu/proxy-state`（代理 SQLite 状态）与 Triton/Inductor 编译缓存均位于 VM 本地 SSD；编译缓存归档会同步至网盘加速后续启动。
