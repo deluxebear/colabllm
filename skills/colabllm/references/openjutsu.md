@@ -44,14 +44,14 @@ colabllm openjutsu check --profile core
 # 1. 先跑几秒钟 SAM 3.1 遮罩预览（可选，快速确认人物追踪准确度）
 colabllm openjutsu mask --video input.mp4 --length 6 -o mask_preview.mp4
 
-# 2. 单人角色动作迁移（simple 模式；G4 推荐 --clip-seconds 9.5 减少重叠损耗，追求速度可加 --steps 4）
-colabllm openjutsu swap --video input.mp4 -p character.png --clip-seconds 9.5 -o swap_result.mp4
+# 2. 单人角色动作迁移（simple 模式；默认挂载 DMAD 4-step LoRA，提速推荐 --steps 4 --clip-seconds 7.5，分辨率匹配原片短边如 576p/736p）
+colabllm openjutsu swap --video input.mp4 -p character.png --steps 4 --clip-seconds 7.5 -o swap_result.mp4
 
 # 3. 多人角色动作迁移（传 2–4 张 -p 自动切换 advanced 模式；双人可加 --max-quality 分两遍精渲）
-colabllm openjutsu swap --video duet.mp4 -p left.png -p right.png --role "left dancer" --role "right dancer" --clip-seconds 9.5 -o duet_swap.mp4
+colabllm openjutsu swap --video duet.mp4 -p left.png -p right.png --role "left dancer" --role "right dancer" --steps 4 --clip-seconds 7.5 -o duet_swap.mp4
 
 # 4. 后台异步提交（立即返回任务 ID，不阻塞当前终端）与后续进度跟踪 / 下载 / 取消
-colabllm openjutsu swap --video input.mp4 -p character.png --clip-seconds 9.5
+colabllm openjutsu swap --video input.mp4 -p character.png --steps 4 --clip-seconds 7.5
 colabllm openjutsu job JOB_ID --wait -o swap_result.mp4
 colabllm openjutsu download JOB_ID -o swap_result.mp4
 colabllm openjutsu cancel JOB_ID
@@ -87,7 +87,7 @@ colabllm openjutsu color --video face_fixed.mp4 --detail -0.2 --tone-mode Reinha
 
 - **显存常驻与系统内存即时回收（`--vram-mode auto|highvram|dynamic|gpu-only`，默认 `auto`；ComfyUI 默认开启 `--cache-classic`）**：Openjutsu 单任务活跃模型总计约 48 GB（H3 20 GB + Qwen3-VL 32B/8B 23 GB + VAE 3.3 GB + SAM 3.1 1.7 GB）。`auto` 在显存 `>=76 GiB` 的 GPU（如 G4 96 GB）上自动向 ComfyUI 传入 `--highvram`，让权重全程常驻显存，省去每个分段约 8 秒的 DynamicVRAM 换页开销与约 50 秒冷启动拷贝；同时传入 `--cache-classic` 让每个 `Context-Loop` 递归分段结束后立即释放 CPU 中间图像张量，避免 ComfyUI 0.44 默认 `--cache-ram` 在长视频或 `10s` 分段 + Spectrum 加速下跨分段累积系统内存导致 VM cgroup OOM。
 - **分段检查点 SSD 加速（`--chains-storage ssd|drive`，默认 `ssd`）**：`MiniMaxH3-Context-Loop` 每生成一段会写出约 450 MB `.safetensors` 潜空间检查点（3 分钟视频约 14 GB）。默认 `ssd` 通过 Linux VFS `mount --bind` 将 `output/h3_chains` 绑定至本地 NVMe SSD（`/content/openjutsu/h3_chains`），既满足节点路径沙箱校验并保留同一 VM 内的断点续跑，又避免每段 Google Drive FUSE 同步写盘阻塞与网盘配额膨胀；**最终拼接成片仍直接保存在 Google Drive**（`output/h3_oneclick_swap/`、`h3_oneclick_edit/`、`openjutsu_color/`、`openjutsu_face/` 等）。若需跨不同 Colab VM 续跑超长任务，可传 `--chains-storage drive`。
-- **网页参数提速建议**：长视频在 G4 96 GB 显存下可将高级设置中的 **Clip length** 从默认 `6s` 调至 `9s–10s`（减少相邻分段固定 39 帧重叠区的重复采样比例），追求速度时可将 **Steps** 从 `6` 调为 `4`（匹配默认挂载的 DMAD 4-step LoRA）。
+- **推理速度与网页/CLI 参数甜点**：MiniMax H3 是 **100 层 3D 音视频全注意力 DiT**，单步耗时随总 Token 数（`分辨率像素 × 分段帧数`）呈 **`O(S²)` 二次方**增长。提速关键有三点：① **分辨率不超过原片短边**（例如 `608×1076` 竖屏原片选 `576p` 即 `576×1024`，若选默认 `736p` 超分至 `736×1312` 会使像素增加 48%、注意力计算量翻 2.2 倍）；② **采样步数设为 `4`**（默认已加载 `DMAD 4-step` 蒸馏加速 LoRA，从默认 `6` 步改为 `4` 步可直接省去 33% 扩散采样时间）；③ **分段时长（Clip length）保持在 `7s–8s` 甜点区间**（过短则固定 `39 帧` 重叠税占比高，拉到 `10s` 则单步序列达 ~5.6 万 Token 导致单步耗时从 `~7s` 激增至 `18.6s`）。在 `576p + 4 steps + 7.5s` 下，1 分钟视频在 G4 热显存下约 **8–9 分钟**即可完成。
 - **高速模型并发拉取（Rust `hf_xet` + 多连接分片续传）**：启动阶段默认在独立环境启用 `huggingface_hub` + `hf_xet`（`HF_XET_HIGH_PERFORMANCE=1`），按模型体积从大到小（LPT）并发拉取 Xet 数据块（单 worker 实测约 600 MB/s），非 HF 源自动回退多连接 HTTP `Range` 分片与断点续传。与所有运行时统一一致，可在网盘放入 `MyDrive/colab-llm/hf_token.txt`（或本机 `~/.cache/huggingface/token` / `HF_TOKEN` / `--hf-token`），启动时会自动读取以解除 Hugging Face 匿名限速告警。
 - **本地高速 NVMe SSD**：`/content/ComfyUI/models`（模型权重）、`/content/ComfyUI/custom_nodes`、`/content/openjutsu/proxy-state`（代理 SQLite 状态）与 Triton/Inductor 编译缓存均位于 VM 本地 SSD；编译缓存归档会同步至网盘加速后续启动。
 - **Google Drive 持久化（`MyDrive/colab-llm/openjutsu/`）**：

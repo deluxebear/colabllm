@@ -10,7 +10,7 @@ Usage:
   colabllm openjutsu up --domain
   colabllm openjutsu up --domain --profile core
   colabllm openjutsu check [--mode all|simple|advanced|object|face|color|montage|people|mask|fit]
-  colabllm openjutsu swap --video input.mp4 -p person.png --clip-seconds 9.5 -o result.mp4
+  colabllm openjutsu swap --video input.mp4 -p person.png --steps 4 --clip-seconds 7.5 -o result.mp4
   colabllm openjutsu object --video input.mp4 --target jacket --change-to "leather jacket" -o edited.mp4
   colabllm openjutsu mask --video input.mp4 -o mask.mp4
   colabllm openjutsu face --video result.mp4 -p person.png -o fixed_face.mp4
@@ -634,7 +634,7 @@ def _add_section_flags(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_model_flags(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--steps", type=int, default=6, help="扩散采样步数 1–100（默认: 6；追求速度可设 4）")
+    parser.add_argument("--steps", type=int, default=6, help="扩散采样步数 1–100（默认: 6；默认挂载 DMAD 4-step LoRA，提速推荐设 4）")
     parser.add_argument("--model", default=str(DEFAULT_MODEL_SETTINGS["model"]), help="H3 扩散底模文件名")
     parser.add_argument("--lora", action="append", dest="loras", metavar="NAME[:STRENGTH]",
                         help="替换默认 LoRA 列表（可重复最多 4 次，如 drive/my.safetensors:0.8）")
@@ -651,11 +651,11 @@ def _add_model_flags(parser: argparse.ArgumentParser) -> None:
 
 def _add_h3_run_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--resolution", default="736p",
-                        help="输出分辨率预设（480p|576p|736p|768p|1080p）或自定义 WIDTHxHEIGHT（默认: 736p）")
+                        help="输出分辨率预设（480p|576p|736p|768p|1080p，建议不超过原片短边）或 WIDTHxHEIGHT（默认: 736p）")
     parser.add_argument("--motion", type=int, choices=MOTION_CHOICES, default=512,
                         help="动作参考长边像素（默认: 512；可选 512 / 768 / 1376）")
     parser.add_argument("--clip-seconds", type=float, default=6.0,
-                        help="单段窗口秒数 2.5–15（默认: 6.0；G4 96GB 推荐 9.5–10 以减少重叠损耗）")
+                        help="单段窗口秒数 2.5–15（默认: 6.0；甜点区间 7–8s，>9s 会触发 3D 全注意力二次方耗时激增）")
     parser.add_argument("--seed", type=int, default=0, help="随机种子 0–4294967295（默认: 0）")
 
 
