@@ -32,7 +32,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Task | Runtime | Reference to read |
 | --- | --- | --- |
 | OpenAI-compatible LLM / vision | `qwen-flash` | [Qwen Flash](references/qwen-flash.md) |
-| Ollama models and inference API | `ollama` | [Ollama](references/ollama.md) |
+| Ollama models, OpenAI/Anthropic/native APIs & tuning | `ollama` | [Ollama](references/ollama.md) |
 | PDF/image files or directories to Markdown | `unlimited-ocr` | [Unlimited-OCR](references/unlimited-ocr.md) |
 | Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |
 | Built-in speech, voice design and cloning | `qwen3-tts` | [Qwen3-TTS](references/qwen3-tts.md) |

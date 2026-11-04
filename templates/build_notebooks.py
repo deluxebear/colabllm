@@ -377,30 +377,270 @@ print(f"service started on 127.0.0.1:{SERVICE_PORT}")
 
 # --------------------------------------------------------------------------- ollama (no built-in auth -> caddy)
 OLLAMA_CFG = dict(name="ollama", service_port=11434, auth="caddy", public_port=18080,
-                  health_path="/api/version", ready_timeout=900)
-OLLAMA_SETUP = r'''# @title 1. Setup -- install Ollama once per VM (idempotent)
-MODELS = os.environ.get("CT_MODELS", "qwen2.5:0.5b").split(",")   # pulled after the server starts
-if not shutil.which("ollama"):
-    subprocess.run("apt-get install -y -qq zstd pciutils >/dev/null 2>&1; "
-                   "curl -fsSL https://ollama.com/install.sh | sh", shell=True, check=True)
-print(subprocess.run(["ollama", "--version"], capture_output=True, text=True).stdout.strip())
+                  health_path="/api/version", ready_timeout=1800)
+OLLAMA_SETUP = (
+    r'''# @title 1. Setup -- install Ollama and load runtime configuration (idempotent)
+from pathlib import Path
+(Path(WORK) / "ollama_runtime.py").write_text('''
+    + repr((ROOT / "src/colabllm/lib/ollama_runtime.py").read_text())
+    + r''', encoding="utf-8")
+if WORK not in sys.path:
+    sys.path.insert(0, WORK)
+
+from ollama_runtime import (
+    COMPAT_APIS,
+    build_ollama_server_env,
+    compat_endpoints_info,
+    copy_model_alias,
+    models_to_pull,
+    parse_compat_apis,
+    parse_model_aliases,
+    parse_model_specs,
+    preload_or_unload_model,
+    pull_model_stream,
+    render_ollama_caddyfile,
+    validate_ollama_version,
+)
+
+def olog(msg):
+    print(time.strftime("[%F %T] [ollama] ") + msg, flush=True)
+
+OLLAMA_NO_MODELS = os.environ.get("CT_OLLAMA_NO_MODELS", "0") == "1"
+OLLAMA_MODELS_LIST = parse_model_specs(os.environ.get("CT_MODELS"), no_models=OLLAMA_NO_MODELS)
+OLLAMA_ALIASES = parse_model_aliases(os.environ.get("CT_OLLAMA_ALIASES"))
+OLLAMA_PULL_LIST = models_to_pull(OLLAMA_MODELS_LIST, OLLAMA_ALIASES)
+OLLAMA_PRELOAD_MODE = os.environ.get("CT_OLLAMA_PRELOAD", "primary").strip().lower()
+OLLAMA_COMPAT = parse_compat_apis(os.environ.get("CT_OLLAMA_COMPAT"))
+OLLAMA_READ_ONLY_MODELS = os.environ.get("CT_OLLAMA_READ_ONLY_MODELS", "0") == "1"
+OLLAMA_STORAGE_MODE = os.environ.get("CT_OLLAMA_MODELS_STORAGE", "ssd").strip().lower()
+OLLAMA_MODELS_DIR = os.environ.get("CT_OLLAMA_MODELS") or (
+    f"{DATA_DIR}/models" if OLLAMA_STORAGE_MODE == "drive" else "/content/ollama/models"
+)
+os.makedirs(OLLAMA_MODELS_DIR, exist_ok=True)
+
+OLLAMA_REQUESTED_VERSION = (
+    validate_ollama_version(os.environ["CT_OLLAMA_VERSION"])
+    if os.environ.get("CT_OLLAMA_VERSION")
+    else ""
+)
+_installed_ver = (
+    subprocess.run(["ollama", "--version"], capture_output=True, text=True).stdout.strip()
+    if shutil.which("ollama")
+    else ""
+)
+if not shutil.which("ollama") or (OLLAMA_REQUESTED_VERSION and OLLAMA_REQUESTED_VERSION not in _installed_ver):
+    olog("Installing Ollama" + (f" v{OLLAMA_REQUESTED_VERSION}" if OLLAMA_REQUESTED_VERSION else "") + " ...")
+    _inst_env = dict(os.environ)
+    if OLLAMA_REQUESTED_VERSION:
+        _inst_env["OLLAMA_VERSION"] = OLLAMA_REQUESTED_VERSION
+    subprocess.run(
+        "apt-get install -y -qq zstd pciutils lshw >/dev/null 2>&1; "
+        "curl -fsSL https://ollama.com/install.sh | sh",
+        shell=True,
+        check=True,
+        env=_inst_env,
+    )
+# Ensure systemd does not hold :11434 with default settings instead of our tuned OLLAMA_ENV
+subprocess.run("systemctl stop ollama >/dev/null 2>&1 || true; systemctl disable ollama >/dev/null 2>&1 || true",
+               shell=True, check=False)
+olog(subprocess.run(["ollama", "--version"], capture_output=True, text=True).stdout.strip())
 '''
-OLLAMA_SERVICE = r'''# @title 2. Service -- ollama serve on 127.0.0.1 (no auth of its own -> Caddy in front)
-OLLAMA_ENV = {"OLLAMA_HOST": f"127.0.0.1:{SERVICE_PORT}",
-              "OLLAMA_MODELS": os.environ.get("CT_OLLAMA_MODELS", "/content/ollama/models"),
-              "OLLAMA_KEEP_ALIVE": "30m"}
+)
+
+OLLAMA_SERVICE = r'''# @title 2. Service -- ollama serve on 127.0.0.1 + automatic model pull, alias & GPU VRAM preload
+if "OLLAMA_COMPAT" not in globals():
+    raise RuntimeError("Ollama setup cell failed before completing initialization; see traceback above.")
+
+_server_env_raw = os.environ.get("CT_OLLAMA_SERVER_ENV", "").strip()
+OLLAMA_ENV = json.loads(_server_env_raw) if _server_env_raw else build_ollama_server_env()
+for _k, _v in os.environ.items():
+    if _k.startswith("OLLAMA_") and _k not in ("OLLAMA_HOST", "OLLAMA_MODELS") and _k not in OLLAMA_ENV:
+        OLLAMA_ENV[_k] = _v
+OLLAMA_ENV["OLLAMA_HOST"] = f"127.0.0.1:{SERVICE_PORT}"
+OLLAMA_ENV["OLLAMA_MODELS"] = OLLAMA_MODELS_DIR
+
+olog(f"GPU: {ct_gpu_stat('name,memory.total,compute_cap')} | storage={OLLAMA_STORAGE_MODE} ({OLLAMA_MODELS_DIR})")
+olog(f"Compatible APIs: {','.join(OLLAMA_COMPAT)} | read_only_models={OLLAMA_READ_ONLY_MODELS}")
+olog("Server env: " + ", ".join(f"{k}={v}" for k, v in sorted(OLLAMA_ENV.items())))
 
 def start_service():
     subprocess.run(["pkill", "-f", "ollama serve"], check=False)
     return ct_spawn("service", ["ollama", "serve"], env=OLLAMA_ENV)
 
+def _wait_ollama_local(timeout=120):
+    deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{SERVICE_PORT}/api/version"
+    while time.time() < deadline:
+        proc = PROCS["service"][0]
+        if proc.poll() is not None:
+            raise RuntimeError(f"ollama serve exited early (code {proc.returncode}):\n{ct_tail('service', 50)}")
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if resp.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(1.5)
+    raise TimeoutError(f"ollama serve not ready after {timeout}s:\n{ct_tail('service', 50)}")
+
 PROCS["service"] = (start_service(), start_service)
-ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/api/version", timeout=120)
-for m in MODELS:
-    print(f"pulling {m} ...", flush=True)
-    subprocess.run(["ollama", "pull", m], env={**os.environ, **OLLAMA_ENV}, check=True,
-                   stdout=subprocess.DEVNULL)
+_wait_ollama_local(timeout=120)
+
+LOCAL_OLLAMA_URL = f"http://127.0.0.1:{SERVICE_PORT}"
+for _m in OLLAMA_PULL_LIST:
+    pull_model_stream(LOCAL_OLLAMA_URL, _m, log_fn=olog, timeout=1800, retries=3)
+
+for _alias_name, _src_model in OLLAMA_ALIASES:
+    copy_model_alias(LOCAL_OLLAMA_URL, _src_model, _alias_name, timeout=60)
+    olog(f"Created model alias: {_alias_name} -> {_src_model}")
+
+_preload_targets = []
+if OLLAMA_PRELOAD_MODE == "all":
+    _preload_targets = list(OLLAMA_MODELS_LIST or [a for a, _ in OLLAMA_ALIASES])
+elif OLLAMA_PRELOAD_MODE != "none":
+    _candidates = list(OLLAMA_MODELS_LIST or [a for a, _ in OLLAMA_ALIASES])
+    if _candidates:
+        _preload_targets = [_candidates[0]]
+
+for _pm in _preload_targets:
+    olog(f"Preloading {_pm} into GPU memory (keep_alive={OLLAMA_ENV.get('OLLAMA_KEEP_ALIVE')}) ...")
+    _preload_res = preload_or_unload_model(
+        LOCAL_OLLAMA_URL,
+        _pm,
+        keep_alive=OLLAMA_ENV.get("OLLAMA_KEEP_ALIVE"),
+        timeout=600,
+    )
+    olog(f"Preloaded {_pm} via {_preload_res['endpoint']}")
+
 print(subprocess.run(["ollama", "list"], env={**os.environ, **OLLAMA_ENV}, capture_output=True, text=True).stdout)
+print(subprocess.run(["ollama", "ps"], env={**os.environ, **OLLAMA_ENV}, capture_output=True, text=True).stdout)
+'''
+
+OLLAMA_CADDY = r'''# @title 3. Auth & compatible API routing -- Caddy (Basic Auth + Bearer + Anthropic X-Api-Key + --compat filter)
+import hashlib, platform
+CADDY_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+
+def start_caddy():
+    if not os.path.exists("/usr/local/bin/caddy"):
+        tag = json.loads(urllib.request.urlopen(
+            "https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=30).read())["tag_name"]
+        tgz = "/tmp/caddy.tgz"
+        with urllib.request.urlopen(f"https://github.com/caddyserver/caddy/releases/download/{tag}/"
+                                    f"caddy_{tag.lstrip('v')}_linux_{CADDY_ARCH}.tar.gz", timeout=60) as src, \
+                open(tgz, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+    cookie_tok = hashlib.sha256(f"ct-cookie-v2:{AUTH_USER}:{AUTH_PASS}:{API_TOKEN}".encode()).hexdigest()
+    hashed = subprocess.check_output(["caddy", "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
+    caddyfile = render_ollama_caddyfile(
+        public_port=PUBLIC_PORT,
+        service_port=SERVICE_PORT,
+        auth_user=AUTH_USER,
+        hashed_pass=hashed,
+        api_token=API_TOKEN,
+        cookie_tok=cookie_tok,
+        compat_apis=OLLAMA_COMPAT,
+        read_only_models=OLLAMA_READ_ONLY_MODELS,
+    )
+    open(f"{WORK}/Caddyfile", "w", encoding="utf-8").write(caddyfile)
+    subprocess.run(["pkill", "-f", "caddy run"], check=False)
+    return ct_spawn("caddy", ["caddy", "run", "--config", f"{WORK}/Caddyfile", "--adapter", "caddyfile"])
+
+AUTH_OK = False
+if AUTH == "caddy":
+    PROCS["caddy"] = (start_caddy(), start_caddy)
+    time.sleep(2)
+    if PROCS["caddy"][0].poll() is not None:
+        raise RuntimeError(f"caddy exited -- is :{PUBLIC_PORT} in use?\n" + ct_tail("caddy"))
+    ct_wait_http(f"http://127.0.0.1:{PUBLIC_PORT}/", timeout=60, ok=lambda c: c == 401)
+    try:
+        urllib.request.urlopen(f"http://127.0.0.1:{PUBLIC_PORT}/", timeout=5)
+    except urllib.error.HTTPError as _e:
+        if _e.headers.get("Set-Cookie"):
+            raise RuntimeError("Caddy leaked Set-Cookie on unauthenticated 401 response!")
+    AUTH_OK = True
+    olog(f"Caddy on :{PUBLIC_PORT} -> 127.0.0.1:{SERVICE_PORT} (Bearer + X-Api-Key + Basic Auth, compat={','.join(OLLAMA_COMPAT)})")
+else:
+    AUTH_OK = True
+    olog(f"auth={AUTH}: targeting :{PUBLIC_PORT} directly")
+'''
+
+OLLAMA_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify Bearer, X-Api-Key, Basic Auth & compatible API policy before CT_READY
+import base64
+
+if "OLLAMA_COMPAT" not in globals() or "service" not in PROCS:
+    raise RuntimeError("Ollama service did not start because an earlier notebook cell failed; see traceback above.")
+
+ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/api/version", timeout=120, ok=lambda c: c == 200)
+
+def _expect_http(url, *, headers=None, method="GET", body=None, expected=401, label="probe"):
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": "Mozilla/5.0", **(headers or {})}, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status != expected:
+                raise RuntimeError(f"{label}: expected HTTP {expected}, got HTTP {resp.status}")
+            return resp
+    except urllib.error.HTTPError as err:
+        if err.code != expected:
+            raise RuntimeError(f"{label}: expected HTTP {expected}, got HTTP {err.code}")
+        return err
+
+def _public_bearer_probe():
+    req = urllib.request.Request(
+        PUBLIC_URL + "/",
+        headers={"Authorization": f"Bearer {API_TOKEN}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.status
+
+def _verify_public_auth():
+    if AUTH != "caddy":
+        return
+    # 1. Unauthenticated request must return 401 without Set-Cookie
+    err_unauth = _expect_http(PUBLIC_URL + "/", expected=401, label="unauthenticated /")
+    if getattr(err_unauth, "headers", None) and err_unauth.headers.get("Set-Cookie"):
+        raise RuntimeError("Public 401 response leaked Set-Cookie")
+    # 2. Invalid Bearer & invalid X-Api-Key must return 401
+    _expect_http(PUBLIC_URL + "/", headers={"Authorization": "Bearer invalid-probe-token"}, expected=401, label="invalid Bearer")
+    _expect_http(PUBLIC_URL + "/", headers={"X-Api-Key": "invalid-probe-token"}, expected=401, label="invalid X-Api-Key")
+    # 3. Valid Anthropic-style X-Api-Key must succeed
+    _expect_http(PUBLIC_URL + "/", headers={"X-Api-Key": API_TOKEN}, expected=200, label="valid X-Api-Key")
+    # 4. Valid Basic Auth must succeed
+    basic = base64.b64encode(f"{AUTH_USER}:{AUTH_PASS}".encode("utf-8")).decode("ascii")
+    _expect_http(PUBLIC_URL + "/", headers={"Authorization": f"Basic {basic}"}, expected=200, label="valid Basic Auth")
+    # 5. Disabled API families & read-only model guard must return 403
+    auth_hdr = {"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"}
+    if "ollama" not in OLLAMA_COMPAT:
+        _expect_http(PUBLIC_URL + "/api/tags", headers=auth_hdr, expected=403, label="disabled ollama /api/tags")
+    elif OLLAMA_READ_ONLY_MODELS:
+        _expect_http(PUBLIC_URL + "/api/pull", headers=auth_hdr, method="POST", body=b"{}", expected=403, label="read-only /api/pull")
+    if "openai" not in OLLAMA_COMPAT:
+        _expect_http(PUBLIC_URL + "/v1/chat/completions", headers=auth_hdr, method="POST", body=b"{}", expected=403, label="disabled openai /v1/chat/completions")
+    if "anthropic" not in OLLAMA_COMPAT:
+        _expect_http(PUBLIC_URL + "/v1/messages", headers={"X-Api-Key": API_TOKEN, "Content-Type": "application/json"},
+                     method="POST", body=b"{}", expected=403, label="disabled anthropic /v1/messages")
+
+ct_public_gate(PUBLIC_URL, _public_bearer_probe, _verify_public_auth, olog, timeout=180)
+if AUTH == "caddy" and not CREDS_FROM_ENV:
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+for _api_name, _detail in compat_endpoints_info(PUBLIC_URL, OLLAMA_COMPAT, read_only_models=OLLAMA_READ_ONLY_MODELS)["interfaces"].items():
+    olog(f"[{_api_name}] base_url={_detail['base_url']} routes={','.join(_detail['endpoints'])}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _ollama_health():
+    if PROCS["service"][0].poll() is not None:
+        return False
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/api/version", timeout=10) as resp:
+        return resp.status == 200
+
+def _ollama_heartbeat(uptime_s):
+    if uptime_s % 600 < 60:
+        states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
+        olog(f"[heartbeat] uptime={uptime_s}s {states} gpu={ct_gpu_stat()}")
+
+ct_watchdog(_ollama_health, start_service, olog, interval=60, grace=300, heartbeat=_ollama_heartbeat)
 '''
 
 # --------------------------------------------------------------------------- unsloth studio (built-in auth)
@@ -2876,9 +3116,13 @@ if __name__ == "__main__":
                    "custom_nodes, user settings, input, and output persist on Google Drive.",
                    COMFYUI_CFG, COMFYUI_SETUP, COMFYUI_SERVICE))
     write(ROOT / "src/colabllm/services/ollama.ipynb",
-          notebook("Ollama", "Ollama API behind Caddy auth (Ollama has no auth of its own). "
-                   "Models: `CT_MODELS` (comma separated, default `qwen2.5:0.5b`).",
-                   OLLAMA_CFG, OLLAMA_SETUP, OLLAMA_SERVICE))
+          notebook("Ollama (Native / OpenAI / Anthropic Compatible)",
+                   "Ollama server behind Caddy auth (Basic Auth + Bearer + Anthropic `x-api-key`), "
+                   "with automatic model download & GPU VRAM warmup (`--models`, `--alias`, `--preload`), "
+                   "selectable or full-open compatible APIs (`--compat all|ollama|openai|anthropic`), "
+                   "and full `OLLAMA_*` server optimization tuning.",
+                   OLLAMA_CFG, OLLAMA_SETUP, OLLAMA_SERVICE,
+                   keepalive=OLLAMA_KEEPALIVE, auth_cell=OLLAMA_CADDY))
     write(ROOT / "src/colabllm/services/unsloth-studio.ipynb",
           notebook("Unsloth Studio", "Based on https://github.com/unslothai/unsloth/blob/main/studio/"
                    "Unsloth_Studio_Colab.ipynb -- built-in login, our own cloudflared (quick or fixed domain).",

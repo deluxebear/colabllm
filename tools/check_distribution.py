@@ -94,6 +94,7 @@ def check(artifact):
         assert run([command, '--version']).startswith('colabllm ')
         assert run([command, 'services']).splitlines() == services
         business = {
+            'ollama': ('endpoints', 'models', 'pull', 'run', 'preload', 'unload', 'cp', 'rm', 'show'),
             'qwen3-tts': ('tts', 'voices', 'design-voice'),
             'indextts': ('tts', 'voices'),
             'comfyui': ('pull-workflow', 'pull-model'),
