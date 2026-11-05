@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-05
+
+### 新增
+
+- 新增 `deepseek-coder` 运行时（G4，`llama-server` Bearer API Key）：部署 `DeepSeek-V4.1-Flash-1017` GSQ-RCO Coder GGUF + Engram 条件记忆表 + `deepseek41v` 视觉投影器，`--context auto` 按实际显存/内存自动规划最大上下文（G4 满血 1M，H100/A100 80G 约 624K，A100 40G 约 320K）并在冷启动显存不足时阶梯回退，Engram 优先常驻主机内存、不足时退回本地 SSD 分页，默认关闭思考并支持按请求开启，提供离线 `plan` 预览子命令。
+- 新增 `qwen-image` 运行时（G4，vLLM-Omni Bearer 认证）：部署 `Qwen/Qwen-Image-2.1`，支持中英双语文生图、1–4 张 `<imageN>` 序号绑定参考图编辑、原生 RGBA 透明通道导出、LoRA 适配器与 Google Drive 图片直接读写，并补充无状态 CORS `OPTIONS` 预检的 ASGI 中间件。
+- 新增 `flux-klein` 运行时（G4，vLLM-Omni Bearer 认证）：部署 `black-forest-labs/flux-3-image-klein`，支持 OpenAI 兼容文生图、1–10 张参考图编辑、LoRA、可选 PUP 提示词扩写与 Google Drive 图片直接读写。
+- `ollama` 运行时：启动时自动拉取 Ollama/HF GGUF 模型与别名并预热显存，`--compat all|ollama|openai|anthropic` 兼容 API 路由（Basic Auth、Bearer、`x-api-key`）与 `--read-only-models` 保护，`OLLAMA_*` 调优参数、`--profile` 预设、`--models-storage ssd|drive`，以及 `endpoints`、`models`、`pull`、`run`、`preload`、`unload`、`cp`、`rm`、`show` 子命令。
+
+### 修复
+
+- `flux-klein`：规范化服务端模型别名，并去除 Drive 子目录重复前缀。
+
+### 文档
+
+- `openjutsu`：统一 H3 片段长度、步数与分辨率调优说明。
+
 ## [0.1.2] - 2026-11-04
 
 ### 新增
