@@ -41,7 +41,8 @@ multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` /
 Also available: `unlimited-ocr` (A100, Caddy auth, persistent Drive OCR jobs),
 `longcat-avatar` (G4, Caddy auth, audio-driven avatar generation with job/download commands),
 `longcat-video` (G4, Caddy auth, Gradio text/image-to-video and continuation UI),
-and `openjutsu` (G4, Caddy auth, co-located ComfyUI + patched `comfy-api-proxy` + Openjutsu Next.js 16 studio for MiniMax H3 motion transfer, object edit, face/colour post-processing & FLUX.3 picture prep; auto `--highvram` on `>=76 GiB` GPUs via `--vram-mode`, local NVMe SSD `h3_chains` bind-mount via `--chains-storage`, and full `swap`/`object`/`mask`/`face`/`color`/`job`/`download`/`cancel`/`check` CLI).
+and `openjutsu` (G4, Caddy auth, co-located ComfyUI + patched `comfy-api-proxy` + Openjutsu Next.js 16 studio for MiniMax H3 motion transfer, object edit, face/colour post-processing & FLUX.3 picture prep; auto `--highvram` on `>=76 GiB` GPUs via `--vram-mode`, local NVMe SSD `h3_chains` bind-mount via `--chains-storage`, and full `swap`/`object`/`mask`/`face`/`color`/`job`/`download`/`cancel`/`check` CLI),
+and `flux-klein` (G4 default, H100/L4 compatible, Bearer API key auth, `black-forest-labs/flux-3-image-klein` BF16/FP8R/NVFP4 via `vllm serve --omni` + optional `flux-3-image-klein-pup` Qwen3.5-9B prompt upsampler, OpenAI-compatible `/v1/images/generations` + `/v1/chat/completions` + `/v1/images/edits` + `/api/ct/edit`, and Drive-native `generate`/`edit`/`upsample`/`ls-drive`/`models` CLI).
 For each runtime's current concrete usage, read `docs/<name>.md`; portable copies are bundled in
 `skills/colabllm/references/<name>.md`.
 

@@ -154,6 +154,20 @@ class MiddlewareImportTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             qwen._prepare_speech_request(json.dumps({"input": "hi", "ref_audio": "file:///etc/passwd"}).encode())
 
+    def test_flux_klein_middleware_rejects_traversal_and_non_drive_urls(self):
+        flux = importlib.import_module("flux_klein_middleware")
+        bad_chat = json.dumps({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "file:///etc/passwd"}},
+        ]}]}).encode()
+        with self.assertRaises(ValueError):
+            flux._rewrite_drive_urls_in_chat_body(bad_chat, is_distilled=True)
+        bad_lora = json.dumps({"prompt": "hi", "lora": {"path": "/etc/passwd"}}).encode()
+        with self.assertRaises(ValueError):
+            flux._prepare_generation_request(bad_lora, is_distilled=True)
+        bad_save = json.dumps({"prompt": "hi", "save_to_drive": "../../escape.png"}).encode()
+        with self.assertRaises(ValueError):
+            flux._prepare_generation_request(bad_save, is_distilled=True)
+
 
 if __name__ == "__main__":
     unittest.main()

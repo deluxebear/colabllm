@@ -3089,7 +3089,540 @@ def _oj_heartbeat(uptime_s):
 ct_watchdog(_oj_health, start_service, olog, interval=60, grace=900, heartbeat=_oj_heartbeat)
 '''
 
+# --------------------------------------------------------------------------- flux-klein (G4 default / H100 / L4, vLLM-Omni FLUX 3 Image Klein T2I + I2I + optional PUP)
+FLUX_KLEIN_CFG = dict(
+    name="flux-klein",
+    service_port=8099,
+    auth="builtin",
+    public_port=8099,
+    health_path="/health",
+    ready_timeout=3600,
+)
+
+FLUX_KLEIN_SETUP = (
+    "# @title 1. Setup -- install vLLM + vLLM-Omni (flux3) & stage FLUX 3 Image Klein on local NVMe SSD\n"
+    "from concurrent.futures import ThreadPoolExecutor\n"
+    "from pathlib import Path\n\n"
+    "FK_SETUP_OK = False\n"
+    "MODEL_REPO = os.environ.get('CT_FLUX_MODEL', 'black-forest-labs/flux-3-image-klein').strip() or 'black-forest-labs/flux-3-image-klein'\n"
+    "VARIANT = os.environ.get('CT_FLUX_VARIANT', 'bf16').strip().lower() or 'bf16'\n"
+    "MODEL_ALIAS = os.environ.get('CT_FLUX_ALIAS', 'flux-3-image-klein').strip() or 'flux-3-image-klein'\n"
+    "LORA_PATH_SPEC = os.environ.get('CT_FLUX_LORA_PATH', '').strip()\n"
+    "LORA_SCALE = os.environ.get('CT_FLUX_LORA_SCALE', '1.0').strip() or '1.0'\n"
+    "FP8_ATTENTION = os.environ.get('CT_FLUX_FP8_ATTENTION', '0').strip() in ('1', 'true', 'True', 'yes')\n"
+    "ENABLE_PUP = os.environ.get('CT_FLUX_ENABLE_PUP', '0').strip() in ('1', 'true', 'True', 'yes')\n"
+    "PUP_REPO = os.environ.get('CT_FLUX_PUP_REPO', 'black-forest-labs/flux-3-image-klein-pup').strip() or 'black-forest-labs/flux-3-image-klein-pup'\n"
+    "PUP_PORT = int(os.environ.get('CT_FLUX_PUP_PORT', '8098'))\n"
+    "PUP_GPU_MEM = float(os.environ.get('CT_FLUX_PUP_GPU_MEM', '0.35'))\n"
+    "VLLM_VERSION = os.environ.get('CT_FLUX_VLLM_VERSION', '0.31.0').strip() or '0.31.0'\n"
+    "VLLM_OMNI_REF = os.environ.get('CT_VLLM_OMNI_REF', '389a02a149ced03a9550368565571fff9d1d99f3').strip() or '389a02a149ced03a9550368565571fff9d1d99f3'\n\n"
+    "FK_WORK = Path('/content/flux-klein')\n"
+    "VENV_DIR = FK_WORK / 'venv'\n"
+    "MODELS_ROOT = FK_WORK / 'model'\n"
+    "MODEL_DIR = MODELS_ROOT / MODEL_REPO.split('/')[-1]\n"
+    "PUP_MODEL_DIR = FK_WORK / 'pup-model'\n"
+    "LOCAL_LORA_DIR = FK_WORK / 'loras'\n"
+    "DRIVE_INPUTS_DIR = Path(DATA_DIR) / 'inputs'\n"
+    "DRIVE_OUTPUTS_DIR = Path(DATA_DIR) / 'outputs'\n"
+    "DRIVE_LORAS_DIR = Path(DATA_DIR) / 'loras'\n\n"
+    "FLASHINFER_DRIVE_DIR = Path(DATA_DIR) / 'flashinfer-cache'\n"
+    "FLASHINFER_CACHE_DIR = FK_WORK / 'flashinfer-cache'\n"
+    "TRITON_DRIVE_DIR = Path(DATA_DIR) / 'triton-cache'\n"
+    "TRITON_CACHE_DIR = FK_WORK / 'triton-cache'\n"
+    "VLLM_DRIVE_DIR = Path(DATA_DIR) / 'vllm-cache'\n"
+    "VLLM_CACHE_DIR = FK_WORK / 'vllm-cache'\n\n"
+    "for _d in (\n"
+    "    FK_WORK, MODELS_ROOT, LOCAL_LORA_DIR,\n"
+    "    DRIVE_INPUTS_DIR, DRIVE_OUTPUTS_DIR, DRIVE_LORAS_DIR,\n"
+    "    FLASHINFER_CACHE_DIR, TRITON_CACHE_DIR, VLLM_CACHE_DIR,\n"
+    "):\n"
+    "    _d.mkdir(parents=True, exist_ok=True)\n\n"
+    "def fklog(msg):\n"
+    "    print(time.strftime('[%F %T] [flux-klein] ') + msg, flush=True)\n\n"
+    + embed_source("FK_WORK", "colab_cache.py", "templates/colab_cache.py")
+    + r"""if str(FK_WORK) not in sys.path:
+    sys.path.insert(0, str(FK_WORK))
+from colab_cache import restore_cache, save_cache
+
+try:
+    _gpu_arch = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], text=True
+    ).strip().splitlines()[0]
+except Exception:
+    _gpu_arch = "90"
+CACHE_KEY = f"vllm-{VLLM_VERSION}-flux3-{VLLM_OMNI_REF[:8]}-sm{_gpu_arch.replace('.', '')}"
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, fklog)
+    except (OSError, ValueError) as _err:
+        fklog(f"Cache restore warning ({_local_c.name}): {_err}; continuing with local SSD cache")
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+fklog(
+    f"GPU detected: {ct_gpu_stat('name,memory.total,compute_cap')} | "
+    f"repo={MODEL_REPO} variant={VARIANT} pup={'on' if ENABLE_PUP else 'off'}"
+)
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def prepare_env():
+    env_log = FK_WORK / "env-setup.log"
+    use_prims_ts = _gpu_arch.startswith("10.") and VARIANT in ("fp8r", "nvfp4")
+    marker = VENV_DIR / f".ct_flux_env_{VLLM_VERSION}_{VLLM_OMNI_REF[:10]}_{int(use_prims_ts)}.ok"
+    vllm_bin = VENV_DIR / "bin" / "vllm"
+    py_bin = VENV_DIR / "bin" / "python"
+    if marker.is_file() and vllm_bin.is_file() and py_bin.is_file():
+        fklog("Reusing existing vLLM-Omni (flux3) virtualenv")
+        return VENV_DIR
+
+    fklog(f"Installing vllm=={VLLM_VERSION} + vllm-omni@{VLLM_OMNI_REF[:10]} (log: {env_log})...")
+    uv_bin = shutil.which("uv") or "uv"
+    run_logged([uv_bin, "venv", "--python", "3.12", str(VENV_DIR), "--clear"], env_log)
+    omni_pkg = (
+        f"vllm-omni[prims-ts] @ git+https://github.com/vllm-project/vllm-omni.git@{VLLM_OMNI_REF}"
+        if use_prims_ts
+        else f"vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@{VLLM_OMNI_REF}"
+    )
+    run_logged(
+        [
+            uv_bin, "pip", "install", "--python", str(py_bin),
+            f"vllm=={VLLM_VERSION}",
+            omni_pkg,
+            "pillow", "huggingface_hub", "hf_xet",
+        ],
+        env_log,
+    )
+    marker.write_text("ok\n", encoding="utf-8")
+    fklog("vLLM-Omni (flux3) virtualenv ready")
+    return VENV_DIR
+
+def _cleanup_hf_temp():
+    for _p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(_p, ignore_errors=True)
+    for _mp in MODELS_ROOT.glob("*/.cache"):
+        shutil.rmtree(_mp, ignore_errors=True)
+    shutil.rmtree(PUP_MODEL_DIR / ".cache", ignore_errors=True)
+
+def prepare_model():
+    dl_log = FK_WORK / "model-download.log"
+    norm_variant = "" if VARIANT in ("", "bf16", "default", "none") else VARIANT
+    ready_stamp = MODEL_DIR / f".ct_model_ready_{norm_variant or 'bf16'}"
+    pup_stamp = PUP_MODEL_DIR / ".ct_pup_ready"
+
+    need_flux = not (
+        ready_stamp.is_file()
+        and (MODEL_DIR / "config.json").is_file()
+        and (MODEL_DIR / "ae.safetensors").is_file()
+    )
+    need_pup = ENABLE_PUP and not (pup_stamp.is_file() and (PUP_MODEL_DIR / "config.json").is_file())
+    if not need_flux and not need_pup:
+        fklog(f"Reusing staged local SSD checkpoint at {MODEL_DIR} (variant={norm_variant or 'bf16'})")
+        return MODEL_DIR
+
+    if need_flux and MODEL_REPO.startswith("black-forest-labs/") and not os.environ.get("HF_TOKEN"):
+        raise RuntimeError(
+            f"{MODEL_REPO} is gated on Hugging Face (FLUX Kommunity License). "
+            f"Accept the license at https://huggingface.co/{MODEL_REPO} and pass `--hf-token hf_...`, "
+            "export `HF_TOKEN`, or save your token to `MyDrive/colab-llm/hf_token.txt`."
+        )
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+    _cleanup_hf_temp()
+    free_gb = shutil.disk_usage("/content").free / 1e9
+    fklog(f"Staging checkpoints onto local SSD (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+
+    dl_script = r'''
+import os, shutil, sys
+from pathlib import Path
+from huggingface_hub import HfApi, snapshot_download
+
+model_repo, model_dir_s, variant, need_flux_s, enable_pup_s, pup_repo, pup_dir_s = sys.argv[1:8]
+model_dir = Path(model_dir_s)
+pup_dir = Path(pup_dir_s)
+token = os.environ.get("HF_TOKEN") or None
+api = HfApi(token=token)
+
+def clean():
+    for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(p, ignore_errors=True)
+    shutil.rmtree(model_dir / ".cache", ignore_errors=True)
+    shutil.rmtree(pup_dir / ".cache", ignore_errors=True)
+
+def download_repo(repo_id, local_dir, allow_patterns=None):
+    try:
+        kwargs = {"repo_id": repo_id, "local_dir": str(local_dir), "token": token, "max_workers": 4}
+        if allow_patterns is not None:
+            kwargs["allow_patterns"] = allow_patterns
+        snapshot_download(**kwargs)
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        if any(k in msg for k in ("401", "403", "GatedRepoError", "restricted", "authorized list")):
+            raise SystemExit(
+                f"Hugging Face gated access denied for {repo_id} ({type(exc).__name__}).\n"
+                f"1) Visit https://huggingface.co/{repo_id} and agree to the FLUX Kommunity License;\n"
+                "2) Ensure HF_TOKEN (or MyDrive/colab-llm/hf_token.txt) belongs to that authorized account, "
+                "and if using a Fine-grained Token, enable 'Read access to contents of all public gated repos you can access'."
+            )
+        raise
+
+if need_flux_s == "1":
+    try:
+        info = api.model_info(model_repo, token=token)
+    except Exception as exc:
+        raise SystemExit(
+            f"Failed to query {model_repo} on Hugging Face ({exc}). "
+            f"Verify HF_TOKEN and gated license access at https://huggingface.co/{model_repo}"
+        )
+    files = {s.rfilename for s in (info.siblings or [])}
+    model_dir.mkdir(parents=True, exist_ok=True)
+    if "ae.safetensors" in files and "config.json" in files:
+        allow = [
+            "config.json", "manifest.json", "modular_model_index.json",
+            "LICENSE*", "NOTICE*", "ae.safetensors", "text_encoder/*",
+        ]
+        if not variant:
+            allow.append("model.safetensors")
+        else:
+            req_cfg = f"variants/{variant}/config.json"
+            if req_cfg not in files:
+                avail = sorted({f.split("/")[1] for f in files if f.startswith("variants/") and f.endswith("/config.json")})
+                raise SystemExit(f"Variant {variant!r} not found in {model_repo}; available variants: {avail}")
+            allow.append(f"variants/{variant}/*")
+        print(f"[dl] Downloading {model_repo} (variant={variant or 'bf16'}) -> {model_dir}", flush=True)
+        download_repo(model_repo, model_dir, allow_patterns=allow)
+    else:
+        print(f"[dl] Downloading full Diffusers checkpoint {model_repo} -> {model_dir}", flush=True)
+        download_repo(model_repo, model_dir)
+    clean()
+    (model_dir / f".ct_model_ready_{variant or 'bf16'}").write_text(f"{model_repo}:{variant or 'bf16'}\n", encoding="utf-8")
+
+if enable_pup_s == "1":
+    pup_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[dl] Downloading prompt upsampler {pup_repo} -> {pup_dir}", flush=True)
+    download_repo(pup_repo, pup_dir)
+    clean()
+    (pup_dir / ".ct_pup_ready").write_text(f"{pup_repo}\n", encoding="utf-8")
+'''
+    try:
+        run_logged(
+            [
+                sys.executable, "-c", dl_script,
+                MODEL_REPO, str(MODEL_DIR), norm_variant,
+                "1" if need_flux else "0",
+                "1" if need_pup else "0",
+                PUP_REPO, str(PUP_MODEL_DIR),
+            ],
+            dl_log,
+            env=dl_env,
+        )
+    finally:
+        _cleanup_hf_temp()
+    fklog(f"Checkpoints staged on local SSD (free SSD: {shutil.disk_usage('/content').free / 1e9:.1f} GB)")
+    return MODEL_DIR
+
+with ThreadPoolExecutor(max_workers=2) as _pool:
+    _f_env = _pool.submit(prepare_env)
+    _f_model = _pool.submit(prepare_model)
+    while not (_f_env.done() and _f_model.done()):
+        for _fut in (_f_env, _f_model):
+            if _fut.done() and _fut.exception():
+                raise _fut.exception()
+        fklog(
+            f"Setup heartbeat | env={'done' if _f_env.done() else 'running'} "
+            f"model={'done' if _f_model.done() else 'running'} | "
+            f"SSD free={shutil.disk_usage('/content').free / 1e9:.1f} GB"
+        )
+        time.sleep(20)
+    _f_env.result()
+    _f_model.result()
+FK_SETUP_OK = True
+fklog("Environment and local SSD model staging complete")
+"""
+)
+
+FLUX_KLEIN_SERVICE = (
+    "# @title 2. Service -- start vLLM-Omni FLUX 3 Image Klein (and optional PUP upsampler) on loopback\n"
+    "if not globals().get('FK_SETUP_OK'):\n"
+    "    raise RuntimeError('FLUX Klein setup cell failed before completing model staging; check HF_TOKEN gated repo access in setup traceback above.')\n"
+    + embed_source("FK_WORK", "colab_asgi_common.py", "templates/colab_asgi_common.py")
+    + embed_source("FK_WORK", "ct_flux_klein_middleware.py", "templates/flux_klein_middleware.py")
+    + r"""import ct_flux_klein_middleware as _fk_mw
+
+PRELOADED_LORA_LOCAL = ""
+if LORA_PATH_SPEC:
+    _staged = _fk_mw.resolve_and_stage_lora(
+        {"path": LORA_PATH_SPEC, "scale": float(LORA_SCALE)},
+        data_dir=Path(DATA_DIR),
+        local_lora_dir=LOCAL_LORA_DIR,
+    )
+    PRELOADED_LORA_LOCAL = _staged["path"]
+    fklog(f"Staged preload LoRA adapter: {PRELOADED_LORA_LOCAL} (scale={LORA_SCALE})")
+
+SERVED_NAMES = list(dict.fromkeys([MODEL_REPO, MODEL_ALIAS, "flux-klein"]))
+
+VLLM_ENV = {
+    "PATH": f"{VENV_DIR}/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
+    "PYTHONPATH": f"{FK_WORK}:{os.environ.get('PYTHONPATH', '')}",
+    "VIRTUAL_ENV": str(VENV_DIR),
+    "VLLM_NO_USAGE_STATS": "1",
+    "DO_NOT_TRACK": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+    "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+    "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
+    "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
+    "CT_API_TOKEN": API_TOKEN,
+    "CT_SERVICE_PORT": str(SERVICE_PORT),
+    "CT_DATA_DIR": str(DATA_DIR),
+    "CT_FLUX_WORK_DIR": str(FK_WORK),
+    "CT_FLUX_MODEL_DIR": str(MODEL_DIR),
+    "CT_FLUX_PUP_MODEL_DIR": str(PUP_MODEL_DIR),
+    "CT_FLUX_LOCAL_LORA_DIR": str(LOCAL_LORA_DIR),
+    "CT_FLUX_MODEL": MODEL_REPO,
+    "CT_FLUX_ALIAS": MODEL_ALIAS,
+    "CT_FLUX_VARIANT": VARIANT,
+    "CT_FLUX_ENABLE_PUP": "1" if ENABLE_PUP else "0",
+    "CT_FLUX_PUP_PORT": str(PUP_PORT),
+    "CT_FLUX_PRELOADED_LORA": PRELOADED_LORA_LOCAL,
+}
+if FP8_ATTENTION:
+    VLLM_ENV.pop("DIFFUSION_ATTENTION_BACKEND", None)
+if _gpu_arch.startswith("12.") and VARIANT in ("fp8r", "nvfp4"):
+    VLLM_ENV["VLLM_DISABLED_KERNELS"] = "FlashInferFP8ScaledMMLinearKernel"
+
+SERVER_ARGS = [
+    str(VENV_DIR / "bin" / "vllm"), "serve", str(MODEL_DIR),
+    "--omni",
+    "--served-model-name", *SERVED_NAMES,
+    "--host", "127.0.0.1",
+    "--port", str(SERVICE_PORT),
+    "--api-key", API_TOKEN,
+    "--allowed-local-media-path", str(FK_WORK),
+    "--middleware", "ct_flux_klein_middleware.FluxKleinMiddleware",
+]
+if VARIANT not in ("", "bf16", "default", "none"):
+    SERVER_ARGS.extend([
+        "--stage-overrides",
+        json.dumps({"0": {"additional_config": {"variant": VARIANT}}}),
+    ])
+if PRELOADED_LORA_LOCAL:
+    SERVER_ARGS.extend(["--lora-path", PRELOADED_LORA_LOCAL, "--lora-scale", str(LORA_SCALE)])
+if FP8_ATTENTION:
+    SERVER_ARGS.extend([
+        "--diffusion-attention-config",
+        '{"default":{"backend":"FLASHINFER_ATTN","quant":{"dtype_qk":"fp8_e4m3"}}}',
+    ])
+
+PUP_ARGS = [
+    str(VENV_DIR / "bin" / "vllm"), "serve", str(PUP_MODEL_DIR),
+    "--served-model-name", "flux-3-image-klein-pup", PUP_REPO,
+    "--host", "127.0.0.1",
+    "--port", str(PUP_PORT),
+    "--api-key", API_TOKEN,
+    "--max-model-len", "16384",
+    "--max-num-seqs", "16",
+    "--gpu-memory-utilization", str(PUP_GPU_MEM),
+    "--reasoning-parser", "qwen3",
+]
+
+# Reclaim GPU VRAM from any leftover workers of an earlier notebook execution on the same VM
+subprocess.run(["pkill", "-f", f"{VENV_DIR}/bin/"], check=False)
+time.sleep(2)
+subprocess.run(["pkill", "-9", "-f", f"{VENV_DIR}/bin/|DiffusionWorker|EngineCore"], check=False)
+time.sleep(1)
+for _stale_log in (f"{WORK}/service.log", f"{WORK}/pup.log"):
+    try:
+        Path(_stale_log).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def start_service():
+    if "service" in PROCS:
+        ct_stop_proc(PROCS["service"][0])
+    subprocess.run(["pkill", "-9", "-f", f"port {SERVICE_PORT}"], check=False)
+    time.sleep(1)
+    fklog(f"Starting vLLM-Omni FLUX 3 server on 127.0.0.1:{SERVICE_PORT} (model={MODEL_REPO}, variant={VARIANT})")
+    return ct_spawn("service", SERVER_ARGS, env=VLLM_ENV, cwd=str(FK_WORK))
+
+def start_pup():
+    if "pup" in PROCS:
+        ct_stop_proc(PROCS["pup"][0])
+    subprocess.run(["pkill", "-9", "-f", f"port {PUP_PORT}"], check=False)
+    time.sleep(1)
+    fklog(f"Starting Prompt Upsampler (PUP) vLLM server on 127.0.0.1:{PUP_PORT}")
+    return ct_spawn("pup", PUP_ARGS, env=VLLM_ENV, cwd=str(FK_WORK))
+
+PROCS["service"] = (start_service(), start_service)
+"""
+)
+
+FLUX_KLEIN_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify auth, run warmup generation, archive JIT kernels & supervise
+if not globals().get("FK_SETUP_OK") or "service" not in PROCS:
+    raise RuntimeError("FLUX Klein service did not start because an earlier notebook cell failed; see traceback above.")
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=30):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url, headers=headers, data=None if payload is None else json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {})
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-token-probe", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+def _abort_startup(msg):
+    for _p, _ in list(PROCS.values()):
+        ct_stop_proc(_p)
+    raise RuntimeError(msg)
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 2400
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        _abort_startup("vLLM-Omni FLUX 3 server exited during startup:\n" + ct_tail("service", 80))
+    try:
+        code_main, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code_main == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 30:
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["starting..."])[-1]
+        fklog(f"Waiting for FLUX 3 init | GPU: {ct_gpu_stat()} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    _abort_startup("Timed out waiting for vLLM-Omni FLUX 3 server:\n" + ct_tail("service", 80))
+
+fklog(f"FLUX 3 server ready on {LOCAL_BASE} | GPU: {ct_gpu_stat()}")
+
+if ENABLE_PUP:
+    PROCS["pup"] = (start_pup(), start_pup)
+    last_notice = 0
+    while time.monotonic() < deadline:
+        if PROCS["service"][0].poll() is not None:
+            _abort_startup("vLLM-Omni FLUX 3 server exited while starting PUP:\n" + ct_tail("service", 80))
+        if PROCS["pup"][0].poll() is not None:
+            _abort_startup("PUP vLLM server exited during startup:\n" + ct_tail("pup", 80))
+        try:
+            code_pup, _ = http_json(f"http://127.0.0.1:{PUP_PORT}/health", API_TOKEN, timeout=10)
+            if code_pup == 200:
+                break
+        except Exception:
+            pass
+        if time.monotonic() - last_notice >= 30:
+            last_line = (ct_tail("pup", 3).strip().splitlines() or ["starting..."])[-1]
+            fklog(f"Waiting for PUP init | GPU: {ct_gpu_stat()} | {last_line[:100]}")
+            last_notice = time.monotonic()
+        time.sleep(5)
+    else:
+        _abort_startup("Timed out waiting for PUP vLLM server:\n" + ct_tail("pup", 80))
+    fklog(f"PUP upsampler ready on 127.0.0.1:{PUP_PORT} | GPU: {ct_gpu_stat()}")
+
+auth_check(LOCAL_BASE, API_TOKEN)
+
+# Fast 2-step 512x512 warmup generation to verify DiT + Qwen3-VL + VAE and populate Triton/FlashInfer caches
+try:
+    w_code, w_body = http_json(
+        LOCAL_BASE + "/v1/images/generations",
+        API_TOKEN,
+        payload={
+            "model": MODEL_ALIAS,
+            "prompt": "a clean minimalist geometric sphere on a soft neutral backdrop",
+            "size": "512x512",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_inference_steps": 2,
+            "seed": 42,
+        },
+        timeout=300,
+    )
+    if w_code == 200 and (w_body.get("data") or [{}])[0].get("b64_json"):
+        fklog("Warmup T2I generation succeeded (512x512, 2 steps)")
+    else:
+        fklog(f"Warmup T2I returned HTTP {w_code}: {str(w_body)[:160]}")
+except Exception as werr:
+    fklog(f"Warmup T2I warning: {werr}")
+
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, fklog)
+    except (OSError, ValueError) as _err:
+        fklog(f"Cache archive save warning ({_local_c.name}): {_err}")
+
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    fklog,
+    timeout=120,
+    interval=8,
+)
+fklog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _fk_healthy():
+    if ENABLE_PUP:
+        if PROCS["pup"][0].poll() is not None:
+            return False
+        if http_json(f"http://127.0.0.1:{PUP_PORT}/health", API_TOKEN, timeout=10)[0] != 200:
+            return False
+    return http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200
+
+ct_watchdog(
+    _fk_healthy,
+    start_service,
+    fklog,
+    dead_markers=("replica-0 is dead", "EngineCore encountered an issue"),
+    heartbeat=lambda up: fklog(f"heartbeat | up={up}s | GPU: {ct_gpu_stat()}"),
+)
+'''
+
 if __name__ == "__main__":
+    write(ROOT / "src/colabllm/services/flux-klein.ipynb",
+          notebook("FLUX 3 Image Klein (G4 / H100 / L4 · vLLM-Omni T2I, Multi-Ref I2I, Drive I/O & PUP)",
+                   "Serves `black-forest-labs/flux-3-image-klein` (BF16 / FP8R / NVFP4, 5.6B DiT + Qwen3-VL-4B text "
+                   "encoder + VAE, 16-step flow-map distillation) on a Colab G4 GPU by default (also compatible with "
+                   "`--gpu H100` and `--gpu L4`) via `vllm serve --omni` with fail-closed Bearer token auth, "
+                   "OpenAI-compatible `/v1/images/generations`, `/v1/chat/completions`, and `/v1/images/edits` / "
+                   "`/api/ct/edit` endpoints, direct Google Drive reference image reading & result persistence, LoRA "
+                   "support, and optional `flux-3-image-klein-pup` prompt upsampling.",
+                   FLUX_KLEIN_CFG, FLUX_KLEIN_SETUP, FLUX_KLEIN_SERVICE,
+                   keepalive=FLUX_KLEIN_KEEPALIVE))
     write(ROOT / "src/colabllm/services/unlimited-ocr.ipynb",
           notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR; official Transformers backend, "
                    "local SSD model and kernels, persistent Drive results, Caddy auth and asynchronous CLI jobs.",

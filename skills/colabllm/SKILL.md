@@ -40,6 +40,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Audio-driven avatar generation | `longcat-avatar` | [LongCat Avatar](references/longcat-avatar.md) |
 | Text/image-to-video and continuation UI | `longcat-video` | [LongCat Video](references/longcat-video.md) |
 | Motion transfer, object/face/color video CLI & UI | `openjutsu` | [Openjutsu](references/openjutsu.md) |
+| Text-to-image, multi-ref image editing & Drive I/O | `flux-klein` | [FLUX 3 Image Klein](references/flux-klein.md) |
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
 

@@ -102,6 +102,7 @@ def check(artifact):
             'unlimited-ocr': ('ocr', 'job', 'resume'),
             'longcat-avatar': ('generate', 'job', 'download'),
             'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),
+            'flux-klein': ('generate', 'edit', 'upsample', 'ls-drive', 'models'),
         }
         for service in services:
             help_text = run([command, service, '--help'])
