@@ -3612,7 +3612,431 @@ ct_watchdog(
 )
 '''
 
+# --------------------------------------------------------------------------- qwen-image (G4 default / H100 / A100, vLLM-Omni Qwen-Image-2.1 T2I + 1-4 Ref RGBA I2I)
+QWEN_IMAGE_CFG = dict(
+    name="qwen-image",
+    service_port=8091,
+    auth="builtin",
+    public_port=8091,
+    health_path="/health",
+    ready_timeout=3600,
+)
+
+QWEN_IMAGE_SETUP = (
+    "# @title 1. Setup -- install vLLM + vLLM-Omni (Qwen-Image-2.1) & stage checkpoint on local NVMe SSD\n"
+    "from concurrent.futures import ThreadPoolExecutor\n"
+    "from pathlib import Path\n\n"
+    "QI_SETUP_OK = False\n"
+    "MODEL_REPO = os.environ.get('CT_QWEN_IMAGE_MODEL', 'Qwen/Qwen-Image-2.1').strip() or 'Qwen/Qwen-Image-2.1'\n"
+    "MODEL_ALIAS = os.environ.get('CT_QWEN_IMAGE_ALIAS', 'qwen-image-2.1').strip() or 'qwen-image-2.1'\n"
+    "QUANTIZATION = os.environ.get('CT_QWEN_IMAGE_QUANTIZATION', 'none').strip().lower() or 'none'\n"
+    "PREFIX_KV_DTYPE = os.environ.get('CT_QWEN_IMAGE_PREFIX_KV_DTYPE', 'auto').strip().lower() or 'auto'\n"
+    "STEP_EXECUTION = os.environ.get('CT_QWEN_IMAGE_STEP_EXECUTION', '0').strip() in ('1', 'true', 'True', 'yes')\n"
+    "VAE_TILING = os.environ.get('CT_QWEN_IMAGE_VAE_TILING', '1').strip() not in ('0', 'false', 'False', 'no')\n"
+    "_raw_mns = os.environ.get('CT_QWEN_IMAGE_MAX_NUM_SEQS', '').strip()\n"
+    "MAX_NUM_SEQS = int(_raw_mns) if _raw_mns else (8 if STEP_EXECUTION else 4)\n"
+    "LORA_PATH_SPEC = os.environ.get('CT_QWEN_IMAGE_LORA_PATH', '').strip()\n"
+    "LORA_SCALE = os.environ.get('CT_QWEN_IMAGE_LORA_SCALE', '1.0').strip() or '1.0'\n"
+    "VLLM_VERSION = os.environ.get('CT_QWEN_IMAGE_VLLM_VERSION', '0.31.0').strip() or '0.31.0'\n"
+    "VLLM_OMNI_REF = os.environ.get('CT_VLLM_OMNI_REF', '389a02a149ced03a9550368565571fff9d1d99f3').strip() or '389a02a149ced03a9550368565571fff9d1d99f3'\n\n"
+    "QI_WORK = Path('/content/qwen-image')\n"
+    "VENV_DIR = QI_WORK / 'venv'\n"
+    "MODELS_ROOT = QI_WORK / 'model'\n"
+    "MODEL_DIR = MODELS_ROOT / MODEL_REPO.split('/')[-1]\n"
+    "LOCAL_LORA_DIR = QI_WORK / 'loras'\n"
+    "DRIVE_INPUTS_DIR = Path(DATA_DIR) / 'inputs'\n"
+    "DRIVE_OUTPUTS_DIR = Path(DATA_DIR) / 'outputs'\n"
+    "DRIVE_LORAS_DIR = Path(DATA_DIR) / 'loras'\n\n"
+    "FLASHINFER_DRIVE_DIR = Path(DATA_DIR) / 'flashinfer-cache'\n"
+    "FLASHINFER_CACHE_DIR = QI_WORK / 'flashinfer-cache'\n"
+    "TRITON_DRIVE_DIR = Path(DATA_DIR) / 'triton-cache'\n"
+    "TRITON_CACHE_DIR = QI_WORK / 'triton-cache'\n"
+    "VLLM_DRIVE_DIR = Path(DATA_DIR) / 'vllm-cache'\n"
+    "VLLM_CACHE_DIR = QI_WORK / 'vllm-cache'\n\n"
+    "for _d in (\n"
+    "    QI_WORK, MODELS_ROOT, LOCAL_LORA_DIR,\n"
+    "    DRIVE_INPUTS_DIR, DRIVE_OUTPUTS_DIR, DRIVE_LORAS_DIR,\n"
+    "    FLASHINFER_CACHE_DIR, TRITON_CACHE_DIR, VLLM_CACHE_DIR,\n"
+    "):\n"
+    "    _d.mkdir(parents=True, exist_ok=True)\n\n"
+    "def qilog(msg):\n"
+    "    print(time.strftime('[%F %T] [qwen-image] ') + msg, flush=True)\n\n"
+    + embed_source("QI_WORK", "colab_cache.py", "templates/colab_cache.py")
+    + r"""if str(QI_WORK) not in sys.path:
+    sys.path.insert(0, str(QI_WORK))
+from colab_cache import restore_cache, save_cache
+
+try:
+    _gpu_arch = subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], text=True
+    ).strip().splitlines()[0]
+except Exception:
+    _gpu_arch = "90"
+CACHE_KEY = f"vllm-{VLLM_VERSION}-qwenimg21-{VLLM_OMNI_REF[:8]}-sm{_gpu_arch.replace('.', '')}"
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_DRIVE_DIR),
+    (TRITON_CACHE_DIR, TRITON_DRIVE_DIR),
+    (VLLM_CACHE_DIR, VLLM_DRIVE_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, qilog)
+    except (OSError, ValueError) as _err:
+        qilog(f"Cache restore warning ({_local_c.name}): {_err}; continuing with local SSD cache")
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+qilog(
+    f"GPU detected: {ct_gpu_stat('name,memory.total,compute_cap')} | "
+    f"repo={MODEL_REPO} quant={QUANTIZATION} step_exec={STEP_EXECUTION} max_seqs={MAX_NUM_SEQS}"
+)
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def prepare_env():
+    env_log = QI_WORK / "env-setup.log"
+    marker = VENV_DIR / f".ct_qwen_img_env_{VLLM_VERSION}_{VLLM_OMNI_REF[:10]}.ok"
+    vllm_bin = VENV_DIR / "bin" / "vllm"
+    py_bin = VENV_DIR / "bin" / "python"
+    if marker.is_file() and vllm_bin.is_file() and py_bin.is_file():
+        qilog("Reusing existing vLLM-Omni (Qwen-Image-2.1) virtualenv")
+        return VENV_DIR
+
+    qilog(f"Installing vllm=={VLLM_VERSION} + vllm-omni@{VLLM_OMNI_REF[:10]} (log: {env_log})...")
+    uv_bin = shutil.which("uv") or "uv"
+    run_logged([uv_bin, "venv", "--python", "3.12", str(VENV_DIR), "--clear"], env_log)
+    run_logged(
+        [
+            uv_bin, "pip", "install", "--python", str(py_bin),
+            f"vllm=={VLLM_VERSION}",
+            f"vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@{VLLM_OMNI_REF}",
+            "pillow", "huggingface_hub", "hf_xet",
+        ],
+        env_log,
+    )
+    marker.write_text("ok\n", encoding="utf-8")
+    qilog("vLLM-Omni (Qwen-Image-2.1) virtualenv ready")
+    return VENV_DIR
+
+def _cleanup_hf_temp():
+    for _p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(_p, ignore_errors=True)
+    for _mp in MODELS_ROOT.glob("*/.cache"):
+        shutil.rmtree(_mp, ignore_errors=True)
+
+def prepare_model():
+    dl_log = QI_WORK / "model-download.log"
+    ready_stamp = MODEL_DIR / ".ct_model_ready"
+    if (
+        ready_stamp.is_file()
+        and (MODEL_DIR / "model_index.json").is_file()
+        and (MODEL_DIR / "vae" / "diffusion_pytorch_model.safetensors").is_file()
+    ):
+        qilog(f"Reusing staged local SSD checkpoint at {MODEL_DIR}")
+        return MODEL_DIR
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+    _cleanup_hf_temp()
+    free_gb = shutil.disk_usage("/content").free / 1e9
+    qilog(f"Staging {MODEL_REPO} (~33.1 GB) onto local SSD (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+
+    dl_script = r'''
+import os, shutil, sys
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+model_repo, model_dir_s = sys.argv[1:3]
+model_dir = Path(model_dir_s)
+token = os.environ.get("HF_TOKEN") or None
+model_dir.mkdir(parents=True, exist_ok=True)
+print(f"[dl] Downloading {model_repo} -> {model_dir}", flush=True)
+snapshot_download(
+    repo_id=model_repo,
+    local_dir=str(model_dir),
+    token=token,
+    max_workers=4,
+    ignore_patterns=["*.md", ".gitattributes"],
+)
+for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+    shutil.rmtree(p, ignore_errors=True)
+shutil.rmtree(model_dir / ".cache", ignore_errors=True)
+(model_dir / ".ct_model_ready").write_text(f"{model_repo}\n", encoding="utf-8")
+'''
+    try:
+        run_logged([sys.executable, "-c", dl_script, MODEL_REPO, str(MODEL_DIR)], dl_log, env=dl_env)
+    finally:
+        _cleanup_hf_temp()
+    qilog(f"Checkpoint staged on local SSD (free SSD: {shutil.disk_usage('/content').free / 1e9:.1f} GB)")
+    return MODEL_DIR
+
+with ThreadPoolExecutor(max_workers=2) as _pool:
+    _f_env = _pool.submit(prepare_env)
+    _f_model = _pool.submit(prepare_model)
+    while not (_f_env.done() and _f_model.done()):
+        for _fut in (_f_env, _f_model):
+            if _fut.done() and _fut.exception():
+                raise _fut.exception()
+        qilog(
+            f"Setup heartbeat | env={'done' if _f_env.done() else 'running'} "
+            f"model={'done' if _f_model.done() else 'running'} | "
+            f"SSD free={shutil.disk_usage('/content').free / 1e9:.1f} GB"
+        )
+        time.sleep(20)
+    _f_env.result()
+    _f_model.result()
+QI_SETUP_OK = True
+qilog("Environment and local SSD model staging complete")
+"""
+)
+
+QWEN_IMAGE_SERVICE = (
+    "# @title 2. Service -- start vLLM-Omni Qwen-Image-2.1 server on loopback\n"
+    "if not globals().get('QI_SETUP_OK'):\n"
+    "    raise RuntimeError('Qwen-Image-2.1 setup cell failed before completing model staging; check setup traceback above.')\n"
+    + embed_source("QI_WORK", "colab_asgi_common.py", "templates/colab_asgi_common.py")
+    + embed_source("QI_WORK", "ct_qwen_image_middleware.py", "templates/qwen_image_middleware.py")
+    + r"""import ct_qwen_image_middleware as _qi_mw
+
+PRELOADED_LORA_LOCAL = ""
+if LORA_PATH_SPEC:
+    _staged = _qi_mw.resolve_and_stage_lora(
+        {"path": LORA_PATH_SPEC, "scale": float(LORA_SCALE)},
+        data_dir=Path(DATA_DIR),
+        local_lora_dir=LOCAL_LORA_DIR,
+    )
+    PRELOADED_LORA_LOCAL = _staged["path"]
+    qilog(f"Staged preload LoRA adapter: {PRELOADED_LORA_LOCAL} (scale={LORA_SCALE})")
+
+SERVED_NAMES = list(dict.fromkeys([MODEL_REPO, MODEL_ALIAS, "qwen-image", "qwen-image-2.1"]))
+
+VLLM_ENV = {
+    "PATH": f"{VENV_DIR}/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
+    "PYTHONPATH": f"{QI_WORK}:{os.environ.get('PYTHONPATH', '')}",
+    "VIRTUAL_ENV": str(VENV_DIR),
+    "VLLM_NO_USAGE_STATS": "1",
+    "DO_NOT_TRACK": "1",
+    "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+    "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+    "VLLM_CACHE_ROOT": str(VLLM_CACHE_DIR),
+    "TORCHINDUCTOR_CACHE_DIR": str(VLLM_CACHE_DIR / "inductor"),
+    "CT_API_TOKEN": API_TOKEN,
+    "CT_SERVICE_PORT": str(SERVICE_PORT),
+    "CT_DATA_DIR": str(DATA_DIR),
+    "CT_QWEN_IMAGE_WORK_DIR": str(QI_WORK),
+    "CT_QWEN_IMAGE_MODEL_DIR": str(MODEL_DIR),
+    "CT_QWEN_IMAGE_LOCAL_LORA_DIR": str(LOCAL_LORA_DIR),
+    "CT_QWEN_IMAGE_MODEL": MODEL_REPO,
+    "CT_QWEN_IMAGE_ALIAS": MODEL_ALIAS,
+    "CT_QWEN_IMAGE_QUANTIZATION": QUANTIZATION,
+    "CT_QWEN_IMAGE_PREFIX_KV_DTYPE": PREFIX_KV_DTYPE,
+    "CT_QWEN_IMAGE_STEP_EXECUTION": "1" if STEP_EXECUTION else "0",
+    "CT_QWEN_IMAGE_VAE_TILING": "1" if VAE_TILING else "0",
+    "CT_QWEN_IMAGE_MAX_NUM_SEQS": str(MAX_NUM_SEQS),
+    "CT_QWEN_IMAGE_PRELOADED_LORA": PRELOADED_LORA_LOCAL,
+}
+if _gpu_arch.startswith("12.") and QUANTIZATION != "none":
+    VLLM_ENV["VLLM_DISABLED_KERNELS"] = "FlashInferFP8ScaledMMLinearKernel"
+
+SERVER_ARGS = [
+    str(VENV_DIR / "bin" / "vllm"), "serve", str(MODEL_DIR),
+    "--omni",
+    "--served-model-name", *SERVED_NAMES,
+    "--host", "127.0.0.1",
+    "--port", str(SERVICE_PORT),
+    "--api-key", API_TOKEN,
+    "--max-num-seqs", str(MAX_NUM_SEQS),
+    "--allowed-local-media-path", str(QI_WORK),
+    "--middleware", "ct_qwen_image_middleware.QwenImageMiddleware",
+]
+if VAE_TILING:
+    SERVER_ARGS.append("--vae-use-tiling")
+if STEP_EXECUTION:
+    SERVER_ARGS.append("--step-execution")
+
+if QUANTIZATION == "fp8":
+    SERVER_ARGS.extend([
+        "--diffusion-quantization-config",
+        json.dumps({"transformer": {"method": "fp8", "ignored_layers": ["img_mlp"]}}),
+    ])
+elif QUANTIZATION == "fp8-text":
+    SERVER_ARGS.extend([
+        "--diffusion-quantization-config",
+        json.dumps({"text_encoder": {"method": "fp8"}}),
+    ])
+elif QUANTIZATION == "fp8-all":
+    SERVER_ARGS.extend([
+        "--diffusion-quantization-config",
+        json.dumps({
+            "transformer": {"method": "fp8", "ignored_layers": ["img_mlp"]},
+            "text_encoder": {"method": "fp8"},
+        }),
+    ])
+
+if PREFIX_KV_DTYPE in ("fp8_v", "fp8"):
+    SERVER_ARGS.extend([
+        "--stage-overrides",
+        json.dumps({"0": {"extras": {"prefix_kv_cache_dtype": PREFIX_KV_DTYPE}}}),
+    ])
+
+if PRELOADED_LORA_LOCAL:
+    SERVER_ARGS.extend(["--lora-path", PRELOADED_LORA_LOCAL, "--lora-scale", str(LORA_SCALE)])
+
+# Reclaim GPU VRAM from any leftover workers of an earlier notebook execution on the same VM
+subprocess.run(["pkill", "-f", f"{VENV_DIR}/bin/"], check=False)
+time.sleep(2)
+subprocess.run(["pkill", "-9", "-f", f"{VENV_DIR}/bin/|DiffusionWorker|EngineCore"], check=False)
+time.sleep(1)
+try:
+    Path(f"{WORK}/service.log").unlink(missing_ok=True)
+except OSError:
+    pass
+
+def start_service():
+    if "service" in PROCS:
+        ct_stop_proc(PROCS["service"][0])
+    subprocess.run(["pkill", "-9", "-f", f"port {SERVICE_PORT}"], check=False)
+    time.sleep(1)
+    qilog(
+        f"Starting vLLM-Omni Qwen-Image-2.1 server on 127.0.0.1:{SERVICE_PORT} "
+        f"(model={MODEL_REPO}, quant={QUANTIZATION}, step_exec={STEP_EXECUTION})"
+    )
+    return ct_spawn("service", SERVER_ARGS, env=VLLM_ENV, cwd=str(QI_WORK))
+
+PROCS["service"] = (start_service(), start_service)
+"""
+)
+
+QWEN_IMAGE_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify auth, run warmup generation, archive JIT kernels & supervise
+if not globals().get("QI_SETUP_OK") or "service" not in PROCS:
+    raise RuntimeError("Qwen-Image-2.1 service did not start because an earlier notebook cell failed; see traceback above.")
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=30):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url, headers=headers, data=None if payload is None else json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {})
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-token-probe", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+def _abort_startup(msg):
+    for _p, _ in list(PROCS.values()):
+        ct_stop_proc(_p)
+    raise RuntimeError(msg)
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 2400
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        _abort_startup("vLLM-Omni Qwen-Image-2.1 server exited during startup:\n" + ct_tail("service", 80))
+    try:
+        code_main, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code_main == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 30:
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["starting..."])[-1]
+        qilog(f"Waiting for Qwen-Image-2.1 init | GPU: {ct_gpu_stat()} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    _abort_startup("Timed out waiting for vLLM-Omni Qwen-Image-2.1 server:\n" + ct_tail("service", 80))
+
+qilog(f"Qwen-Image-2.1 server ready on {LOCAL_BASE} | GPU: {ct_gpu_stat()}")
+auth_check(LOCAL_BASE, API_TOKEN)
+
+# Fast 2-step 512x512 warmup generation to verify DiT + Qwen3-VL-8B + 4ch RGBA VAE and populate JIT caches
+try:
+    w_code, w_body = http_json(
+        LOCAL_BASE + "/v1/images/generations",
+        API_TOKEN,
+        payload={
+            "model": MODEL_REPO,
+            "prompt": "a ceramic teapot on a wooden table, soft window light",
+            "size": "512x512",
+            "n": 1,
+            "response_format": "b64_json",
+            "num_inference_steps": 2,
+            "true_cfg_scale": 1.0,
+            "seed": 42,
+        },
+        timeout=300,
+    )
+    if w_code == 200 and (w_body.get("data") or [{}])[0].get("b64_json"):
+        qilog("Warmup T2I generation succeeded (512x512, 2 steps, true_cfg_scale=1.0)")
+    else:
+        qilog(f"Warmup T2I returned HTTP {w_code}: {str(w_body)[:160]}")
+except Exception as werr:
+    qilog(f"Warmup T2I warning: {werr}")
+
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, qilog)
+    except (OSError, ValueError) as _err:
+        qilog(f"Cache archive save warning ({_local_c.name}): {_err}")
+
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    qilog,
+    timeout=120,
+    interval=8,
+)
+qilog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    qilog,
+    dead_markers=("replica-0 is dead", "EngineCore encountered an issue"),
+    heartbeat=lambda up: qilog(f"heartbeat | up={up}s | GPU: {ct_gpu_stat()}"),
+)
+'''
+
 if __name__ == "__main__":
+    write(ROOT / "src/colabllm/services/qwen-image.ipynb",
+          notebook("Qwen-Image-2.1 (G4 / H100 / A100 · vLLM-Omni T2I, 1-4 Ref RGBA I2I & Drive I/O)",
+                   "Serves `Qwen/Qwen-Image-2.1` (7.1B single-stream DiT with cross-step prefix KV cache + "
+                   "Qwen3-VL-8B vision-language encoder + 16x 4-channel RGBA VAE) on a Colab G4 GPU by default "
+                   "(also compatible with `--gpu H100` and `--gpu A100 --quantization fp8-all`) via `vllm serve --omni` "
+                   "with fail-closed Bearer token auth, CORS preflight support, OpenAI-compatible `/v1/images/generations`, "
+                   "`/v1/images/edits`, `/api/ct/edit`, and `/v1/chat/completions`, 1–4 `<image1>..<image4>` reference "
+                   "images, RGBA transparency, direct Google Drive reference image reading & output persistence, and LoRA.",
+                   QWEN_IMAGE_CFG, QWEN_IMAGE_SETUP, QWEN_IMAGE_SERVICE,
+                   keepalive=QWEN_IMAGE_KEEPALIVE))
     write(ROOT / "src/colabllm/services/flux-klein.ipynb",
           notebook("FLUX 3 Image Klein (G4 / H100 / L4 · vLLM-Omni T2I, Multi-Ref I2I, Drive I/O & PUP)",
                    "Serves `black-forest-labs/flux-3-image-klein` (BF16 / FP8R / NVFP4, 5.6B DiT + Qwen3-VL-4B text "

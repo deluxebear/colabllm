@@ -103,6 +103,7 @@ def check(artifact):
             'longcat-avatar': ('generate', 'job', 'download'),
             'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),
             'flux-klein': ('generate', 'edit', 'upsample', 'ls-drive', 'models'),
+            'qwen-image': ('generate', 'edit', 'ls-drive', 'models'),
         }
         for service in services:
             help_text = run([command, service, '--help'])
