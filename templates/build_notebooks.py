@@ -4026,7 +4026,333 @@ ct_watchdog(
 )
 '''
 
+# --------------------------------------------------------------------------- deepseek-coder (G4/H100/A100, llama.cpp DSV4.1 + Engram SSD mmap + Vision)
+DEEPSEEK_CODER_CFG = dict(name="deepseek-coder", service_port=8001, auth="builtin", public_port=8001,
+                          health_path="/health", ready_timeout=5400)
+
+DEEPSEEK_CODER_SETUP = (
+    r'''# @title 1. Setup -- parallel llama.cpp CUDA build/cache + 183.7 GB Coder GGUF + Engram shard-6 symlink + hardware-max context plan
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+DS_WORK = Path(os.environ.get("CT_DS_WORK_DIR", "/content/deepseek-coder"))
+DS_WORK.mkdir(parents=True, exist_ok=True)
+(DS_WORK / "deepseek_coder_runtime.py").write_text('''
+    + repr((ROOT / "src/colabllm/lib/deepseek_coder_runtime.py").read_text())
+    + r''', encoding="utf-8")
+if str(DS_WORK) not in sys.path:
+    sys.path.insert(0, str(DS_WORK))
+
+from deepseek_coder_runtime import (
+    DEFAULT_ALIAS,
+    DEFAULT_LLAMA_COMMIT,
+    DEFAULT_LLAMA_REPO,
+    DEFAULT_QUANT,
+    DEFAULT_REPO,
+    build_server_args,
+    detect_gpu_info,
+    detect_host_ram_mib,
+    evict_gguf_page_cache,
+    looks_like_oom,
+    plan_hardware_config,
+    prepare_llama_runtime,
+    prepare_patched_chat_template,
+    should_evict_page_cache,
+    stage_model_and_projector,
+    write_json_atomic,
+)
+
+def dslog(msg):
+    print(time.strftime("[%F %T] [deepseek-coder] ") + msg, flush=True)
+
+if MOUNT_DRIVE and not Path("/content/drive/MyDrive").is_dir():
+    raise RuntimeError("Drive is not mounted. Run via `colabllm deepseek-coder up`.")
+
+DS_SERVICE_DIR = Path(DATA_DIR)
+DS_SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+DS_DRIVE_BACKUP_ROOT = (
+    Path("/content/drive/MyDrive/models") if (MOUNT_DRIVE and Path("/content/drive/MyDrive").is_dir()) else None
+)
+DS_RUNTIME_CACHE = DS_SERVICE_DIR / "runtime-cache"
+
+DS_CFG = {
+    "repo": os.environ.get("CT_DS_REPO", DEFAULT_REPO),
+    "quant": os.environ.get("CT_DS_QUANT", DEFAULT_QUANT),
+    "alias": os.environ.get("CT_DS_ALIAS", DEFAULT_ALIAS),
+    "context": os.environ.get("CT_DS_CONTEXT", "auto"),
+    "parallel": int(os.environ.get("CT_DS_PARALLEL", "1")),
+    "cache_type": os.environ.get("CT_DS_CACHE_TYPE", "f16"),
+    "batch": int(os.environ.get("CT_DS_BATCH", "4096")),
+    "ubatch": os.environ.get("CT_DS_UBATCH", "auto"),
+    "cpu_moe": os.environ.get("CT_DS_CPU_MOE", "auto"),
+    "reasoning": os.environ.get("CT_DS_REASONING", "off"),
+    "reasoning_effort": os.environ.get("CT_DS_REASONING_EFFORT", ""),
+    "enable_vision": os.environ.get("CT_DS_VISION", "1") != "0",
+    "llama_repo": os.environ.get("CT_LLAMA_REPO", DEFAULT_LLAMA_REPO),
+    "llama_commit": os.environ.get("CT_LLAMA_COMMIT", DEFAULT_LLAMA_COMMIT),
+}
+
+DS_GPU = detect_gpu_info()
+DS_RAM_MIB = detect_host_ram_mib()
+HW_PLAN = plan_hardware_config(
+    vram_mib=DS_GPU["vram_mib"],
+    ram_mib=DS_RAM_MIB,
+    requested_context=DS_CFG["context"],
+    parallel=DS_CFG["parallel"],
+    cache_type=DS_CFG["cache_type"],
+    enable_vision=DS_CFG["enable_vision"],
+    batch=DS_CFG["batch"],
+    requested_ubatch=DS_CFG["ubatch"],
+    requested_cpu_moe=DS_CFG["cpu_moe"],
+)
+dslog(
+    f"Hardware plan: gpu={DS_GPU['name']} ({DS_GPU['vram_mib']} MiB VRAM, sm_{DS_GPU['cuda_arch'] or 'cpu'}) "
+    f"ram={DS_RAM_MIB} MiB -> mode={HW_PLAN['mode']} context={HW_PLAN['context']} "
+    f"(kv={HW_PLAN['kv_cache_mib']} MiB, ubatch={HW_PLAN['ubatch']}, n_cpu_moe={HW_PLAN['n_cpu_moe']}, "
+    f"engram_in_ram={HW_PLAN['engram_in_ram']})"
+)
+
+with ThreadPoolExecutor(max_workers=2) as _pool:
+    _f_runtime = _pool.submit(
+        prepare_llama_runtime,
+        work_dir=DS_WORK,
+        cache_root=DS_RUNTIME_CACHE,
+        llama_repo=DS_CFG["llama_repo"],
+        llama_commit=DS_CFG["llama_commit"],
+        gpu_info=DS_GPU,
+        log=dslog,
+    )
+    _f_model = _pool.submit(
+        stage_model_and_projector,
+        repo=DS_CFG["repo"],
+        quant=DS_CFG["quant"],
+        enable_vision=DS_CFG["enable_vision"],
+        service_dir=DS_SERVICE_DIR,
+        work_dir=DS_WORK,
+        drive_backup_root=DS_DRIVE_BACKUP_ROOT,
+        log=dslog,
+    )
+    while not (_f_runtime.done() and _f_model.done()):
+        for _fut in (_f_runtime, _f_model):
+            if _fut.done() and _fut.exception():
+                raise _fut.exception()
+        _free_gb = shutil.disk_usage(DS_WORK).free / 1e9
+        dslog(
+            f"Setup heartbeat | runtime={'done' if _f_runtime.done() else 'running'} "
+            f"model={'done' if _f_model.done() else 'running'} | free_ssd={_free_gb:.1f} GB"
+        )
+        time.sleep(30)
+    BIN_DIR, LLAMA_ENV, _ = _f_runtime.result()
+    MODEL_PATH, PROJECTOR_PATH = _f_model.result()
+
+CHAT_TEMPLATE_PATH = prepare_patched_chat_template(MODEL_PATH, DS_WORK / "chat_template.jinja")
+dslog(f"Setup complete: model={MODEL_PATH} projector={PROJECTOR_PATH} chat_template={CHAT_TEMPLATE_PATH}")
+'''
+)
+
+DEEPSEEK_CODER_SERVICE = r'''# @title 2. Service -- llama-server on 127.0.0.1 (Engram host-RAM or SSD lazy read, hardware-max context, --api-key-file)
+KEY_FILE = DS_WORK / "api_key.txt"
+KEY_FILE.write_text(API_TOKEN + "\n", encoding="utf-8")
+KEY_FILE.chmod(0o600)
+SPAWN_LOG_OFFSET = 0
+
+def start_service():
+    global SPAWN_LOG_OFFSET
+    subprocess.run(["pkill", "-f", str(BIN_DIR / "llama-server")], check=False, timeout=15)
+    args = build_server_args(
+        server_bin=BIN_DIR / "llama-server",
+        model_path=MODEL_PATH,
+        alias=DS_CFG["alias"],
+        port=SERVICE_PORT,
+        key_file=KEY_FILE,
+        plan=HW_PLAN,
+        projector_path=PROJECTOR_PATH,
+        chat_template_file=CHAT_TEMPLATE_PATH,
+        reasoning=DS_CFG["reasoning"],
+        reasoning_effort=DS_CFG["reasoning_effort"],
+    )
+    SPAWN_LOG_OFFSET = ct_log_size("llama-server")
+    engram_loc = "host-ram" if HW_PLAN.get("engram_in_ram") else "ssd-lazy"
+    dslog(
+        f"Starting llama-server on 127.0.0.1:{SERVICE_PORT} | ctx={HW_PLAN['context']} "
+        f"mode={HW_PLAN['mode']} engram={engram_loc} kv={HW_PLAN['cache_type']} "
+        f"batch={HW_PLAN['batch']}/{HW_PLAN['ubatch']} reasoning={DS_CFG['reasoning']}"
+    )
+    return ct_spawn("llama-server", args, env=LLAMA_ENV)
+
+PROCS["service"] = (start_service(), start_service)
+'''
+
+DEEPSEEK_CODER_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- auto-stepdown on OOM, verify auth/context/vision, smoke completion & supervise
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=15):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url,
+        headers=headers,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-deployment-test-key", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Authentication test failed on {base}: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+ladder = list(HW_PLAN.get("context_ladder") or [HW_PLAN["context"]])
+ub_ladder = list(HW_PLAN.get("ubatch_ladder") or [HW_PLAN["ubatch"]])
+rung_idx = 0
+ub_idx = 0
+deadline = time.monotonic() + 2400
+last_notice = 0.0
+
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        recent_log = ct_log_since("llama-server", SPAWN_LOG_OFFSET)
+        if looks_like_oom(recent_log) and ub_idx + 1 < len(ub_ladder):
+            # Prefer a smaller micro-batch (slower prefill) over a smaller context window
+            ub_idx += 1
+            prev_ub = HW_PLAN["ubatch"]
+            HW_PLAN["ubatch"] = ub_ladder[ub_idx]
+            dslog(f"Startup OOM at ubatch={prev_ub}; stepping down to ubatch={HW_PLAN['ubatch']} and retrying")
+            PROCS["service"] = (start_service(), start_service)
+            continue
+        if HW_PLAN.get("context_auto") and rung_idx + 1 < len(ladder) and looks_like_oom(recent_log):
+            rung_idx += 1
+            prev_ctx = HW_PLAN["context"]
+            HW_PLAN["context"] = ladder[rung_idx]
+            dslog(f"Startup OOM at ctx={prev_ctx}; stepping down to ctx={HW_PLAN['context']} and retrying")
+            PROCS["service"] = (start_service(), start_service)
+            continue
+        raise RuntimeError("llama-server exited during load:\n" + ct_tail("llama-server", 60))
+    try:
+        if http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200:
+            break
+    except (OSError, ValueError):
+        pass
+    if time.monotonic() - last_notice > 45:
+        dslog(f"Waiting for model load / warmup (ctx={HW_PLAN['context']}) | GPU: {ct_gpu_stat()}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    raise RuntimeError("Model load timeout:\n" + ct_tail("llama-server", 60))
+
+if should_evict_page_cache(HW_PLAN):
+    evict_gguf_page_cache(MODEL_PATH.parent, keep_engram=not HW_PLAN.get("engram_in_ram", False), log=dslog)
+
+auth_check(LOCAL_BASE, API_TOKEN)
+code, props = http_json(LOCAL_BASE + "/props", API_TOKEN, timeout=20)
+allocated = (props.get("default_generation_settings") or {}).get("n_ctx")
+if code != 200 or allocated != HW_PLAN["context"]:
+    raise RuntimeError(f"Allocated context ({allocated}) differs from target ({HW_PLAN['context']})")
+vision_enabled = bool((props.get("modalities") or {}).get("vision", False))
+if PROJECTOR_PATH is not None and not vision_enabled:
+    raise RuntimeError("Vision projector configured but server does not advertise vision")
+dslog(
+    f"Local verified: auth=401/401/200, n_ctx={allocated}, vision={vision_enabled}, "
+    f"mode={HW_PLAN['mode']}, engram_in_ram={HW_PLAN['engram_in_ram']}"
+)
+
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    dslog,
+    timeout=180,
+    interval=8,
+)
+smoke_payload = {
+    "model": DS_CFG["alias"],
+    "messages": [{"role": "user", "content": "Reply with the exact token OK"}],
+    "max_tokens": 32,
+    "temperature": 0,
+}
+if DS_CFG["reasoning"] != "off":
+    smoke_payload["chat_template_kwargs"] = {"enable_thinking": False}
+code, resp = http_json(
+    PUBLIC_URL + "/v1/chat/completions",
+    API_TOKEN,
+    smoke_payload,
+    timeout=240,
+)
+if code != 200:
+    raise RuntimeError(f"Public smoke completion failed: HTTP {code}")
+msg_obj = ((resp.get("choices") or [{}])[0].get("message") or {})
+reply = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
+dslog(f"PUBLIC VERIFIED: {PUBLIC_URL}/v1 | n_ctx={allocated} | reply={reply.strip()[:60]!r}")
+
+ver_rec = {
+    "service": SERVICE,
+    "verified_at": time.strftime("%FT%T%z"),
+    "base_url": PUBLIC_URL + "/v1",
+    "repo": DS_CFG["repo"],
+    "alias": DS_CFG["alias"],
+    "mode": HW_PLAN["mode"],
+    "n_cpu_moe": HW_PLAN["n_cpu_moe"],
+    "engram_in_ram": HW_PLAN["engram_in_ram"],
+    "default_reasoning": DS_CFG["reasoning"],
+    "context_allocated": allocated,
+    "vision_enabled": vision_enabled,
+    "reply": reply[:120],
+}
+write_json_atomic(DS_SERVICE_DIR / "last-verification.json", ver_rec)
+
+print(f"{SERVICE} is up: {PUBLIC_URL} (n_ctx={allocated}, mode={HW_PLAN['mode']})")
+print("CT_READY", flush=True)
+
+def ds_heartbeat(uptime):
+    gpu_mem = ct_gpu_stat("memory.used,memory.total,utilization.gpu")
+    try:
+        write_json_atomic(
+            DS_SERVICE_DIR / "last-status.json",
+            {
+                "service": SERVICE,
+                "kernel_pid": os.getpid(),
+                "server_pid": PROCS["service"][0].pid,
+                "tunnel_pid": PROCS[TUNNEL_PROCESS_KEY][0].pid,
+                "context": HW_PLAN["context"],
+                "mode": HW_PLAN["mode"],
+                "engram_in_ram": HW_PLAN["engram_in_ram"],
+                "alias": DS_CFG["alias"],
+                "url": PUBLIC_URL + "/v1",
+                "updated_at": time.strftime("%FT%T%z"),
+                "uptime_sec": uptime,
+                "gpu_memory": gpu_mem,
+            },
+        )
+    except OSError:
+        pass
+    dslog(f"heartbeat | up={uptime}s | n_ctx={HW_PLAN['context']} | GPU: {gpu_mem}")
+
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    dslog,
+    log_name="llama-server",
+    heartbeat=ds_heartbeat,
+)
+'''
+
 if __name__ == "__main__":
+    write(ROOT / "src/colabllm/services/deepseek-coder.ipynb",
+          notebook("DeepSeek-V4.1-Flash-1017 Uncensored GSQ-RCO Coder (G4 / H100 / A100 · Auto Max Context up to 1M + Vision)",
+                   "Serves `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` (50% expert-pruned 192-expert "
+                   "`IQ2_XXS` MoE trunk, 72.1 GB + 110.6 GB `IQ4_NL` Engram lookup table + BF16 `deepseek41v` vision "
+                   "projector) via `llama-server --api-key-file` on a Colab G4 GPU by default (100% GPU offload + full "
+                   "1,048,576 native 1M context + 100% DDR5 RAM-resident Engram + default `--reasoning off` with "
+                   "per-request API thinking control), and automatic SSD lazy fallback on lower-RAM GPUs.",
+                   DEEPSEEK_CODER_CFG, DEEPSEEK_CODER_SETUP, DEEPSEEK_CODER_SERVICE,
+                   keepalive=DEEPSEEK_CODER_KEEPALIVE))
     write(ROOT / "src/colabllm/services/qwen-image.ipynb",
           notebook("Qwen-Image-2.1 (G4 / H100 / A100 · vLLM-Omni T2I, 1-4 Ref RGBA I2I & Drive I/O)",
                    "Serves `Qwen/Qwen-Image-2.1` (7.1B single-stream DiT with cross-step prefix KV cache + "

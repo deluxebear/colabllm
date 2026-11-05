@@ -32,6 +32,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Task | Runtime | Reference to read |
 | --- | --- | --- |
 | OpenAI-compatible LLM / vision | `qwen-flash` | [Qwen Flash](references/qwen-flash.md) |
+| DeepSeek-V4.1-Flash Coder (auto max context up to 1M + vision) | `deepseek-coder` | [DeepSeek Coder](references/deepseek-coder.md) |
 | Ollama models, OpenAI/Anthropic/native APIs & tuning | `ollama` | [Ollama](references/ollama.md) |
 | PDF/image files or directories to Markdown | `unlimited-ocr` | [Unlimited-OCR](references/unlimited-ocr.md) |
 | Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |

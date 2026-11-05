@@ -182,6 +182,23 @@ class MiddlewareImportTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             qwen_img._prepare_generation_request(bad_save)
 
+    def test_deepseek_coder_notebook_embeds_runtime_and_loopback_auth(self):
+        ds_rt = importlib.import_module("deepseek_coder_runtime")
+        plan = ds_rt.plan_hardware_config(vram_mib=97_887, ram_mib=180_224)
+        args = ds_rt.build_server_args(
+            server_bin="/tmp/llama-server",
+            model_path="/tmp/m.gguf",
+            alias="deepseek-v4.1-flash-coder",
+            port=8001,
+            key_file="/tmp/keys.txt",
+            plan=plan,
+        )
+        self.assertIn("127.0.0.1", args)
+        self.assertIn("--api-key-file", args)
+        nb = (ROOT / "src/colabllm/services/deepseek-coder.ipynb").read_text(encoding="utf-8")
+        self.assertIn("deepseek_coder_runtime.py", nb)
+        self.assertIn("per_layer_token_embd.weight=CPU", nb)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -72,8 +72,16 @@ class RepoHygieneTest(unittest.TestCase):
         ollama.prepare_up(types.SimpleNamespace(models=None))
         self.assertEqual(ollama.SERVICE.env, baseline)
 
+        deepseek = load_service("deepseek-coder")
+        ds_baseline = dict(deepseek.SERVICE.env)
+        deepseek.prepare_up(types.SimpleNamespace(up_CT_DS_CONTEXT="524288", up_no_vision=True))
+        self.assertEqual(deepseek.SERVICE.env["CT_DS_CONTEXT"], "524288")
+        self.assertEqual(deepseek.SERVICE.env["CT_DS_VISION"], "0")
+        deepseek.prepare_up(types.SimpleNamespace())
+        self.assertEqual(deepseek.SERVICE.env, ds_baseline)
+
     def test_service_default_hostnames_are_short_aliases(self):
-        for name in ("qwen-flash", "nemotron-transcribe", "indextts", "qwen3-tts"):
+        for name in ("qwen-flash", "deepseek-coder", "nemotron-transcribe", "indextts", "qwen3-tts"):
             alias = load_service(name).SERVICE.default_hostname
             self.assertTrue(alias and "." not in alias, (name, alias))
 
