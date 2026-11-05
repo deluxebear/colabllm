@@ -154,10 +154,24 @@ def resolve_drive_path(
         candidates.append(drive_root / clean)
     elif clean == "MyDrive":
         candidates.append(mydrive_root)
+    elif clean.startswith("colab-llm/") and mydrive_root.is_dir():
+        candidates.append(mydrive_root / clean)
+        candidates.append(data_dir / clean)
     else:
-        if default_subdir:
+        first_seg = clean.split("/", 1)[0]
+        already_prefixed = bool(
+            default_subdir
+            and (
+                clean == default_subdir
+                or clean.startswith(f"{default_subdir}/")
+                or (first_seg != clean and (data_dir / first_seg).is_dir())
+            )
+        )
+        if default_subdir and not already_prefixed:
             candidates.append(data_dir / default_subdir / clean)
         candidates.append(data_dir / clean)
+        if default_subdir and already_prefixed:
+            candidates.append(data_dir / default_subdir / clean)
         if mydrive_root.is_dir():
             candidates.append(mydrive_root / clean)
 

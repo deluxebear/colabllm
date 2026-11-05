@@ -116,18 +116,30 @@ class FluxKleinNotebookAndMiddlewareTest(unittest.TestCase):
             self.assertTrue(urls[0].startswith("data:image/png;base64,"))
             self.assertTrue(urls[1].startswith("data:image/jpeg;base64,"))
 
-            # Save single & multi-image outputs safely inside Drive
+            # Save single & multi-image outputs safely inside Drive (without outputs/outputs double-prefix)
             saved_one = mw.save_output_images_to_drive(
                 [TINY_PNG],
-                "edited/result.png",
+                "outputs/edited/result.png",
                 data_dir=data_dir,
                 output_dir=outputs_dir,
                 mydrive_root=mydrive,
                 drive_root=root / "drive",
             )
             self.assertEqual(len(saved_one), 1)
-            self.assertTrue(Path(saved_one[0]).is_file())
-            self.assertTrue(Path(saved_one[0]).resolve().is_relative_to(outputs_dir.resolve()))
+            self.assertEqual(Path(saved_one[0]).resolve(), (outputs_dir / "edited/result.png").resolve())
+
+            saved_in_inputs = mw.save_output_images_to_drive(
+                [TINY_PNG],
+                "inputs/ref_out.png",
+                data_dir=data_dir,
+                output_dir=outputs_dir,
+                mydrive_root=mydrive,
+                drive_root=root / "drive",
+            )
+            self.assertEqual(Path(saved_in_inputs[0]).resolve(), (inputs_dir / "ref_out.png").resolve())
+
+            # Short model aliases rewrite cleanly to primary MODEL_REPO
+            self.assertEqual(rewritten["model"], mw.MODEL_REPO)
 
             saved_two = mw.save_output_images_to_drive(
                 [TINY_PNG, TINY_PNG],

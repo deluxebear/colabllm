@@ -3559,7 +3559,7 @@ try:
         LOCAL_BASE + "/v1/images/generations",
         API_TOKEN,
         payload={
-            "model": MODEL_ALIAS,
+            "model": MODEL_REPO,
             "prompt": "a clean minimalist geometric sphere on a soft neutral backdrop",
             "size": "512x512",
             "n": 1,

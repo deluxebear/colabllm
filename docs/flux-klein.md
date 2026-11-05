@@ -175,7 +175,7 @@ base_url = os.environ["FLUX_KLEIN_URL"].rstrip("/")
 token = os.environ["FLUX_KLEIN_API_TOKEN"]
 
 payload = {
-    "model": "flux-3-image-klein",
+    "model": "black-forest-labs/flux-3-image-klein",
     "prompt": "turn this daylight street photo into rainy neon cyberpunk night, keeping architecture intact",
     "images": ["drive://inputs/street.jpg"],
     "save_to_drive": "outputs/street-cyberpunk.png",

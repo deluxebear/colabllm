@@ -673,7 +673,11 @@ def _add_generation_common_flags(p: argparse.ArgumentParser, *, is_edit: bool) -
         action="store_true",
         help="Save only on Google Drive and skip downloading image bytes locally",
     )
-    p.add_argument("--model", default="flux-3-image-klein", help="Served model name (default: flux-3-image-klein)")
+    p.add_argument(
+        "--model",
+        default="black-forest-labs/flux-3-image-klein",
+        help="Served model name (default: black-forest-labs/flux-3-image-klein)",
+    )
     p.add_argument(
         "--timeout",
         type=nonnegative_seconds,

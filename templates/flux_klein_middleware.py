@@ -13,6 +13,7 @@ import mimetypes
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import time
 from typing import Any
@@ -377,7 +378,7 @@ def save_output_images_to_drive(
     if ext not in IMAGE_EXTS:
         ext = ".png"
 
-    stamp = f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}"
+    stamp = f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
     raw_spec = (spec or "").strip()
     is_auto = not raw_spec or raw_spec in ("auto", "true", "True", "1")
     treat_as_dir = False
@@ -658,6 +659,21 @@ def _extract_drive_options(payload: dict[str, Any], header_save: str = "", heade
     return save_spec, drive_only
 
 
+def _normalize_served_model(payload: dict[str, Any]) -> None:
+    """Map short model aliases (e.g. 'flux-3-image-klein', 'flux-klein') to primary MODEL_REPO for vLLM-Omni."""
+    req_model = str(payload.get("model") or "").strip()
+    accepted_aliases = {
+        "",
+        MODEL_REPO,
+        MODEL_ALIAS,
+        "flux-klein",
+        "flux-3-image-klein",
+        MODEL_REPO.split("/")[-1],
+    }
+    if req_model in accepted_aliases:
+        payload["model"] = MODEL_REPO
+
+
 def _prepare_generation_request(
     raw_body: bytes,
     *,
@@ -677,6 +693,7 @@ def _prepare_generation_request(
     if not isinstance(payload, dict):
         raise ValueError("JSON request body must be an object")
 
+    _normalize_served_model(payload)
     save_spec, drive_only = _extract_drive_options(payload, header_save, header_drive_only)
     upsample = bool(payload.pop("upsample", False))
     bbox = bool(payload.pop("bbox", False))
@@ -754,6 +771,7 @@ def _rewrite_drive_urls_in_chat_body(
     if not isinstance(payload, dict):
         raise ValueError("JSON request body must be an object")
 
+    _normalize_served_model(payload)
     save_spec, drive_only = _extract_drive_options(payload, header_save, header_drive_only)
     upsample = bool(payload.pop("upsample", False))
     bbox = bool(payload.pop("bbox", False))
