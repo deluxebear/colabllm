@@ -38,6 +38,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |
 | Built-in speech, voice design and cloning | `qwen3-tts` | [Qwen3-TTS](references/qwen3-tts.md) |
 | Voice cloning, emotion and speed | `indextts` | [IndexTTS](references/indextts.md) |
+| Multi-ref voice cloning, expressive tags & novel narration | `drama3` | [Fish Audio Drama 3](references/drama3.md) |
 | Audio-driven avatar generation | `longcat-avatar` | [LongCat Avatar](references/longcat-avatar.md) |
 | Text/image-to-video and continuation UI | `longcat-video` | [LongCat Video](references/longcat-video.md) |
 | Motion transfer, object/face/color video CLI & UI | `openjutsu` | [Openjutsu](references/openjutsu.md) |

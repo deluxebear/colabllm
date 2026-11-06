@@ -97,6 +97,7 @@ def check(artifact):
             'ollama': ('endpoints', 'models', 'pull', 'run', 'preload', 'unload', 'cp', 'rm', 'show'),
             'qwen3-tts': ('tts', 'voices', 'design-voice'),
             'indextts': ('tts', 'voices'),
+            'drama3': ('tts', 'narrate', 'voices', 'upload-voice', 'delete-voice', 'ls-drive'),
             'comfyui': ('pull-workflow', 'pull-model'),
             'openjutsu': ('check',),
             'unlimited-ocr': ('ocr', 'job', 'resume'),

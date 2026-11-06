@@ -37,7 +37,8 @@ Bearer API key auth, G4 GPU, domain alias `transcribe`, single & batch Drive aud
 `indextts` (`IndexTeam/IndexTTS-2.5` via `vllm serve --omni` 2-stage pipeline, Bearer API key auth, L4 GPU,
 domain alias `indextts`, zero-shot voice cloning, persistent Drive voices, native speed 0.5-2.0x,
 multilingual `zh`/`en`/`zhen`/`ja`/`es`/`ar`/`yue` & emotion control CLI `tts` / `voices` / `upload-voice`),
-`qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, domain alias `qwen3-tts`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow).
+`qwen3-tts` (`Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice` / `VoiceDesign` / `Base` via `vllm serve --omni` 2-stage pipeline + auxiliary multi-task GPU worker, Bearer API key auth, L4 GPU, domain alias `qwen3-tts`, 9 built-in speakers, natural-language instruction control, VoiceDesign persona synthesis, 3-second zero-shot voice cloning, and `design-voice` Voice-Design-then-Clone workflow),
+`drama3` (`fishaudio/drama-3` BF16 / `fishaudio/drama-3-int4` via `sglang-omni[fishaudio]==0.2.0` 3-stage pipeline + `Drama3Middleware` Bearer API key auth, G4 default / H100 / A100 GPU, domain alias `drama3`, single & multi-reference voice cloning, inline event tags `[sighs]`/`[laughs]`, persistent Drive voices, `/v1/audio/speech/batch`, and resumable `narrate` novel/audiobook CLI).
 
 Also available: `unlimited-ocr` (A100, Caddy auth, persistent Drive OCR jobs),
 `longcat-avatar` (G4, Caddy auth, audio-driven avatar generation with job/download commands),

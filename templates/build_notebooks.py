@@ -4343,7 +4343,463 @@ ct_watchdog(
 )
 '''
 
+# --------------------------------------------------------------------------- drama3 (G4 / H100 / A100 · SGLang-Omni Fish Audio Drama 3 TTS & Novel Narration)
+DRAMA3_CFG = dict(
+    name="drama3",
+    service_port=8000,
+    auth="builtin",
+    public_port=8000,
+    health_path="/health",
+    ready_timeout=3600,
+)
+
+DRAMA3_SETUP = r'''# @title 1. Setup -- install SGLang-Omni 0.2.0 + stage Fish Audio Drama 3 & S2-Pro codec on local SSD
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VARIANT_REPOS = {
+    "bf16": "fishaudio/drama-3",
+    "drama-3": "fishaudio/drama-3",
+    "int4": "fishaudio/drama-3-int4",
+    "drama-3-int4": "fishaudio/drama-3-int4",
+}
+CODEC_REPO = "fishaudio/s2-pro"
+CODEC_REVISION = "1de9996b6be38b745688de084d87a5633f714e4e"
+
+def dlog(msg):
+    print(time.strftime("[%F %T] [drama3] ") + msg, flush=True)
+
+_gpu_raw = subprocess.check_output(
+    ["nvidia-smi", "--query-gpu=name,memory.total,compute_cap", "--format=csv,noheader,nounits"],
+    text=True,
+).strip().splitlines()[0]
+_gpu_parts = [p.strip() for p in _gpu_raw.split(",")]
+GPU_NAME = _gpu_parts[0]
+GPU_VRAM_MIB = int(float(_gpu_parts[1])) if len(_gpu_parts) > 1 else 0
+GPU_ARCH = (_gpu_parts[2] if len(_gpu_parts) > 2 else "8.0").replace(".", "")
+
+RAW_VARIANT = os.environ.get("CT_DRAMA3_VARIANT", "auto").strip().lower()
+EXPLICIT_MODEL = os.environ.get("CT_DRAMA3_MODEL", "").strip()
+if EXPLICIT_MODEL:
+    MODEL_REPO = EXPLICIT_MODEL
+    VARIANT = "int4" if "int4" in EXPLICIT_MODEL.lower() else "bf16"
+elif RAW_VARIANT in VARIANT_REPOS:
+    MODEL_REPO = VARIANT_REPOS[RAW_VARIANT]
+    VARIANT = "int4" if "int4" in RAW_VARIANT else "bf16"
+else:
+    VARIANT = "bf16" if GPU_VRAM_MIB >= 72000 else "int4"
+    MODEL_REPO = VARIANT_REPOS[VARIANT]
+
+MODEL_ALIAS = os.environ.get("CT_DRAMA3_ALIAS", "drama3").strip() or "drama3"
+ENGINE_GPU_MEM = float(os.environ.get("CT_DRAMA3_ENGINE_GPU_MEM", "0.70"))
+VOCODER_GPU_MEM = float(os.environ.get("CT_DRAMA3_VOCODER_GPU_MEM", "0.10"))
+MAX_RUNNING_REQS = int(os.environ.get("CT_DRAMA3_MAX_RUNNING_REQS", "16"))
+CONTEXT_LENGTH = int(os.environ.get("CT_DRAMA3_CONTEXT_LENGTH", "16384"))
+BATCH_MAX_ITEMS = int(os.environ.get("CT_DRAMA3_BATCH_MAX_ITEMS", "32"))
+MAX_REF_SEC = float(os.environ.get("CT_DRAMA3_MAX_REF_SEC", "60.0"))
+SGL_OMNI_VER = os.environ.get("CT_DRAMA3_SGL_OMNI_VERSION", "0.2.0").strip() or "0.2.0"
+
+D3_WORK = Path("/content/drama3")
+VENV_DIR = D3_WORK / "venv"
+MODELS_ROOT = D3_WORK / "models"
+MODEL_DIR = MODELS_ROOT / MODEL_REPO.split("/")[-1]
+CODEC_DIR = D3_WORK / "codec"
+SPEAKERS_DIR = D3_WORK / "speakers"
+DRIVE_VOICES_DIR = Path(DATA_DIR) / "voices"
+DRIVE_OUTPUT_DIR = Path(DATA_DIR) / "outputs"
+DEFAULT_REF_WAV = D3_WORK / "default_ref.wav"
+DEFAULT_REF_TEXT = (
+    "Okay. Yeah. I resent you. I love you. I respect you. "
+    "But you know what? You blew it! And thanks to you."
+)
+
+# Local NVMe SSD compiler caches archived as single tarballs on Google Drive
+FLASHINFER_CACHE_DIR = D3_WORK / "flashinfer-cache"
+TRITON_CACHE_DIR = D3_WORK / "triton-cache"
+INDUCTOR_CACHE_DIR = D3_WORK / "inductor-cache"
+FLASHINFER_LEGACY_DIR = Path(DATA_DIR) / "flashinfer-cache"
+TRITON_LEGACY_DIR = Path(DATA_DIR) / "triton-cache"
+INDUCTOR_LEGACY_DIR = Path(DATA_DIR) / "inductor-cache"
+
+for _d in (
+    D3_WORK, MODELS_ROOT, CODEC_DIR, SPEAKERS_DIR, DRIVE_VOICES_DIR, DRIVE_OUTPUT_DIR,
+    FLASHINFER_CACHE_DIR, TRITON_CACHE_DIR, INDUCTOR_CACHE_DIR,
+):
+    _d.mkdir(parents=True, exist_ok=True)
+
+(D3_WORK / "colab_cache.py").write_text(__DRAMA3_CACHE_SOURCE__, encoding="utf-8")
+if str(D3_WORK) not in sys.path:
+    sys.path.insert(0, str(D3_WORK))
+from colab_cache import restore_cache, save_cache
+
+CACHE_KEY = f"sglomni-{SGL_OMNI_VER}-py312-{VARIANT}-sm{GPU_ARCH}"
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (FLASHINFER_CACHE_DIR, FLASHINFER_LEGACY_DIR),
+    (TRITON_CACHE_DIR, TRITON_LEGACY_DIR),
+    (INDUCTOR_CACHE_DIR, INDUCTOR_LEGACY_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, dlog)
+    except (OSError, ValueError) as err:
+        dlog(f"Cache restore warning ({_local_c.name}): {err}; continuing with local cache")
+
+dlog("Restoring registered voice samples from Drive")
+subprocess.run(["cp", "-rn", f"{DRIVE_VOICES_DIR}/.", f"{SPEAKERS_DIR}/"], check=False)
+dlog(
+    f"GPU: {GPU_NAME} ({GPU_VRAM_MIB} MiB, sm_{GPU_ARCH}) | model={MODEL_REPO} ({VARIANT}) | "
+    f"engine_mem={ENGINE_GPU_MEM} vocoder_mem={VOCODER_GPU_MEM} max_reqs={MAX_RUNNING_REQS} batch_max={BATCH_MAX_ITEMS}"
+)
+
+if not shutil.which("ffmpeg") or not shutil.which("sox"):
+    subprocess.run(
+        "apt-get update -qq && apt-get install -y -qq ffmpeg sox libsox-fmt-all >/dev/null 2>&1",
+        shell=True,
+        check=False,
+    )
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+def prepare_env():
+    env_log = D3_WORK / "env-setup.log"
+    marker = VENV_DIR / f".ct_drama3_env_{SGL_OMNI_VER}_ready"
+    py_bin = VENV_DIR / "bin" / "python"
+    sgl_bin = VENV_DIR / "bin" / "sgl-omni"
+    if marker.is_file() and py_bin.is_file() and sgl_bin.is_file():
+        dlog(f"Reusing existing sglang-omni=={SGL_OMNI_VER} virtualenv at {VENV_DIR}")
+        return VENV_DIR
+
+    dlog(f"Installing sglang-omni[fishaudio]=={SGL_OMNI_VER} in Python 3.12 venv (log: {env_log})...")
+    uv_bin = shutil.which("uv") or "uv"
+    overrides_file = D3_WORK / "uv-overrides.txt"
+    # descript-audiotools pins protobuf<3.20 while sglang/nvidia-cutlass-dsl requires protobuf>=4.21.12;
+    # sglang-omni upstream pyproject.toml resolves this via override-dependencies protobuf>=6.31.1,<7.0.0.
+    overrides_file.write_text("protobuf>=6.31.1,<7.0.0\n", encoding="utf-8")
+    run_logged([uv_bin, "venv", "--python", "3.12", str(VENV_DIR), "--clear"], env_log)
+    run_logged(
+        [
+            uv_bin, "pip", "install",
+            "--python", str(py_bin),
+            "--prerelease=allow",
+            "--overrides", str(overrides_file),
+            f"sglang-omni[fishaudio]=={SGL_OMNI_VER}",
+            "huggingface_hub",
+            "hf_xet",
+        ],
+        env_log,
+    )
+    run_logged(
+        [str(py_bin), "-c", "import torch, sglang, sglang_omni, dac, audiotools; print('imports-ok', torch.__version__)"],
+        env_log,
+    )
+    marker.write_text(f"{SGL_OMNI_VER}\n", encoding="utf-8")
+    dlog(f"sglang-omni[fishaudio]=={SGL_OMNI_VER} virtualenv ready")
+    return VENV_DIR
+
+def _cleanup_hf_temp():
+    for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(p, ignore_errors=True)
+    for mp in (MODEL_DIR / ".cache", CODEC_DIR / ".cache"):
+        shutil.rmtree(mp, ignore_errors=True)
+
+def _ensure_default_ref_wav():
+    if DEFAULT_REF_WAV.is_file() and DEFAULT_REF_WAV.stat().st_size > 1024:
+        return
+    drive_copy = DRIVE_VOICES_DIR / "default_ref.wav"
+    if drive_copy.is_file() and drive_copy.stat().st_size > 1024:
+        shutil.copyfile(drive_copy, DEFAULT_REF_WAV)
+        return
+    for ref_url in (
+        "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
+        "https://raw.githubusercontent.com/vllm-project/vllm-omni/main/tests/assets/indextts2/ref_audio.wav",
+    ):
+        try:
+            with urllib.request.urlopen(ref_url, timeout=60) as _src, open(DEFAULT_REF_WAV, "wb") as _dst:
+                shutil.copyfileobj(_src, _dst)
+            if DEFAULT_REF_WAV.is_file() and DEFAULT_REF_WAV.stat().st_size > 1024:
+                break
+        except Exception:
+            pass
+    if not DEFAULT_REF_WAV.is_file() or DEFAULT_REF_WAV.stat().st_size <= 1024:
+        import math, struct, wave
+        sr = 44100
+        n = sr * 3
+        with wave.open(str(DEFAULT_REF_WAV), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            samples = [int(10000 * math.sin(2 * math.pi * 220 * i / sr)) for i in range(n)]
+            wf.writeframes(struct.pack(f"<{n}h", *samples))
+    if not drive_copy.is_file():
+        shutil.copyfile(DEFAULT_REF_WAV, drive_copy)
+
+def prepare_model():
+    dl_log = D3_WORK / "model-download.log"
+    _ensure_default_ref_wav()
+    marker = MODEL_DIR / ".ct_model_ready"
+    codec_file = CODEC_DIR / "codec.pth"
+    has_weights = any(MODEL_DIR.glob("*.safetensors"))
+    if marker.is_file() and (MODEL_DIR / "config.json").is_file() and has_weights and codec_file.is_file():
+        dlog(f"Reusing local SSD model {MODEL_DIR} and codec {codec_file}")
+        return MODEL_DIR
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
+    _cleanup_hf_temp()
+    free_gb = shutil.disk_usage("/content").free / 1e9
+    dlog(f"Downloading {MODEL_REPO} + {CODEC_REPO} codec -> local SSD {D3_WORK} (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
+    dl_script = r"""
+import shutil, sys
+from pathlib import Path
+from huggingface_hub import hf_hub_download, snapshot_download
+
+repo_id, model_dir, codec_repo, codec_rev, codec_dir = sys.argv[1:6]
+model_path = Path(model_dir)
+codec_path = Path(codec_dir)
+model_path.mkdir(parents=True, exist_ok=True)
+codec_path.mkdir(parents=True, exist_ok=True)
+
+snapshot_download(
+    repo_id=repo_id,
+    local_dir=str(model_path),
+    max_workers=8,
+)
+if not (codec_path / "codec.pth").is_file():
+    hf_hub_download(
+        repo_id=codec_repo,
+        filename="codec.pth",
+        revision=codec_rev,
+        local_dir=str(codec_path),
+    )
+for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+    shutil.rmtree(p, ignore_errors=True)
+for mp in (model_path / ".cache", codec_path / ".cache"):
+    shutil.rmtree(mp, ignore_errors=True)
+"""
+    try:
+        run_logged(
+            [sys.executable, "-c", dl_script, MODEL_REPO, str(MODEL_DIR), CODEC_REPO, CODEC_REVISION, str(CODEC_DIR)],
+            dl_log,
+            env=dl_env,
+        )
+    finally:
+        _cleanup_hf_temp()
+
+    if not (MODEL_DIR / "config.json").is_file() or not any(MODEL_DIR.glob("*.safetensors")) or not codec_file.is_file():
+        raise RuntimeError(f"Model/codec download incomplete in {MODEL_DIR} / {CODEC_DIR}")
+    marker.write_text(MODEL_REPO + "\n", encoding="utf-8")
+    total_gb = (
+        sum(p.stat().st_size for p in MODEL_DIR.rglob("*") if p.is_file())
+        + codec_file.stat().st_size
+    ) / 1e9
+    dlog(f"Drama 3 weights + S2-Pro codec ready on local SSD ({total_gb:.2f} GB)")
+    return MODEL_DIR
+
+with ThreadPoolExecutor(max_workers=2) as pool:
+    f_env = pool.submit(prepare_env)
+    f_mod = pool.submit(prepare_model)
+    while not (f_env.done() and f_mod.done()):
+        for fut in (f_env, f_mod):
+            if fut.done() and fut.exception():
+                raise fut.exception()
+        free_gb = shutil.disk_usage("/content").free / 1e9
+        dlog(
+            f"Setup heartbeat | env={'done' if f_env.done() else 'running'} "
+            f"model={'done' if f_mod.done() else 'running'} | free_ssd={free_gb:.1f} GB"
+        )
+        time.sleep(25)
+    VENV_DIR = f_env.result()
+    MODEL_DIR = f_mod.result()
+
+dlog(f"Setup complete: venv={VENV_DIR} model={MODEL_DIR} codec={CODEC_DIR} drive_data={DATA_DIR}")
+'''.replace("__DRAMA3_CACHE_SOURCE__", repr((ROOT / "templates/colab_cache.py").read_text()))
+
+DRAMA3_SERVICE = r'''# @title 2. Service -- SGLang-Omni Fish Audio Drama 3 on 127.0.0.1:8000 (Bearer Auth + Drive Voices & Batch TTS)
+(D3_WORK / "colab_asgi_common.py").write_text(__DRAMA3_COMMON_SOURCE__, encoding="utf-8")
+(D3_WORK / "ct_drama3_middleware.py").write_text(__DRAMA3_MW_SOURCE__, encoding="utf-8")
+
+SGL_ENV = {
+    "PATH": f"{VENV_DIR}/bin:/usr/local/cuda/bin:{os.environ.get('PATH', '')}",
+    "PYTHONPATH": f"{D3_WORK}:{os.environ.get('PYTHONPATH', '')}",
+    "VIRTUAL_ENV": str(VENV_DIR),
+    "FLASHINFER_DISABLE_VERSION_CHECK": "1",
+    "FLASHINFER_WORKSPACE_BASE": str(FLASHINFER_CACHE_DIR),
+    "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+    "TORCHINDUCTOR_CACHE_DIR": str(INDUCTOR_CACHE_DIR),
+    "SPEAKER_SAMPLES_DIR": str(SPEAKERS_DIR),
+    "CT_API_TOKEN": API_TOKEN,
+    "CT_SERVICE_PORT": str(SERVICE_PORT),
+    "CT_DATA_DIR": str(DATA_DIR),
+    "CT_DRAMA3_MODEL": MODEL_REPO,
+    "CT_DRAMA3_ALIAS": MODEL_ALIAS,
+    "CT_DRAMA3_MAX_REF_SEC": str(MAX_REF_SEC),
+    "CT_DEFAULT_REF_WAV": str(DEFAULT_REF_WAV),
+    "CT_DEFAULT_REF_TEXT": DEFAULT_REF_TEXT,
+}
+
+SERVER_ARGS = [
+    str(VENV_DIR / "bin" / "python"),
+    str(D3_WORK / "ct_drama3_middleware.py"),
+    "serve",
+    "--model-path", str(MODEL_DIR),
+    "--host", "127.0.0.1",
+    "--port", str(SERVICE_PORT),
+    "--model-name", MODEL_REPO,
+    "--allowed-local-media-path", str(D3_WORK),
+    "--tts-batch-max-items", str(BATCH_MAX_ITEMS),
+    "--tts_engine.gpu_memory_fraction", str(ENGINE_GPU_MEM),
+    "--vocoder.gpu_memory_fraction", str(VOCODER_GPU_MEM),
+    "--vocoder.factory.codec_path", str(CODEC_DIR),
+    "--tts_engine.factory.max_running_requests", str(MAX_RUNNING_REQS),
+    "--tts_engine.factory.context_length", str(CONTEXT_LENGTH),
+    "--preprocessing.factory.max_reference_audio_seconds", str(MAX_REF_SEC),
+]
+
+def start_service():
+    subprocess.run(["pkill", "-9", "-f", "ct_drama3_middleware|sglang_omni"], check=False)
+    time.sleep(1)
+    dlog(f"Starting SGLang-Omni Drama 3 server on 127.0.0.1:{SERVICE_PORT} (model={MODEL_REPO})")
+    return ct_spawn("service", SERVER_ARGS, env=SGL_ENV, cwd=str(D3_WORK))
+
+PROCS["service"] = (start_service(), start_service)
+'''.replace(
+    "__DRAMA3_COMMON_SOURCE__", repr((ROOT / "templates/colab_asgi_common.py").read_text())).replace(
+    "__DRAMA3_MW_SOURCE__", repr((ROOT / "templates/drama3_middleware.py").read_text()))
+
+DRAMA3_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- wait for CUDA graph capture, verify auth, register default voice, warmup & sync caches
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=30):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url, headers=headers, data=None if payload is None else json.dumps(payload).encode("utf-8")
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return resp.status, (json.loads(raw) if raw.strip().startswith(("{", "[")) else {})
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-token-probe", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 2400
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        raise RuntimeError("SGLang-Omni Drama 3 exited during startup:\n" + ct_tail("service", 90))
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 25:
+        gpu_stat = ct_gpu_stat()
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["starting..."])[-1]
+        dlog(f"Waiting for Drama 3 pipeline & CUDA graphs | GPU: {gpu_stat} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+else:
+    raise RuntimeError("Timed out waiting for SGLang-Omni Drama 3 server to become ready:\n" + ct_tail("service", 90))
+
+auth_check(LOCAL_BASE, API_TOKEN)
+
+# Register default 'alloy' voice preset if not yet saved
+code, voices_data = http_json(LOCAL_BASE + "/v1/audio/voices", API_TOKEN, timeout=20)
+existing_voices = set(voices_data.get("voices") or [])
+for preset_voice in ("alloy",):
+    if preset_voice not in existing_voices and DEFAULT_REF_WAV.is_file():
+        v_code, _ = http_json(
+            LOCAL_BASE + "/api/ct/drive-upload-voice",
+            API_TOKEN,
+            payload={
+                "name": preset_voice,
+                "use_default_ref": True,
+                "consent": "builtin-default-reference",
+                "speaker_description": "Default English reference voice for Fish Audio Drama 3",
+            },
+            timeout=90,
+        )
+        dlog(f"Registered preset voice '{preset_voice}': HTTP {v_code}")
+
+# Warmup synthesis to populate Triton/FlashInfer JIT kernels before saving cache archives
+warmup_req = urllib.request.Request(
+    LOCAL_BASE + "/v1/audio/speech",
+    headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
+    data=json.dumps({
+        "model": MODEL_REPO,
+        "input": "你好，Fish Audio Drama 3 语音服务已经准备就绪。",
+        "response_format": "wav",
+        "max_new_tokens": 384,
+    }, ensure_ascii=False).encode("utf-8"),
+)
+try:
+    with urllib.request.urlopen(warmup_req, timeout=180) as wresp:
+        wav_bytes = wresp.read()
+        dlog(f"Warmup synthesis succeeded ({len(wav_bytes):,} bytes 44.1 kHz WAV)")
+except Exception as werr:
+    dlog(f"Warmup synthesis warning: {werr}")
+
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, dlog)
+    except (OSError, ValueError) as err:
+        dlog(f"Cache archive save warning ({_local_c.name}): {err}")
+subprocess.run(["cp", "-ru", f"{SPEAKERS_DIR}/.", f"{DRIVE_VOICES_DIR}/"], check=False)
+
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    dlog,
+    timeout=180,
+    interval=8,
+)
+dlog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+
+print(f"{SERVICE} is up: {PUBLIC_URL} (model={MODEL_REPO})")
+print("CT_READY", flush=True)
+
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    dlog,
+    heartbeat=lambda up: dlog(f"heartbeat | up={up}s | GPU: {ct_gpu_stat()}"),
+)
+'''
+
 if __name__ == "__main__":
+    write(ROOT / "src/colabllm/services/drama3.ipynb",
+          notebook("Fish Audio Drama 3 (G4 / H100 / A100 · SGLang-Omni Zero-Shot Multi-Ref TTS & Novel Narration)",
+                   "Serves `fishaudio/drama-3` (BF16 on G4 / H100 / A100-80GB) or `fishaudio/drama-3-int4` "
+                   "(auto-selected on <72 GiB GPUs or via `--variant int4`) through `sglang-omni[fishaudio]==0.2.0` "
+                   "(3-stage `preprocessing` -> `tts_engine` -> `vocoder`, 44.1 kHz mono output, ~22x aggregate "
+                   "realtime throughput on G4) with fail-closed Bearer token auth, multi-reference voice cloning, "
+                   "expressive inline event tags (`[sighs]`, `[laughs]`), `/v1/audio/speech/batch` novel narration, "
+                   "and persistent Google Drive voices/outputs.",
+                   DRAMA3_CFG, DRAMA3_SETUP, DRAMA3_SERVICE,
+                   keepalive=DRAMA3_KEEPALIVE))
     write(ROOT / "src/colabllm/services/deepseek-coder.ipynb",
           notebook("DeepSeek-V4.1-Flash-1017 Uncensored GSQ-RCO Coder (G4 / H100 / A100 · Auto Max Context up to 1M + Vision)",
                    "Serves `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` (50% expert-pruned 192-expert "
