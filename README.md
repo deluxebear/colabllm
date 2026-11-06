@@ -8,7 +8,7 @@
 用户通过分发包安装，无需克隆源码。从 [GitHub Releases](https://github.com/deluxebear/colabllm/releases) 下载 wheel 后安装（私有仓库需要相应访问权限）：
 
 ```bash
-uv tool install ./colabllm-0.1.3-py3-none-any.whl
+uv tool install ./colabllm-0.1.4-py3-none-any.whl
 # 如果命令目录尚未加入 PATH
 uv tool update-shell
 ```
@@ -108,23 +108,23 @@ uv tool install --force .
 uv build --no-sources
 
 # 验证 wheel 在隔离环境中的安装与运行
-python tools/check_distribution.py dist/colabllm-0.1.3-py3-none-any.whl
+python tools/check_distribution.py dist/colabllm-0.1.4-py3-none-any.whl
 ```
 
 版本号以 `pyproject.toml` 为唯一来源，CLI 从已安装包元数据读取版本。
 采用 `MAJOR.MINOR.PATCH`：修复递增 PATCH、新功能递增 MINOR、不兼容变更递增 MAJOR；
 在 `0.x` 开发阶段，不兼容变更递增 MINOR，并在 [CHANGELOG.md](https://github.com/deluxebear/colabllm/blob/master/CHANGELOG.md) 中说明。
-当前版本为 `0.1.3`，对应 Git 标签 `v0.1.3`（`0.1.0` 已撤回）；后续发布示例：
+当前版本为 `0.1.4`，对应 Git 标签 `v0.1.4`（`0.1.0` 已撤回）；后续发布示例：
 
 ```bash
 uv version --bump patch
 # 将 CHANGELOG.md 的 Unreleased 内容整理到本次版本的日期条目
-python tools/check_release.py --tag v0.1.4
+python tools/check_release.py --tag v0.1.5
 git add pyproject.toml CHANGELOG.md
-git commit -m "chore: release 0.1.4"
-git tag -a v0.1.4 -m "Release 0.1.4"
+git commit -m "chore: release 0.1.5"
+git tag -a v0.1.5 -m "Release 0.1.5"
 git push origin master
-git push origin v0.1.4
+git push origin v0.1.5
 ```
 
 推送 `v*` 标签触发 [release.yml](https://github.com/deluxebear/colabllm/blob/master/.github/workflows/release.yml)：
