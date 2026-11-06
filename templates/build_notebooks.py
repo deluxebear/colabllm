@@ -4085,7 +4085,7 @@ DS_CFG = {
     "batch": int(os.environ.get("CT_DS_BATCH", "4096")),
     "ubatch": os.environ.get("CT_DS_UBATCH", "auto"),
     "cpu_moe": os.environ.get("CT_DS_CPU_MOE", "auto"),
-    "reasoning": os.environ.get("CT_DS_REASONING", "off"),
+    "reasoning": os.environ.get("CT_DS_REASONING", "on"),
     "reasoning_effort": os.environ.get("CT_DS_REASONING_EFFORT", ""),
     "enable_vision": os.environ.get("CT_DS_VISION", "1") != "0",
     "llama_repo": os.environ.get("CT_LLAMA_REPO", DEFAULT_LLAMA_REPO),
@@ -4349,8 +4349,8 @@ if __name__ == "__main__":
                    "Serves `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` (50% expert-pruned 192-expert "
                    "`IQ2_XXS` MoE trunk, 72.1 GB + 110.6 GB `IQ4_NL` Engram lookup table + BF16 `deepseek41v` vision "
                    "projector) via `llama-server --api-key-file` on a Colab G4 GPU by default (100% GPU offload + full "
-                   "1,048,576 native 1M context + 100% DDR5 RAM-resident Engram + default `--reasoning off` with "
-                   "per-request API thinking control), and automatic SSD lazy fallback on lower-RAM GPUs.",
+                   "1,048,576 native 1M context + 100% DDR5 RAM-resident Engram + default `--reasoning on` with "
+                   "per-request client thinking control), and automatic SSD lazy fallback on lower-RAM GPUs.",
                    DEEPSEEK_CODER_CFG, DEEPSEEK_CODER_SETUP, DEEPSEEK_CODER_SERVICE,
                    keepalive=DEEPSEEK_CODER_KEEPALIVE))
     write(ROOT / "src/colabllm/services/qwen-image.ipynb",

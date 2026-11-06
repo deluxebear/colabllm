@@ -18,8 +18,8 @@ Key properties:
     (`HF_XET_CHUNK_CACHE_SIZE_BYTES=0`). On high-RAM hosts (`G4` 176 GiB / `H100` 167 GiB), loads the
     103 GiB Engram table 100% into DDR5 RAM (`--load-mode none --lazy-mode off`) for zero disk page faults;
     on lower-RAM hosts (`A100-40G`), falls back to `--load-mode mmap --lazy-mode on`.
-  * Thinking mode: `--reasoning off` by default for low-latency coding/tool responses; clients/agents can
-    dynamically enable & tune thinking per API request via `chat_template_kwargs: {"enable_thinking": true}`
+  * Thinking mode: `--reasoning on` by default; clients/agents decide per API request via
+    `chat_template_kwargs: {"enable_thinking": false}` (fast direct answers) or `true`, and tune it with
     plus `reasoning_effort` (`minimal|low|medium|high|xhigh|max` or `1..100`) and `reasoning_budget_tokens`.
   * Auth: native `llama-server --api-key-file` (`auth="builtin"`, OpenAI-compatible `/v1`).
 
@@ -91,7 +91,7 @@ SERVICE = Service(
         "CT_DS_BATCH": "4096",
         "CT_DS_UBATCH": "auto",
         "CT_DS_CPU_MOE": "auto",
-        "CT_DS_REASONING": "off",
+        "CT_DS_REASONING": "on",
         "CT_DS_REASONING_EFFORT": "",
         "CT_DS_VISION": "1",
         "CT_LLAMA_REPO": DEFAULT_LLAMA_REPO,
@@ -317,7 +317,7 @@ def configure_cli(
         "--reasoning",
         dest="up_CT_DS_REASONING",
         choices=("on", "off", "auto"),
-        help="Default thinking mode (--reasoning, default: off; agents can toggle per request via API)",
+        help="Default thinking mode when a request does not set chat_template_kwargs.enable_thinking (--reasoning, default: on)",
     )
     up.add_argument(
         "--reasoning-effort",

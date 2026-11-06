@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 变更
+
+- `deepseek-coder` 默认开启思考（`--reasoning on`），由客户端通过请求体 `chat_template_kwargs.enable_thinking` 自行决定是否思考；需要旧行为可在启动时传入 `--reasoning off`。
+
 ## [0.1.3] - 2026-11-05
 
 ### 新增

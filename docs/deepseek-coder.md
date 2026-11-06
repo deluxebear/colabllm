@@ -1,6 +1,6 @@
 # DeepSeek Coder：DeepSeek-V4.1-Flash 编程与视觉推理（硬件自适应最大上下文）
 
-默认 **G4**（RTX PRO 6000 Blackwell，96 GB VRAM），兼容 **H100**（80 GB HBM3）与 **A100**（80 GB / 40 GB）；通过 `llama-server` 原生 Bearer 认证部署 `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF`（50% 路由专家剪枝 `192` 专家/层 `IQ2_XXS` 主干 72.1 GB + `IQ4_NL` Engram 条件记忆表 110.6 GB + `BF16` `deepseek41v` 视觉投影器 0.97 GB），并在启动时根据实际 GPU 显存与系统内存自动设置最大安全上下文窗口（`G4` 默认满血 **1,048,576（1M）** 上下文 + **103 GiB Engram 全量常驻主机 DDR5 内存** + **默认关闭思考直出**）。
+默认 **G4**（RTX PRO 6000 Blackwell，96 GB VRAM），兼容 **H100**（80 GB HBM3）与 **A100**（80 GB / 40 GB）；通过 `llama-server` 原生 Bearer 认证部署 `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF`（50% 路由专家剪枝 `192` 专家/层 `IQ2_XXS` 主干 72.1 GB + `IQ4_NL` Engram 条件记忆表 110.6 GB + `BF16` `deepseek41v` 视觉投影器 0.97 GB），并在启动时根据实际 GPU 显存与系统内存自动设置最大安全上下文窗口（`G4` 默认满血 **1,048,576（1M）** 上下文 + **103 GiB Engram 全量常驻主机 DDR5 内存** + **默认开启思考，客户端按请求自行决定是否思考**）。
 
 共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 
@@ -26,7 +26,7 @@ colabllm deepseek-coder plan --vram-gb 80 --ram-gb 167
 ## 启动与凭据
 
 ```bash
-# 默认 G4 + 自动满血 1M 上下文 + 默认关闭思考（--reasoning off）
+# 默认 G4 + 自动满血 1M 上下文 + 默认开启思考（--reasoning on，客户端可按请求关闭）
 colabllm deepseek-coder up --ready-timeout 5400
 
 # G4 + 绑定项目固定子域名（默认别名 deepseek.<base-domain>）
@@ -36,8 +36,9 @@ colabllm deepseek-coder up --domain
 colabllm deepseek-coder up --gpu H100 --domain
 colabllm deepseek-coder up --gpu H100 --domain --context 1m
 
-# 若希望全局默认开启思考，可显式指定 --reasoning on 与强度（minimal|low|medium|high|xhigh|max 或 1..100）
-colabllm deepseek-coder up --domain --reasoning on --reasoning-effort medium
+# 若希望未指定 enable_thinking 的请求默认直出，可显式指定 --reasoning off；也可设置默认思考强度（minimal|low|medium|high|xhigh|max 或 1..100）
+colabllm deepseek-coder up --domain --reasoning off
+colabllm deepseek-coder up --domain --reasoning-effort medium
 
 # 查询运行状态、实际分配的 n_ctx 与认证密钥
 colabllm deepseek-coder status --json
@@ -85,7 +86,7 @@ with opener.open(urllib.request.Request(
     print(msg.get("content") or msg.get("reasoning_content"))
 ```
 
-服务默认关闭思考（`--reasoning off --reasoning-format deepseek`）以降低 Coding Agent 高频工具调用延迟；Agent 或客户端可在**任意单次请求**中通过 `/v1/chat/completions` 请求体动态开启思考、调节思考强度（`minimal`/`low`/`medium`/`high`/`xhigh`/`max` 或整数 `1..100`，默认校准值 `50`）或设置思考 Token 硬上限（思考内容自动分离至 `message.reasoning_content`）：
+服务默认开启思考（`--reasoning on --reasoning-format deepseek`），是否思考由客户端决定：Agent 或客户端可在**任意单次请求**中通过 `/v1/chat/completions` 请求体设置 `chat_template_kwargs.enable_thinking` 为 `false` 直出低延迟回答（适合高频工具调用）或 `true` 开启思考，并调节思考强度（`minimal`/`low`/`medium`/`high`/`xhigh`/`max` 或整数 `1..100`，默认校准值 `50`）或设置思考 Token 硬上限（思考内容自动分离至 `message.reasoning_content`）：
 
 ```json
 {

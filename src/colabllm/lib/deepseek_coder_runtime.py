@@ -552,7 +552,7 @@ def build_server_args(
     plan: dict[str, Any],
     projector_path: Path | str | None = None,
     chat_template_file: Path | str | None = None,
-    reasoning: str = "off",
+    reasoning: str = "on",
     reasoning_effort: str | int | None = None,
     threads: int | None = None,
     threads_batch: int | None = None,

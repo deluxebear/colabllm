@@ -135,7 +135,7 @@ class DeepSeekShardSymlinkAndArgsTest(unittest.TestCase):
             self.assertTrue(nested_link.is_symlink())
             self.assertEqual(nested_link.read_bytes(), b"GGUF-ENGRAM")
 
-    def test_build_server_args_enforces_loopback_auth_engram_residency_and_default_reasoning_off(self):
+    def test_build_server_args_enforces_loopback_auth_engram_residency_and_default_reasoning_on(self):
         plan = rt.plan_hardware_config(vram_mib=97_887, ram_mib=180_224)
         args = rt.build_server_args(
             server_bin="/tmp/llama-server",
@@ -155,7 +155,7 @@ class DeepSeekShardSymlinkAndArgsTest(unittest.TestCase):
         lzm_idx = args.index("--lazy-mode")
         self.assertEqual(args[lzm_idx + 1], "off")
         rea_idx = args.index("--reasoning")
-        self.assertEqual(args[rea_idx + 1], "off")
+        self.assertEqual(args[rea_idx + 1], "on")
         rf_idx = args.index("--reasoning-format")
         self.assertEqual(args[rf_idx + 1], "deepseek")
         self.assertLess(args.index("--jinja"), args.index("--chat-template-file"))
@@ -178,12 +178,12 @@ class DeepSeekShardSymlinkAndArgsTest(unittest.TestCase):
             key_file="/tmp/api_keys.txt",
             plan=hybrid_plan,
             projector_path="/tmp/mmproj.gguf",
-            reasoning="on",
+            reasoning="off",
             reasoning_effort="medium",
         )
         self.assertEqual(hybrid_args[hybrid_args.index("--load-mode") + 1], "mmap")
         self.assertEqual(hybrid_args[hybrid_args.index("--lazy-mode") + 1], "on")
-        self.assertEqual(hybrid_args[hybrid_args.index("--reasoning") + 1], "on")
+        self.assertEqual(hybrid_args[hybrid_args.index("--reasoning") + 1], "off")
         self.assertEqual(hybrid_args[hybrid_args.index("--reasoning-effort") + 1], "medium")
         self.assertNotIn("--no-host", hybrid_args)
         self.assertFalse(rt.should_evict_page_cache(hybrid_plan))
