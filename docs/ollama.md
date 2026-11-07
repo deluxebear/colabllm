@@ -30,6 +30,27 @@ colabllm ollama up --no-models
 - `--models-storage ssd|drive`：默认 `ssd`（`/content/ollama/models`，NVMe 本地高速盘，释放 VM 后需重拉）；指定 `drive` 可将模型缓存保存在 Google Drive（`<DATA_DIR>/models`）以跨会话复用。
 - `--ollama-version 0.17.7`：可按需固定安装的 Ollama 版本。
 
+### 一键模型预设（`--preset`）
+
+预设一次性指定 GPU、模型、别名和服务端调优参数；命令行显式传入的参数优先于预设值。
+
+```bash
+# Huihui Qwen3.8-27B abliterated：BF16 满血权重 + 原生 262K 上下文 + 视觉/工具/思考，默认 G4
+colabllm ollama up --preset huihui-27b --domain
+```
+
+| 预设 | GPU | 模型 | 别名 | 服务端参数 |
+| :--- | :--- | :--- | :--- | :--- |
+| `huihui-27b` | G4 | `huihui_ai/Qwen3.8-abliterated:27b-bf16`（约 56 GB） | `huihui-qwen3.8-27b` | 上下文 262144、Flash Attention、f16 KV、单并发、常驻显存 |
+
+客户端模型名可使用别名 `huihui-qwen3.8-27b`。需要更省资源时可覆盖预设，例如 L4 上使用 Q4 量化与 64K 上下文：
+
+```bash
+colabllm ollama up --preset huihui-27b --gpu L4 -m huihui_ai/Qwen3.8-abliterated:27b-q4_K_M --context-length 65536 --kv-cache-type q8_0
+```
+
+通过 `-m` 覆盖模型时不会创建预设别名。Ollama 默认上下文仅 4096，超出部分会被静默截断；不使用预设时请显式设置 `--context-length`。
+
 ## 2. 兼容接口选择（支持全开或按需限定）
 
 Ollama 原生同时提供三套接口；默认 `--compat all` **全部开启**，也可在启动时按需限定对外暴露的接口族：
