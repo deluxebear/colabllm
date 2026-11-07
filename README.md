@@ -54,6 +54,37 @@ colabllm frp-status
 卸载使用 `uv tool uninstall colabllm`，用户配置目录保留。
 升级前先停止运行中的服务，升级后重新启动，避免后台 runner 依赖的安装文件被替换。
 
+### 更换电脑（沿用相同域名与 API Key）
+
+域名归属和凭据只保存在本机 `~/.colabllm/`。在另一台电脑上直接执行 `up --domain` 会遇到：
+
+- **FRP 后端无法启动**：新电脑执行 `frp-config` 会生成新的 `project_id`，已有 DNS 记录和 FRP 服务器路由属于旧 `project_id`，`up` 会以 `DNS conflict` 拒绝接管（防止误抢域名）。
+- **API Key 改变**：新电脑没有 `state.json`，会生成新的 Token，客户端中配置的旧 Key 全部返回 401。
+- **Cloudflare 后端双连接**：隧道与 DNS 按服务名复用、不区分电脑；若两台电脑同时运行同一服务，请求会在两台 VM 间轮流分发（Key 不同时随机 401）。
+- **重复计费**：旧电脑的 runner 未停止时，旧 Colab VM 会继续运行，新电脑会再创建一台。
+
+同一服务、同一实例同一时间只应由一台电脑运行。迁移步骤：
+
+```bash
+# 1. 旧电脑：停止服务；不要加 --delete-tunnel，以保留域名路由与 DNS 归属
+colabllm <name> down
+
+# 2. 复制整个状态目录到新电脑（含私密凭据，保持仅本人可读）
+rsync -a --chmod=go-rwx ~/.colabllm/ <新电脑>:~/.colabllm/
+
+# 3. 新电脑：安装 colabllm，并完成外部工具授权
+#    colab 登录 + `colab dfs consent`；同一 Cloudflare 账号的 `cf` 登录；FRP 后端还需能 SSH 到服务器
+colabllm tunnel-config            # 确认主域名与 FRP 配置已带过来
+colabllm doctor
+
+# 4. 新电脑：启动，域名、API Key 与 FRP 路由保持不变
+colabllm <name> up --domain
+```
+
+`~/.colabllm/` 中与迁移相关的文件：`tunnel-config.json`（主域名、FRP `project_id`）、`frp/*.json`（FRP 客户端凭据）、
+`services/<name>/state.json`（API Key / 登录密码、隧道与 DNS 记录）。若确实需要两台电脑同时运行同一服务，
+请使用不同实例（如 `-i 2`），它们使用独立的子域名、状态和 Key。
+
 ## 运行时使用指南
 
 每个运行时的具体命令、API/UI 工作流、输入输出及恢复语义见下方“各运行时使用文档”表。
