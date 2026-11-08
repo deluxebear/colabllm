@@ -286,7 +286,7 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **FLUX 3 Image Klein (T2I + Multi-Ref I2I + PUP)** | `G4` | `vLLM-Omni` Bearer API Key (`builtin`) | `https://flux-klein.example.com` | [docs/flux-klein.md](https://github.com/deluxebear/colabllm/blob/master/docs/flux-klein.md) |
 | **Qwen-Image-2.1 (T2I + 1-4 Ref RGBA I2I)** | `G4` | `vLLM-Omni` Bearer API Key (`builtin`) | `https://qwen-image.example.com` | [docs/qwen-image.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-image.md) |
 | **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](https://github.com/deluxebear/colabllm/blob/master/docs/comfyui.md) |
-| **Qwen3.8-Flash-Next (800K + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-flash.md) |
+| **Qwen3.8-Flash-Next (UD-Q4_K_XL-V2 · 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-flash.md) |
 | **DeepSeek-V4.1-Flash Coder (Auto Max 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://deepseek.example.com` | [docs/deepseek-coder.md](https://github.com/deluxebear/colabllm/blob/master/docs/deepseek-coder.md) |
 | **Ollama** | `T4` | Caddy (Basic Auth + Bearer + `x-api-key`) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
 | **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](https://github.com/deluxebear/colabllm/blob/master/docs/unsloth-studio.md) |
@@ -485,7 +485,7 @@ colabllm unsloth-studio up
 # 2. 配置所有服务共享的主域名，再启动固定域名服务
 colabllm tunnel-config --base-domain example.com
 colabllm ollama up --domain
-colabllm qwen-flash up --domain     # 绑定 https://qwen.example.com（G4 GPU，800K 上下文 + 视觉）
+colabllm qwen-flash up --domain     # 绑定 https://qwen.example.com（G4 GPU，1M 上下文 + 视觉）
 
 # 3. 查看访问 URL、登录密码与 API Token
 colabllm ollama info --show-secrets

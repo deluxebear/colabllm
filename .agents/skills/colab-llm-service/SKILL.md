@@ -29,7 +29,7 @@ templates/               also service.py + service.ipynb to copy for a new servi
 
 Existing services: `unsloth-studio` (built-in login, L4), `ollama` (Caddy auth, T4),
 `comfyui` (ComfyUI + ComfyUI-Manager, Caddy auth, L4, on-demand workflow model download to local SSD via `--workflow` / `pull-workflow`),
-`qwen-flash` (`SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF` IQ3_S, 800K YaRN 3.125x + BF16 vision,
+`qwen-flash` (`huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` `unsloth-UD-Q4_K_XL-V2`, 1M `1,048,576` YaRN 4.0x + `q8_0` KV + 26.82 GiB PLE in DDR5 RAM + `--n-cpu-moe 3` + BF16 vision,
 `llama-server --api-key-file` built-in auth, G4 GPU, domain alias `qwen`),
 `deepseek-coder` (`Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` IQ2_XXS 72.1 GB pruned trunk + 110.6 GB Engram DDR5 host-RAM resident on G4/H100 or SSD lazy `mmap` fallback + BF16 `deepseek41v` vision, default `--reasoning on` with per-request client `enable_thinking` toggle, hardware-adaptive max context up to 1,048,576 via `llama-server --api-key-file`, G4/H100/A100 GPU, domain alias `deepseek`),
 `nemotron-transcribe` (`nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` via `vllm serve` + `nemo_speechlm`,

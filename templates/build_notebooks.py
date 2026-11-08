@@ -700,372 +700,192 @@ from colab import start
 start(port=SERVICE_PORT, cloudflare=False)
 '''
 
-# --------------------------------------------------------------------------- qwen-flash (G4, llama.cpp sm_120, 800K + vision)
+# --------------------------------------------------------------------------- qwen-flash (G4, llama.cpp sm_120, UD-Q4_K_XL-V2, 1M YaRN 4x + q8_0 KV + vision)
 QWEN_FLASH_CFG = dict(name="qwen-flash", service_port=8000, auth="builtin", public_port=8000,
-                      health_path="/health", ready_timeout=2400)
+                      health_path="/health", ready_timeout=5400)
 
-QWEN_FLASH_SETUP = r'''# @title 1. Setup -- parallel llama.cpp sm_120 build/cache restore + 84 GB GGUF + BF16 mmproj staging
+QWEN_FLASH_SETUP = (
+    r'''# @title 1. Setup -- parallel llama.cpp b11540 sm_120 build/cache + 103.7 GiB UD-Q4_K_XL-V2 GGUF + BF16 mmproj + 1M G4 hardware plan
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import hashlib, platform, tarfile
 
-CFG = {
-    "repo": os.environ.get("CT_QWEN_REPO", "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF"),
-    "quant": os.environ.get("CT_QWEN_QUANT", "IQ3_S"),
-    "alias": os.environ.get("CT_QWEN_ALIAS", "qwen3.8-flash-next"),
-    "context": int(os.environ.get("CT_QWEN_CONTEXT", "819200")),
-    "rope_scaling": os.environ.get("CT_QWEN_ROPE_SCALING", "yarn"),
-    "rope_scale": float(os.environ.get("CT_QWEN_ROPE_SCALE", "3.125")),
-    "yarn_orig_ctx": int(os.environ.get("CT_QWEN_YARN_ORIG_CTX", "262144")),
-    "cache_type": os.environ.get("CT_QWEN_CACHE_TYPE", "f16"),
-    "batch": int(os.environ.get("CT_QWEN_BATCH", "512")),
-    "ubatch": int(os.environ.get("CT_QWEN_UBATCH", "128")),
-    "llama_repo": os.environ.get("CT_LLAMA_REPO", "https://github.com/ggml-org/llama.cpp.git"),
-    "llama_commit": os.environ.get("CT_LLAMA_COMMIT", "a0e6dc7384edb8f5d927155e1d26c10b4a310e6d"),
-    "service_dir": os.environ.get("CT_QWEN_SERVICE_DIR", "/content/drive/MyDrive/colab-services/qwen-flash"),
-    "model_root": os.environ.get("CT_QWEN_MODEL_ROOT", "/content/drive/MyDrive/models"),
-    "work_dir": os.environ.get("CT_QWEN_WORK_DIR", "/content/qwen-flash"),
-    "vision_projector": {
-        "name": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
-        "revision": "eec4e10a2c29b440a2ae85591fa11569ce752963",
-        "size": 907542944,
-        "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
-    },
-}
+QWEN_WORK = Path(os.environ.get("CT_QWEN_WORK_DIR", "/content/qwen-flash"))
+QWEN_WORK.mkdir(parents=True, exist_ok=True)
+(QWEN_WORK / "qwen_flash_runtime.py").write_text('''
+    + repr((ROOT / "src/colabllm/lib/qwen_flash_runtime.py").read_text())
+    + r''', encoding="utf-8")
+if str(QWEN_WORK) not in sys.path:
+    sys.path.insert(0, str(QWEN_WORK))
 
-DEFAULT_MODEL_LOCK = {
-    "repo": "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
-    "revision": "eec4e10a2c29b440a2ae85591fa11569ce752963",
-    "files": [
-        {
-            "name": "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00001-of-00002.gguf",
-            "size": 55063448064,
-            "sha256": "40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296c",
-        },
-        {
-            "name": "IQ3_S/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_S-00002-of-00002.gguf",
-            "size": 28800138432,
-            "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
-        },
-    ],
-}
+from qwen_flash_runtime import (
+    DEFAULT_ALIAS,
+    DEFAULT_CONTEXT,
+    DEFAULT_LLAMA_COMMIT,
+    DEFAULT_LLAMA_REPO,
+    DEFAULT_QUANT,
+    DEFAULT_REPO,
+    MODEL_NUM_LAYERS,
+    build_server_args,
+    compute_yarn_params,
+    detect_gpu_info,
+    detect_host_ram_mib,
+    evict_gguf_page_cache,
+    looks_like_oom,
+    plan_hardware_config,
+    prepare_llama_runtime,
+    stage_model_and_projector,
+    write_json_atomic,
+)
 
 def qlog(msg):
-    print(time.strftime("[%F %T] ") + msg, flush=True)
-
-def write_json_atomic(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{SERVICE}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(value, indent=2) + "\n")
-    tmp.replace(path)
-
-def cmd_out(command, **kwargs):
-    return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, **kwargs).strip()
-
-def run_logged(command, filename, env=None):
-    with open(filename, "a") as handle:
-        res = subprocess.run(command, stdout=handle, stderr=subprocess.STDOUT, env=env)
-    if res.returncode:
-        raise RuntimeError(f"Command failed ({res.returncode}); see {filename}")
-
-def digest_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(16 * 1024 * 1024):
-            h.update(chunk)
-    return h.hexdigest()
-
-def require_space(path, needed):
-    free = shutil.disk_usage(path).free
-    if free < needed:
-        raise RuntimeError(f"{path}: need {needed/1e9:.1f} GB, free {free/1e9:.1f} GB")
-
-def restore_valid_bin(bin_dir, env):
-    server = bin_dir / "llama-server"
-    if not server.is_file():
-        return False
-    try:
-        server.chmod(0o755)
-        cmd_out([str(server), "--version"], env=env)
-        devices = cmd_out([str(server), "--list-devices"], env=env)
-        return "CUDA" in devices and "RTX PRO 6000" in devices
-    except (OSError, subprocess.CalledProcessError):
-        return False
-
-def prepare_runtime(config, service, work):
-    commit_file = service / "llama-commit.txt"
-    if not commit_file.exists():
-        commit = config.get("llama_commit") or cmd_out(["git", "ls-remote", config["llama_repo"], "HEAD"]).split()[0]
-        commit_file.write_text(commit + "\n")
-    commit = commit_file.read_text().strip()
-    gpu = cmd_out(["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"]).splitlines()[0]
-    if "RTX PRO 6000" not in gpu or "12.0" not in gpu:
-        raise RuntimeError("This deployment requires G4 / RTX PRO 6000 sm_120: " + gpu)
-    signature = {
-        "llama_commit": commit, "gpu": gpu, "cuda": cmd_out(["nvcc", "--version"]),
-        "os_release": Path("/etc/os-release").read_text(), "arch": platform.machine(),
-        "glibc": platform.libc_ver(), "cuda_arch": "120", "ggml_native": False,
-    }
-    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:20]
-    cache = Path(config["model_root"]) / ".runtimes" / "llama.cpp" / ("sm120-" + key)
-    cache.mkdir(parents=True, exist_ok=True)
-    bin_dir = work / "runtime" / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, LD_LIBRARY_PATH=str(bin_dir) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
-    local_manifest = work / "runtime-manifest.json"
-    if bin_dir.exists() and any(bin_dir.iterdir()) and (
-        not local_manifest.exists() or json.loads(local_manifest.read_text()) != json.loads(json.dumps(signature))
-    ):
-        shutil.rmtree(bin_dir)
-        bin_dir.mkdir()
-    archive = cache / "runtime.tar"
-    checksum = cache / "runtime.sha256"
-    if not restore_valid_bin(bin_dir, env) and archive.exists() and checksum.exists():
-        qlog("Restoring compatible build cache from Drive: " + str(cache))
-        local_tar = work / "runtime.tar"
-        shutil.copyfile(archive, local_tar)
-        if digest_file(local_tar) != checksum.read_text().strip():
-            raise RuntimeError("Build cache checksum mismatch; refusing corrupt archive")
-        with tarfile.open(local_tar) as bundle:
-            bundle.extractall(work / "runtime", filter="data")
-        local_tar.unlink()
-    if not restore_valid_bin(bin_dir, env):
-        qlog("Building pinned llama.cpp for CUDA sm_120; progress: " + str(work / "build.log"))
-        source = work / "llama.cpp"
-        if not (source / ".git").exists():
-            run_logged(["git", "clone", "--no-checkout", "--filter=blob:none", config["llama_repo"], str(source)], work / "build.log")
-        run_logged(["git", "-C", str(source), "fetch", "--depth", "1", "origin", commit], work / "build.log")
-        run_logged(["git", "-C", str(source), "checkout", "--detach", commit], work / "build.log")
-        run_logged(["cmake", "-S", str(source), "-B", str(source / "build"),
-                    "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=120",
-                    "-DGGML_NATIVE=OFF", "-DCMAKE_BUILD_TYPE=Release",
-                    "-DLLAMA_CURL=OFF", "-DLLAMA_OPENSSL=OFF", "-DLLAMA_BUILD_TESTS=OFF"], work / "build.log")
-        run_logged(["cmake", "--build", str(source / "build"), "--config", "Release",
-                    "-j", str(min(12, os.cpu_count() or 4))], work / "build.log")
-        shutil.copytree(source / "build" / "bin", bin_dir, dirs_exist_ok=True, symlinks=False)
-        if not restore_valid_bin(bin_dir, env):
-            raise RuntimeError("Built runtime did not enumerate the G4 CUDA device")
-        local_tar = work / "runtime.tar"
-        with tarfile.open(local_tar, "w", dereference=True) as bundle:
-            bundle.add(bin_dir, arcname="bin")
-        checksum_value = digest_file(local_tar)
-        partial = cache / f"runtime.tar.{SERVICE}.{os.getpid()}.partial"
-        shutil.copyfile(local_tar, partial)
-        partial.replace(archive)
-        checksum.write_text(checksum_value + "\n")
-        write_json_atomic(cache / "manifest.json", signature)
-        local_tar.unlink()
-        qlog("Complete runtime cached on Drive: " + str(cache))
-    help_text = cmd_out([str(bin_dir / "llama-server"), "--help"], env=env)
-    for flag in ("--lazy-mode", "--load-mode", "--api-key-file"):
-        if flag not in help_text:
-            raise RuntimeError("Pinned llama.cpp lacks required option: " + flag)
-    write_json_atomic(local_manifest, signature)
-    return bin_dir, env
-
-def hf_download_client(work):
-    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    try:
-        import hf_xet
-        from huggingface_hub import HfApi, hf_hub_download
-    except ImportError:
-        run_logged([sys.executable, "-m", "pip", "install", "-U", "huggingface_hub", "hf_xet"], work / "download.log")
-        from huggingface_hub import HfApi, hf_hub_download
-    return HfApi, hf_hub_download
-
-def valid_shard(path, item):
-    return path.is_file() and path.stat().st_size == item["size"] and digest_file(path) == item["sha256"]
-
-def prepare_shard(item, config, revision, local_dir, download):
-    target = local_dir / item["name"]
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if download is not None:
-        try:
-            qlog("Downloading HF -> local SSD (resumable): " + item["name"])
-            downloaded = Path(download(repo_id=config["repo"], filename=item["name"],
-                                       revision=revision, local_dir=local_dir / ".hf-download"))
-            if not valid_shard(downloaded, item):
-                downloaded.unlink(missing_ok=True)
-                raise RuntimeError("HF shard size/SHA256 mismatch")
-            downloaded.replace(target)
-            qlog("SHA256 OK (HF): " + target.name)
-            return target
-        except Exception as error:
-            qlog(f"HF download failed ({type(error).__name__}); trying Drive backup: " + item["name"])
-
-    source = Path(config["model_root"]) / config["repo"] / item["name"]
-    if not source.is_file() or source.stat().st_size != item["size"]:
-        raise RuntimeError("HF download unavailable and no complete Drive backup: " + item["name"])
-    qlog("Copying Drive backup -> local SSD and verifying SHA256: " + item["name"])
-    partial = target.with_suffix(".gguf.drive.partial")
-    h = hashlib.sha256()
-    copied, last_report = 0, time.monotonic()
-    with source.open("rb") as src, partial.open("wb") as dst:
-        while chunk := src.read(16 * 1024 * 1024):
-            dst.write(chunk)
-            h.update(chunk)
-            copied += len(chunk)
-            if time.monotonic() - last_report >= 30:
-                qlog(f"Copy {target.name}: {copied/1e9:.1f}/{item['size']/1e9:.1f} GB")
-                last_report = time.monotonic()
-    if copied != item["size"] or h.hexdigest() != item["sha256"]:
-        partial.unlink(missing_ok=True)
-        raise RuntimeError("Drive backup size/SHA256 mismatch: " + item["name"])
-    partial.replace(target)
-    qlog("SHA256 OK (Drive): " + target.name)
-    return target
-
-def prepare_model(config, service, work):
-    download = None
-    lock_path = service / ("model-" + config["quant"] + ".json")
-    if lock_path.exists():
-        lock = json.loads(lock_path.read_text())
-    elif config["repo"] == DEFAULT_MODEL_LOCK["repo"] and config["quant"] == "IQ3_S":
-        lock = DEFAULT_MODEL_LOCK
-        write_json_atomic(lock_path, lock)
-    else:
-        HfApi, download = hf_download_client(work)
-        info = HfApi().model_info(config["repo"], files_metadata=True)
-        files = []
-        for entry in info.siblings:
-            if entry.rfilename.startswith(config["quant"] + "/") and entry.rfilename.endswith(".gguf"):
-                if not entry.lfs:
-                    raise RuntimeError("Expected LFS SHA256 metadata")
-                files.append({"name": entry.rfilename, "size": entry.size, "sha256": entry.lfs.sha256})
-        if len(files) != 2:
-            raise RuntimeError(f"Expected two GGUF shards, got {len(files)}")
-        lock = {"repo": config["repo"], "revision": info.sha, "files": sorted(files, key=lambda x: x["name"])}
-        write_json_atomic(lock_path, lock)
-    if lock["repo"] != config["repo"]:
-        raise RuntimeError("Model lock belongs to a different repository")
-    local_dir = work / "model"
-    local_dir.mkdir(exist_ok=True)
-    marker = local_dir / "verified.json"
-    expected = {item["name"]: item["sha256"] for item in lock["files"]}
-    if marker.exists() and json.loads(marker.read_text()) == expected and all(
-        (local_dir / item["name"]).is_file() and (local_dir / item["name"]).stat().st_size == item["size"]
-        for item in lock["files"]
-    ):
-        qlog("Reusing previously verified local model shards")
-        return local_dir / lock["files"][0]["name"]
-    pending = [item for item in lock["files"] if not valid_shard(local_dir / item["name"], item)]
-    if pending:
-        require_space(work, sum(item["size"] for item in pending) + 15 * 1024**3)
-        if download is None:
-            try:
-                _, download = hf_download_client(work)
-            except Exception as error:
-                qlog(f"HF client unavailable ({type(error).__name__}); using Drive backups")
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(prepare_shard, item, config, lock["revision"], local_dir, download)
-                       for item in pending]
-            for future in futures:
-                future.result()
-    write_json_atomic(marker, expected)
-    return local_dir / lock["files"][0]["name"]
-
-def prepare_projector(config, service, work):
-    item = config.get("vision_projector")
-    if not item:
-        return None
-    lock = json.loads((service / ("model-" + config["quant"] + ".json")).read_text())
-    if lock["repo"] != config["repo"] or lock["revision"] != item["revision"]:
-        raise RuntimeError("Vision projector must match the pinned model repository/revision")
-    local_dir = work / "model"
-    local_dir.mkdir(exist_ok=True)
-    target = local_dir / item["name"]
-    if valid_shard(target, item):
-        qlog("Reusing verified local vision projector")
-        return target
-    require_space(work, item["size"] + 1024**3)
-    try:
-        _, download = hf_download_client(work)
-    except Exception as error:
-        qlog(f"HF client unavailable ({type(error).__name__}); using Drive projector backup")
-        download = None
-    target = prepare_shard(item, config, item["revision"], local_dir, download)
-    backup = Path(config["model_root"]) / config["repo"] / item["name"]
-    if not valid_shard(backup, item):
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        partial = backup.with_suffix(f".gguf.{SERVICE}.{os.getpid()}.partial")
-        shutil.copyfile(target, partial)
-        if not valid_shard(partial, item):
-            partial.unlink(missing_ok=True)
-            raise RuntimeError("Vision projector backup size/SHA256 mismatch")
-        partial.replace(backup)
-    return target
+    print(time.strftime("[%F %T] [qwen-flash] ") + msg, flush=True)
 
 if MOUNT_DRIVE and not Path("/content/drive/MyDrive").is_dir():
     raise RuntimeError("Drive is not mounted. Run via `colabllm qwen-flash up`.")
-if not MOUNT_DRIVE:   # --no-drive: keep durable state/model backups on local SSD
-    for _key, _sub in (("service_dir", "service"), ("model_root", "models")):
-        if CFG[_key].startswith("/content/drive/"):
-            CFG[_key] = str(Path(DATA_DIR) / _sub)
-SERVICE_DIR = Path(CFG["service_dir"])
+
+SERVICE_DIR = Path(DATA_DIR)
 SERVICE_DIR.mkdir(parents=True, exist_ok=True)
-QWEN_WORK = Path(CFG["work_dir"])
-QWEN_WORK.mkdir(parents=True, exist_ok=True)
+DRIVE_BACKUP_ROOT = (
+    Path(os.environ.get("CT_QWEN_MODEL_ROOT", "/content/drive/MyDrive/models"))
+    if (MOUNT_DRIVE and Path("/content/drive/MyDrive").is_dir())
+    else None
+)
+QWEN_RUNTIME_CACHE = (
+    (DRIVE_BACKUP_ROOT / ".runtimes" / "llama.cpp")
+    if DRIVE_BACKUP_ROOT is not None
+    else (SERVICE_DIR / "runtime-cache")
+)
 
-qlog("Preparing model and runtime concurrently; durable state: " + str(SERVICE_DIR))
-with ThreadPoolExecutor(max_workers=2) as pool:
-    f_build = pool.submit(prepare_runtime, CFG, SERVICE_DIR, QWEN_WORK)
-    f_model = pool.submit(prepare_model, CFG, SERVICE_DIR, QWEN_WORK)
-    while not (f_build.done() and f_model.done()):
-        for fut in (f_build, f_model):
-            if fut.done() and fut.exception():
-                raise fut.exception()
-        qlog(f"Preparation heartbeat | build={'done' if f_build.done() else 'running'} "
-             f"model={'done' if f_model.done() else 'running'}")
+CFG = {
+    "repo": os.environ.get("CT_QWEN_REPO", DEFAULT_REPO),
+    "quant": os.environ.get("CT_QWEN_QUANT", DEFAULT_QUANT),
+    "alias": os.environ.get("CT_QWEN_ALIAS", DEFAULT_ALIAS),
+    "context": os.environ.get("CT_QWEN_CONTEXT", str(DEFAULT_CONTEXT)),
+    "cache_type": os.environ.get("CT_QWEN_CACHE_TYPE", "q8_0"),
+    "cpu_moe": os.environ.get("CT_QWEN_CPU_MOE", "auto"),
+    "parallel": int(os.environ.get("CT_QWEN_PARALLEL", "1")),
+    "batch": int(os.environ.get("CT_QWEN_BATCH", "512")),
+    "ubatch": int(os.environ.get("CT_QWEN_UBATCH", "128")),
+    "reasoning": os.environ.get("CT_QWEN_REASONING", "on"),
+    "enable_vision": os.environ.get("CT_QWEN_VISION", "1") != "0",
+    "llama_repo": os.environ.get("CT_LLAMA_REPO", DEFAULT_LLAMA_REPO),
+    "llama_commit": os.environ.get("CT_LLAMA_COMMIT", DEFAULT_LLAMA_COMMIT),
+}
+
+QWEN_GPU = detect_gpu_info()
+QWEN_RAM_MIB = detect_host_ram_mib()
+HW_PLAN = plan_hardware_config(
+    vram_mib=QWEN_GPU["vram_mib"],
+    ram_mib=QWEN_RAM_MIB,
+    quant=CFG["quant"],
+    requested_context=CFG["context"],
+    cache_type=CFG["cache_type"],
+    requested_cpu_moe=CFG["cpu_moe"],
+    enable_vision=CFG["enable_vision"],
+    parallel=CFG["parallel"],
+    batch=CFG["batch"],
+    ubatch=CFG["ubatch"],
+)
+qlog(
+    f"Hardware plan: gpu={QWEN_GPU['name']} ({QWEN_GPU['vram_mib']} MiB VRAM, sm_{QWEN_GPU['cuda_arch'] or 'cpu'}) "
+    f"ram={QWEN_RAM_MIB} MiB -> mode={HW_PLAN['mode']} context={HW_PLAN['context']} "
+    f"(yarn={HW_PLAN['rope_scale']}x, kv={HW_PLAN['cache_type']} {HW_PLAN['kv_cache_mib']} MiB, "
+    f"n_cpu_moe={HW_PLAN['n_cpu_moe']}, ple_in_ram={HW_PLAN['ple_in_ram']}, "
+    f"vram_headroom={HW_PLAN['estimated_vram_headroom_mib']} MiB)"
+)
+
+with ThreadPoolExecutor(max_workers=2) as _pool:
+    _f_runtime = _pool.submit(
+        prepare_llama_runtime,
+        work_dir=QWEN_WORK,
+        cache_root=QWEN_RUNTIME_CACHE,
+        llama_repo=CFG["llama_repo"],
+        llama_commit=CFG["llama_commit"],
+        gpu_info=QWEN_GPU,
+        log=qlog,
+    )
+    _f_model = _pool.submit(
+        stage_model_and_projector,
+        repo=CFG["repo"],
+        quant=CFG["quant"],
+        enable_vision=CFG["enable_vision"],
+        service_dir=SERVICE_DIR,
+        work_dir=QWEN_WORK,
+        drive_backup_root=DRIVE_BACKUP_ROOT,
+        log=qlog,
+    )
+    while not (_f_runtime.done() and _f_model.done()):
+        for _fut in (_f_runtime, _f_model):
+            if _fut.done() and _fut.exception():
+                raise _fut.exception()
+        _free_gb = shutil.disk_usage(QWEN_WORK).free / 1e9
+        qlog(
+            f"Preparation heartbeat | build={'done' if _f_runtime.done() else 'running'} "
+            f"model={'done' if _f_model.done() else 'running'} | free_ssd={_free_gb:.1f} GB"
+        )
         time.sleep(30)
-    BIN_DIR, LLAMA_ENV = f_build.result()
-    MODEL_PATH = f_model.result()
-PROJECTOR_PATH = prepare_projector(CFG, SERVICE_DIR, QWEN_WORK)
-qlog(f"Setup complete: model={MODEL_PATH} projector={PROJECTOR_PATH}")
+    BIN_DIR, LLAMA_ENV, PINNED_COMMIT = _f_runtime.result()
+    MODEL_PATH, PROJECTOR_PATH = _f_model.result()
+
+QWEN_SETUP_OK = True
+qlog(f"Setup complete: commit={PINNED_COMMIT[:10]} model={MODEL_PATH} projector={PROJECTOR_PATH}")
 '''
+)
 
-QWEN_FLASH_SERVICE = r'''# @title 2. Service -- llama-server on 127.0.0.1 (--load-mode none --lazy-mode off, YaRN 800K, vision, --api-key-file)
+QWEN_FLASH_SERVICE = r'''# @title 2. Service -- llama-server on 127.0.0.1 (UD-Q4_K_XL-V2, 1M YaRN 4x, q8_0 KV, PLE in DDR5 RAM, --api-key-file)
+if not globals().get("QWEN_SETUP_OK"):
+    raise RuntimeError("qwen-flash setup cell failed before completing model/runtime preparation; check traceback above.")
+
 KEY_FILE = QWEN_WORK / "api_key.txt"
-KEY_FILE.write_text(API_TOKEN + "\n")
+KEY_FILE.write_text(API_TOKEN + "\n", encoding="utf-8")
 KEY_FILE.chmod(0o600)
-
-SERVER_ARGS = [
-    str(BIN_DIR / "llama-server"), "-m", str(MODEL_PATH), "--alias", CFG["alias"],
-    "--host", "127.0.0.1", "--port", str(SERVICE_PORT), "-ngl", "all",
-    "-c", str(CFG["context"]), "-np", "1", "-lm", "none", "--lazy-mode", "off",
-    "-ctk", CFG["cache_type"], "-ctv", CFG["cache_type"], "-fa", "on",
-    "-b", str(CFG["batch"]), "-ub", str(CFG["ubatch"]),
-    "--jinja", "--api-key-file", str(KEY_FILE), "--no-context-shift", "-lv", "4",
-]
-if PROJECTOR_PATH is not None:
-    SERVER_ARGS += ["--mmproj", str(PROJECTOR_PATH)]
-if CFG.get("rope_scaling"):
-    SERVER_ARGS += [
-        "--rope-scaling", CFG["rope_scaling"],
-        "--rope-scale", str(CFG["rope_scale"]),
-        "--yarn-orig-ctx", str(CFG["yarn_orig_ctx"]),
-    ]
+SPAWN_LOG_OFFSET = 0
 
 def start_service():
-    subprocess.run(["pkill", "-f", "llama-server"], check=False)
-    qlog(f"Starting llama-server: ctx={CFG['context']}, KV={CFG['cache_type']}")
-    return ct_spawn("llama-server", SERVER_ARGS, env=LLAMA_ENV)
+    global SPAWN_LOG_OFFSET
+    subprocess.run(["pkill", "-f", str(BIN_DIR / "llama-server")], check=False, timeout=15)
+    if HW_PLAN.get("ple_in_ram"):
+        evict_gguf_page_cache(QWEN_WORK / "model", log=qlog)
+    args = build_server_args(
+        server_bin=BIN_DIR / "llama-server",
+        model_path=MODEL_PATH,
+        alias=CFG["alias"],
+        port=SERVICE_PORT,
+        key_file=KEY_FILE,
+        plan=HW_PLAN,
+        projector_path=PROJECTOR_PATH,
+        reasoning=CFG["reasoning"],
+    )
+    SPAWN_LOG_OFFSET = ct_log_size("llama-server")
+    ple_loc = "host-ram" if HW_PLAN.get("ple_in_ram") else "ssd-mmap-lazy"
+    qlog(
+        f"Starting llama-server on 127.0.0.1:{SERVICE_PORT} | ctx={HW_PLAN['context']} "
+        f"mode={HW_PLAN['mode']} ple={ple_loc} kv={HW_PLAN['cache_type']} "
+        f"batch={HW_PLAN['batch']}/{HW_PLAN['ubatch']} reasoning={CFG['reasoning']}"
+    )
+    return ct_spawn("llama-server", args, env=LLAMA_ENV)
 
 PROCS["service"] = (start_service(), start_service)
 '''
 
-QWEN_FLASH_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify local/public auth, 800K context, vision, smoke test, then supervise
+QWEN_FLASH_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- auto-stepup CPU MoE on OOM, verify auth/1M context/vision, smoke completion & supervise
+if not globals().get("QWEN_SETUP_OK") or "service" not in PROCS:
+    raise RuntimeError("qwen-flash service did not start because an earlier notebook cell failed; see traceback above.")
+
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
 
 def http_json(url, key=None, payload=None, timeout=15):
     headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
     if key is not None:
         headers["Authorization"] = "Bearer " + key
-    req = urllib.request.Request(url, headers=headers,
-                                 data=None if payload is None else json.dumps(payload).encode())
+    req = urllib.request.Request(
+        url,
+        headers=headers,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read())
+            return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
         return err.code, {}
 
@@ -1076,67 +896,138 @@ def auth_check(base, key):
             raise RuntimeError(f"Authentication test failed on {base}: expected {expected}, got {code}")
 
 LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
-deadline = time.monotonic() + 1800
-last_notice = 0
+moe_stepups = 0
+ctx_fallback = [819_200, 524_288]
+ctx_idx = 0
+deadline = time.monotonic() + 2400
+last_notice = 0.0
+
 while time.monotonic() < deadline:
     proc = PROCS["service"][0]
     if proc.poll() is not None:
-        raise RuntimeError("llama-server exited during load:\n" + ct_tail("llama-server", 40))
+        recent_log = ct_log_since("llama-server", SPAWN_LOG_OFFSET)
+        if (
+            CFG["cpu_moe"].strip().lower() == "auto"
+            and moe_stepups < 3
+            and HW_PLAN["n_cpu_moe"] + 2 <= MODEL_NUM_LAYERS
+            and looks_like_oom(recent_log)
+        ):
+            moe_stepups += 1
+            prev_moe = HW_PLAN["n_cpu_moe"]
+            HW_PLAN["n_cpu_moe"] = min(MODEL_NUM_LAYERS, prev_moe + 2)
+            HW_PLAN["mode"] = f"hybrid-cpu-moe-{HW_PLAN['n_cpu_moe']}"
+            qlog(
+                f"Startup CUDA OOM at n_cpu_moe={prev_moe}; offloading +2 expert layers "
+                f"(-> n_cpu_moe={HW_PLAN['n_cpu_moe']}) while keeping ctx={HW_PLAN['context']}"
+            )
+            PROCS["service"] = (start_service(), start_service)
+            continue
+        if HW_PLAN.get("context_auto") and ctx_idx < len(ctx_fallback) and looks_like_oom(recent_log):
+            prev_ctx = HW_PLAN["context"]
+            next_ctx = ctx_fallback[ctx_idx]
+            ctx_idx += 1
+            if next_ctx < prev_ctx:
+                rs, rscale, yorig = compute_yarn_params(next_ctx)
+                HW_PLAN["context"] = next_ctx
+                HW_PLAN["rope_scaling"] = rs
+                HW_PLAN["rope_scale"] = rscale
+                HW_PLAN["yarn_orig_ctx"] = yorig
+                qlog(f"Startup OOM at ctx={prev_ctx}; stepping down to ctx={next_ctx} and retrying")
+                PROCS["service"] = (start_service(), start_service)
+                continue
+        raise RuntimeError("llama-server exited during load:\n" + ct_tail("llama-server", 60))
     try:
-        if http_json(LOCAL_BASE + "/health", API_TOKEN)[0] == 200:
+        if http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200:
             break
     except (OSError, ValueError):
         pass
-    if time.monotonic() - last_notice > 60:
-        qlog("Waiting for model load / warmup | " + ct_gpu_stat("memory.used,utilization.gpu"))
+    if time.monotonic() - last_notice > 45:
+        qlog(
+            f"Waiting for model load / warmup (ctx={HW_PLAN['context']}, mode={HW_PLAN['mode']}) | "
+            f"GPU: {ct_gpu_stat('memory.used,memory.total,utilization.gpu')}"
+        )
         last_notice = time.monotonic()
     time.sleep(5)
 else:
-    raise RuntimeError("Model load timeout")
+    raise RuntimeError("Model load timeout:\n" + ct_tail("llama-server", 60))
+
+if HW_PLAN.get("ple_in_ram"):
+    evict_gguf_page_cache(QWEN_WORK / "model", log=qlog)
 
 auth_check(LOCAL_BASE, API_TOKEN)
-code, props = http_json(LOCAL_BASE + "/props", API_TOKEN)
-allocated = props.get("default_generation_settings", {}).get("n_ctx")
-if code != 200 or allocated != CFG["context"]:
-    raise RuntimeError(f"Actual context differs from requested context: {allocated}")
-vision_enabled = props.get("modalities", {}).get("vision", False)
-if PROJECTOR_PATH is not None and not vision_enabled:
+code, props = http_json(LOCAL_BASE + "/props", API_TOKEN, timeout=20)
+allocated = (props.get("default_generation_settings") or {}).get("n_ctx")
+if code != 200 or allocated != HW_PLAN["context"]:
+    raise RuntimeError(f"Actual context ({allocated}) differs from requested context ({HW_PLAN['context']})")
+vision_enabled = bool((props.get("modalities") or {}).get("vision", False))
+if PROJECTOR_PATH is not None and HW_PLAN.get("enable_vision", True) and not vision_enabled:
     raise RuntimeError("Vision projector configured but server does not advertise vision")
-qlog(f"Local verified: auth=401/401/200, n_ctx={allocated}, vision={vision_enabled}")
+qlog(
+    f"Local verified: auth=401/401/200, n_ctx={allocated}, vision={vision_enabled}, "
+    f"mode={HW_PLAN['mode']}, kv={HW_PLAN['cache_type']}, ple_in_ram={HW_PLAN['ple_in_ram']}"
+)
 
 # Public endpoint verification (DNS/edge propagation can take a few seconds)
-ct_public_gate(PUBLIC_URL, lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
-               lambda: auth_check(PUBLIC_URL, API_TOKEN), qlog, timeout=120, interval=10)
-code, resp = http_json(PUBLIC_URL + "/v1/chat/completions", API_TOKEN, {
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    qlog,
+    timeout=180,
+    interval=8,
+)
+smoke_payload = {
     "model": CFG["alias"],
     "messages": [{"role": "user", "content": "只输出四个字：部署成功"}],
-    "max_tokens": 64, "temperature": 0,
-    "chat_template_kwargs": {"enable_thinking": False},
-}, timeout=180)
+    "max_tokens": 64,
+    "temperature": 0,
+}
+if CFG["reasoning"] != "off":
+    smoke_payload["chat_template_kwargs"] = {"enable_thinking": False}
+code, resp = http_json(PUBLIC_URL + "/v1/chat/completions", API_TOKEN, smoke_payload, timeout=180)
 if code != 200:
     raise RuntimeError(f"Public smoke completion failed: HTTP {code}")
-reply = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
-qlog(f"PUBLIC VERIFIED: {PUBLIC_URL}/v1 | reply={reply[:60]}")
+msg_obj = ((resp.get("choices") or [{}])[0].get("message") or {})
+reply = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
+qlog(f"PUBLIC VERIFIED: {PUBLIC_URL}/v1 | n_ctx={allocated} | reply={reply.strip()[:60]!r}")
+
 ver_rec = {
     "service": SERVICE,
-    "verified_at": time.strftime("%FT%T%z"), "base_url": PUBLIC_URL + "/v1",
-    "context_allocated": allocated, "vision_enabled": vision_enabled, "reply": reply,
+    "verified_at": time.strftime("%FT%T%z"),
+    "base_url": PUBLIC_URL + "/v1",
+    "repo": CFG["repo"],
+    "quant": CFG["quant"],
+    "alias": CFG["alias"],
+    "mode": HW_PLAN["mode"],
+    "n_cpu_moe": HW_PLAN["n_cpu_moe"],
+    "cache_type": HW_PLAN["cache_type"],
+    "ple_in_ram": HW_PLAN["ple_in_ram"],
+    "context_allocated": allocated,
+    "vision_enabled": vision_enabled,
+    "reply": reply[:120],
 }
 write_json_atomic(SERVICE_DIR / "last-verification.json", ver_rec)
 if SERVICE != "qwen-flash":
     write_json_atomic(SERVICE_DIR / f"last-verification-{SERVICE}.json", ver_rec)
 
-print(f"{SERVICE} is up: {PUBLIC_URL}")
+print(f"{SERVICE} is up: {PUBLIC_URL} (n_ctx={allocated}, mode={HW_PLAN['mode']})")
 print("CT_READY", flush=True)
 
 def qwen_heartbeat(uptime):
-    gpu_mem = ct_gpu_stat("memory.used,memory.total")
+    gpu_mem = ct_gpu_stat("memory.used,memory.total,utilization.gpu")
     status_rec = {
         "service": SERVICE,
-        "kernel_pid": os.getpid(), "server_pid": PROCS["service"][0].pid,
-        "tunnel_pid": PROCS[TUNNEL_PROCESS_KEY][0].pid, "context": CFG["context"],
-        "alias": CFG["alias"], "url": PUBLIC_URL + "/v1",
-        "updated_at": time.strftime("%FT%T%z"), "uptime_sec": uptime,
+        "kernel_pid": os.getpid(),
+        "server_pid": PROCS["service"][0].pid,
+        "tunnel_pid": PROCS[TUNNEL_PROCESS_KEY][0].pid,
+        "context": HW_PLAN["context"],
+        "mode": HW_PLAN["mode"],
+        "n_cpu_moe": HW_PLAN["n_cpu_moe"],
+        "cache_type": HW_PLAN["cache_type"],
+        "alias": CFG["alias"],
+        "url": PUBLIC_URL + "/v1",
+        "updated_at": time.strftime("%FT%T%z"),
+        "uptime_sec": uptime,
         "gpu_memory": gpu_mem,
     }
     try:
@@ -1145,10 +1036,15 @@ def qwen_heartbeat(uptime):
             write_json_atomic(SERVICE_DIR / f"last-status-{SERVICE}.json", status_rec)
     except OSError:
         pass
-    qlog("heartbeat | " + gpu_mem)
+    qlog(f"heartbeat | up={uptime}s | n_ctx={HW_PLAN['context']} | GPU: {gpu_mem}")
 
-ct_watchdog(lambda: http_json(LOCAL_BASE + "/health", API_TOKEN)[0] == 200, start_service, qlog,
-            log_name="llama-server", heartbeat=qwen_heartbeat)
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    qlog,
+    log_name="llama-server",
+    heartbeat=qwen_heartbeat,
+)
 '''
 
 # --------------------------------------------------------------------------- comfyui (Caddy auth + ComfyUI-Manager)
@@ -5250,11 +5146,12 @@ if __name__ == "__main__":
                    "Unsloth_Studio_Colab.ipynb -- built-in login, our own cloudflared (quick or fixed domain).",
                    UNSLOTH_CFG, UNSLOTH_SETUP, UNSLOTH_SERVICE, keepalive=UNSLOTH_KEEPALIVE))
     write(ROOT / "src/colabllm/services/qwen-flash.ipynb",
-          notebook("Qwen3.8-Flash-Next (G4 / 800K / Vision)",
-                   "Runs `SC117/Qwen3.8-Flash-Next-GSQ-RCO-"
-                   "abliterated-GGUF` (IQ3_S, 819200 context with YaRN 3.125x, BF16 vision projector, "
-                   "`--load-mode none --lazy-mode off`) on a Colab G4 (RTX PRO 6000 Blackwell sm_120) with "
-                   "`llama-server --api-key-file` authentication.",
+          notebook("Qwen3.8-Flash-Next (G4 · UD-Q4_K_XL-V2 · 1M Context · q8_0 KV + BF16 Vision)",
+                   "Serves `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (`unsloth-UD-Q4_K_XL-V2` "
+                   "calibrated 4-bit MoE, 1,048,576 1M context via YaRN 4.0x + `q8_0` KV/QSA k-pool cache, "
+                   "26.82 GiB 3-gram PLE table in DDR5 host RAM via `--load-mode none --lazy-mode off --no-host`, "
+                   "hardware-adaptive `--n-cpu-moe` (`3/48` layers on G4), and `mmproj-Qwen3.8-Flash-Next-BF16.gguf` "
+                   "vision projector) on a Colab G4 (RTX PRO 6000 Blackwell sm_120) with `llama-server --api-key-file`.",
                    QWEN_FLASH_CFG, QWEN_FLASH_SETUP, QWEN_FLASH_SERVICE, keepalive=QWEN_FLASH_KEEPALIVE))
     write(ROOT / "src/colabllm/services/nemotron-transcribe.ipynb",
           notebook("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech)",
