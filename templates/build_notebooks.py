@@ -4789,7 +4789,390 @@ ct_watchdog(
 )
 '''
 
+# --------------------------------------------------------------------------- tangoflux (T4 / L4 / G4 · 44.1 kHz Stereo Text-to-Audio / Sound Effect Generation)
+TANGOFLUX_CFG = dict(
+    name="tangoflux",
+    service_port=8000,
+    auth="builtin",
+    public_port=8000,
+    health_path="/health",
+    ready_timeout=2400,
+)
+
+TANGOFLUX_SETUP = r'''# @title 1. Setup -- install TangoFlux + stage weights & Flan-T5-Large on local NVMe SSD
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+VARIANT_REPOS = {
+    "crpo": "declare-lab/TangoFlux",
+    "default": "declare-lab/TangoFlux",
+    "tangoflux": "declare-lab/TangoFlux",
+    "base": "declare-lab/TangoFlux-base",
+    "tangoflux-base": "declare-lab/TangoFlux-base",
+}
+TANGOFLUX_GIT_URL = "https://github.com/declare-lab/TangoFlux.git"
+
+def tflog(msg):
+    print(time.strftime("[%F %T] [tangoflux] ") + msg, flush=True)
+
+_gpu_raw = ct_gpu_stat("name,memory.total,compute_cap").splitlines()[0]
+_gpu_parts = [p.strip() for p in _gpu_raw.split(",")]
+GPU_NAME = _gpu_parts[0]
+_vram_tok = _gpu_parts[1].split()[0] if len(_gpu_parts) > 1 and _gpu_parts[1].strip() else ""
+GPU_VRAM_MIB = int(float(_vram_tok)) if _vram_tok.replace(".", "", 1).isdigit() else 0
+GPU_ARCH = (_gpu_parts[2] if len(_gpu_parts) > 2 else "7.5").replace(".", "")
+
+RAW_VARIANT = os.environ.get("CT_TANGOFLUX_VARIANT", "crpo").strip().lower()
+EXPLICIT_MODEL = os.environ.get("CT_TANGOFLUX_MODEL", "").strip()
+if EXPLICIT_MODEL:
+    MODEL_REPO = EXPLICIT_MODEL
+    VARIANT = "base" if "base" in EXPLICIT_MODEL.lower() else "crpo"
+elif RAW_VARIANT in VARIANT_REPOS:
+    MODEL_REPO = VARIANT_REPOS[RAW_VARIANT]
+    VARIANT = "base" if "base" in RAW_VARIANT else "crpo"
+else:
+    MODEL_REPO = "declare-lab/TangoFlux"
+    VARIANT = "crpo"
+
+MODEL_ALIAS = os.environ.get("CT_TANGOFLUX_ALIAS", "tangoflux").strip() or "tangoflux"
+
+TF_WORK = Path("/content/tangoflux")
+VENV_DIR = TF_WORK / "venv"
+SRC_DIR = TF_WORK / "src"
+MODELS_ROOT = TF_WORK / "models"
+MODEL_DIR = MODELS_ROOT / MODEL_REPO.split("/")[-1]
+TEXT_ENCODER_DIR = MODELS_ROOT / "flan-t5-large"
+DRIVE_OUTPUT_DIR = Path(DATA_DIR) / "outputs"
+
+TRITON_CACHE_DIR = TF_WORK / "triton-cache"
+INDUCTOR_CACHE_DIR = TF_WORK / "inductor-cache"
+TRITON_LEGACY_DIR = Path(DATA_DIR) / "triton-cache"
+INDUCTOR_LEGACY_DIR = Path(DATA_DIR) / "inductor-cache"
+
+for _d in (TF_WORK, MODELS_ROOT, DRIVE_OUTPUT_DIR, TRITON_CACHE_DIR, INDUCTOR_CACHE_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+(TF_WORK / "colab_cache.py").write_text(__TANGOFLUX_CACHE_SOURCE__, encoding="utf-8")
+if str(TF_WORK) not in sys.path:
+    sys.path.insert(0, str(TF_WORK))
+from colab_cache import restore_cache, save_cache
+
+CACHE_KEY = f"tangoflux-diffusers0303-py{sys.version_info.major}{sys.version_info.minor}-sm{GPU_ARCH}"
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_PAIRS = (
+    (TRITON_CACHE_DIR, TRITON_LEGACY_DIR),
+    (INDUCTOR_CACHE_DIR, INDUCTOR_LEGACY_DIR),
+)
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        restore_cache(_local_c, _legacy_c, CACHE_ARCHIVES, CACHE_KEY, tflog)
+    except (OSError, ValueError) as err:
+        tflog(f"Cache restore warning ({_local_c.name}): {err}")
+
+tflog(f"GPU: {GPU_NAME} ({GPU_VRAM_MIB} MiB, sm_{GPU_ARCH}) | model={MODEL_REPO} ({VARIANT})")
+
+if not shutil.which("ffmpeg"):
+    subprocess.run(
+        "apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null 2>&1",
+        shell=True,
+        check=False,
+    )
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+
+def run_logged(cmd, log_path, env=None, cwd=None, check=True):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True, timeout=900)
+    if check and res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
+    return res
+
+def prepare_env():
+    env_log = TF_WORK / "env-setup.log"
+    marker = VENV_DIR / ".ct_tangoflux_env_v2_ready"
+    py_bin = VENV_DIR / "bin" / "python"
+    if marker.is_file() and py_bin.is_file():
+        tflog(f"Reusing existing TangoFlux virtualenv at {VENV_DIR}")
+        return py_bin
+
+    if (SRC_DIR / ".git").is_dir():
+        run_logged(["git", "-C", str(SRC_DIR), "pull", "--ff-only"], env_log, check=False)
+    else:
+        shutil.rmtree(SRC_DIR, ignore_errors=True)
+        run_logged(["git", "clone", "--depth", "1", TANGOFLUX_GIT_URL, str(SRC_DIR)], env_log)
+
+    tflog(f"Creating TangoFlux venv inheriting Colab PyTorch (log: {env_log})...")
+    uv_bin = shutil.which("uv") or "uv"
+    run_logged([uv_bin, "venv", "--system-site-packages", str(VENV_DIR), "--clear"], env_log)
+    if subprocess.run([str(py_bin), "-c", "import torch"], check=False).returncode != 0:
+        run_logged([uv_bin, "pip", "install", "--python", str(py_bin), "torch"], env_log)
+    run_logged(
+        [
+            uv_bin, "pip", "install",
+            "--python", str(py_bin),
+            "diffusers==0.30.3",
+            "transformers>=4.44.2,<4.50.0",
+            "safetensors>=0.4.3",
+            "huggingface_hub>=0.25.0",
+            "hf_xet",
+            "sentencepiece>=0.2.0",
+            "protobuf>=4.25.0,<7.0.0",
+            "psutil",
+            "packaging",
+            "pyyaml",
+            "tqdm",
+            "uvicorn>=0.30.0",
+            "starlette>=0.38.0",
+        ],
+        env_log,
+    )
+    run_logged(
+        [uv_bin, "pip", "install", "--python", str(py_bin), "--no-deps", "accelerate>=0.34.2", str(SRC_DIR)],
+        env_log,
+    )
+    check_env = dict(os.environ)
+    check_env.update({"USE_TF": "0", "USE_FLAX": "0", "TRANSFORMERS_NO_TF": "1", "TRANSFORMERS_NO_FLAX": "1"})
+    run_logged(
+        [
+            str(py_bin), "-c",
+            "import importlib.machinery, sys, types\n"
+            "try:\n"
+            "    import datasets\n"
+            "except ImportError:\n"
+            "    _s = types.ModuleType('datasets')\n"
+            "    _s.__spec__ = importlib.machinery.ModuleSpec('datasets', loader=None)\n"
+            "    _s.load_dataset = None; _s.Audio = None\n"
+            "    sys.modules['datasets'] = _s\n"
+            "import torch, diffusers, transformers\n"
+            "from tangoflux.model import TangoFlux\n"
+            "print('imports-ok', torch.__version__, 'cuda=', torch.cuda.is_available(), diffusers.__version__)",
+        ],
+        env_log,
+        env=check_env,
+    )
+    marker.write_text("v2\n", encoding="utf-8")
+    tflog("TangoFlux virtualenv ready")
+    return py_bin
+
+def _cleanup_hf_temp():
+    for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+        shutil.rmtree(p, ignore_errors=True)
+    for mp in (MODEL_DIR / ".cache", TEXT_ENCODER_DIR / ".cache"):
+        shutil.rmtree(mp, ignore_errors=True)
+
+def stage_models(py_bin):
+    dl_env = dict(os.environ)
+    dl_env["HF_XET_CHUNK_CACHE_SIZE_BYTES"] = "0"
+    dl_env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+    def _stage_main():
+        if (MODEL_DIR / "tangoflux.safetensors").is_file() and (MODEL_DIR / "vae.safetensors").is_file():
+            tflog(f"Reusing local SSD TangoFlux weights at {MODEL_DIR}")
+            return
+        tflog(f"Downloading {MODEL_REPO} -> {MODEL_DIR} ...")
+        subprocess.run(
+            [
+                str(py_bin), "-c",
+                "import os; from huggingface_hub import snapshot_download; "
+                f"snapshot_download(repo_id={MODEL_REPO!r}, local_dir={str(MODEL_DIR)!r}, "
+                "allow_patterns=['config.json', 'tangoflux.safetensors', 'vae.safetensors'])",
+            ],
+            env=dl_env,
+            check=True,
+            timeout=1800,
+        )
+
+    def _stage_t5():
+        if (TEXT_ENCODER_DIR / "model.safetensors").is_file() and (TEXT_ENCODER_DIR / "spiece.model").is_file():
+            tflog(f"Reusing local SSD Flan-T5-Large weights at {TEXT_ENCODER_DIR}")
+            return
+        tflog(f"Downloading google/flan-t5-large (safetensors only) -> {TEXT_ENCODER_DIR} ...")
+        subprocess.run(
+            [
+                str(py_bin), "-c",
+                "from huggingface_hub import snapshot_download; "
+                f"snapshot_download(repo_id='google/flan-t5-large', local_dir={str(TEXT_ENCODER_DIR)!r}, "
+                "allow_patterns=['*.json', 'spiece.model', 'model.safetensors'])",
+            ],
+            env=dl_env,
+            check=True,
+            timeout=1800,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_main = pool.submit(_stage_main)
+        f_t5 = pool.submit(_stage_t5)
+        f_main.result()
+        f_t5.result()
+    _cleanup_hf_temp()
+
+PY_BIN = prepare_env()
+stage_models(PY_BIN)
+TF_SETUP_OK = True
+tflog("Setup complete")
+'''.replace("__TANGOFLUX_CACHE_SOURCE__", repr((ROOT / "templates/colab_cache.py").read_text(encoding="utf-8")))
+
+TANGOFLUX_SERVICE = r'''# @title 2. Service -- launch authenticated TangoFlux ASGI server on 127.0.0.1
+from pathlib import Path
+if not globals().get("TF_SETUP_OK"):
+    raise RuntimeError("TangoFlux setup cell failed before completing model staging; check setup traceback above.")
+
+(TF_WORK / "colab_asgi_common.py").write_text(__TANGOFLUX_ASGI_COMMON_SOURCE__, encoding="utf-8")
+(TF_WORK / "tangoflux_server.py").write_text(__TANGOFLUX_SERVER_SOURCE__, encoding="utf-8")
+
+def start_service():
+    if not API_TOKEN:
+        raise RuntimeError("CT_API_TOKEN is empty; refusing to start unauthenticated TangoFlux server")
+    if "service" in PROCS:
+        ct_stop_proc(PROCS["service"][0])
+    subprocess.run(["pkill", "-9", "-f", "tangoflux_server.py"], check=False)
+    time.sleep(1)
+    svc_env = dict(os.environ)
+    svc_env.update({
+        "CT_API_TOKEN": API_TOKEN,
+        "CT_SERVICE_PORT": str(SERVICE_PORT),
+        "CT_DATA_DIR": str(DATA_DIR),
+        "CT_TANGOFLUX_SERVED_MODEL": MODEL_REPO,
+        "CT_TANGOFLUX_ALIAS": MODEL_ALIAS,
+        "CT_TANGOFLUX_VARIANT": VARIANT,
+        "CT_TANGOFLUX_MODEL_DIR": str(MODEL_DIR),
+        "CT_TANGOFLUX_TEXT_ENCODER_DIR": str(TEXT_ENCODER_DIR),
+        "TRITON_CACHE_DIR": str(TRITON_CACHE_DIR),
+        "TORCHINDUCTOR_CACHE_DIR": str(INDUCTOR_CACHE_DIR),
+        "USE_TF": "0",
+        "USE_FLAX": "0",
+        "TRANSFORMERS_NO_TF": "1",
+        "TRANSFORMERS_NO_FLAX": "1",
+        "PYTHONPATH": f"{TF_WORK}:{svc_env.get('PYTHONPATH', '')}".rstrip(":"),
+    })
+    proc = ct_spawn(
+        "service",
+        [str(VENV_DIR / "bin" / "python"), str(TF_WORK / "tangoflux_server.py")],
+        env=svc_env,
+        cwd=str(TF_WORK),
+    )
+    PROCS["service"] = (proc, start_service)
+    return proc
+
+start_service()
+tflog(f"Spawned TangoFlux server (pid={PROCS['service'][0].pid}) on 127.0.0.1:{SERVICE_PORT}")
+'''.replace(
+    "__TANGOFLUX_ASGI_COMMON_SOURCE__", repr((ROOT / "templates/colab_asgi_common.py").read_text(encoding="utf-8"))
+).replace(
+    "__TANGOFLUX_SERVER_SOURCE__", repr((ROOT / "templates/tangoflux_server.py").read_text(encoding="utf-8"))
+)
+
+TANGOFLUX_KEEPALIVE = r'''# @title 5. Readiness gate, warmup SFX generation, cache archiving & watchdog
+import urllib.error
+import urllib.request
+if not globals().get("TF_SETUP_OK") or "service" not in PROCS:
+    raise RuntimeError("TangoFlux service did not start because an earlier notebook cell failed; see traceback above.")
+
+def http_json(url, token="", payload=None, timeout=20):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read().decode("utf-8", errors="replace")
+            return r.status, (json.loads(body) if body.strip().startswith("{") else {})
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+def auth_check(base, token):
+    for candidate, expected in (("", 401), ("invalid-probe-token", 401), (token, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Auth test failed on {base}/v1/models: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+deadline = time.monotonic() + 1800
+last_notice = 0
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        raise RuntimeError("TangoFlux server exited during startup:\n" + ct_tail("service", 90))
+    try:
+        code, _ = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        if code == 200:
+            break
+    except Exception:
+        pass
+    if time.monotonic() - last_notice >= 20:
+        last_line = (ct_tail("service", 3).strip().splitlines() or ["loading weights..."])[-1]
+        tflog(f"Waiting for TangoFlux server | GPU: {ct_gpu_stat()} | {last_line[:100]}")
+        last_notice = time.monotonic()
+    time.sleep(4)
+else:
+    raise RuntimeError("Timed out waiting for TangoFlux server to become ready:\n" + ct_tail("service", 90))
+
+auth_check(LOCAL_BASE, API_TOKEN)
+
+# Warmup generation to compile/cache CUDA & Triton kernels before opening public gate
+warmup_req = urllib.request.Request(
+    LOCAL_BASE + "/api/ct/generate",
+    headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_TOKEN}"},
+    data=json.dumps({
+        "prompt": "Gentle rain falling on wooden roof",
+        "duration": 2.0,
+        "steps": 10,
+        "guidance_scale": 4.5,
+        "seed": 0,
+        "response_format": "wav",
+    }).encode("utf-8"),
+)
+try:
+    with urllib.request.urlopen(warmup_req, timeout=180) as wresp:
+        wav_bytes = wresp.read()
+        tflog(f"Warmup SFX generation succeeded ({len(wav_bytes):,} bytes 44.1 kHz stereo WAV)")
+except Exception as werr:
+    tflog(f"Warmup SFX generation warning: {werr}")
+
+for _local_c, _legacy_c in CACHE_PAIRS:
+    try:
+        save_cache(_local_c, CACHE_ARCHIVES, CACHE_KEY, tflog)
+    except (OSError, ValueError) as err:
+        tflog(f"Cache archive save warning ({_local_c.name}): {err}")
+
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    tflog,
+    timeout=180,
+    interval=8,
+)
+tflog(f"Public endpoint verified: {PUBLIC_URL}/v1/models")
+
+print(f"{SERVICE} is up: {PUBLIC_URL} (model={MODEL_REPO})")
+print("CT_READY", flush=True)
+
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    tflog,
+    heartbeat=lambda up: tflog(f"heartbeat | up={up}s | GPU: {ct_gpu_stat()}"),
+)
+'''
+
 if __name__ == "__main__":
+    write(ROOT / "src/colabllm/services/tangoflux.ipynb",
+          notebook("TangoFlux (T4 / L4 / G4 · 44.1 kHz Stereo Text-to-Audio & Sound Effect Generation)",
+                   "Serves `declare-lab/TangoFlux` (CRPO preference-optimized 515M FluxTransformer + Flan-T5-Large + "
+                   "AutoencoderOobleck VAE, or `declare-lab/TangoFlux-base` via `--variant base`) on a Colab T4 GPU by "
+                   "default (also fast on L4/G4/A100), generating 1–30s 44.1 kHz stereo sound effects, ambient audio, "
+                   "and musical cues with fail-closed Bearer token auth, single & batch SFX endpoints, and Google Drive "
+                   "output persistence.",
+                   TANGOFLUX_CFG, TANGOFLUX_SETUP, TANGOFLUX_SERVICE,
+                   keepalive=TANGOFLUX_KEEPALIVE))
     write(ROOT / "src/colabllm/services/drama3.ipynb",
           notebook("Fish Audio Drama 3 (G4 / H100 / A100 · SGLang-Omni Zero-Shot Multi-Ref TTS & Novel Narration)",
                    "Serves `fishaudio/drama-3` (BF16 on G4 / H100 / A100-80GB) or `fishaudio/drama-3-int4` "

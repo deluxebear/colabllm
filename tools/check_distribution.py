@@ -98,6 +98,7 @@ def check(artifact):
             'qwen3-tts': ('tts', 'voices', 'design-voice'),
             'indextts': ('tts', 'voices'),
             'drama3': ('tts', 'narrate', 'voices', 'upload-voice', 'delete-voice', 'ls-drive'),
+            'tangoflux': ('generate', 'sfx', 'batch', 'models', 'ls-drive'),
             'comfyui': ('pull-workflow', 'pull-model'),
             'openjutsu': ('check',),
             'unlimited-ocr': ('ocr', 'job', 'resume'),

@@ -278,6 +278,7 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **Qwen3-TTS** | `L4` | Bearer API Key (`builtin`) | `https://qwen3-tts.example.com` | [docs/qwen3-tts.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen3-tts.md) |
 | **IndexTTS-2.5** | `L4` | Bearer API Key (`builtin`) | `https://indextts.example.com` | [docs/indextts.md](https://github.com/deluxebear/colabllm/blob/master/docs/indextts.md) |
 | **Fish Audio Drama 3 (SGLang-Omni TTS & 小说朗读)** | `G4` | `SGLang-Omni` Bearer API Key (`builtin`) | `https://drama3.example.com` | [docs/drama3.md](https://github.com/deluxebear/colabllm/blob/master/docs/drama3.md) |
+| **TangoFlux (44.1 kHz 立体声音效与文本生音频)** | `T4` | Bearer API Key (`builtin`) | `https://tangoflux.example.com` | [docs/tangoflux.md](https://github.com/deluxebear/colabllm/blob/master/docs/tangoflux.md) |
 | **Unlimited-OCR 2** | `A100` | Caddy (Basic Auth + Bearer) | `https://unlimited-ocr.example.com` | [docs/unlimited-ocr.md](https://github.com/deluxebear/colabllm/blob/master/docs/unlimited-ocr.md) |
 | **LongCat-Video-Avatar 1.5** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-avatar.example.com` | [docs/longcat-avatar.md](https://github.com/deluxebear/colabllm/blob/master/docs/longcat-avatar.md) |
 | **LongCat-Video** | `G4` | Caddy (Basic Auth + Bearer) | `https://longcat-video.example.com` | [docs/longcat-video.md](https://github.com/deluxebear/colabllm/blob/master/docs/longcat-video.md) |
