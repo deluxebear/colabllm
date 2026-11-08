@@ -1047,6 +1047,359 @@ ct_watchdog(
 )
 '''
 
+# --------------------------------------------------------------------------- deepseek-qwen-9b (L4 default / T4, llama.cpp b11540, i1-Q4_K_M + native MTP, 256K + q8_0 KV + F16 vision)
+DEEPSEEK_QWEN_9B_CFG = dict(name="deepseek-qwen-9b", service_port=8000, auth="builtin", public_port=8000,
+                            health_path="/health", ready_timeout=2400)
+
+DEEPSEEK_QWEN_9B_SETUP = (
+    r'''# @title 1. Setup -- parallel llama.cpp b11540 CUDA cache + i1-Q4_K_M GGUF + native MTP Q8_0 sidecar + F16 mmproj + 256K L4/T4 plan
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+DS9B_WORK = Path(os.environ.get("CT_DS9B_WORK_DIR", "/content/deepseek-qwen-9b"))
+DS9B_WORK.mkdir(parents=True, exist_ok=True)
+(DS9B_WORK / "deepseek_qwen_9b_runtime.py").write_text('''
+    + repr((ROOT / "src/colabllm/lib/deepseek_qwen_9b_runtime.py").read_text())
+    + r''', encoding="utf-8")
+if str(DS9B_WORK) not in sys.path:
+    sys.path.insert(0, str(DS9B_WORK))
+
+from deepseek_qwen_9b_runtime import (
+    DEFAULT_ALIAS,
+    DEFAULT_LLAMA_COMMIT,
+    DEFAULT_LLAMA_REPO,
+    DEFAULT_MTP_DRAFT_MAX,
+    DEFAULT_MTP_MODE,
+    DEFAULT_QUANT,
+    DEFAULT_REPO,
+    UPSTREAM_HF_REPO,
+    build_server_args,
+    compute_yarn_params,
+    detect_gpu_info,
+    detect_host_ram_mib,
+    looks_like_oom,
+    plan_hardware_config,
+    prepare_llama_runtime,
+    stage_model_and_projector,
+    stage_mtp_sidecar,
+    write_json_atomic,
+)
+
+def ds9log(msg):
+    print(time.strftime("[%F %T] [deepseek-qwen-9b] ") + msg, flush=True)
+
+if MOUNT_DRIVE and not Path("/content/drive/MyDrive").is_dir():
+    raise RuntimeError("Drive is not mounted. Run via `colabllm deepseek-qwen-9b up`.")
+
+SERVICE_DIR = Path(DATA_DIR)
+SERVICE_DIR.mkdir(parents=True, exist_ok=True)
+DRIVE_BACKUP_ROOT = (
+    Path(os.environ.get("CT_DS9B_MODEL_ROOT", "/content/drive/MyDrive/models"))
+    if (MOUNT_DRIVE and Path("/content/drive/MyDrive").is_dir())
+    else None
+)
+DS9B_RUNTIME_CACHE = (
+    (DRIVE_BACKUP_ROOT / ".runtimes" / "llama.cpp")
+    if DRIVE_BACKUP_ROOT is not None
+    else (SERVICE_DIR / "runtime-cache")
+)
+
+CFG = {
+    "repo": os.environ.get("CT_DS9B_REPO", DEFAULT_REPO),
+    "upstream_repo": os.environ.get("CT_DS9B_UPSTREAM_REPO", UPSTREAM_HF_REPO),
+    "quant": os.environ.get("CT_DS9B_QUANT", DEFAULT_QUANT),
+    "alias": os.environ.get("CT_DS9B_ALIAS", DEFAULT_ALIAS),
+    "context": os.environ.get("CT_DS9B_CONTEXT", "auto"),
+    "cache_type": os.environ.get("CT_DS9B_CACHE_TYPE", "q8_0"),
+    "parallel": int(os.environ.get("CT_DS9B_PARALLEL", "1")),
+    "batch": int(os.environ.get("CT_DS9B_BATCH", "2048")),
+    "ubatch": int(os.environ.get("CT_DS9B_UBATCH", "512")),
+    "reasoning": os.environ.get("CT_DS9B_REASONING", "on"),
+    "enable_vision": os.environ.get("CT_DS9B_VISION", "1") != "0",
+    "mtp": os.environ.get("CT_DS9B_MTP", DEFAULT_MTP_MODE),
+    "mtp_draft_max": int(os.environ.get("CT_DS9B_MTP_DRAFT", str(DEFAULT_MTP_DRAFT_MAX))),
+    "llama_repo": os.environ.get("CT_LLAMA_REPO", DEFAULT_LLAMA_REPO),
+    "llama_commit": os.environ.get("CT_LLAMA_COMMIT", DEFAULT_LLAMA_COMMIT),
+}
+
+DS9B_GPU = detect_gpu_info()
+DS9B_RAM_MIB = detect_host_ram_mib()
+HW_PLAN = plan_hardware_config(
+    vram_mib=DS9B_GPU["vram_mib"],
+    ram_mib=DS9B_RAM_MIB,
+    quant=CFG["quant"],
+    requested_context=CFG["context"],
+    cache_type=CFG["cache_type"],
+    enable_vision=CFG["enable_vision"],
+    mtp=CFG["mtp"],
+    mtp_draft_max=CFG["mtp_draft_max"],
+    parallel=CFG["parallel"],
+    batch=CFG["batch"],
+    ubatch=CFG["ubatch"],
+)
+ds9log(
+    f"Hardware plan: gpu={DS9B_GPU['name']} ({DS9B_GPU['vram_mib']} MiB VRAM, sm_{DS9B_GPU['cuda_arch'] or 'cpu'}) "
+    f"ram={DS9B_RAM_MIB} MiB -> mode={HW_PLAN['mode']} quant={HW_PLAN['quant']} mtp={HW_PLAN['enable_mtp']} "
+    f"context={HW_PLAN['context']} (yarn={HW_PLAN['rope_scale']}x, kv={HW_PLAN['cache_type']} {HW_PLAN['kv_cache_mib']} MiB, "
+    f"vram_headroom={HW_PLAN['estimated_vram_headroom_mib']} MiB)"
+)
+
+with ThreadPoolExecutor(max_workers=3) as _pool:
+    _f_runtime = _pool.submit(
+        prepare_llama_runtime,
+        work_dir=DS9B_WORK,
+        cache_root=DS9B_RUNTIME_CACHE,
+        llama_repo=CFG["llama_repo"],
+        llama_commit=CFG["llama_commit"],
+        gpu_info=DS9B_GPU,
+        log=ds9log,
+    )
+    _f_model = _pool.submit(
+        stage_model_and_projector,
+        repo=CFG["repo"],
+        quant=HW_PLAN["quant"],
+        enable_vision=CFG["enable_vision"],
+        service_dir=SERVICE_DIR,
+        work_dir=DS9B_WORK,
+        drive_backup_root=DRIVE_BACKUP_ROOT,
+        log=ds9log,
+    )
+    _f_mtp = _pool.submit(
+        stage_mtp_sidecar,
+        upstream_repo=CFG["upstream_repo"],
+        llama_repo=CFG["llama_repo"],
+        llama_commit=CFG["llama_commit"],
+        work_dir=DS9B_WORK,
+        drive_backup_root=DRIVE_BACKUP_ROOT,
+        mtp_mode=("off" if not HW_PLAN.get("enable_mtp") else CFG["mtp"]),
+        log=ds9log,
+    )
+    while not (_f_runtime.done() and _f_model.done() and _f_mtp.done()):
+        for _fut in (_f_runtime, _f_model, _f_mtp):
+            if _fut.done() and _fut.exception():
+                raise _fut.exception()
+        _free_gb = shutil.disk_usage(DS9B_WORK).free / 1e9
+        ds9log(
+            f"Preparation heartbeat | build={'done' if _f_runtime.done() else 'running'} "
+            f"model={'done' if _f_model.done() else 'running'} "
+            f"mtp={'done' if _f_mtp.done() else 'running'} | free_ssd={_free_gb:.1f} GB"
+        )
+        time.sleep(25)
+    BIN_DIR, LLAMA_ENV, PINNED_COMMIT = _f_runtime.result()
+    MODEL_PATH, PROJECTOR_PATH = _f_model.result()
+    MTP_PATH = _f_mtp.result()
+
+if MTP_PATH is None:
+    HW_PLAN["enable_mtp"] = False
+
+DS9B_SETUP_OK = True
+ds9log(f"Setup complete: commit={PINNED_COMMIT[:10]} model={MODEL_PATH} projector={PROJECTOR_PATH} mtp={MTP_PATH}")
+'''
+)
+
+DEEPSEEK_QWEN_9B_SERVICE = r'''# @title 2. Service -- llama-server on 127.0.0.1 (DeepSeek-V4-Pro-Qwen3.5-9B, i1-Q4_K_M + draft-mtp, 256K q8_0 KV, F16 vision)
+if not globals().get("DS9B_SETUP_OK"):
+    raise RuntimeError("deepseek-qwen-9b setup cell failed before completing model/runtime preparation; check traceback above.")
+
+KEY_FILE = DS9B_WORK / "api_key.txt"
+KEY_FILE.write_text(API_TOKEN + "\n", encoding="utf-8")
+KEY_FILE.chmod(0o600)
+SPAWN_LOG_OFFSET = 0
+
+def start_service():
+    global SPAWN_LOG_OFFSET
+    subprocess.run(["pkill", "-f", str(BIN_DIR / "llama-server")], check=False, timeout=15)
+    args = build_server_args(
+        server_bin=BIN_DIR / "llama-server",
+        model_path=MODEL_PATH,
+        alias=CFG["alias"],
+        port=SERVICE_PORT,
+        key_file=KEY_FILE,
+        plan=HW_PLAN,
+        projector_path=PROJECTOR_PATH,
+        mtp_path=MTP_PATH,
+        reasoning=CFG["reasoning"],
+    )
+    SPAWN_LOG_OFFSET = ct_log_size("llama-server")
+    ds9log(
+        f"Starting llama-server on 127.0.0.1:{SERVICE_PORT} | quant={HW_PLAN['quant']} ctx={HW_PLAN['context']} "
+        f"mtp={bool(MTP_PATH and HW_PLAN.get('enable_mtp'))}(n={HW_PLAN.get('mtp_draft_max')}) "
+        f"mode={HW_PLAN['mode']} kv={HW_PLAN['cache_type']} "
+        f"batch={HW_PLAN['batch']}/{HW_PLAN['ubatch']} reasoning={CFG['reasoning']}"
+    )
+    return ct_spawn("llama-server", args, env=LLAMA_ENV)
+
+PROCS["service"] = (start_service(), start_service)
+'''
+
+DEEPSEEK_QWEN_9B_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- auto-stepdown context on OOM, verify auth/256K context/vision, smoke completion & supervise
+if not globals().get("DS9B_SETUP_OK") or "service" not in PROCS:
+    raise RuntimeError("deepseek-qwen-9b service did not start because an earlier notebook cell failed; see traceback above.")
+
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
+
+def http_json(url, key=None, payload=None, timeout=15):
+    headers = {"Content-Type": "application/json", "User-Agent": BROWSER_UA}
+    if key is not None:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(
+        url,
+        headers=headers,
+        data=None if payload is None else json.dumps(payload).encode("utf-8"),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        return err.code, {}
+
+def auth_check(base, key):
+    for candidate, expected in ((None, 401), ("invalid-deployment-test-key", 401), (key, 200)):
+        code, _ = http_json(base + "/v1/models", candidate)
+        if code != expected:
+            raise RuntimeError(f"Authentication test failed on {base}: expected {expected}, got {code}")
+
+LOCAL_BASE = f"http://127.0.0.1:{SERVICE_PORT}"
+ctx_fallback = [196_608, 131_072, 65_536, 32_768]
+ctx_idx = 0
+deadline = time.monotonic() + 900
+last_notice = 0.0
+
+while time.monotonic() < deadline:
+    proc = PROCS["service"][0]
+    if proc.poll() is not None:
+        recent_log = ct_log_since("llama-server", SPAWN_LOG_OFFSET)
+        if HW_PLAN.get("context_auto") and ctx_idx < len(ctx_fallback) and looks_like_oom(recent_log):
+            prev_ctx = HW_PLAN["context"]
+            while ctx_idx < len(ctx_fallback) and ctx_fallback[ctx_idx] >= prev_ctx:
+                ctx_idx += 1
+            if ctx_idx < len(ctx_fallback):
+                next_ctx = ctx_fallback[ctx_idx]
+                ctx_idx += 1
+                rs, rscale, yorig = compute_yarn_params(next_ctx)
+                HW_PLAN["context"] = next_ctx
+                HW_PLAN["rope_scaling"] = rs
+                HW_PLAN["rope_scale"] = rscale
+                HW_PLAN["yarn_orig_ctx"] = yorig
+                ds9log(f"Startup OOM at ctx={prev_ctx}; stepping down to ctx={next_ctx} and retrying")
+                PROCS["service"] = (start_service(), start_service)
+                continue
+        if HW_PLAN.get("enable_mtp") and str(CFG.get("mtp", "auto")).lower() == "auto":
+            HW_PLAN["enable_mtp"] = False
+            ds9log("llama-server exited during MTP draft startup in auto mode; retrying without MTP draft:\n" + recent_log[-500:])
+            PROCS["service"] = (start_service(), start_service)
+            continue
+        raise RuntimeError("llama-server exited during load:\n" + ct_tail("llama-server", 60))
+    try:
+        if http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200:
+            break
+    except (OSError, ValueError):
+        pass
+    if time.monotonic() - last_notice > 30:
+        ds9log(
+            f"Waiting for model load / warmup (quant={HW_PLAN['quant']}, mtp={HW_PLAN.get('enable_mtp')}, ctx={HW_PLAN['context']}) | "
+            f"GPU: {ct_gpu_stat('memory.used,memory.total,utilization.gpu')}"
+        )
+        last_notice = time.monotonic()
+    time.sleep(4)
+else:
+    raise RuntimeError("Model load timeout:\n" + ct_tail("llama-server", 60))
+
+auth_check(LOCAL_BASE, API_TOKEN)
+code, props = http_json(LOCAL_BASE + "/props", API_TOKEN, timeout=20)
+allocated = (props.get("default_generation_settings") or {}).get("n_ctx")
+if code != 200 or allocated != HW_PLAN["context"]:
+    raise RuntimeError(f"Actual context ({allocated}) differs from requested context ({HW_PLAN['context']})")
+vision_enabled = bool((props.get("modalities") or {}).get("vision", False))
+if PROJECTOR_PATH is not None and HW_PLAN.get("enable_vision", True) and not vision_enabled:
+    raise RuntimeError("Vision projector configured but server does not advertise vision")
+mtp_active = bool(MTP_PATH is not None and HW_PLAN.get("enable_mtp", False))
+ds9log(
+    f"Local verified: auth=401/401/200, quant={HW_PLAN['quant']}, mtp={mtp_active}, n_ctx={allocated}, "
+    f"vision={vision_enabled}, mode={HW_PLAN['mode']}, kv={HW_PLAN['cache_type']}"
+)
+
+# Public endpoint verification (DNS/edge propagation can take a few seconds)
+ct_public_gate(
+    PUBLIC_URL,
+    lambda: http_json(PUBLIC_URL + "/v1/models", API_TOKEN, timeout=15)[0],
+    lambda: auth_check(PUBLIC_URL, API_TOKEN),
+    ds9log,
+    timeout=180,
+    interval=8,
+)
+smoke_payload = {
+    "model": CFG["alias"],
+    "messages": [{"role": "user", "content": "只输出四个字：部署成功"}],
+    "max_tokens": 64,
+    "temperature": 0,
+}
+if CFG["reasoning"] != "off":
+    smoke_payload["chat_template_kwargs"] = {"enable_thinking": False}
+code, resp = http_json(PUBLIC_URL + "/v1/chat/completions", API_TOKEN, smoke_payload, timeout=120)
+if code != 200:
+    raise RuntimeError(f"Public smoke completion failed: HTTP {code}")
+msg_obj = ((resp.get("choices") or [{}])[0].get("message") or {})
+reply = msg_obj.get("content") or msg_obj.get("reasoning_content") or ""
+ds9log(f"PUBLIC VERIFIED: {PUBLIC_URL}/v1 | quant={HW_PLAN['quant']} | mtp={mtp_active} | n_ctx={allocated} | reply={reply.strip()[:60]!r}")
+
+ver_rec = {
+    "service": SERVICE,
+    "verified_at": time.strftime("%FT%T%z"),
+    "base_url": PUBLIC_URL + "/v1",
+    "repo": HW_PLAN.get("resolved_repo") or CFG["repo"],
+    "quant": HW_PLAN["quant"],
+    "alias": CFG["alias"],
+    "mode": HW_PLAN["mode"],
+    "cache_type": HW_PLAN["cache_type"],
+    "context_allocated": allocated,
+    "vision_enabled": vision_enabled,
+    "mtp_enabled": mtp_active,
+    "mtp_draft_max": HW_PLAN.get("mtp_draft_max"),
+    "reply": reply[:120],
+}
+write_json_atomic(SERVICE_DIR / "last-verification.json", ver_rec)
+if SERVICE != "deepseek-qwen-9b":
+    write_json_atomic(SERVICE_DIR / f"last-verification-{SERVICE}.json", ver_rec)
+
+print(f"{SERVICE} is up: {PUBLIC_URL} (quant={HW_PLAN['quant']}, mtp={mtp_active}, n_ctx={allocated})")
+print("CT_READY", flush=True)
+
+def ds9b_heartbeat(uptime):
+    gpu_mem = ct_gpu_stat("memory.used,memory.total,utilization.gpu")
+    status_rec = {
+        "service": SERVICE,
+        "kernel_pid": os.getpid(),
+        "server_pid": PROCS["service"][0].pid,
+        "tunnel_pid": PROCS[TUNNEL_PROCESS_KEY][0].pid,
+        "quant": HW_PLAN["quant"],
+        "mtp_enabled": mtp_active,
+        "context": HW_PLAN["context"],
+        "mode": HW_PLAN["mode"],
+        "cache_type": HW_PLAN["cache_type"],
+        "alias": CFG["alias"],
+        "url": PUBLIC_URL + "/v1",
+        "updated_at": time.strftime("%FT%T%z"),
+        "uptime_sec": uptime,
+        "gpu_memory": gpu_mem,
+    }
+    try:
+        write_json_atomic(SERVICE_DIR / "last-status.json", status_rec)
+        if SERVICE != "deepseek-qwen-9b":
+            write_json_atomic(SERVICE_DIR / f"last-status-{SERVICE}.json", status_rec)
+    except OSError:
+        pass
+    ds9log(f"heartbeat | up={uptime}s | quant={HW_PLAN['quant']} | mtp={mtp_active} | n_ctx={HW_PLAN['context']} | GPU: {gpu_mem}")
+
+ct_watchdog(
+    lambda: http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200,
+    start_service,
+    ds9log,
+    log_name="llama-server",
+    heartbeat=ds9b_heartbeat,
+)
+'''
+
 # --------------------------------------------------------------------------- comfyui (Caddy auth + ComfyUI-Manager)
 COMFYUI_CFG = dict(name="comfyui", service_port=8188, auth="caddy", public_port=18080,
                    health_path="/system_stats", ready_timeout=2400)
@@ -5153,6 +5506,14 @@ if __name__ == "__main__":
                    "hardware-adaptive `--n-cpu-moe` (`3/48` layers on G4), and `mmproj-Qwen3.8-Flash-Next-BF16.gguf` "
                    "vision projector) on a Colab G4 (RTX PRO 6000 Blackwell sm_120) with `llama-server --api-key-file`.",
                    QWEN_FLASH_CFG, QWEN_FLASH_SETUP, QWEN_FLASH_SERVICE, keepalive=QWEN_FLASH_KEEPALIVE))
+    write(ROOT / "src/colabllm/services/deepseek-qwen-9b.ipynb",
+          notebook("DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic (L4 Default / T4 · i1-Q4_K_M + Native MTP · 256K Context + F16 Vision)",
+                   "Serves `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` GGUF (`i1-Q4_K_M` 5.24 GiB imatrix "
+                   "4-bit default, native Multi-Token Prediction `mtp-Q8_0.gguf` draft sidecar via `--spec-type draft-mtp`, "
+                   "`mmproj-f16.gguf` multimodal vision projector, and full native 262,144 256K context with `q8_0` KV cache) "
+                   "on a Colab L4 GPU by default via `llama-server --api-key-file`.",
+                   DEEPSEEK_QWEN_9B_CFG, DEEPSEEK_QWEN_9B_SETUP, DEEPSEEK_QWEN_9B_SERVICE,
+                   keepalive=DEEPSEEK_QWEN_9B_KEEPALIVE))
     write(ROOT / "src/colabllm/services/nemotron-transcribe.ipynb",
           notebook("NVIDIA-Nemotron-3.5-Transcribe-30B-A4B (G4 / vLLM + NeMo Speech)",
                    "Serves `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` (BF16 / FP8 / NVFP4, 65536 context, "

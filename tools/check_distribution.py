@@ -106,7 +106,9 @@ def check(artifact):
             'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),
             'flux-klein': ('generate', 'edit', 'upsample', 'ls-drive', 'models'),
             'qwen-image': ('generate', 'edit', 'ls-drive', 'models'),
+            'qwen-flash': ('models', 'plan'),
             'deepseek-coder': ('models', 'plan'),
+            'deepseek-qwen-9b': ('models', 'plan'),
         }
         for service in services:
             help_text = run([command, service, '--help'])

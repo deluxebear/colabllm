@@ -33,6 +33,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | --- | --- | --- |
 | Qwen3.8-Flash-Next LLM / vision (1M context on G4) | `qwen-flash` | [Qwen Flash](references/qwen-flash.md) |
 | DeepSeek-V4.1-Flash Coder (auto max context up to 1M + vision) | `deepseek-coder` | [DeepSeek Coder](references/deepseek-coder.md) |
+| DeepSeek-V4-Pro Qwen3.5-9B reasoning / vision (256K on L4/T4) | `deepseek-qwen-9b` | [DeepSeek-Qwen-9B](references/deepseek-qwen-9b.md) |
 | Ollama models, OpenAI/Anthropic/native APIs & tuning | `ollama` | [Ollama](references/ollama.md) |
 | PDF/image files or directories to Markdown | `unlimited-ocr` | [Unlimited-OCR](references/unlimited-ocr.md) |
 | Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |

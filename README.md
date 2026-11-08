@@ -288,8 +288,19 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](https://github.com/deluxebear/colabllm/blob/master/docs/comfyui.md) |
 | **Qwen3.8-Flash-Next (UD-Q4_K_XL-V2 · 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-flash.md) |
 | **DeepSeek-V4.1-Flash Coder (Auto Max 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://deepseek.example.com` | [docs/deepseek-coder.md](https://github.com/deluxebear/colabllm/blob/master/docs/deepseek-coder.md) |
-| **Ollama** | `T4` | Caddy (Basic Auth + Bearer + `x-api-key`) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
+| **DeepSeek-V4-Pro-Qwen3.5-9B (i1-Q4_K_M + MTP · 256K + Vision)** | `L4` | `llama-server` Bearer API Key | `https://deepseek-9b.example.com` | [docs/deepseek-qwen-9b.md](https://github.com/deluxebear/colabllm/blob/master/docs/deepseek-qwen-9b.md) |
+| **Ollama（含 Qwen3.8-27B BF16 预设）** | `T4` / `G4` | Caddy (Basic Auth + Bearer + `x-api-key`) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
 | **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](https://github.com/deluxebear/colabllm/blob/master/docs/unsloth-studio.md) |
+
+### 文本与编程大模型选型说明（Colab G4 硬件边界）
+
+针对 Colab G4 的实测硬件边界（本地 NVMe 可用空间约 **`253 GB`**、显存 **`95.6 GiB`**、主机 DDR5 内存 **`~176 GiB`**），项目内三套主力文本/多模态推理方案按如下分工与选型构建：
+
+- **`deepseek-coder`（编程、Coding Agent 与复杂逻辑推理首选）**：默认部署 `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF`（基于 `ISTA-DASLab` 50% 能力剪枝、保留核心 `192` 编程/推理专家的 `GSQ-RCO IQ2_XXS` 主干 `72.1 GB` + `110.6 GB` `IQ4_NL` Engram + `BF16` 视觉，总计 **`183.7 GB`**）。
+  - **为何不换用未剪枝 `huihui-ai/Huihui-DeepSeek-V4.1-Flash-1017-abliterated-GGUF`**：该仓库可直接加载的成品仅有 **`1-bit`** 的 `UD-IQ1_S`（`234 GB`，贴近本地盘红线，且主干 `114 GiB` 超出 G4 显存、须卸载约 `30 GiB` 专家至内存而大幅降速）与 `UD-IQ1_M`（`251 GB`，超出本地盘安全容量），其余 `Q2` / `Coder` 均为需本地二次重写的 `patch` 差分包；而当前 `Abiray` 成品版不仅稳留约 `65 GB` 本地盘空间、**主干 100% 全驻 G4 显存（`n_cpu_moe=0`）+ `103 GiB` Engram 全驻 DDR5 内存跑满 `1,048,576`（1M）上下文**，且 `192` 个 `IQ2_XXS` 编程专家保持字节级无损（与原版 Top-1 一致率 `99.80%`、安全拒答率 `0.0%`）。
+- **`qwen-flash`（日常通用对话、超长文档理解与文学创作首选）**：默认部署 `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` 成品目录 **`unsloth-UD-Q4_K_XL-V2`**（`imatrix_micro3` 校准 **4-bit** 量化，`103.7 GiB` + `BF16` 视觉；该目录已是去审查重校准成品，无需也不应重复叠加仓库内的 `patch-unsloth` 差分包）。通过 `26.82 GiB` PLE 表常驻 DDR5 内存、`q8_0` 压缩 KV/QSA 索引缓存（`16.05 GiB`）及自动卸载仅 `3/48` 层路由专家（`4.39 GiB`），在 G4 上跑满 **`1,048,576`（1M）** 上下文，实测生成吞吐达 **`67 ~ 88 tok/s`**（`84K` 无缓存输入 Prefill 达 `818 tok/s`）。
+- **`ollama --preset huihui-27b`（无损 BF16 稠密模型与多协议兼容首选）**：在 G4 上一键部署 `huihui_ai/Qwen3.8-abliterated:27b-bf16`（约 `56 GB` 满血 BF16 权重 + 原生 `262,144` 上下文 + `f16` KV），原生同时开放 Ollama `/api/*`、OpenAI `/v1/*` 与 Anthropic `/v1/messages` 三套接口。
+- **`deepseek-qwen-9b`（L4 / T4 省配额高吞吐强推理与多模态首选）**：默认在 **L4（24 GB）** 上部署 `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` 的 imatrix 校准 **`i1-Q4_K_M`（`5.24 GiB`）** + **原生 Multi-Token Prediction（`MTP`）草稿侧车（`--spec-type draft-mtp`）** + `mmproj-f16` 视觉（亦可 `--quant Q8_0` 切换 8-bit）；依托 24 层 Gated DeltaNet + 主干/MTP 共 9 层全注意力的混合结构，**256K（`262,144`）满窗口 `q8_0` KV 仅占 `4.83 GiB`**，在 L4（余量 `~9.3 GiB`）上全层 GPU 常驻跑满原生 256K 上下文 + 深度思考 + 视觉理解（`--gpu T4` 同样自动启用 `i1-Q4_K_M` + MTP）。
 
 ## 目录结构
 
