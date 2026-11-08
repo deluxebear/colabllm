@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-09
+
+### 新增
+
+- 新增 `deepseek-qwen-9b` 运行时（默认 L4，兼容 T4/A100/H100/G4，`llama-server` Bearer API Key）：部署 `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` GGUF，默认加载 `i1-Q4_K_M` imatrix 权重 + 远程导出并缓存至 Google Drive 的原生 `Q8_0` MTP 草稿侧车（`--spec-type draft-mtp` 无损推测解码，L4 实测约 `57–68 tok/s`）+ `mmproj-f16` 视觉投影器与满血原生 `256K`（`262,144`）上下文，提供 `plan` 与 `models` 子命令。
+- 新增 `tangoflux` 运行时（默认 L4，Bearer API Key）：部署 `declare-lab/TangoFlux` 44.1 kHz 立体声文生音效服务，提供单条 `generate`、多随机变体与断点续跑 `batch` 音效包生成命令。
+- 新增 `drama3` 运行时（G4，SGLang-Omni Bearer API Key）：部署 `fishaudio/drama-3` 多语种零样本克隆语音合成服务，支持自定义音色库管理、小说分章有声书断点续合成与外接 OpenAI 兼容 LLM 的自动多角色台词拆解配音。
+- `ollama` 运行时：新增 `--preset huihui-27b` 一键预设，自动匹配 `Huihui-Qwen3.8-27B-abliterated` 量化规格与上下文配置。
+
+### 变更
+
+- `qwen-flash` 升级为 `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF`（`unsloth-UD-Q4_K_XL-V2` + Unsloth `bf16` 精度修复补丁 + `mmproj-BF16`），基于 `llama.cpp` `b11540` 在 G4 上启用 YaRN 4.0x 满血 `1M`（`1,048,576`）上下文、DDR5 主机内存 PLE 常驻与自适应 `--n-cpu-moe 3`，并新增离线 `plan` 与在线 `models` 子命令。
+
+### 文档
+
+- 补充跨机器迁移状态目录与固定域名配置的说明，以及 DeepSeek 系列运行时（`deepseek-coder` vs `deepseek-qwen-9b`）的选型对比说明。
+
 ## [0.1.4] - 2026-11-06
 
 ### 变更
