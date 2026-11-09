@@ -287,6 +287,19 @@ class Drama3MiddlewareTest(unittest.TestCase):
                 saved_hdr = resp_hdrs.get("x-saved-drive-path", "")
                 self.assertTrue(saved_hdr and Path(saved_hdr).is_file())
 
+                # 6. WAV reference fallback succeeds even when ffmpeg is absent from PATH
+                with patch("colab_asgi_common.subprocess.run", side_effect=FileNotFoundError(2, "No ffmpeg", "ffmpeg")):
+                    code_no_ff, _, _ = asyncio.run(
+                        _call_asgi(
+                            app,
+                            "POST",
+                            "/v1/audio/speech",
+                            headers=auth_hdr,
+                            body=json.dumps(req_payload).encode("utf-8"),
+                        )
+                    )
+                    self.assertEqual(code_no_ff, 200)
+
 
 class Drama3CliNarrationEndToEndTest(unittest.TestCase):
     def test_narrate_batch_stitch_and_resume(self):

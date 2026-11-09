@@ -317,8 +317,11 @@ def _upload_drive_voice_sync(body: dict[str, Any]) -> tuple[int, dict[str, Any]]
             "-i", str(ap),
             "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", "-f", "wav", "pipe:1",
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
-        wav_bytes = res.stdout if (res.returncode == 0 and res.stdout) else ap.read_bytes()
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
+            wav_bytes = res.stdout if (res.returncode == 0 and res.stdout) else ap.read_bytes()
+        except OSError:
+            wav_bytes = ap.read_bytes()
     finally:
         if temp_input is not None:
             temp_input.unlink(missing_ok=True)
