@@ -117,6 +117,45 @@ class LifecycleSafetyTest(unittest.TestCase):
         child.wait(timeout=5)
         self.assertFalse(processes.owned_process(child.pid, identity))
 
+    def test_parse_colab_session_status_detects_missing_despite_zero_exit(self):
+        self.assertEqual(
+            svc.parse_colab_session_status(
+                'qwen-flash',
+                0,
+                '[qwen-flash] gpu-g4-s-asso1c0 | Hardware: G4 | Status: BUSY',
+            ),
+            'alive',
+        )
+        self.assertEqual(
+            svc.parse_colab_session_status(
+                'minimax-h3-image',
+                0,
+                "[colab] Session 'minimax-h3-image' not found.",
+            ),
+            'missing',
+        )
+        self.assertEqual(svc.parse_colab_session_status('ollama', 0, ''), 'unknown')
+
+    def test_restart_tuning_flags_require_auto_restart(self):
+        args = self.args(auto_restart=False, restart_delay=10.0, max_restarts=0)
+        with self.assertRaisesRegex(ValueError, '--auto-restart'):
+            svc.cmd_up(self.service, self.script, args)
+        args2 = self.args(auto_restart=False, restart_delay=None, max_restarts=2)
+        with self.assertRaisesRegex(ValueError, '--auto-restart'):
+            svc.cmd_up(self.service, self.script, args2)
+
+    def test_ensure_session_recreates_when_cached_session_was_reclaimed(self):
+        fake_home = self.root / 'home'
+        cfg_dir = fake_home / '.config/colab-cli'
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / 'sessions.json').write_text(json.dumps({'test': {'id': 'stale'}}))
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'check_remote_session', return_value='missing'), \
+             patch.object(svc, 'run') as mock_run:
+            svc.ensure_session(self.service)
+        cmds = [call.args[0] for call in mock_run.call_args_list]
+        self.assertEqual(cmds, [['colab', 'stop', '-s', 'test'], ['colab', 'new', '-s', 'test', '--gpu', 'T4']])
+
 
 if __name__ == '__main__':
     unittest.main()

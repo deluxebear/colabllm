@@ -286,6 +286,8 @@ def list_service_instances(base_name: str) -> list[dict]:
             "alive": alive,
             "running": alive,
             "ready": bool(st.get("ready") and alive),
+            "auto_restart": bool(st.get("auto_restart")),
+            "restart_count": int(st.get("restart_count", 0)),
             "runner_pid": st.get("runner_pid"),
             "url": st.get("url"),
             "api_token": st.get("api_token"),
@@ -552,6 +554,45 @@ def _write_private_notebook(nb_path: Path, built: dict, env: dict | None = None)
 
 
 # --------------------------------------------------------------------------- runner (attached `colab exec`)
+DEFAULT_RESTART_DELAY = 15.0
+MAX_RESTART_BACKOFF = 300.0
+DEFAULT_IDLE_CHECK_SECONDS = 900.0
+DEFAULT_MAX_STARTUP_RETRIES = 3
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise ValueError("整数格式无效") from None
+    if parsed < 0:
+        raise ValueError("数值不能小于 0")
+    return parsed
+
+
+def parse_colab_session_status(session_name: str, returncode: int, stdout: str = "", stderr: str = "") -> str:
+    """Classify `colab status -s <name>` output into 'alive', 'missing', or 'unknown'.
+
+    Note: `colab status` returns exit code 0 even when the VM was reclaimed
+    (`[colab] Session '<name>' not found.`), so text inspection is required.
+    """
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    lower = combined.lower()
+    if "not found" in lower or "no active session" in lower or "does not exist" in lower:
+        return "missing"
+    if returncode == 0 and f"[{session_name}]" in combined:
+        return "alive"
+    return "unknown"
+
+
+def check_remote_session(svc: Service, timeout: float = 30.0) -> str:
+    try:
+        res = run(["colab", "status", "-s", svc.name], capture=True, check=False, timeout=timeout)
+    except (OSError, subprocess.SubprocessError, CliError):
+        return "unknown"
+    return parse_colab_session_status(svc.name, res.returncode, res.stdout or "", res.stderr or "")
+
+
 def finish_runner(state, pid, identity, exit_code=None):
     def finish(st):
         if st.get("runner_pid") == pid and st.get("runner_identity") == identity:
@@ -561,12 +602,143 @@ def finish_runner(state, pid, identity, exit_code=None):
     state.update(finish)
 
 
+def _runner_still_owned(state: State, pid: int, identity: str | None) -> tuple[bool, dict]:
+    st = state.load()
+    return bool(identity and st.get("runner_pid") == pid and st.get("runner_identity") == identity), st
+
+
+def _run_single_exec(
+    svc: Service,
+    state: State,
+    cmd: list[str],
+    *,
+    deadline: float | None,
+    auto_restart: bool,
+    idle_check_seconds: float,
+) -> tuple[int, bool, bool]:
+    """Run one `colab exec` session and return `(exit_code, reached_ready, half_open_reclaimed)`."""
+    proc = None
+    child_identity = None
+    selector = selectors.DefaultSelector()
+    reached_ready = False
+    half_open_reclaimed = False
+    st = state.save(ready=False)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        child_identity = process_identity(proc.pid)
+        st = state.save(exec_pid=proc.pid, exec_identity=child_identity)
+        protocol = NotebookProtocol()
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        last_output_at = time.monotonic()
+        while True:
+            now = time.monotonic()
+            wait_timeout = None
+            if deadline is not None and not st.get("ready"):
+                remaining = max(0.0, deadline - now)
+                if remaining == 0:
+                    raise TimeoutError("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
+                wait_timeout = remaining
+            elif auto_restart and st.get("ready") and idle_check_seconds > 0:
+                wait_timeout = max(0.0, (last_output_at + idle_check_seconds) - now)
+            if not selector.select(wait_timeout):
+                if deadline is not None and not st.get("ready") and time.monotonic() >= deadline:
+                    continue
+                if auto_restart and st.get("ready") and idle_check_seconds > 0:
+                    last_output_at = time.monotonic()
+                    if check_remote_session(svc) == "missing":
+                        warn(f"[auto-restart] 远端会话 '{svc.name}' 已不存在（本地连接半开僵死），正在断开并准备恢复")
+                        half_open_reclaimed = True
+                        break
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            last_output_at = time.monotonic()
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+            update = {key: value for key, value in protocol.feed(chunk).items() if st.get(key) != value}
+            if update:
+                st = state.save(**update)
+                if st.get("ready"):
+                    reached_ready = True
+        update = protocol.feed(b"", final=True)
+        if update:
+            st = state.save(**update)
+            if st.get("ready"):
+                reached_ready = True
+        if half_open_reclaimed:
+            stop_owned_process(proc.pid, child_identity, group=True)
+            rc = 1
+        else:
+            rc = proc.wait()
+            if rc == 0 and not st.get("ready"):
+                warn("Colab 在 CT_READY 之前退出，请查看日志中的启动错误")
+                rc = 1
+        return (rc if rc >= 0 else 128 - rc), reached_ready, half_open_reclaimed
+    finally:
+        selector.close()
+        if proc is not None:
+            stop_owned_process(proc.pid, child_identity, group=True)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
+            if proc.stdout:
+                proc.stdout.close()
+
+
+def _provision_session_for_restart(svc: Service, state: State, pid: int, identity: str | None) -> str:
+    """Verify remote session state under `.operation.lock` and reconnect or recreate the Colab VM.
+
+    Returns `'ready'`, `'stopped'` (when `down` took over), or `'failed'` (transient error; caller backs off).
+    """
+    with state.lock("operation", blocking=True):
+        owned, st = _runner_still_owned(state, pid, identity)
+        if not owned:
+            return "stopped"
+        target_svc = dataclasses.replace(
+            svc,
+            gpu=st["session_gpu"] if "session_gpu" in st else svc.gpu,
+            tpu=st["session_tpu"] if "session_tpu" in st else svc.tpu,
+            high_mem=bool(st["session_high_mem"]) if "session_high_mem" in st else svc.high_mem,
+        )
+        mount_drive = bool(st.get("mount_drive", True))
+        try:
+            remote = check_remote_session(target_svc)
+            if remote == "alive":
+                log(f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活（本地连接闪断），正在恢复挂载与保活连接")
+                if mount_drive:
+                    try:
+                        log("colab dfs mount")
+                        run(["colab", "dfs", "mount", "-s", target_svc.name])
+                        return "ready"
+                    except (CliError, OSError, subprocess.SubprocessError) as err:
+                        warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
+                else:
+                    return "ready"
+            log(f"[auto-restart] 远端会话 '{target_svc.name}' 已停机，正在清理残留记录并重新申请实例")
+            run(["colab", "stop", "-s", target_svc.name], capture=True, check=False)
+            ensure_session(target_svc, force_new=True)
+            if mount_drive:
+                log("colab dfs mount")
+                run(["colab", "dfs", "mount", "-s", target_svc.name])
+            return "ready"
+        except (CliError, OSError, subprocess.SubprocessError) as err:
+            warn(f"[auto-restart] 会话恢复失败：{err}")
+            return "failed"
+
+
+def _compute_backoff_delay(base_delay: float, consecutive_failures: int) -> float:
+    if consecutive_failures <= 0:
+        return base_delay
+    exponent = min(consecutive_failures - 1, 8)
+    return min(MAX_RESTART_BACKOFF, base_delay * (2 ** exponent))
+
+
 def exec_runner(svc: Service, nb_path: Path) -> int:
-    """Own the Colab connection and always reap its separate process group."""
+    """Own the Colab connection, reap its process group, and optionally supervise auto-restarts."""
     state = State(svc)
     st = state.load()
     pid, identity = os.getpid(), process_identity(os.getpid())
-    state.save(runner_pid=pid, runner_identity=identity)
+    st = state.save(runner_pid=pid, runner_identity=identity)
     if nb_path.is_file() and st.get("env"):
         try:
             current_nb = json.loads(nb_path.read_text(encoding="utf-8"))
@@ -579,63 +751,132 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         "--timeout", str(7 * 24 * 3600),
         "--env", f"CT_SERVICE={svc.name}",
     ]
-    proc = None
-    child_identity = None
+    auto_restart = bool(st.get("auto_restart"))
+    base_delay = float(st.get("restart_delay") or DEFAULT_RESTART_DELAY)
+    max_restarts = int(st.get("max_restarts") or 0)
+    try:
+        idle_check_seconds = float(os.environ.get("COLABLLM_IDLE_CHECK_SECONDS", DEFAULT_IDLE_CHECK_SECONDS))
+    except ValueError:
+        idle_check_seconds = DEFAULT_IDLE_CHECK_SECONDS
+    try:
+        max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
+    except ValueError:
+        max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
+
     old_handler = signal.getsignal(signal.SIGTERM)
     def terminated(signum, frame):
         raise SystemExit(128 + signum)
     signal.signal(signal.SIGTERM, terminated)
     rc = None
-    selector = selectors.DefaultSelector()
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        child_identity = process_identity(proc.pid)
-        state.save(exec_pid=proc.pid, exec_identity=child_identity)
-        protocol = NotebookProtocol()
-        selector.register(proc.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + st.get('ready_timeout', svc.ready_timeout) if st.get('runner_mode') == 'foreground' else None
+        ready_timeout = st.get("ready_timeout", svc.ready_timeout)
+        is_foreground = st.get("runner_mode") == "foreground"
+        if not auto_restart:
+            deadline = time.monotonic() + ready_timeout if is_foreground else None
+            rc, _, _ = _run_single_exec(
+                svc, state, cmd, deadline=deadline, auto_restart=False, idle_check_seconds=0.0
+            )
+            return rc
+
+        ever_ready = False
+        consecutive_failures = 0
+        restart_count = int(st.get("restart_count") or 0)
+        attempt = 0
         while True:
-            remaining = max(0, deadline - time.monotonic()) if deadline is not None and not st.get('ready') else None
-            if remaining == 0:
-                raise TimeoutError('等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话')
-            if not selector.select(remaining):
-                continue
-            chunk = os.read(proc.stdout.fileno(), 65536)
-            if not chunk:
-                break
-            sys.stdout.buffer.write(chunk)
+            deadline = time.monotonic() + ready_timeout if (is_foreground or attempt > 0) else None
+            last_timeout_err: TimeoutError | None = None
+            reached_ready = False
+            try:
+                rc, reached_ready, _ = _run_single_exec(
+                    svc,
+                    state,
+                    cmd,
+                    deadline=deadline,
+                    auto_restart=True,
+                    idle_check_seconds=idle_check_seconds,
+                )
+            except TimeoutError as err:
+                last_timeout_err = err
+                rc = 124
+                warn(f"[auto-restart] 等待 CT_READY 超时 ({ready_timeout}s)")
+
+            owned, st = _runner_still_owned(state, pid, identity)
+            if not owned:
+                rc = 0
+                return 0
+
+            if reached_ready:
+                ever_ready = True
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+
+            if not ever_ready and consecutive_failures >= max_startup_retries:
+                warn(f"[auto-restart] 首次启动连续 {consecutive_failures} 次未就绪，停止自动重试")
+                if last_timeout_err is not None:
+                    raise last_timeout_err
+                return rc or 1
+
+            if max_restarts > 0 and restart_count >= max_restarts:
+                warn(f"[auto-restart] 已达到最大重启次数 ({max_restarts})，停止自动守护")
+                if last_timeout_err is not None and not reached_ready:
+                    raise last_timeout_err
+                return rc or 1
+
+            restart_count += 1
+            keep_url = st.get("url") if st.get("hostname") else None
+            st = state.save(
+                ready=False,
+                url=keep_url,
+                exec_pid=None,
+                exec_identity=None,
+                last_cell_started=False,
+                restart_count=restart_count,
+            )
+
+            delay = _compute_backoff_delay(base_delay, 0 if reached_ready else consecutive_failures)
+            log(f"[auto-restart #{restart_count}] 检测到运行时已停止 (exit={rc})，将在 {delay:g}s 后检查并恢复会话")
+            time.sleep(delay)
+
+            while True:
+                status_result = _provision_session_for_restart(svc, state, pid, identity)
+                if status_result == "stopped":
+                    rc = 0
+                    return 0
+                if status_result == "ready":
+                    break
+                consecutive_failures += 1
+                if not ever_ready and consecutive_failures >= max_startup_retries:
+                    warn(f"[auto-restart] 首次启动连续 {consecutive_failures} 次失败，停止自动重试")
+                    return 1
+                retry_delay = _compute_backoff_delay(base_delay, consecutive_failures)
+                warn(f"[auto-restart #{restart_count}] 将在 {retry_delay:g}s 后重试会话重建")
+                time.sleep(retry_delay)
+
+            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+            state.save(started=now_str, last_restart=now_str)
+            header = f"\n=== [colabsvc] auto-restart #{restart_count} at {now_str} ({svc.name}) ===\n"
+            sys.stdout.buffer.write(header.encode("utf-8"))
             sys.stdout.flush()
-            update = {key: value for key, value in protocol.feed(chunk).items() if st.get(key) != value}
-            if update:
-                st = state.save(**update)
-        update = protocol.feed(b"", final=True)
-        if update:
-            st = state.save(**update)
-        rc = proc.wait()
-        if rc == 0 and not st.get("ready"):
-            warn("Colab 在 CT_READY 之前退出，请查看日志中的启动错误")
-            rc = 1
-        return rc if rc >= 0 else 128 - rc
+            attempt += 1
     finally:
         signal.signal(signal.SIGTERM, old_handler)
-        selector.close()
-        if proc is not None:
-            stop_owned_process(proc.pid, child_identity, group=True)
-            proc.wait(timeout=5)
-            if proc.stdout:
-                proc.stdout.close()
         finish_runner(state, pid, identity, rc)
 
 
 # --------------------------------------------------------------------------- commands
-def ensure_session(svc: Service) -> None:
-    try:
-        sessions = json.loads((Path.home() / ".config/colab-cli/sessions.json").read_text())
-    except Exception:
-        sessions = {}
-    if svc.name in sessions:
-        log(f"reusing Colab session '{svc.name}'")
-        return
+def ensure_session(svc: Service, *, force_new: bool = False) -> None:
+    if not force_new:
+        try:
+            sessions = json.loads((Path.home() / ".config/colab-cli/sessions.json").read_text())
+        except Exception:
+            sessions = {}
+        if svc.name in sessions:
+            if check_remote_session(svc) != "missing":
+                log(f"reusing Colab session '{svc.name}'")
+                return
+            log(f"stale Colab session '{svc.name}' was reclaimed remotely; recreating")
+            run(["colab", "stop", "-s", svc.name], capture=True, check=False)
     args = ["colab", "new", "-s", svc.name]
     if svc.tpu:
         args += ["--tpu", svc.tpu]
@@ -666,6 +907,11 @@ def cmd_up(svc: Service, script: Path, a) -> None:
 
 
 def _start_up(svc: Service, script: Path, a):
+    auto_restart = bool(getattr(a, "auto_restart", False))
+    restart_delay = getattr(a, "restart_delay", None)
+    max_restarts = int(getattr(a, "max_restarts", 0) or 0)
+    if (restart_delay is not None or max_restarts > 0) and not auto_restart:
+        raise ValueError("--restart-delay 与 --max-restarts 需配合 --auto-restart 使用")
     hostname = tunnel_hostname(svc, a)
     transport=tunnel_transport(a)
     frp_config=None
@@ -770,6 +1016,13 @@ def _start_up(svc: Service, script: Path, a):
         env=env, url=None, ready=False, last_cell_started=False, login_user=None, login_pass=None,
         runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout,
         started=time.strftime("%Y-%m-%d %H:%M:%S"),
+        session_gpu=svc.gpu, session_tpu=svc.tpu, session_high_mem=bool(svc.high_mem),
+        mount_drive=not a.no_drive,
+        auto_restart=auto_restart,
+        restart_delay=float(restart_delay if restart_delay is not None else DEFAULT_RESTART_DELAY),
+        max_restarts=max_restarts,
+        restart_count=0,
+        last_restart=None,
     )
 
     # 4. notebook through an attached `colab exec` (keep-alive)
@@ -844,13 +1097,22 @@ def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = No
         return f"error ({type(e).__name__})"
 
 
-def show_info(svc: Service, do_probe=False, reveal=False, output_json=False):
+def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, remote_session: str | None = None):
     st = State(svc).load()
     alive = runner_alive(st)
-    ready = bool(alive and st.get("ready"))
+    ready = bool(alive and st.get("ready") and remote_session != "missing")
     data = dict(service=svc.name, running=alive, ready=ready, url=st.get("url"))
-    lines = [f"service : {svc.name}   (runner {'alive' if alive else 'stopped'})",
+    mode_suffix = ", auto-restart" if st.get("auto_restart") else ""
+    lines = [f"service : {svc.name}   (runner {'alive' if alive else 'stopped'}{mode_suffix})",
              f"ready   : {ready}"]
+    if st.get("auto_restart"):
+        data["auto_restart"] = True
+        data["restart_count"] = int(st.get("restart_count") or 0)
+        if st.get("restart_count"):
+            lines.append(f"restarts: {st['restart_count']}")
+    if remote_session == "missing":
+        data["remote_session"] = "missing"
+        lines.append("colab   : session not found")
     if st.get("url"):
         lines.append(f"URL     : {st['url']}")
     if reveal:
@@ -965,6 +1227,12 @@ def build_parser(svc: Service, configure=None):
     mode = u.add_mutually_exclusive_group()
     mode.add_argument("--foreground", action="store_true", help="stay attached in this terminal instead")
     mode.add_argument("--detach", action="store_true", help="return after starting the runner without waiting for readiness")
+    u.add_argument("--auto-restart", action="store_true",
+                   help="守护模式：监听运行时停机或断连并自动重连/重建会话")
+    u.add_argument("--restart-delay", type=positive_seconds, metavar="SECONDS",
+                   help="自动重启基础等待秒数，连续失败时指数退避（默认: 15）")
+    u.add_argument("--max-restarts", type=nonnegative_int, default=0, metavar="N",
+                   help="最大自动重启次数，0 表示就绪后不限次数（默认: 0）")
     u.add_argument("--ready-timeout", type=positive_seconds, help="seconds to wait for readiness (default: service-specific)")
     u.add_argument("--dry-run", action="store_true", help="only show the cell plan")
     d = sub.add_parser("down", help="stop runner + Colab session")
@@ -1032,7 +1300,8 @@ def main(svc: Service, *, configure=None, handlers=None, prepare_up=None) -> Non
         result = run(["colab", "status", "-s", svc.name], capture=True, check=False)
         if result.returncode != 0:
             raise CliError((result.stderr or "Colab 状态查询失败").strip(), result.returncode if result.returncode > 0 else 1)
-        if not show_info(svc, do_probe=True, reveal=a.show_secrets, output_json=a.json):
+        remote_state = parse_colab_session_status(svc.name, result.returncode, result.stdout or "", result.stderr or "")
+        if not show_info(svc, do_probe=True, reveal=a.show_secrets, output_json=a.json, remote_session=remote_state):
             raise SystemExit(1)
     elif a.cmd == "logs":
         lp = State(svc).log_path

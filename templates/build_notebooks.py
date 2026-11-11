@@ -687,6 +687,7 @@ def _watch_inner():
         break
     print(f"{SERVICE} is up: {PUBLIC_URL}")
     print("CT_READY", flush=True)
+    last_beat = time.time()
     while True:
         time.sleep(30)
         for name, (proc, restart) in list(PROCS.items()):
@@ -694,6 +695,10 @@ def _watch_inner():
                 print(f"[watchdog] {name} exited; restarting", flush=True)
                 ct_stop_proc(proc)
                 PROCS[name] = (restart(), restart)
+        if time.time() - last_beat > 600:
+            last_beat = time.time()
+            states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
+            print(f"[heartbeat] {time.strftime('%H:%M:%S')} {states} gpu={ct_gpu_stat()}", flush=True)
 
 threading.Thread(target=_watch, daemon=True).start()
 from colab import start

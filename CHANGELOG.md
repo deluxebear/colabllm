@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 所有运行时 `up` 新增 `--auto-restart` 掉线自动重拉守护模式（可配合 `--restart-delay` 与 `--max-restarts`）：结合容器内 `ct_watchdog`、`colab exec` 退出监听、保活心跳静默半开连接巡检与 `colab status` 远端会话文本核实，自动区分本地网络闪断（复用原 VM 保住 SSD 缓存）与 Colab 强收停机（清理残留记录并按原 GPU 规格重新 `colab new` + `colab dfs mount` 恢复服务），首次未就绪支持指数退避与熔断保护，手动 `down` 时安全退出。
+
 ## [0.1.6] - 2026-11-12
 
 ### 新增
