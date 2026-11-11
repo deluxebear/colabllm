@@ -24,6 +24,8 @@ uv tool upgrade colabllm
 
 ```bash
 colabllm services                       # 列出全部运行时
+colabllm minimax-h3-image up            # 默认 G4（SGLang Diffusion 原生 4K 生图 / 1-16 图编辑）
+colabllm minimax-h3-image generate "Rain-soaked Tokyo alley at dusk" --tier 2k -o alley.webp
 colabllm unlimited-ocr up                # 默认 A100
 colabllm unlimited-ocr ocr ./documents -O ./results
 colabllm unlimited-ocr resume JOB_ID --wait
@@ -203,6 +205,7 @@ colabllm ollama up --foreground --ready-timeout 600
 
 # 轮询等待上限：0 保留不限时行为；每次请求也会受剩余时间约束
 colabllm unlimited-ocr job JOB_ID --wait --timeout 300
+colabllm minimax-h3-image job JOB_ID --wait --timeout 300
 colabllm comfyui pull-workflow TEMPLATE --timeout 300 --poll 2
 colabllm longcat-avatar job JOB_ID --wait --timeout 300
 
@@ -285,6 +288,7 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **Openjutsu (MiniMax H3 Video Studio)** | `G4` | Caddy (Basic Auth + Bearer) | `https://openjutsu.example.com` | [docs/openjutsu.md](https://github.com/deluxebear/colabllm/blob/master/docs/openjutsu.md) |
 | **FLUX 3 Image Klein (T2I + Multi-Ref I2I + PUP)** | `G4` | `vLLM-Omni` Bearer API Key (`builtin`) | `https://flux-klein.example.com` | [docs/flux-klein.md](https://github.com/deluxebear/colabllm/blob/master/docs/flux-klein.md) |
 | **Qwen-Image-2.1 (T2I + 1-4 Ref RGBA I2I)** | `G4` | `vLLM-Omni` Bearer API Key (`builtin`) | `https://qwen-image.example.com` | [docs/qwen-image.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-image.md) |
+| **MiniMax-H3-Image (6-Step PDD Native 4K T2I + 1-16 Ref I2I)** | `G4` | `SGLang Diffusion` Bearer API Key (`builtin`) | `https://minimax-h3-image.example.com` | [docs/minimax-h3-image.md](https://github.com/deluxebear/colabllm/blob/master/docs/minimax-h3-image.md) |
 | **ComfyUI + ComfyUI-Manager** | `L4` | Caddy (Basic Auth + Bearer) | `https://comfyui.example.com` | [docs/comfyui.md](https://github.com/deluxebear/colabllm/blob/master/docs/comfyui.md) |
 | **Qwen3.8-Flash-Next (UD-Q4_K_XL-V2 · 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://qwen.example.com` | [docs/qwen-flash.md](https://github.com/deluxebear/colabllm/blob/master/docs/qwen-flash.md) |
 | **DeepSeek-V4.1-Flash Coder (Auto Max 1M + Vision)** | `G4` | `llama-server` Bearer API Key | `https://deepseek.example.com` | [docs/deepseek-coder.md](https://github.com/deluxebear/colabllm/blob/master/docs/deepseek-coder.md) |
@@ -301,6 +305,12 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 - **`qwen-flash`（日常通用对话、超长文档理解与文学创作首选）**：默认部署 `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` 成品目录 **`unsloth-UD-Q4_K_XL-V2`**（`imatrix_micro3` 校准 **4-bit** 量化，`103.7 GiB` + `BF16` 视觉；该目录已是去审查重校准成品，无需也不应重复叠加仓库内的 `patch-unsloth` 差分包）。通过 `26.82 GiB` PLE 表常驻 DDR5 内存、`q8_0` 压缩 KV/QSA 索引缓存（`16.05 GiB`）及自动卸载仅 `3/48` 层路由专家（`4.39 GiB`），在 G4 上跑满 **`1,048,576`（1M）** 上下文，实测生成吞吐达 **`67 ~ 88 tok/s`**（`84K` 无缓存输入 Prefill 达 `818 tok/s`）。
 - **`ollama --preset huihui-27b`（无损 BF16 稠密模型与多协议兼容首选）**：在 G4 上一键部署 `huihui_ai/Qwen3.8-abliterated:27b-bf16`（约 `56 GB` 满血 BF16 权重 + 原生 `262,144` 上下文 + `f16` KV），原生同时开放 Ollama `/api/*`、OpenAI `/v1/*` 与 Anthropic `/v1/messages` 三套接口。
 - **`deepseek-qwen-9b`（L4 / T4 省配额高吞吐强推理与多模态首选）**：默认在 **L4（24 GB）** 上部署 `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` 的 imatrix 校准 **`i1-Q4_K_M`（`5.24 GiB`）** + **原生 Multi-Token Prediction（`MTP`）草稿侧车（`--spec-type draft-mtp`）** + `mmproj-f16` 视觉（亦可 `--quant Q8_0` 切换 8-bit）；依托 24 层 Gated DeltaNet + 主干/MTP 共 9 层全注意力的混合结构，**256K（`262,144`）满窗口 `q8_0` KV 仅占 `4.83 GiB`**，在 L4（余量 `~9.3 GiB`）上全层 GPU 常驻跑满原生 256K 上下文 + 深度思考 + 视觉理解（`--gpu T4` 同样自动启用 `i1-Q4_K_M` + MTP）。
+
+### 图像生成与多图编辑选型说明（Colab G4 硬件边界）
+
+- **`minimax-h3-image`（旗舰原生 4K 商业质感生图与 1–16 张多参考图编辑首选）**：基于 **SGLang Diffusion + FlashAttention-4** 部署 `MiniMaxAI/MiniMax-H3-Image`（33.1B DiT + 33.4B Qwen3-VL 编码器 + MiniMaxH3ImageVAE，6 步融合 PDD 蒸馏调度 + 在线 AdaLN 预计算释放 `24.6 GiB` 显存）。默认 `fp8-all` 全组件常驻（峰值显存仅 **`~50.4 GiB`**，G4 实测 GPU 推理 **2K 约 `2.6s`、原生 4K `5472×3072` 约 `15.7s`**，留出 `~45 GiB` 余量应对多参考图编辑），亦可 `--quantization bf16` 切换单卡无损常驻（`~92.2 GiB`）；CLI 默认走网络友好的内部 `/api/ct/*` 协议（本地参考图裸二进制上传 + SHA-256 零字节去重、异步后台任务轮询、`HTTP Range` 断点续传与服务端 WebP/JPEG 实时转码、Google Drive 零流量直读直写），同时兼容标准 OpenAI `/v1/images/*`。
+- **`qwen-image`（中英双语精准文字排版与原生 RGBA 透明底素材首选）**：基于 `vLLM-Omni` 部署 `Qwen/Qwen-Image-2.1`（7.1B DiT + Qwen3-VL-8B + 4 通道 RGBA VAE），支持 `--rgba` 原生透明通道直出、1–4 张 `<image1>..<image4>` 序号绑定编辑与 LoRA 适配器。
+- **`flux-klein`（轻量多卡阶梯兼容、LoRA 生态与提示词扩写首选）**：基于 `vLLM-Omni` 部署 `black-forest-labs/flux-3-image-klein`（5.6B DiT，支持 G4 / H100 / L4），支持 1–10 张参考图编辑、LoRA 适配器以及可选 `flux-3-image-klein-pup`（Qwen3.5-9B）提示词自动扩写。
 
 ## 目录结构
 

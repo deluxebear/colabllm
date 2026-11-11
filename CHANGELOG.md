@@ -4,6 +4,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 新增 `minimax-h3-image` 运行时（默认 G4，兼容 H100/A100，`SGLang Diffusion` Bearer API Key）：部署 `MiniMaxAI/MiniMax-H3-Image`（33.1B DiT + 33.4B Qwen3-VL 编码器 + MiniMaxH3ImageVAE，6 步融合 PDD 蒸馏调度 + 在线 AdaLN 预计算释放 24.6 GiB 显存），默认启用 `fp8-all` 全组件常驻显存（峰值 `~50.4 GiB`，G4 GPU 推理实测 2K 约 `2.6s`、原生 4K 16:9 约 `15.7s`）并支持 `--quantization bf16` 无损常驻（`~92.2 GiB`）；CLI 默认走网络友好的内部 `/api/ct/*` 协议（本地参考图裸二进制上传 + SHA-256 零字节去重、异步后台任务与轻量 JSON 轮询、`HTTP Range` 断点续传下载与服务端 WebP/JPEG 转码、Google Drive 零公网流量直读直写），同时完整保留标准 OpenAI `/v1/images/generations` 与 `/v1/images/edits` 兼容接口及 1–16 张 `<Picture 1>..<Picture 16>` 多参考图编辑。
+
 ## [0.1.5] - 2026-11-09
 
 ### 新增

@@ -53,7 +53,7 @@ colabllm tunnel-config
 Drive 数据通常在 `MyDrive/colab-llm/<服务>/`；各服务具体存储以指南和返回结果为准。
 
 JSON 结果写 stdout，诊断写 stderr。成功退出 0、参数用法错误 2、等待/命令超时 124、Ctrl+C 130；底层操作失败为非零。
-TTS 和转写的 `--timeout` 是请求限时；OCR/Avatar/ComfyUI 的等待限时不会取消已提交的后台任务。
+TTS 和转写的 `--timeout` 是请求限时；OCR/Avatar/Openjutsu/MiniMax-H3-Image/ComfyUI 的等待限时不会取消已提交的后台任务。
 
 ## 排错顺序
 

@@ -3,9 +3,10 @@ name: colabllm
 description: >-
   Use installed colabllm runtimes on Google Colab for LLM inference, PDF/image OCR,
   speech transcription, speech synthesis, voice cloning, sound-effect/audio generation,
-  avatar/video generation, ComfyUI and Unsloth Studio. Use when the user asks to start,
-  query, call or stop these runtimes, retrieve their API key, or troubleshoot a colabllm
-  service. Intended for package users; runtime development and notebook editing are outside scope.
+  image generation, multi-reference image editing, avatar/video generation, ComfyUI and
+  Unsloth Studio. Use when the user asks to start, query, call or stop these runtimes,
+  retrieve their API key, or troubleshoot a colabllm service. Intended for package users;
+  runtime development and notebook editing are outside scope.
 ---
 
 # ColabLLM runtimes
@@ -46,6 +47,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Motion transfer, object/face/color video CLI & UI | `openjutsu` | [Openjutsu](references/openjutsu.md) |
 | Text-to-image, multi-ref image editing & Drive I/O | `flux-klein` | [FLUX 3 Image Klein](references/flux-klein.md) |
 | Bilingual T2I, 1-4 `<imageN>` RGBA editing & Drive I/O | `qwen-image` | [Qwen-Image-2.1](references/qwen-image.md) |
+| Native 4K 6-step PDD T2I, 1-16 `<Picture N>` editing & async jobs | `minimax-h3-image` | [MiniMax-H3-Image](references/minimax-h3-image.md) |
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
 
