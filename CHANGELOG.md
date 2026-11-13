@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 变更
+
+- `--auto-restart` 半开连接静默巡检默认阈值从 `900s`（15 分钟）缩短为 `300s`（5 分钟，支持 `--idle-check SECONDS` 自定义），首次静默未检出 `missing` 时改为每 `60s` 快速复查直至收到新输出或确认回收，并将长周期运行时保活心跳统一加密至 `<= 4` 分钟。
+
+### 修复
+
+- `--auto-restart` 在本地网络闪断后重连仍存活的远端 VM 时，若服务端认证探针已返回 `200`，立即恢复 `ready=True` 且不再受 `ready_timeout` 影响重复断开重连（避免远端 Jupyter Kernel 阻塞在上一轮保活 Cell 时本地 `status` 误显示 `ready: false`）。
+
 ## [0.1.7] - 2026-11-12
 
 ### 新增

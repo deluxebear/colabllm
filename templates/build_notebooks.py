@@ -287,7 +287,7 @@ TUNNEL = ("# @title 4. Tunnel -- Cloudflare by default, or project-configured FR
 
 KEEPALIVE = r'''# @title 5. Ready + keep-alive -- KEEP THIS CELL RUNNING
 # The Colab session only lives while the `colab exec` connection is open and this cell blocks.
-# The watchdog restarts any process from PROCS that died; a heartbeat line is printed every 10 min.
+# The watchdog restarts any process from PROCS that died; a heartbeat line is printed every 4 min.
 ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}%(health_path)s", timeout=%(ready_timeout)d)
 if AUTH == "caddy" and not CREDS_FROM_ENV:   # started from the Colab UI: show generated credentials
     print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
@@ -304,7 +304,7 @@ while True:
             print(f"[watchdog] {name} exited with {proc.returncode}; restarting\n{ct_tail(name, 15)}", flush=True)
             ct_stop_proc(proc)
             PROCS[name] = (restart(), restart)
-    if time.time() - last_beat > 600:
+    if time.time() - last_beat > 240:
         last_beat = time.time()
         print(f"[heartbeat] {time.strftime('%%H:%%M:%%S')} " +
               " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items()), flush=True)
@@ -636,7 +636,7 @@ def _ollama_health():
         return resp.status == 200
 
 def _ollama_heartbeat(uptime_s):
-    if uptime_s % 600 < 60:
+    if uptime_s % 240 < 60:
         states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
         olog(f"[heartbeat] uptime={uptime_s}s {states} gpu={ct_gpu_stat()}")
 
@@ -695,7 +695,7 @@ def _watch_inner():
                 print(f"[watchdog] {name} exited; restarting", flush=True)
                 ct_stop_proc(proc)
                 PROCS[name] = (restart(), restart)
-        if time.time() - last_beat > 600:
+        if time.time() - last_beat > 240:
             last_beat = time.time()
             states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
             print(f"[heartbeat] {time.strftime('%H:%M:%S')} {states} gpu={ct_gpu_stat()}", flush=True)
@@ -3336,7 +3336,7 @@ def _oj_health():
         return resp.status == 200
 
 def _oj_heartbeat(uptime_s):
-    if uptime_s % 600 < 60:
+    if uptime_s % 240 < 60:
         states = " ".join(f"{n}={'up' if p.poll() is None else 'down'}" for n, (p, _) in PROCS.items())
         olog(f"[heartbeat] uptime={uptime_s}s {states} gpu={ct_gpu_stat()}")
 

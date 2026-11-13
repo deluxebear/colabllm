@@ -58,6 +58,10 @@ if cmd == 'exec':
     count_file.write_text(str(count))
     if (root / 'exit-before-ready').exists():
         sys.exit(0)
+    if count >= 2 and (root / 'queued-behind-busy-kernel').exists():
+        # Simulate re-attaching `colab exec` to a live VM whose Jupyter kernel is still blocked in Cell 5
+        while True:
+            time.sleep(1)
     print('CT_PUBLIC_URL=' + os.environ['FAKE_COLAB_URL'], flush=True)
     if (root / 'false-ready').exists():
         print('ERROR: expected CT_READY but startup failed', flush=True)
@@ -235,11 +239,21 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
     def test_auto_restart_reuses_live_vm_on_transient_exec_disconnect(self):
         (self.root / 'crash-once-after-ready').touch()
         (self.root / 'session-alive').touch()
+        (self.root / 'queued-behind-busy-kernel').touch()
         start = self.cli(
-            'up', '--quick-tunnel', '--no-drive', '--auto-restart', '--restart-delay', '.05', '--detach'
+            'up', '--quick-tunnel', '--no-drive', '--auto-restart',
+            '--restart-delay', '.05', '--ready-timeout', '.25', '--detach',
         )
         self.assertEqual(start.returncode, 0, start.stderr)
         st = self.wait_restart_ready(min_restarts=1)
+        status = self.cli('status', '--json')
+        self.assertEqual(status.returncode, 0, status.stderr)
+        payload = json.loads(status.stdout)
+        self.assertTrue(payload['ready'])
+        self.assertEqual(payload['http_status'], '200')
+        # Ensure ready_timeout (.25s) does NOT tear down an already-healthy re-attached VM:
+        time.sleep(0.35)
+        self.assertEqual(json.loads(self.state_path.read_text())['restart_count'], 1)
         calls = self.colab_calls()
         new_calls = [c for c in calls if c[:1] == ['new']]
         stop_calls = [c for c in calls if c[:1] == ['stop']]

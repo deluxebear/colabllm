@@ -90,10 +90,12 @@ Instance IDs are validated strictly; parsing stops at `--`. State updates are lo
 startup/shutdown also use a per-instance operation lock. Both foreground and detached runners record
 PID plus start identity, and shutdown verifies ownership before signalling. `down` preserves state
 on remote stop failure; readiness timeout is nonzero, while `up --detach` explicitly skips waiting.
-`up --auto-restart` (`--restart-delay`, `--max-restarts`) runs an ownership-checked supervisor loop in
-`exec_runner`: it parses `colab status` text (which exits 0 even on `Session ... not found`), reuses
-live VMs on transient network drops, recreates reclaimed VMs with saved `session_gpu`/`mount_drive`,
-breaks half-open silent sockets only when `colab status` confirms `missing`, and caps pre-`CT_READY`
+`up --auto-restart` (`--idle-check`, `--restart-delay`, `--max-restarts`) runs an ownership-checked
+supervisor loop in `exec_runner`: it parses `colab status` text (which exits 0 even on
+`Session ... not found`), reuses live VMs on transient network drops (preserving `ready=True` and
+skipping `ready_timeout` when the authenticated endpoint is already serving HTTP 200), recreates
+reclaimed VMs with saved `session_gpu`/`mount_drive`, breaks half-open silent sockets (default 300s
+with 60s follow-up re-checks) only when `colab status` confirms `missing`, and caps pre-`CT_READY`
 startup retries with exponential backoff.
 `info/ps/status --json` default to redacted output; credentials require `--show-secrets`.
 

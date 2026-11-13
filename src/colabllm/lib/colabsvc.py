@@ -556,7 +556,8 @@ def _write_private_notebook(nb_path: Path, built: dict, env: dict | None = None)
 # --------------------------------------------------------------------------- runner (attached `colab exec`)
 DEFAULT_RESTART_DELAY = 15.0
 MAX_RESTART_BACKOFF = 300.0
-DEFAULT_IDLE_CHECK_SECONDS = 900.0
+DEFAULT_IDLE_CHECK_SECONDS = 300.0
+DEFAULT_SILENT_RECHECK_SECONDS = 60.0
 DEFAULT_MAX_STARTUP_RETRIES = 3
 
 
@@ -607,6 +608,17 @@ def _runner_still_owned(state: State, pid: int, identity: str | None) -> tuple[b
     return bool(identity and st.get("runner_pid") == pid and st.get("runner_identity") == identity), st
 
 
+def _probe_service_endpoint(svc: Service, st: dict, url_override: str | None = None) -> str:
+    url = (url_override or st.get("url") or "").strip()
+    if not url:
+        return "missing-url"
+    if svc.auth == "caddy":
+        return probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")))
+    if svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
+        return probe(url.rstrip("/") + "/v1/models", bearer=st["api_token"])
+    return probe(url)
+
+
 def _run_single_exec(
     svc: Service,
     state: State,
@@ -615,21 +627,22 @@ def _run_single_exec(
     deadline: float | None,
     auto_restart: bool,
     idle_check_seconds: float,
+    initially_ready: bool = False,
 ) -> tuple[int, bool, bool]:
     """Run one `colab exec` session and return `(exit_code, reached_ready, half_open_reclaimed)`."""
     proc = None
     child_identity = None
     selector = selectors.DefaultSelector()
-    reached_ready = False
+    reached_ready = bool(initially_ready)
     half_open_reclaimed = False
-    st = state.save(ready=False)
+    st = state.save(ready=bool(initially_ready))
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         child_identity = process_identity(proc.pid)
         st = state.save(exec_pid=proc.pid, exec_identity=child_identity)
         protocol = NotebookProtocol()
         selector.register(proc.stdout, selectors.EVENT_READ)
-        last_output_at = time.monotonic()
+        next_idle_probe_at = time.monotonic() + idle_check_seconds
         while True:
             now = time.monotonic()
             wait_timeout = None
@@ -639,21 +652,21 @@ def _run_single_exec(
                     raise TimeoutError("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
                 wait_timeout = remaining
             elif auto_restart and st.get("ready") and idle_check_seconds > 0:
-                wait_timeout = max(0.0, (last_output_at + idle_check_seconds) - now)
+                wait_timeout = max(0.0, next_idle_probe_at - now)
             if not selector.select(wait_timeout):
                 if deadline is not None and not st.get("ready") and time.monotonic() >= deadline:
                     continue
                 if auto_restart and st.get("ready") and idle_check_seconds > 0:
-                    last_output_at = time.monotonic()
                     if check_remote_session(svc) == "missing":
                         warn(f"[auto-restart] 远端会话 '{svc.name}' 已不存在（本地连接半开僵死），正在断开并准备恢复")
                         half_open_reclaimed = True
                         break
+                    next_idle_probe_at = time.monotonic() + min(idle_check_seconds, DEFAULT_SILENT_RECHECK_SECONDS)
                 continue
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
                 break
-            last_output_at = time.monotonic()
+            next_idle_probe_at = time.monotonic() + idle_check_seconds
             sys.stdout.buffer.write(chunk)
             sys.stdout.flush()
             update = {key: value for key, value in protocol.feed(chunk).items() if st.get(key) != value}
@@ -685,10 +698,17 @@ def _run_single_exec(
                 proc.stdout.close()
 
 
-def _provision_session_for_restart(svc: Service, state: State, pid: int, identity: str | None) -> str:
+def _provision_session_for_restart(
+    svc: Service,
+    state: State,
+    pid: int,
+    identity: str | None,
+    *,
+    previous_url: str | None = None,
+) -> str:
     """Verify remote session state under `.operation.lock` and reconnect or recreate the Colab VM.
 
-    Returns `'ready'`, `'stopped'` (when `down` took over), or `'failed'` (transient error; caller backs off).
+    Returns `'reattached_ready'` (live VM + live HTTP endpoint), `'ready'`, `'stopped'`, or `'failed'`.
     """
     with state.lock("operation", blocking=True):
         owned, st = _runner_still_owned(state, pid, identity)
@@ -705,14 +725,22 @@ def _provision_session_for_restart(svc: Service, state: State, pid: int, identit
             remote = check_remote_session(target_svc)
             if remote == "alive":
                 log(f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活（本地连接闪断），正在恢复挂载与保活连接")
+                remount_ok = True
                 if mount_drive:
                     try:
                         log("colab dfs mount")
                         run(["colab", "dfs", "mount", "-s", target_svc.name])
-                        return "ready"
                     except (CliError, OSError, subprocess.SubprocessError) as err:
                         warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
-                else:
+                        remount_ok = False
+                if remount_ok:
+                    candidate_url = previous_url or st.get("url")
+                    if candidate_url:
+                        code = _probe_service_endpoint(svc, st, url_override=candidate_url)
+                        if code.isdigit() and 200 <= int(code) < 400:
+                            state.save(url=candidate_url, ready=True)
+                            log(f"[auto-restart] 远端服务探针正常 (HTTP {code})，保持 ready=True 并继续附着保活")
+                            return "reattached_ready"
                     return "ready"
             log(f"[auto-restart] 远端会话 '{target_svc.name}' 已停机，正在清理残留记录并重新申请实例")
             run(["colab", "stop", "-s", target_svc.name], capture=True, check=False)
@@ -754,10 +782,11 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     auto_restart = bool(st.get("auto_restart"))
     base_delay = float(st.get("restart_delay") or DEFAULT_RESTART_DELAY)
     max_restarts = int(st.get("max_restarts") or 0)
+    saved_idle_check = float(st.get("idle_check_seconds") or DEFAULT_IDLE_CHECK_SECONDS)
     try:
-        idle_check_seconds = float(os.environ.get("COLABLLM_IDLE_CHECK_SECONDS", DEFAULT_IDLE_CHECK_SECONDS))
+        idle_check_seconds = float(os.environ.get("COLABLLM_IDLE_CHECK_SECONDS", saved_idle_check))
     except ValueError:
-        idle_check_seconds = DEFAULT_IDLE_CHECK_SECONDS
+        idle_check_seconds = saved_idle_check
     try:
         max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
     except ValueError:
@@ -782,8 +811,13 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         consecutive_failures = 0
         restart_count = int(st.get("restart_count") or 0)
         attempt = 0
+        reattached_ready = False
         while True:
-            deadline = time.monotonic() + ready_timeout if (is_foreground or attempt > 0) else None
+            deadline = (
+                time.monotonic() + ready_timeout
+                if (not reattached_ready and (is_foreground or attempt > 0))
+                else None
+            )
             last_timeout_err: TimeoutError | None = None
             reached_ready = False
             try:
@@ -794,6 +828,7 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
                     deadline=deadline,
                     auto_restart=True,
                     idle_check_seconds=idle_check_seconds,
+                    initially_ready=reattached_ready,
                 )
             except TimeoutError as err:
                 last_timeout_err = err
@@ -824,7 +859,8 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
                 return rc or 1
 
             restart_count += 1
-            keep_url = st.get("url") if st.get("hostname") else None
+            previous_url = st.get("url")
+            keep_url = previous_url if st.get("hostname") else None
             st = state.save(
                 ready=False,
                 url=keep_url,
@@ -838,12 +874,16 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
             log(f"[auto-restart #{restart_count}] 检测到运行时已停止 (exit={rc})，将在 {delay:g}s 后检查并恢复会话")
             time.sleep(delay)
 
+            reattached_ready = False
             while True:
-                status_result = _provision_session_for_restart(svc, state, pid, identity)
+                status_result = _provision_session_for_restart(
+                    svc, state, pid, identity, previous_url=previous_url
+                )
                 if status_result == "stopped":
                     rc = 0
                     return 0
-                if status_result == "ready":
+                if status_result in ("ready", "reattached_ready"):
+                    reattached_ready = status_result == "reattached_ready"
                     break
                 consecutive_failures += 1
                 if not ever_ready and consecutive_failures >= max_startup_retries:
@@ -909,9 +949,10 @@ def cmd_up(svc: Service, script: Path, a) -> None:
 def _start_up(svc: Service, script: Path, a):
     auto_restart = bool(getattr(a, "auto_restart", False))
     restart_delay = getattr(a, "restart_delay", None)
+    idle_check = getattr(a, "idle_check", None)
     max_restarts = int(getattr(a, "max_restarts", 0) or 0)
-    if (restart_delay is not None or max_restarts > 0) and not auto_restart:
-        raise ValueError("--restart-delay 与 --max-restarts 需配合 --auto-restart 使用")
+    if (restart_delay is not None or idle_check is not None or max_restarts > 0) and not auto_restart:
+        raise ValueError("--restart-delay、--idle-check 与 --max-restarts 需配合 --auto-restart 使用")
     hostname = tunnel_hostname(svc, a)
     transport=tunnel_transport(a)
     frp_config=None
@@ -1020,6 +1061,7 @@ def _start_up(svc: Service, script: Path, a):
         mount_drive=not a.no_drive,
         auto_restart=auto_restart,
         restart_delay=float(restart_delay if restart_delay is not None else DEFAULT_RESTART_DELAY),
+        idle_check_seconds=float(idle_check if idle_check is not None else DEFAULT_IDLE_CHECK_SECONDS),
         max_restarts=max_restarts,
         restart_count=0,
         last_restart=None,
@@ -1231,6 +1273,8 @@ def build_parser(svc: Service, configure=None):
                    help="守护模式：监听运行时停机或断连并自动重连/重建会话")
     u.add_argument("--restart-delay", type=positive_seconds, metavar="SECONDS",
                    help="自动重启基础等待秒数，连续失败时指数退避（默认: 15）")
+    u.add_argument("--idle-check", type=positive_seconds, metavar="SECONDS",
+                   help="半开连接静默巡检秒数，超时无输出时主动核实远端会话（默认: 300）")
     u.add_argument("--max-restarts", type=nonnegative_int, default=0, metavar="N",
                    help="最大自动重启次数，0 表示就绪后不限次数（默认: 0）")
     u.add_argument("--ready-timeout", type=positive_seconds, help="seconds to wait for readiness (default: service-specific)")

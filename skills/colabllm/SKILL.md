@@ -74,10 +74,11 @@ IDs contain 1–64 ASCII letters, digits, underscores or hyphens, with no leadin
 override only when requested or compatible with the runtime; do not silently downgrade hardware.
 
 Default `up` waits for readiness. `up --detach` only launches a runner; poll `status --json` until
-`running` and `ready` are true. `up --auto-restart` (optional `--restart-delay SECONDS`,
-`--max-restarts N`) supervises the runtime after launch: if `colab exec` disconnects or goes silent
-on a reclaimed VM (`colab status` reports `not found`), it re-attaches live VMs or recreates and
-re-mounts reclaimed VMs while preserving fixed domains and `api_token`; `down` stops it cleanly.
+`running` and `ready` are true. `up --auto-restart` (optional `--idle-check SECONDS`,
+`--restart-delay SECONDS`, `--max-restarts N`) supervises the runtime after launch: if `colab exec`
+disconnects or goes silent on a reclaimed VM (`colab status` reports `not found`), it re-attaches
+live VMs (preserving `ready` when the authenticated endpoint responds) or recreates and re-mounts
+reclaimed VMs while preserving fixed domains and `api_token`; `down` stops it cleanly.
 A reachable domain or 502 during loading is not model readiness.
 Use `up --ready-timeout SECONDS` for a suitable startup wait and `--command-timeout SECONDS` for
 external command limits. Exit 124 means timeout; default startup timeout leaves the runner active.
