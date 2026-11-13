@@ -94,9 +94,9 @@ on remote stop failure; readiness timeout is nonzero, while `up --detach` explic
 supervisor loop in `exec_runner`: it parses `colab status` text (which exits 0 even on
 `Session ... not found`), reuses live VMs on transient network drops (preserving `ready=True` and
 skipping `ready_timeout` when the authenticated endpoint is already serving HTTP 200), recreates
-reclaimed VMs with saved `session_gpu`/`mount_drive`, breaks half-open silent sockets (default 300s
-with 60s follow-up re-checks) only when `colab status` confirms `missing`, and caps pre-`CT_READY`
-startup retries with exponential backoff.
+reclaimed VMs with saved `session_gpu`/`mount_drive` (default `3s` restart delay), and breaks
+half-open silent sockets within `~10s` via a two-stage edge HTTP probe + `colab status` confirmation
+(plus a 300s `--idle-check` backstop) while capping pre-`CT_READY` startup retries with backoff.
 `info/ps/status --json` default to redacted output; credentials require `--show-secrets`.
 
 Readiness is parsed incrementally as complete protocol lines; preserve the exact `CT_READY` line

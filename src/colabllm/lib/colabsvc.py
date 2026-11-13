@@ -554,8 +554,10 @@ def _write_private_notebook(nb_path: Path, built: dict, env: dict | None = None)
 
 
 # --------------------------------------------------------------------------- runner (attached `colab exec`)
-DEFAULT_RESTART_DELAY = 15.0
+DEFAULT_RESTART_DELAY = 3.0
 MAX_RESTART_BACKOFF = 300.0
+DEFAULT_FAST_PROBE_SECONDS = 10.0
+DEFAULT_FAST_PROBE_TIMEOUT = 5.0
 DEFAULT_IDLE_CHECK_SECONDS = 300.0
 DEFAULT_SILENT_RECHECK_SECONDS = 60.0
 DEFAULT_MAX_STARTUP_RETRIES = 3
@@ -608,15 +610,17 @@ def _runner_still_owned(state: State, pid: int, identity: str | None) -> tuple[b
     return bool(identity and st.get("runner_pid") == pid and st.get("runner_identity") == identity), st
 
 
-def _probe_service_endpoint(svc: Service, st: dict, url_override: str | None = None) -> str:
+def _probe_service_endpoint(
+    svc: Service, st: dict, url_override: str | None = None, *, timeout: float = 15.0
+) -> str:
     url = (url_override or st.get("url") or "").strip()
     if not url:
         return "missing-url"
     if svc.auth == "caddy":
-        return probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")))
+        return probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")), timeout=timeout)
     if svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
-        return probe(url.rstrip("/") + "/v1/models", bearer=st["api_token"])
-    return probe(url)
+        return probe(url.rstrip("/") + "/v1/models", bearer=st["api_token"], timeout=timeout)
+    return probe(url, timeout=timeout)
 
 
 def _run_single_exec(
@@ -627,6 +631,7 @@ def _run_single_exec(
     deadline: float | None,
     auto_restart: bool,
     idle_check_seconds: float,
+    fast_probe_seconds: float = DEFAULT_FAST_PROBE_SECONDS,
     initially_ready: bool = False,
 ) -> tuple[int, bool, bool]:
     """Run one `colab exec` session and return `(exit_code, reached_ready, half_open_reclaimed)`."""
@@ -642,7 +647,10 @@ def _run_single_exec(
         st = state.save(exec_pid=proc.pid, exec_identity=child_identity)
         protocol = NotebookProtocol()
         selector.register(proc.stdout, selectors.EVENT_READ)
-        next_idle_probe_at = time.monotonic() + idle_check_seconds
+        now0 = time.monotonic()
+        next_idle_probe_at = now0 + idle_check_seconds
+        next_fast_probe_at = now0 + fast_probe_seconds
+        next_status_allowed_at = 0.0
         while True:
             now = time.monotonic()
             wait_timeout = None
@@ -651,22 +659,50 @@ def _run_single_exec(
                 if remaining == 0:
                     raise TimeoutError("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
                 wait_timeout = remaining
-            elif auto_restart and st.get("ready") and idle_check_seconds > 0:
-                wait_timeout = max(0.0, next_idle_probe_at - now)
+            elif auto_restart and st.get("ready"):
+                wakeups: list[float] = []
+                if idle_check_seconds > 0:
+                    wakeups.append(next_idle_probe_at - now)
+                if fast_probe_seconds > 0 and st.get("url"):
+                    wakeups.append(next_fast_probe_at - now)
+                if wakeups:
+                    wait_timeout = max(0.0, min(wakeups))
             if not selector.select(wait_timeout):
-                if deadline is not None and not st.get("ready") and time.monotonic() >= deadline:
+                now = time.monotonic()
+                if deadline is not None and not st.get("ready") and now >= deadline:
                     continue
-                if auto_restart and st.get("ready") and idle_check_seconds > 0:
-                    if check_remote_session(svc) == "missing":
-                        warn(f"[auto-restart] 远端会话 '{svc.name}' 已不存在（本地连接半开僵死），正在断开并准备恢复")
-                        half_open_reclaimed = True
-                        break
-                    next_idle_probe_at = time.monotonic() + min(idle_check_seconds, DEFAULT_SILENT_RECHECK_SECONDS)
+                if auto_restart and st.get("ready"):
+                    need_remote_check = False
+                    if idle_check_seconds > 0 and now >= next_idle_probe_at:
+                        need_remote_check = True
+                        next_idle_probe_at = now + min(idle_check_seconds, DEFAULT_SILENT_RECHECK_SECONDS)
+                    if fast_probe_seconds > 0 and st.get("url") and now >= next_fast_probe_at:
+                        code = _probe_service_endpoint(
+                            svc, st, timeout=min(DEFAULT_FAST_PROBE_TIMEOUT, max(0.5, fast_probe_seconds))
+                        )
+                        next_fast_probe_at = time.monotonic() + fast_probe_seconds
+                        if code.isdigit() and 200 <= int(code) < 500:
+                            next_status_allowed_at = 0.0
+                        elif time.monotonic() >= next_status_allowed_at:
+                            need_remote_check = True
+                    if need_remote_check:
+                        if check_remote_session(svc) == "missing":
+                            warn(f"[auto-restart] 远端会话 '{svc.name}' 已不存在（连接半开或边缘探针检出停机），正在立即断开并恢复")
+                            half_open_reclaimed = True
+                            break
+                        cooldown = (
+                            min(idle_check_seconds, DEFAULT_SILENT_RECHECK_SECONDS)
+                            if idle_check_seconds > 0
+                            else DEFAULT_SILENT_RECHECK_SECONDS
+                        )
+                        next_status_allowed_at = time.monotonic() + cooldown
                 continue
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
                 break
-            next_idle_probe_at = time.monotonic() + idle_check_seconds
+            now_read = time.monotonic()
+            next_idle_probe_at = now_read + idle_check_seconds
+            next_fast_probe_at = now_read + fast_probe_seconds
             sys.stdout.buffer.write(chunk)
             sys.stdout.flush()
             update = {key: value for key, value in protocol.feed(chunk).items() if st.get(key) != value}
@@ -788,6 +824,10 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     except ValueError:
         idle_check_seconds = saved_idle_check
     try:
+        fast_probe_seconds = float(os.environ.get("COLABLLM_FAST_PROBE_SECONDS", DEFAULT_FAST_PROBE_SECONDS))
+    except ValueError:
+        fast_probe_seconds = DEFAULT_FAST_PROBE_SECONDS
+    try:
         max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
     except ValueError:
         max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
@@ -800,18 +840,25 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     try:
         ready_timeout = st.get("ready_timeout", svc.ready_timeout)
         is_foreground = st.get("runner_mode") == "foreground"
+        already_ready = bool(st.get("ready") and st.get("url"))
         if not auto_restart:
-            deadline = time.monotonic() + ready_timeout if is_foreground else None
+            deadline = time.monotonic() + ready_timeout if (is_foreground and not already_ready) else None
             rc, _, _ = _run_single_exec(
-                svc, state, cmd, deadline=deadline, auto_restart=False, idle_check_seconds=0.0
+                svc,
+                state,
+                cmd,
+                deadline=deadline,
+                auto_restart=False,
+                idle_check_seconds=0.0,
+                initially_ready=already_ready,
             )
             return rc
 
-        ever_ready = False
+        ever_ready = already_ready
         consecutive_failures = 0
         restart_count = int(st.get("restart_count") or 0)
         attempt = 0
-        reattached_ready = False
+        reattached_ready = already_ready
         while True:
             deadline = (
                 time.monotonic() + ready_timeout
@@ -820,14 +867,16 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
             )
             last_timeout_err: TimeoutError | None = None
             reached_ready = False
+            half_open_reclaimed = False
             try:
-                rc, reached_ready, _ = _run_single_exec(
+                rc, reached_ready, half_open_reclaimed = _run_single_exec(
                     svc,
                     state,
                     cmd,
                     deadline=deadline,
                     auto_restart=True,
                     idle_check_seconds=idle_check_seconds,
+                    fast_probe_seconds=fast_probe_seconds,
                     initially_ready=reattached_ready,
                 )
             except TimeoutError as err:
@@ -870,9 +919,14 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
                 restart_count=restart_count,
             )
 
-            delay = _compute_backoff_delay(base_delay, 0 if reached_ready else consecutive_failures)
-            log(f"[auto-restart #{restart_count}] 检测到运行时已停止 (exit={rc})，将在 {delay:g}s 后检查并恢复会话")
-            time.sleep(delay)
+            delay = 0.0 if half_open_reclaimed else _compute_backoff_delay(
+                base_delay, 0 if reached_ready else consecutive_failures
+            )
+            if delay > 0:
+                log(f"[auto-restart #{restart_count}] 检测到运行时已停止 (exit={rc})，将在 {delay:g}s 后检查并恢复会话")
+                time.sleep(delay)
+            else:
+                log(f"[auto-restart #{restart_count}] 已确认远端会话停机，立即恢复会话")
 
             reattached_ready = False
             while True:
@@ -905,7 +959,7 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
 
 
 # --------------------------------------------------------------------------- commands
-def ensure_session(svc: Service, *, force_new: bool = False) -> None:
+def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
     if not force_new:
         try:
             sessions = json.loads((Path.home() / ".config/colab-cli/sessions.json").read_text())
@@ -914,7 +968,7 @@ def ensure_session(svc: Service, *, force_new: bool = False) -> None:
         if svc.name in sessions:
             if check_remote_session(svc) != "missing":
                 log(f"reusing Colab session '{svc.name}'")
-                return
+                return True
             log(f"stale Colab session '{svc.name}' was reclaimed remotely; recreating")
             run(["colab", "stop", "-s", svc.name], capture=True, check=False)
     args = ["colab", "new", "-s", svc.name]
@@ -926,6 +980,7 @@ def ensure_session(svc: Service, *, force_new: bool = False) -> None:
         args += ["--high-mem"]
     log(" ".join(args))
     run(args)
+    return False
 
 
 def cmd_up(svc: Service, script: Path, a) -> None:
@@ -1048,13 +1103,24 @@ def _start_up(svc: Service, script: Path, a):
         st=state.save(transport=transport)
     _write_private_notebook(nb_path, built, env)
     # 2. session + 3. Drive
-    ensure_session(svc)
+    previous_url = st.get("url")
+    reused_session = ensure_session(svc) is True
     if not a.no_drive:
         log("colab dfs mount")
         run(["colab", "dfs", "mount", "-s", svc.name])
+    initial_url = None
+    initial_ready = False
+    if reused_session and not a.new_credentials:
+        candidate_url = f"https://{hostname}" if hostname else previous_url
+        if candidate_url:
+            code = _probe_service_endpoint(svc, st, url_override=candidate_url, timeout=5.0)
+            if code.isdigit() and 200 <= int(code) < 400:
+                log(f"远端服务已在运行 (HTTP {code})，直接复用现有实例并接管保活")
+                initial_url = candidate_url
+                initial_ready = True
     st = state.save(
         base_service=svc.base_name or svc.name,
-        env=env, url=None, ready=False, last_cell_started=False, login_user=None, login_pass=None,
+        env=env, url=initial_url, ready=initial_ready, last_cell_started=False, login_user=None, login_pass=None,
         runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout,
         started=time.strftime("%Y-%m-%d %H:%M:%S"),
         session_gpu=svc.gpu, session_tpu=svc.tpu, session_high_mem=bool(svc.high_mem),
@@ -1122,7 +1188,13 @@ def _wait_ready(svc, proc, timeout=None):
     show_info(svc, do_probe=True, reveal=False)
 
 
-def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = None) -> str:
+def probe(
+    url: str,
+    auth: tuple[str, str] | None = None,
+    bearer: str | None = None,
+    *,
+    timeout: float = 15.0,
+) -> str:
     ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
     req = urllib.request.Request(url, headers={"User-Agent": ua})
     if auth:
@@ -1131,7 +1203,7 @@ def probe(url: str, auth: tuple[str, str] | None = None, bearer: str | None = No
     elif bearer:
         req.add_header("Authorization", f"Bearer {bearer}")
     try:
-        with safe_urlopen(req, timeout=15) as r:
+        with safe_urlopen(req, timeout=timeout) as r:
             return str(r.status)
     except urllib.error.HTTPError as e:
         return str(e.code)
@@ -1272,7 +1344,7 @@ def build_parser(svc: Service, configure=None):
     u.add_argument("--auto-restart", action="store_true",
                    help="守护模式：监听运行时停机或断连并自动重连/重建会话")
     u.add_argument("--restart-delay", type=positive_seconds, metavar="SECONDS",
-                   help="自动重启基础等待秒数，连续失败时指数退避（默认: 15）")
+                   help="自动重启基础等待秒数，连续失败时指数退避（默认: 3）")
     u.add_argument("--idle-check", type=positive_seconds, metavar="SECONDS",
                    help="半开连接静默巡检秒数，超时无输出时主动核实远端会话（默认: 300）")
     u.add_argument("--max-restarts", type=nonnegative_int, default=0, metavar="N",

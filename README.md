@@ -189,7 +189,7 @@ PyPI 上传失败时，GitHub Release 仍可下载；修复身份配置后在 Ac
 - 成功退出码为 0；操作失败为非零，参数用法错误为 2；外部 Colab 命令失败时保留其正退出码；Ctrl+C 为 130。
 - 就绪标记只接受完整的 `CT_READY` 协议行；日志中的普通文字提及不会被视为就绪。
 - `up` 默认等待 `CT_READY`；等待超时返回失败，但后台 runner 保留。`up --detach` 仅启动后台 runner，立即返回；`up --foreground` 在当前终端保持连接。
-- `up --auto-restart`（可选 `--idle-check SECONDS`、`--restart-delay SECONDS`、`--max-restarts N`）开启所有运行时通用的掉线自动拉起守护：监听 `colab exec` 退出及保活心跳静默（默认 5 分钟）后的 `colab status` 远端核实，网络闪断时直接重连原 VM 并在服务可用时立即恢复 `ready` 状态，VM 被 Colab 回收时自动清理残留会话并按原 GPU 规格重新建卡、挂载 Drive 与恢复服务（固定域名与 `api_token` 不变）；执行 `down` 时正常停止。
+- `up --auto-restart`（可选 `--idle-check SECONDS`、`--restart-delay SECONDS`、`--max-restarts N`）开启所有运行时通用的掉线自动拉起守护：监听 `colab exec` 退出（默认 `3s` 后核实）及每 `10s` 公网边缘探针 + `--idle-check`（默认 5 分钟）兜底的 `colab status` 远端核实，网络闪断时直接重连原 VM 并在服务可用时立即恢复 `ready` 状态，VM 被 Colab 回收时立即清理残留会话并按原 GPU 规格重新建卡、挂载 Drive 与恢复服务（固定域名与 `api_token` 不变）；执行 `down` 时正常停止。
 - 同一实例的启动和停止互斥；状态事务使用文件锁和原子替换。前台/后台 runner 都记录进程启动身份，停止前校验身份并等待退出。
 - `down` 先确认远端停止成功，再停止本地连接并清理运行状态；远端停止失败时保留连接和追踪信息，便于重试。
 - 携带认证信息的 HTTP 请求拒绝跨来源重定向。`--url` 或服务 URL 环境变量切换来源时，需要显式提供 Token，不能自动借用原服务的凭据。来源按协议、主机和有效端口比较。

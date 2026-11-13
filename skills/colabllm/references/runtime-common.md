@@ -29,7 +29,7 @@ colabllm tunnel-config
 每个运行时指南给出了具体服务名。共享命令为 `up/down/info/ps/list/status/logs/tunnel-config`，服务专用命令见各自指南。
 
 - `up` 等到完整的 `CT_READY` 协议行；`up --detach` 仅提交后台启动，需要继续检查 `status --json`。
-- `up --auto-restart` 开启守护模式（可配合 `--restart-delay SECONDS`、`--idle-check SECONDS` 与 `--max-restarts N`）：当 `colab exec` 断开或默认 `300s`（5 分钟）无心跳输出后核实远端会话已不存在时，若远端 VM 仍存活则直接重连挂载，若已被回收则自动清理残留记录并重新 `colab new` 申卡挂载恢复，固定域名与 `api_token` 保持不变；手动 `down` 时正常退出不重拉。
+- `up --auto-restart` 开启守护模式（可配合 `--restart-delay SECONDS`、`--idle-check SECONDS` 与 `--max-restarts N`）：当 `colab exec` 断开（默认 `3s` 后立即核实恢复）、或静默期间每 `10s` 轻量公网边缘探针检出网关异常（如 `502`/`530`/不可达）及 `--idle-check`（默认 `300s`）兜底巡检确认远端会话已不存在时，若远端 VM 仍存活则直接重连挂载，若已被回收则立即清理残留记录并重新 `colab new` 申卡挂载恢复，固定域名与 `api_token` 保持不变；手动 `down` 时正常退出不重拉。
 - `up --ready-timeout SECONDS` 限制就绪等待。默认后台模式超时保留 runner；前台 `--foreground` 超时断开连接。
 - `--command-timeout SECONDS` 或 `COLABLLM_COMMAND_TIMEOUT` 限制外部控制命令；长驻保活连接不受该通用上限影响。
 - `status --json` 返回运行、就绪、URL 和探测信息；`running: true` 只代表本地 runner 活着，不能替代模型就绪检查。

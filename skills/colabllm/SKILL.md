@@ -76,9 +76,10 @@ override only when requested or compatible with the runtime; do not silently dow
 Default `up` waits for readiness. `up --detach` only launches a runner; poll `status --json` until
 `running` and `ready` are true. `up --auto-restart` (optional `--idle-check SECONDS`,
 `--restart-delay SECONDS`, `--max-restarts N`) supervises the runtime after launch: if `colab exec`
-disconnects or goes silent on a reclaimed VM (`colab status` reports `not found`), it re-attaches
-live VMs (preserving `ready` when the authenticated endpoint responds) or recreates and re-mounts
-reclaimed VMs while preserving fixed domains and `api_token`; `down` stops it cleanly.
+disconnects (checked after `3s` by default) or the `10s` edge HTTP probe / `300s` `--idle-check`
+detects a reclaimed VM (`colab status` reports `not found`), it re-attaches live VMs (preserving
+`ready` when the authenticated endpoint responds) or immediately recreates and re-mounts reclaimed
+VMs while preserving fixed domains and `api_token`; `down` stops it cleanly.
 A reachable domain or 502 during loading is not model readiness.
 Use `up --ready-timeout SECONDS` for a suitable startup wait and `--command-timeout SECONDS` for
 external command limits. Exit 124 means timeout; default startup timeout leaves the runner active.

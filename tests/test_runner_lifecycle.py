@@ -20,10 +20,12 @@ class RunnerLifecycleTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        root_dir = self.root
         class Health(BaseHTTPRequestHandler):
             def log_message(self, *args): pass
             def do_GET(self):
-                self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                code = 502 if (root_dir / 'http-502').exists() else 200
+                self.send_response(code); self.end_headers(); self.wfile.write(b'ok' if code == 200 else b'bad gateway')
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Health)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -50,6 +52,8 @@ if cmd == 'new':
         (root / 'fail-new-once').unlink()
         print('GPU capacity temporarily unavailable', file=sys.stderr)
         sys.exit(1)
+    if (root / 'new-clears-502').exists():
+        (root / 'http-502').unlink(missing_ok=True)
     (root / 'session-missing').unlink(missing_ok=True)
     sys.exit(0)
 if cmd == 'exec':
@@ -275,6 +279,31 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
         restarted = self.wait_restart_ready(min_restarts=1)
         self.assertNotEqual(restarted['exec_pid'], first['exec_pid'])
         self.assertEqual(restarted['api_token'], first['api_token'])
+        self.assertEqual(self.cli('down').returncode, 0)
+
+    def test_auto_restart_fast_edge_probe_detects_502_immediately_without_waiting_idle_check(self):
+        # Keep idle_check huge (300s), so ONLY the fast edge probe (0.08s) can trigger immediate recovery:
+        self.env['COLABLLM_IDLE_CHECK_SECONDS'] = '300'
+        self.env['COLABLLM_FAST_PROBE_SECONDS'] = '0.08'
+        start = self.cli('up', '--quick-tunnel', '--no-drive', '--auto-restart', '--detach')
+        self.assertEqual(start.returncode, 0, start.stderr)
+        first = self.wait_ready()
+
+        # Subcase A: transient 502 while remote Colab VM is still ALIVE must NOT kill or recreate the VM:
+        (self.root / 'session-alive').touch()
+        (self.root / 'http-502').touch()
+        time.sleep(0.25)
+        self.assertEqual(json.loads(self.state_path.read_text()).get('restart_count', 0), 0)
+
+        # Subcase B: 502 + remote Colab VM MISSING triggers immediate restart without waiting 300s:
+        (self.root / 'http-502').unlink()
+        time.sleep(0.12)  # 200 resets status check cooldown
+        (self.root / 'session-alive').unlink()
+        (self.root / 'new-clears-502').touch()
+        (self.root / 'http-502').touch()
+        (self.root / 'session-missing').touch()
+        restarted = self.wait_restart_ready(min_restarts=1)
+        self.assertNotEqual(restarted['exec_pid'], first['exec_pid'])
         self.assertEqual(self.cli('down').returncode, 0)
 
     def test_auto_restart_stops_after_consecutive_pre_ready_startup_failures(self):
