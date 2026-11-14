@@ -32,6 +32,18 @@ class UnifiedCliTest(unittest.TestCase):
                 cli.main([name, '--help'])
                 execute.assert_called_once_with(sys.executable, [sys.executable, str(ROOT / 'src/colabllm/control.py'), name, '--help'])
 
+    def test_web_command_dispatch(self):
+        with patch.object(cli.os, 'execv') as execute:
+            cli.main(['web', '--help'])
+            execute.assert_called_once_with(sys.executable, [sys.executable, str(ROOT / 'src/colabllm/web.py'), 'web', '--help'])
+
+        with patch.object(cli.os, 'execv') as execute:
+            cli.main(['--account', 'work', 'web', '--read-only'])
+            execute.assert_called_once_with(
+                sys.executable,
+                [sys.executable, str(ROOT / 'src/colabllm/web.py'), '--account', 'work', 'web', '--read-only'],
+            )
+
     def test_listing_and_unknown_command_never_execute_a_service(self):
         with patch.object(cli.os, 'execv') as execute, contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(['services']), 0)

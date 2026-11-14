@@ -21,6 +21,10 @@ def _inspect_wheel(wheel: Path) -> list[str]:
         assert services, 'Wheel contains no services'
         assert services == notebooks, f'Service script/notebook mismatch: {services} != {notebooks}'
         assert 'colabllm/lib/frp_server.py' in names, 'Missing SSH provisioning source'
+        assert 'colabllm/web.py' in names, 'Missing web CLI module'
+        assert 'colabllm/web_ui/server.py' in names, 'Missing web_ui server module'
+        for asset in ('index.html', 'styles.css', 'app.js', 'favicon.svg'):
+            assert f'colabllm/web_ui/static/{asset}' in names, f'Missing web_ui static asset: {asset}'
         assert any(n.endswith('/licenses/LICENSE') or n.endswith('/LICENSE') for n in names), 'Missing LICENSE in wheel'
         meta_files = [n for n in names if n.endswith('.dist-info/METADATA')]
         assert meta_files, 'Missing METADATA in wheel'
@@ -43,6 +47,10 @@ def _inspect_sdist(sdist: Path) -> list[str]:
         assert services, 'Source distribution contains no services'
         assert services == notebooks, f'Service script/notebook mismatch in sdist: {services} != {notebooks}'
         assert any(n.endswith('/src/colabllm/lib/frp_server.py') for n in names), 'Missing SSH provisioning source in sdist'
+        assert any(n.endswith('/src/colabllm/web.py') for n in names), 'Missing web CLI module in sdist'
+        assert any(n.endswith('/src/colabllm/web_ui/server.py') for n in names), 'Missing web_ui server module in sdist'
+        for asset in ('index.html', 'styles.css', 'app.js', 'favicon.svg'):
+            assert any(n.endswith(f'/src/colabllm/web_ui/static/{asset}') for n in names), f'Missing web_ui static asset in sdist: {asset}'
         assert any(n.endswith('/LICENSE') for n in names), 'Missing LICENSE in sdist'
         pkg_infos = [n for n in names if n.endswith('/PKG-INFO')]
         assert pkg_infos, 'Missing PKG-INFO in sdist'
@@ -123,6 +131,8 @@ def check(artifact):
             script = run([command, 'completion', shell])
             assert 'colabllm _complete' in script
         assert 'tts' in run([command, '_complete', '--', 'qwen3-tts', 't']).splitlines()
+        assert 'web' in run([command, '_complete', '--', 'w']).splitlines()
+        run([command, 'web', '--help'])
         run([command, 'frp-config', '--help'])
         skill_text = run([command, 'skill'])
         assert 'name: colabllm' in skill_text

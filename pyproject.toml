@@ -27,12 +27,13 @@ Issues = "https://github.com/deluxebear/colabllm/issues"
 Changelog = "https://github.com/deluxebear/colabllm/blob/master/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["colabllm"]
+packages = ["colabllm", "colabllm.web_ui"]
 package-dir = {"" = "src"}
 include-package-data = false
 
 [tool.setuptools.package-data]
 colabllm = ["lib/*.py", "services/*.py", "services/*.ipynb"]
+"colabllm.web_ui" = ["static/*"]
 
 [tool.setuptools.data-files]
 "share/colabllm/skills/colabllm" = ["skills/colabllm/SKILL.md"]

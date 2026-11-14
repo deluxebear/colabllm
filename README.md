@@ -34,7 +34,9 @@ colabllm comfyui up
 colabllm ollama up --dry-run
 colabllm unlimited-ocr --help
 
-# 项目级配置也使用同一入口
+# 项目级配置与本地 Web 控制台也使用同一入口
+colabllm web
+colabllm web --port 8765 --read-only
 colabllm tunnel-config
 colabllm frp-config --help
 colabllm frp-status

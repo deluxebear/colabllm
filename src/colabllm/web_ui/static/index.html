@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="colabllm-csrf" content="__CSRF_TOKEN__">
+  <meta name="colabllm-readonly" content="__READ_ONLY__">
+  <title>ColabLLM Web 控制台</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script nonce="__CSP_NONCE__" type="module" src="/static/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="/static/favicon.svg" alt="" width="28" height="28">
+        <div>
+          <strong>ColabLLM</strong>
+          <small id="app-version">v...</small>
+        </div>
+      </div>
+
+      <nav aria-label="主导航" class="side-nav">
+        <button type="button" class="nav-btn" data-view="fleet" aria-current="page">舰队与实例</button>
+        <button type="button" class="nav-btn" data-view="workbench">工作台与命令</button>
+        <button type="button" class="nav-btn" data-view="network">隧道与账户</button>
+        <button type="button" class="nav-btn" data-view="doctor">环境体检</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-line">
+          <span id="sse-dot" class="dot" data-state="connecting"></span>
+          <span id="sse-label">正在连接事件流</span>
+        </div>
+        <label class="switch-row">
+          <span>深色外观</span>
+          <input id="theme-toggle" type="checkbox" switch>
+        </label>
+      </div>
+    </aside>
+
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-title">
+          <h1 id="view-title">舰队与实例</h1>
+          <p id="view-subtitle">管理 Google Colab 运行时生命周期、实时日志与公网隧道</p>
+        </div>
+        <div class="topbar-actions">
+          <span id="readonly-badge" class="badge warn" hidden>只读模式 (--read-only)</span>
+          <button type="button" id="refresh-btn" class="btn secondary">刷新状态</button>
+          <button type="button" class="btn primary" commandfor="up-dialog" command="show-modal" data-open-up>启动新实例</button>
+        </div>
+      </header>
+
+      <main class="content">
+        <!-- View 1: Fleet & Instances -->
+        <section id="view-fleet" class="view-section">
+          <div class="kpi-strip" id="kpi-strip">
+            <div class="kpi-card"><span class="kpi-label">运行中实例</span><strong id="kpi-running">0</strong></div>
+            <div class="kpi-card"><span class="kpi-label">已就绪服务</span><strong id="kpi-ready">0</strong></div>
+            <div class="kpi-card"><span class="kpi-label">全局传输后端</span><strong id="kpi-transport">-</strong></div>
+            <div class="kpi-card"><span class="kpi-label">可用运行时</span><strong id="kpi-services">0</strong></div>
+          </div>
+
+          <section class="block">
+            <div class="block-header">
+              <h2>活跃与历史实例</h2>
+              <span class="muted" id="instances-count">0 个实例</span>
+            </div>
+            <div id="instances-grid" class="cards-grid"></div>
+          </section>
+
+          <section class="block">
+            <div class="block-header">
+              <h2>全部运行时目录</h2>
+              <div class="filter-bar">
+                <input id="service-search" type="search" placeholder="筛选服务名称或说明..." aria-label="筛选运行时">
+                <select id="category-filter" aria-label="按分类筛选">
+                  <option value="all">全部分类</option>
+                  <option value="llm">LLM 与推理</option>
+                  <option value="image">图像生成与编辑</option>
+                  <option value="audio">语音合成 / 转写 / 音效</option>
+                  <option value="video">视频与原生工作流 UI</option>
+                  <option value="ocr">文档 OCR</option>
+                </select>
+              </div>
+            </div>
+            <div id="services-grid" class="cards-grid"></div>
+          </section>
+        </section>
+
+        <!-- View 2: Workbench (Tabs inside view) -->
+        <section id="view-workbench" class="view-section" hidden>
+          <div class="tabs-shell">
+            <div class="tablist" focusgroup="tablist nomemory" aria-label="工作台模式">
+              <button type="button" class="tab-btn" id="tab-cli" aria-selected="true" focusgroupstart data-panel="panel-cli">通用命令表单</button>
+              <button type="button" class="tab-btn" id="tab-chat" aria-selected="false" data-panel="panel-chat">对话与同源代理</button>
+              <button type="button" class="tab-btn" id="tab-tasks" aria-selected="false" data-panel="panel-tasks">任务执行记录</button>
+            </div>
+
+            <div role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" tabindex="0">
+              <div class="panel-body">
+                <div class="workbench-controls">
+                  <label>
+                    <span>运行时</span>
+                    <select id="wb-service"></select>
+                  </label>
+                  <label>
+                    <span>子命令</span>
+                    <select id="wb-subcommand"></select>
+                  </label>
+                  <label>
+                    <span>实例 ID (-i，可空)</span>
+                    <input id="wb-instance" type="text" placeholder="默认实例留空">
+                  </label>
+                  <label>
+                    <span>计算账户 (--account，可空)</span>
+                    <select id="wb-account"><option value="">默认规则解析</option></select>
+                  </label>
+                </div>
+                <p id="wb-subcommand-desc" class="muted"></p>
+                <form id="wb-form" class="schema-form">
+                  <div id="wb-fields" class="schema-fields"></div>
+                  <div class="cmd-preview-box">
+                    <span class="muted">等价 CLI 命令</span>
+                    <code id="wb-cmd-preview">colabllm ...</code>
+                  </div>
+                  <div class="form-actions">
+                    <button type="button" id="wb-copy-cmd" class="btn secondary">复制命令</button>
+                    <button type="submit" id="wb-run-btn" class="btn primary">运行子命令</button>
+                    <button type="button" id="wb-cancel-btn" class="btn danger" hidden>停止当前任务</button>
+                  </div>
+                </form>
+                <div class="terminal-wrap">
+                  <div class="terminal-head">
+                    <span>命令输出流</span>
+                    <span id="wb-task-status" class="badge">待命</span>
+                  </div>
+                  <pre id="wb-output" class="log-viewer">选择服务与子命令后可在此直接预览参数并执行。</pre>
+                </div>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" hidden="until-found">
+              <div class="panel-body">
+                <div class="workbench-controls">
+                  <label>
+                    <span>目标实例</span>
+                    <select id="proxy-target"></select>
+                  </label>
+                  <label>
+                    <span>模型别名 (OpenAI /v1/models)</span>
+                    <input id="chat-model" type="text" placeholder="自动读取或手填模型 ID">
+                  </label>
+                  <div class="inline-btn-wrap">
+                    <button type="button" id="chat-load-models" class="btn secondary">探测模型列表</button>
+                  </div>
+                </div>
+
+                <div class="chat-grid">
+                  <div class="card">
+                    <h3>OpenAI 兼容流式对话 (/v1/chat/completions)</h3>
+                    <div id="chat-messages" class="chat-messages"></div>
+                    <form id="chat-form" class="chat-form">
+                      <label>
+                        <span>System 提示词（可选）</span>
+                        <input id="chat-system" type="text" placeholder="You are a helpful assistant.">
+                      </label>
+                      <label>
+                        <span>用户输入</span>
+                        <textarea id="chat-input" rows="3" placeholder="输入问题或指令..." required></textarea>
+                      </label>
+                      <div class="chat-options">
+                        <label class="switch-row">
+                          <span>启用思考模式 (enable_thinking)</span>
+                          <input id="chat-thinking" type="checkbox" switch>
+                        </label>
+                        <button type="submit" id="chat-send-btn" class="btn primary">发送流式请求</button>
+                      </div>
+                    </form>
+                  </div>
+
+                  <div class="card">
+                    <h3>同源认证 HTTP 代理调试 (/api/proxy/...)</h3>
+                    <p class="muted">由本机后端自动补全 Bearer / Basic Auth 凭据并安全转发，浏览器端不保存密钥。</p>
+                    <form id="proxy-http-form" class="schema-form">
+                      <div class="two-col">
+                        <label>
+                          <span>HTTP 方法</span>
+                          <select id="proxy-method">
+                            <option value="GET">GET</option>
+                            <option value="POST">POST</option>
+                          </select>
+                        </label>
+                        <label>
+                          <span>远端相对路径</span>
+                          <input id="proxy-path" type="text" value="v1/models" placeholder="v1/models 或 api/tags">
+                        </label>
+                      </div>
+                      <label>
+                        <span>JSON 请求体（POST 时可选）</span>
+                        <textarea id="proxy-body" rows="4" placeholder='{"model": "..."}'></textarea>
+                      </label>
+                      <button type="submit" class="btn secondary">发送代理请求</button>
+                    </form>
+                    <pre id="proxy-output" class="log-viewer">响应内容将显示在这里。</pre>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="panel-tasks" aria-labelledby="tab-tasks" hidden="until-found">
+              <div class="panel-body">
+                <div class="block-header">
+                  <h3>近期后台任务</h3>
+                  <span class="muted">点击任意任务可跳转到“通用命令表单”查看完整输出</span>
+                </div>
+                <div id="tasks-list" class="tasks-list"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- View 3: Tunnel & Multi-Account -->
+        <section id="view-network" class="view-section" hidden>
+          <div class="two-col-grid">
+            <section class="card">
+              <h2>全局隧道与域名 (tunnel-config)</h2>
+              <div class="kv-list" id="tunnel-summary"></div>
+              <form id="tunnel-form" class="schema-form">
+                <label>
+                  <span>项目全局主域名 (--base-domain)</span>
+                  <input id="tunnel-base-domain" type="text" placeholder="example.com">
+                </label>
+                <div class="form-actions">
+                  <button type="submit" class="btn primary">保存主域名</button>
+                  <button type="button" id="tunnel-clear-btn" class="btn secondary">清除主域名</button>
+                  <button type="button" id="frp-probe-btn" class="btn secondary">检查 FRP 状态</button>
+                </div>
+              </form>
+              <pre id="frp-status-output" class="log-viewer" hidden></pre>
+            </section>
+
+            <section class="card">
+              <h2>Colab 多账户与共享 Drive 状态</h2>
+              <p class="muted">仅只读读取 ~/.config/colab-cli 账户索引与授权文件存在性，不读取 OAuth 凭据原文。</p>
+              <div id="accounts-summary" class="kv-list"></div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>账户名</th>
+                      <th>邮箱</th>
+                      <th>绑定 Drive</th>
+                      <th>Drive 授权</th>
+                    </tr>
+                  </thead>
+                  <tbody id="accounts-tbody"></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <!-- View 4: Doctor -->
+        <section id="view-doctor" class="view-section" hidden>
+          <section class="card">
+            <div class="block-header">
+              <h2>环境依赖与授权体检 (doctor)</h2>
+              <button type="button" id="doctor-run-btn" class="btn primary">运行体检</button>
+            </div>
+            <div class="workbench-controls">
+              <label>
+                <span>Colab 账户 (-a)</span>
+                <select id="doctor-account"><option value="">自动解析</option></select>
+              </label>
+              <label>
+                <span>共享 Drive 账户</span>
+                <select id="doctor-drive-account"><option value="">跟随账户绑定</option></select>
+              </label>
+              <label>
+                <span>隧道检查模式</span>
+                <select id="doctor-transport">
+                  <option value="">跟随当前配置</option>
+                  <option value="quick">quick</option>
+                  <option value="cloudflare">cloudflare</option>
+                  <option value="frp">frp</option>
+                </select>
+              </label>
+              <div class="switch-group">
+                <label class="switch-row">
+                  <span>联网只读核验 (--online)</span>
+                  <input id="doctor-online" type="checkbox" switch>
+                </label>
+                <label class="switch-row">
+                  <span>跳过 Drive 检查 (--no-drive)</span>
+                  <input id="doctor-no-drive" type="checkbox" switch>
+                </label>
+              </div>
+            </div>
+            <div id="doctor-banner" class="muted"></div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>状态</th>
+                    <th>检查项</th>
+                    <th>说明</th>
+                    <th>必需</th>
+                  </tr>
+                </thead>
+                <tbody id="doctor-tbody"></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Launch / Dry-run Modal Dialog -->
+  <dialog id="up-dialog" aria-labelledby="up-dialog-title">
+    <div class="dialog-header">
+      <h2 id="up-dialog-title">启动运行时实例</h2>
+      <button type="button" class="btn icon-btn" commandfor="up-dialog" command="close" aria-label="关闭窗口">✕</button>
+    </div>
+    <form id="up-form" class="dialog-body">
+      <div class="two-col">
+        <label>
+          <span>选择运行时</span>
+          <select id="up-service" required></select>
+        </label>
+        <label>
+          <span>实例 ID (-i，默认实例留空)</span>
+          <input id="up-instance" type="text" placeholder="例如 2 或 gpu1">
+        </label>
+      </div>
+      <div class="two-col">
+        <label>
+          <span>计算账户 (-a / --account)</span>
+          <select id="up-account"><option value="">自动解析</option></select>
+        </label>
+        <label>
+          <span>共享 Drive 账户 (--drive-account)</span>
+          <select id="up-drive-account"><option value="">自动解析</option></select>
+        </label>
+      </div>
+      <div class="two-col">
+        <label>
+          <span>隧道模式</span>
+          <select id="up-tunnel-mode">
+            <option value="default">跟随全局配置</option>
+            <option value="domain">固定域名 (--domain)</option>
+            <option value="base_domain">单次主域名 (--base-domain)</option>
+            <option value="quick">强制临时地址 (--quick-tunnel)</option>
+          </select>
+        </label>
+        <label id="up-domain-wrap" hidden>
+          <span id="up-domain-label">自定义域名（留空则使用服务别名+主域名）</span>
+          <input id="up-domain-input" type="text" placeholder="example.com">
+        </label>
+      </div>
+      <div class="two-col">
+        <label>
+          <span>GPU 覆盖 (--gpu)</span>
+          <select id="up-gpu">
+            <option value="">服务默认</option>
+            <option value="G4">G4</option>
+            <option value="H100">H100</option>
+            <option value="A100">A100</option>
+            <option value="L4">L4</option>
+            <option value="T4">T4</option>
+            <option value="none">none (仅 CPU)</option>
+          </select>
+        </label>
+        <label>
+          <span>隧道后端覆盖 (--transport)</span>
+          <select id="up-transport">
+            <option value="">全局默认</option>
+            <option value="cloudflare">cloudflare</option>
+            <option value="frp">frp</option>
+          </select>
+        </label>
+      </div>
+      <div class="two-col">
+        <label>
+          <span>跳过 Cell (--skip，如 1,2)</span>
+          <input id="up-skip" type="text" placeholder="1,2">
+        </label>
+        <label>
+          <span>HuggingFace Token (--hf-token，可选)</span>
+          <input id="up-hf-token" type="password" autocomplete="off" placeholder="留空则沿用已保存或环境变量">
+        </label>
+      </div>
+      <div class="switch-grid">
+        <label class="switch-row">
+          <span>守护自动重启 (--auto-restart)</span>
+          <input id="up-auto-restart" type="checkbox" switch>
+        </label>
+        <label class="switch-row">
+          <span>不挂载 Drive (--no-drive)</span>
+          <input id="up-no-drive" type="checkbox" switch>
+        </label>
+        <label class="switch-row">
+          <span>轮换凭据 (--new-credentials)</span>
+          <input id="up-new-credentials" type="checkbox" switch>
+        </label>
+      </div>
+      <details class="advanced-box">
+        <summary>守护超时与运行时专属参数</summary>
+        <div class="two-col">
+          <label><span>--restart-delay (秒)</span><input id="up-restart-delay" type="number" step="any" min="0.1" placeholder="3"></label>
+          <label><span>--idle-check (秒)</span><input id="up-idle-check" type="number" step="any" min="1" placeholder="300"></label>
+          <label><span>--max-restarts (0 不限)</span><input id="up-max-restarts" type="number" step="1" min="0" placeholder="0"></label>
+          <label><span>--ready-timeout (秒)</span><input id="up-ready-timeout" type="number" step="any" min="1" placeholder="默认"></label>
+        </div>
+        <div id="up-extra-fields" class="schema-fields"></div>
+      </details>
+      <div class="cmd-preview-box">
+        <span class="muted">将执行命令</span>
+        <code id="up-cmd-preview">colabllm ...</code>
+      </div>
+      <pre id="up-dryrun-output" class="log-viewer" hidden></pre>
+      <div class="dialog-actions">
+        <button type="button" class="btn secondary" commandfor="up-dialog" command="close">取消</button>
+        <button type="button" id="up-dryrun-btn" class="btn secondary">预览执行计划 (--dry-run)</button>
+        <button type="submit" id="up-submit-btn" class="btn primary">后台启动 (up --detach)</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Stop Confirmation Modal Dialog -->
+  <dialog id="down-dialog" aria-labelledby="down-dialog-title">
+    <div class="dialog-header">
+      <h2 id="down-dialog-title">确认停止实例</h2>
+    </div>
+    <form method="dialog" id="down-form" class="dialog-body">
+      <p id="down-dialog-desc"></p>
+      <label class="switch-row">
+        <span>同时删除命名隧道与 DNS 记录 (--delete-tunnel)</span>
+        <input id="down-delete-tunnel" type="checkbox" switch>
+      </label>
+      <label class="switch-row">
+        <span>停止该服务下的全部实例 (--all)</span>
+        <input id="down-all" type="checkbox" switch>
+      </label>
+      <div class="dialog-actions">
+        <button value="cancel" autofocus class="btn secondary">取消</button>
+        <button value="confirm" class="btn danger">确认停止</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Live Logs Modal Dialog -->
+  <dialog id="logs-dialog" class="wide-dialog" aria-labelledby="logs-dialog-title">
+    <div class="dialog-header">
+      <h2 id="logs-dialog-title">实例实时日志</h2>
+      <button type="button" class="btn icon-btn" commandfor="logs-dialog" command="close" aria-label="关闭日志">✕</button>
+    </div>
+    <div class="dialog-body">
+      <div class="filter-bar">
+        <input id="logs-filter" type="search" placeholder="高亮或过滤关键词..." aria-label="过滤日志">
+        <label class="switch-row">
+          <span>自动滚动到底部</span>
+          <input id="logs-autoscroll" type="checkbox" switch checked>
+        </label>
+      </div>
+      <pre id="logs-viewer" class="log-viewer tall"></pre>
+      <div class="dialog-actions">
+        <button type="button" id="logs-download-btn" class="btn secondary">导出当前日志</button>
+        <button type="button" class="btn primary" commandfor="logs-dialog" command="close">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- Connection & Secrets Modal Dialog -->
+  <dialog id="connect-dialog" class="wide-dialog" aria-labelledby="connect-dialog-title">
+    <div class="dialog-header">
+      <h2 id="connect-dialog-title">连接方式与凭据</h2>
+      <button type="button" class="btn icon-btn" commandfor="connect-dialog" command="close" aria-label="关闭窗口">✕</button>
+    </div>
+    <div class="dialog-body">
+      <div id="connect-meta" class="kv-list"></div>
+      <div class="form-actions">
+        <button type="button" id="connect-reveal-btn" class="btn primary">按需获取完整凭据 (--show-secrets)</button>
+        <button type="button" id="connect-copy-curl" class="btn secondary">复制 curl 示例</button>
+        <button type="button" id="connect-copy-py" class="btn secondary">复制 OpenAI SDK 示例</button>
+      </div>
+      <pre id="connect-snippet" class="log-viewer"></pre>
+    </div>
+  </dialog>
+
+  <div id="toast-region" role="region" aria-label="Notifications"></div>
+  <p class="sr-only">Screen reader announcements</p>
+  <div id="sr-announcer" class="sr-only" aria-live="polite"></div>
+</body>
+</html>
