@@ -138,6 +138,45 @@ class CliRegressionTest(unittest.TestCase):
             self.assertIn(str(state/'state.json'), result.stderr)
             self.assertNotIn('Traceback', result.stderr)
 
+    def test_unsloth_studio_info_and_ps_scope_and_mask_credentials(self):
+        with tempfile.TemporaryDirectory() as home:
+            state = Path(home) / 'services/unsloth-studio'
+            state.mkdir(parents=True)
+            (state / 'state.json').write_text(
+                json.dumps({
+                    'url': 'https://demo.trycloudflare.com',
+                    'auth_user': 'admin',
+                    'auth_pass': 'unused-caddy-pass',
+                    'api_token': 'unused-api-token',
+                    'login_user': 'unsloth',
+                    'login_pass': 'studio-real-pass',
+                }),
+                encoding='utf-8',
+            )
+            env = {**os.environ, 'COLABLLM_HOME': home}
+            for subcmd in ('info', 'ps'):
+                masked = subprocess.run(
+                    [str(ROOT / 'colabllm'), 'unsloth-studio', subcmd, '--json'],
+                    env=env, text=True, capture_output=True,
+                )
+                self.assertEqual(masked.returncode, 0, masked.stderr)
+                for secret in ('unused-caddy-pass', 'unused-api-token', 'studio-real-pass', 'login_user', 'login_pass'):
+                    self.assertNotIn(secret, masked.stdout)
+
+                revealed = subprocess.run(
+                    [str(ROOT / 'colabllm'), 'unsloth-studio', subcmd, '--json', '--show-secrets'],
+                    env=env, text=True, capture_output=True,
+                )
+                self.assertEqual(revealed.returncode, 0, revealed.stderr)
+                data = json.loads(revealed.stdout)
+                entry = data[0] if subcmd == 'ps' else data
+                self.assertEqual(entry.get('login_user'), 'unsloth')
+                self.assertEqual(entry.get('login_pass'), 'studio-real-pass')
+                for unused in ('auth_user', 'auth_pass', 'api_token'):
+                    self.assertNotIn(unused, entry)
+                self.assertNotIn('unused-caddy-pass', revealed.stdout)
+                self.assertNotIn('unused-api-token', revealed.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

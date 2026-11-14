@@ -228,5 +228,104 @@ class MiddlewareImportTest(unittest.TestCase):
         self.assertIn("per_layer_token_embd.weight=CPU", nb)
 
 
+class UnslothAuthHelperTest(unittest.TestCase):
+    def _make_fake_studio_opener(self, state):
+        import io
+        import urllib.error
+
+        class FakeResp:
+            def __init__(self, status, payload):
+                self.status = status
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def read(self):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_open(req, timeout=15.0):
+            url = req.full_url
+            body = json.loads(req.data.decode("utf-8")) if req.data else {}
+            if url.endswith("/api/auth/status"):
+                return FakeResp(
+                    200,
+                    {
+                        "initialized": True,
+                        "default_username": "unsloth",
+                        "requires_password_change": state["requires_password_change"],
+                    },
+                )
+            if url.endswith("/api/auth/login"):
+                if body.get("username") == "unsloth" and body.get("password") == state["password"]:
+                    return FakeResp(
+                        200,
+                        {
+                            "access_token": "jwt-ok",
+                            "must_change_password": state["requires_password_change"],
+                        },
+                    )
+                raise urllib.error.HTTPError(
+                    url, 401, "Unauthorized", {}, io.BytesIO(b'{"detail":"Incorrect password"}')
+                )
+            if url.endswith("/api/auth/change-password"):
+                auth = req.headers.get("Authorization")
+                if auth != "Bearer jwt-ok" or body.get("current_password") != state["password"]:
+                    raise urllib.error.HTTPError(
+                        url, 401, "Unauthorized", {}, io.BytesIO(b'{"detail":"Incorrect password"}')
+                    )
+                state["password"] = body["new_password"]
+                state["requires_password_change"] = False
+                state["changed"] += 1
+                return FakeResp(200, {"access_token": "jwt-new"})
+            raise AssertionError(f"unexpected URL: {url}")
+
+        return fake_open
+
+    def test_fresh_bootstrap_password_reconciles_to_target(self):
+        helper = importlib.import_module("unsloth_auth_helper")
+        state = {"password": "bootstrap-temp-pass", "requires_password_change": True, "changed": 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            auth_dir = Path(tmp)
+            (auth_dir / ".bootstrap_password").write_text("bootstrap-temp-pass\n", encoding="utf-8")
+            user, pw = helper.ensure_unsloth_admin_password(
+                "http://127.0.0.1:8888",
+                "persistent-target-pass",
+                auth_dir=str(auth_dir),
+                prefer_target=True,
+                timeout=2.0,
+                poll_interval=0.01,
+                opener=self._make_fake_studio_opener(state),
+            )
+        self.assertEqual((user, pw), ("unsloth", "persistent-target-pass"))
+        self.assertEqual(state["password"], "persistent-target-pass")
+        self.assertFalse(state["requires_password_change"])
+        self.assertEqual(state["changed"], 1)
+
+    def test_reused_runtime_already_using_target_password(self):
+        helper = importlib.import_module("unsloth_auth_helper")
+        state = {"password": "persistent-target-pass", "requires_password_change": False, "changed": 0}
+        with tempfile.TemporaryDirectory() as tmp:
+            user, pw = helper.ensure_unsloth_admin_password(
+                "http://127.0.0.1:8888",
+                "persistent-target-pass",
+                auth_dir=tmp,
+                prefer_target=True,
+                timeout=2.0,
+                poll_interval=0.01,
+                opener=self._make_fake_studio_opener(state),
+            )
+        self.assertEqual((user, pw), ("unsloth", "persistent-target-pass"))
+        self.assertEqual(state["changed"], 0)
+
+    def test_unsloth_notebook_embeds_auth_helper(self):
+        nb = (ROOT / "src/colabllm/services/unsloth-studio.ipynb").read_text(encoding="utf-8")
+        self.assertIn("unsloth_auth_helper.py", nb)
+        self.assertIn("ensure_unsloth_admin_password", nb)
+
+
 if __name__ == "__main__":
     unittest.main()

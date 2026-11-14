@@ -333,6 +333,8 @@ def list_service_instances(base_name: str) -> list[dict]:
             "api_token": st.get("api_token"),
             "auth_user": st.get("auth_user"),
             "auth_pass": st.get("auth_pass"),
+            "login_user": st.get("login_user"),
+            "login_pass": st.get("login_pass"),
             "started": st.get("started"),
         })
     return items
@@ -1185,7 +1187,7 @@ def _start_up(svc: Service, script: Path, a):
         st = state.update(lambda current: {k: v for k, v in current.items() if k != "hf_token"})
     if hf_tok:
         env.update(HF_TOKEN=hf_tok, HUGGING_FACE_HUB_TOKEN=hf_tok)
-    if svc.auth == "caddy":
+    if svc.auth == "caddy" or (svc.base_name or svc.name) == "unsloth-studio":
         env.update(CT_AUTH_USER=st["auth_user"], CT_AUTH_PASS=st["auth_pass"])
 
     # 1. named tunnel + DNS (local, cf CLI)
@@ -1347,7 +1349,7 @@ def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, rem
     if st.get("url"):
         lines.append(f"URL     : {st['url']}")
     if reveal:
-        for key in ("auth_user", "auth_pass", "api_token", "login_user", "login_pass"):
+        for key in _service_secret_keys(svc):
             if st.get(key):
                 data[key] = st[key]
                 lines.append(f"{key}: {st[key]}")
@@ -1372,10 +1374,22 @@ def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, rem
     return healthy
 
 
+_ALL_SECRET_KEYS = ("auth_user", "auth_pass", "api_token", "login_user", "login_pass")
+
+
+def _service_secret_keys(svc: Service) -> tuple[str, ...]:
+    if (svc.base_name or svc.name) == "unsloth-studio":
+        return ("login_user", "login_pass")
+    if svc.auth == "caddy":
+        return _ALL_SECRET_KEYS
+    return ("api_token", "login_user", "login_pass")
+
+
 def show_instances(svc: Service, reveal=False, output_json=False):
     items = list_service_instances(svc.base_name or svc.name)
-    if not reveal:
-        items = [{key: value for key, value in item.items() if key not in ("api_token", "auth_pass", "auth_user")}
+    hidden = set(_ALL_SECRET_KEYS) if not reveal else (set(_ALL_SECRET_KEYS) - set(_service_secret_keys(svc)))
+    if hidden:
+        items = [{key: value for key, value in item.items() if key not in hidden}
                  for item in items]
     if output_json:
         print(json.dumps(items, ensure_ascii=False, indent=2))
@@ -1383,13 +1397,22 @@ def show_instances(svc: Service, reveal=False, output_json=False):
     if not items:
         log(f"no instances found for '{svc.base_name or svc.name}'")
         return
-    print(f"{'INSTANCE':<12} {'ACCOUNT':<18} {'SESSION':<28} {'STATE':<12} URL" + (" / API TOKEN" if reveal else ""))
+    print(f"{'INSTANCE':<12} {'ACCOUNT':<18} {'SESSION':<28} {'STATE':<12} URL" + (" / CREDENTIAL" if reveal else ""))
     for item in items:
         label = "READY" if item["ready"] else ("STARTING" if item["alive"] else "STOPPED")
         acct = item.get("account")
         drv = item.get("drive_account")
         acct_col = f"{acct}->{drv}" if (acct and drv and drv != acct) else (acct or drv or "-")
-        suffix = f" / {item.get('api_token', '-')}" if reveal else ""
+        if reveal:
+            cred = (
+                item.get("api_token")
+                or (f"{item['login_user']}:{item['login_pass']}" if item.get("login_user") and item.get("login_pass") else "")
+                or (f"{item['auth_user']}:{item['auth_pass']}" if item.get("auth_user") and item.get("auth_pass") else "")
+                or "-"
+            )
+            suffix = f" / {cred}"
+        else:
+            suffix = ""
         print(f"{item['instance']:<12} {acct_col:<18} {item['name']:<28} {label:<12} {item.get('url') or '-'}{suffix}")
 
 

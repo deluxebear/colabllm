@@ -657,10 +657,22 @@ UNSLOTH_SERVICE = r'''# @title 2. Service -- Unsloth Studio is started by its ow
 sys.path.insert(0, "/content/unsloth/studio/backend")
 print("Unsloth Studio will listen on port", SERVICE_PORT)
 '''
-UNSLOTH_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- KEEP THIS CELL RUNNING
+UNSLOTH_KEEPALIVE = (
+    r'''# @title 5. Ready + keep-alive -- KEEP THIS CELL RUNNING
 # start() blocks forever (its own keep-alive loop). Our tunnel from cell 4 is used, so cloudflare=False.
-# A watcher thread reports the admin password + CT_READY and restarts cloudflared if it dies.
+# A watcher thread ensures admin credentials + CT_READY and restarts cloudflared if it dies.
+import pathlib
 import threading
+
+pathlib.Path(f"{WORK}/unsloth_auth_helper.py").write_text(
+    '''
+    + repr((ROOT / "templates/unsloth_auth_helper.py").read_text(encoding="utf-8"))
+    + r''',
+    encoding="utf-8",
+)
+if WORK not in sys.path:
+    sys.path.insert(0, WORK)
+from unsloth_auth_helper import ensure_unsloth_admin_password
 
 def _watch():
     try:
@@ -673,18 +685,13 @@ def _watch():
 
 def _watch_inner():
     ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/api/health", timeout=900)
-    auth_dir = "/root/.unsloth/studio/auth"
-    for _ in range(60):
-        for fn in (".bootstrap_password", ".colab_notebook_login"):
-            p = os.path.join(auth_dir, fn)
-            if os.path.exists(p):
-                lines = open(p).read().split()
-                pw = lines[-1] if lines else ""
-                print(f"CT_CREDENTIALS user=unsloth pass={pw}", flush=True)
-                break
-        else:
-            time.sleep(2); continue
-        break
+    user, pw = ensure_unsloth_admin_password(
+        f"http://127.0.0.1:{SERVICE_PORT}",
+        AUTH_PASS,
+        prefer_target=CREDS_FROM_ENV,
+    )
+    if pw:
+        print(f"CT_CREDENTIALS user={user} pass={pw}", flush=True)
     print(f"{SERVICE} is up: {PUBLIC_URL}")
     print("CT_READY", flush=True)
     last_beat = time.time()
@@ -704,6 +711,7 @@ threading.Thread(target=_watch, daemon=True).start()
 from colab import start
 start(port=SERVICE_PORT, cloudflare=False)
 '''
+)
 
 # --------------------------------------------------------------------------- qwen-flash (G4, llama.cpp sm_120, UD-Q4_K_XL-V2, 1M YaRN 4x + q8_0 KV + vision)
 QWEN_FLASH_CFG = dict(name="qwen-flash", service_port=8000, auth="builtin", public_port=8000,

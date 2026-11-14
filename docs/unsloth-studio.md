@@ -14,9 +14,9 @@ colabllm unsloth-studio info --show-secrets
 colabllm unsloth-studio logs -n 100
 ```
 
-从返回的 URL 打开 Studio，使用实际 `login_user/login_pass`（若应用已报告）或其 UI 登录流程。
-不要把其他 Caddy 服务的账号字段或随机 `api_token` 当成 Studio 必定接受的 API Key。
-当前 notebook 启动 Studio 后才可能产生应用凭据，启动标记与登录字段的出现时间不同；界面不可用时继续查日志。
+`unsloth-studio` 使用应用自带 Web 登录（`auth="builtin"`），不使用 Caddy Basic Auth（`auth_user`/`auth_pass`）或随机 `api_token`。
+notebook 启动 Studio 后会自动使用 `.bootstrap_password` 调用 `/api/auth/login` 与 `/api/auth/change-password`，将管理员密码统一为该实例持久化凭据后才报告 `CT_READY`。
+打开返回的 Studio URL 后可直接进入登录页，通过 `colabllm unsloth-studio info --show-secrets`（或 `colabllm web` 的凭据弹窗）获取 `login_user`（默认 `unsloth`）与 `login_pass` 登录，无需手动改密。
 
 ## 微调流程
 
