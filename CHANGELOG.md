@@ -4,12 +4,18 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-14
+
 ### 新增
 
 - 原生集成 `colab-ext`（`https://github.com/deluxebear/colab-ext`）多账户与共享 Google Drive 绑定能力：
   - 全链路支持 `--account` / `COLABLLM_ACCOUNT` / `COLAB_ACCOUNT`（按档案名或邮箱解析）及 `up --drive-account` / `doctor --drive-account` 共享网盘账号覆写（`up` 与 `doctor` 同时支持短参数 `-a`，不影响 `minimax-h3-image` 等子命令自有的 `-a/--aspect`）。
   - `up` 启动时将解析后的 `account` 与 `drive_account` 写入实例 `state.json`，并在 `ensure_session` 读取 `~/.config/colab-cli/accounts/<账户>/sessions.json`；后续 `--auto-restart` 断线重连/停机重建、`status`、`down`、`nemotron-transcribe` 网盘操作均锁定原账户，不受之后终端 `colab account use` 切换活动账户影响，同时对未初始化 `accounts.json` 的旧版单账户环境保持 100% 向后兼容。
   - `info`、`ps`/`list` 与 `doctor` 展示账户与共享 Drive 状态，`doctor` 与离线 Shell 补全（读取账户目录/注册表，不触及凭据或 Keyring）原生适配 `accounts.json` 与分账户 `dfs_credentials.json`。
+
+### 修复
+
+- `qwen-flash`：移除 `llama-server` 启动前的 `evict_gguf_page_cache()` 调用（保留加载完成后的重复文件缓存释放），避免清空分片拉取阶段预热在主机 DDR5 内存中的 Linux Page Cache 而退化为限速磁盘冷读；同时改进就绪探针对 HTTP `503` 错误响应体的分类（区分 `"Loading model"` 与异步加载失败状态并立即触发显存溢出卸载递增或快速报错）。
 
 ### 文档
 
