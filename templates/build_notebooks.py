@@ -731,6 +731,7 @@ from qwen_flash_runtime import (
     DEFAULT_REPO,
     MODEL_NUM_LAYERS,
     build_server_args,
+    classify_health_response,
     compute_yarn_params,
     detect_gpu_info,
     detect_host_ram_mib,
@@ -849,8 +850,6 @@ SPAWN_LOG_OFFSET = 0
 def start_service():
     global SPAWN_LOG_OFFSET
     subprocess.run(["pkill", "-f", str(BIN_DIR / "llama-server")], check=False, timeout=15)
-    if HW_PLAN.get("ple_in_ram"):
-        evict_gguf_page_cache(QWEN_WORK / "model", log=qlog)
     args = build_server_args(
         server_bin=BIN_DIR / "llama-server",
         model_path=MODEL_PATH,
@@ -892,7 +891,13 @@ def http_json(url, key=None, payload=None, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as err:
-        return err.code, {}
+        try:
+            raw = err.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else {}
+            body = parsed if isinstance(parsed, dict) else {}
+        except (OSError, ValueError):
+            body = {}
+        return err.code, body
 
 def auth_check(base, key):
     for candidate, expected in ((None, 401), ("invalid-deployment-test-key", 401), (key, 200)):
@@ -906,50 +911,68 @@ ctx_fallback = [819_200, 524_288]
 ctx_idx = 0
 deadline = time.monotonic() + 2400
 last_notice = 0.0
+last_health_detail = "starting"
+
+def try_recover_from_load_failure(reason_label):
+    global moe_stepups, ctx_idx
+    recent_log = ct_log_since("llama-server", SPAWN_LOG_OFFSET)
+    if (
+        CFG["cpu_moe"].strip().lower() == "auto"
+        and moe_stepups < 3
+        and HW_PLAN["n_cpu_moe"] + 2 <= MODEL_NUM_LAYERS
+        and looks_like_oom(recent_log)
+    ):
+        moe_stepups += 1
+        prev_moe = HW_PLAN["n_cpu_moe"]
+        HW_PLAN["n_cpu_moe"] = min(MODEL_NUM_LAYERS, prev_moe + 2)
+        HW_PLAN["mode"] = f"hybrid-cpu-moe-{HW_PLAN['n_cpu_moe']}"
+        qlog(
+            f"Startup CUDA OOM at n_cpu_moe={prev_moe}; offloading +2 expert layers "
+            f"(-> n_cpu_moe={HW_PLAN['n_cpu_moe']}) while keeping ctx={HW_PLAN['context']}"
+        )
+        PROCS["service"] = (start_service(), start_service)
+        return True
+    if HW_PLAN.get("context_auto") and ctx_idx < len(ctx_fallback) and looks_like_oom(recent_log):
+        prev_ctx = HW_PLAN["context"]
+        next_ctx = ctx_fallback[ctx_idx]
+        ctx_idx += 1
+        if next_ctx < prev_ctx:
+            rs, rscale, yorig = compute_yarn_params(next_ctx)
+            HW_PLAN["context"] = next_ctx
+            HW_PLAN["rope_scaling"] = rs
+            HW_PLAN["rope_scale"] = rscale
+            HW_PLAN["yarn_orig_ctx"] = yorig
+            qlog(f"Startup OOM at ctx={prev_ctx}; stepping down to ctx={next_ctx} and retrying")
+            PROCS["service"] = (start_service(), start_service)
+            return True
+    raise RuntimeError(f"{reason_label}:\n" + ct_tail("llama-server", 60))
 
 while time.monotonic() < deadline:
     proc = PROCS["service"][0]
     if proc.poll() is not None:
-        recent_log = ct_log_since("llama-server", SPAWN_LOG_OFFSET)
-        if (
-            CFG["cpu_moe"].strip().lower() == "auto"
-            and moe_stepups < 3
-            and HW_PLAN["n_cpu_moe"] + 2 <= MODEL_NUM_LAYERS
-            and looks_like_oom(recent_log)
-        ):
-            moe_stepups += 1
-            prev_moe = HW_PLAN["n_cpu_moe"]
-            HW_PLAN["n_cpu_moe"] = min(MODEL_NUM_LAYERS, prev_moe + 2)
-            HW_PLAN["mode"] = f"hybrid-cpu-moe-{HW_PLAN['n_cpu_moe']}"
-            qlog(
-                f"Startup CUDA OOM at n_cpu_moe={prev_moe}; offloading +2 expert layers "
-                f"(-> n_cpu_moe={HW_PLAN['n_cpu_moe']}) while keeping ctx={HW_PLAN['context']}"
-            )
-            PROCS["service"] = (start_service(), start_service)
-            continue
-        if HW_PLAN.get("context_auto") and ctx_idx < len(ctx_fallback) and looks_like_oom(recent_log):
-            prev_ctx = HW_PLAN["context"]
-            next_ctx = ctx_fallback[ctx_idx]
-            ctx_idx += 1
-            if next_ctx < prev_ctx:
-                rs, rscale, yorig = compute_yarn_params(next_ctx)
-                HW_PLAN["context"] = next_ctx
-                HW_PLAN["rope_scaling"] = rs
-                HW_PLAN["rope_scale"] = rscale
-                HW_PLAN["yarn_orig_ctx"] = yorig
-                qlog(f"Startup OOM at ctx={prev_ctx}; stepping down to ctx={next_ctx} and retrying")
-                PROCS["service"] = (start_service(), start_service)
-                continue
-        raise RuntimeError("llama-server exited during load:\n" + ct_tail("llama-server", 60))
+        if try_recover_from_load_failure("llama-server exited during load"):
+            last_health_detail = "restarting"
+        continue
     try:
-        if http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)[0] == 200:
+        h_code, h_body = http_json(LOCAL_BASE + "/health", API_TOKEN, timeout=10)
+        h_state, h_detail = classify_health_response(h_code, h_body)
+        last_health_detail = h_detail
+        if h_state == "ready":
             break
+        if h_state == "error":
+            ct_stop_proc(proc)
+            if try_recover_from_load_failure(f"llama-server reported model load error ({h_detail})"):
+                last_health_detail = "restarting"
+            continue
+        if h_state == "auth_error":
+            ct_stop_proc(proc)
+            raise RuntimeError(f"Local /health rejected API token ({h_detail})")
     except (OSError, ValueError):
         pass
     if time.monotonic() - last_notice > 45:
         qlog(
-            f"Waiting for model load / warmup (ctx={HW_PLAN['context']}, mode={HW_PLAN['mode']}) | "
-            f"GPU: {ct_gpu_stat('memory.used,memory.total,utilization.gpu')}"
+            f"Waiting for model load / warmup (ctx={HW_PLAN['context']}, mode={HW_PLAN['mode']}, "
+            f"status={last_health_detail}) | GPU: {ct_gpu_stat('memory.used,memory.total,utilization.gpu')}"
         )
         last_notice = time.monotonic()
     time.sleep(5)
