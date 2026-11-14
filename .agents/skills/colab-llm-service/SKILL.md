@@ -16,6 +16,7 @@ src/colabllm/cli.py     packaged CLI: service dispatch and project configuration
 src/colabllm/services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
 src/colabllm/services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
 src/colabllm/lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
+src/colabllm/lib/colab_accounts.py    read-only colab-ext multi-account & shared-Drive resolver (no secrets read)
 src/colabllm/control.py             project-global domain and FRP configuration
 src/colabllm/lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
 templates/build_notebooks.py  generator of every .ipynb (never hand-edit generated notebooks)
@@ -86,7 +87,14 @@ there is no migration. New service pairs are discovered automatically and must b
 Runtime command registration belongs in the shared parser (`main(..., configure=..., handlers=...)`),
 and script entry points use `cli_support.run_cli` for consistent errors. Local authenticated HTTP
 clients use `safe_urlopen` or `SameOriginRedirect`. Keep diagnostics on stderr and JSON on stdout.
-Instance IDs are validated strictly; parsing stops at `--`. State updates are locked transactions;
+Instance IDs are validated strictly; parsing stops at `--`. Do not register `-a` on the root
+service parser or strip `-a` before subcommand dispatch (`minimax-h3-image` uses `-a` for `--aspect`);
+use `--account` globally/per-service and keep `-a/--account` only on `up` and `doctor`.
+`colab_accounts` mirrors `colab-ext` (`~/.config/colab-cli/accounts.json` and `accounts/<name>/`)
+and propagates `COLAB_ACCOUNT` / `COLAB_DRIVE_ACCOUNT` to `colab` subprocesses while pinning `account`
+and `drive_account` in `state.json` for `--auto-restart`, `status`, `down`, and `nemotron-transcribe`
+helper calls (falling back cleanly to legacy `sessions.json`/`dfs_credentials.json` when unconfigured).
+State updates are locked transactions;
 startup/shutdown also use a per-instance operation lock. Both foreground and detached runners record
 PID plus start identity, and shutdown verifies ownership before signalling. `down` preserves state
 on remote stop failure; readiness timeout is nonzero, while `up --detach` explicitly skips waiting.
@@ -139,7 +147,7 @@ Configuration changes affect future starts; preserve running generation tasks wh
 
 `up` normally returns once the notebook prints `CT_READY`; `--detach` returns before readiness.
 A detached local runner keeps `colab exec`
-attached (= keep-alive). Requirements: `colab` CLI logged in, `colab dfs consent` done once.
+attached (= keep-alive). Requirements: `colab` CLI logged in (`colab account list`), `colab drive consent` (legacy alias `colab dfs consent`) done once on the compute or shared Drive account (`colab ext doctor`).
 Fixed domains use the local `cf` login for DNS in either backend. FRP server management also needs SSH.
 
 ## Hard-won rules (verified on real runs -- do not "simplify" them away)

@@ -27,7 +27,7 @@ colabllm <service> <command> --help
 If the command is missing, use the user's supplied wheel or package source. A distributed wheel
 installs with `uv tool install /path/to/colabllm-VERSION-py3-none-any.whl`; use
 `uv tool install colabllm` only when that package has actually been published to the intended index.
-`colab`, its Drive extension and authorization are separate prerequisites. Local model libraries
+`colab`, its `colab-ext` Drive/multi-account extension (`colab drive`/`dfs`, `colab account`, `colab ext`) and authorization are separate prerequisites. Local model libraries
 such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 
 | Task | Runtime | Reference to read |
@@ -70,6 +70,13 @@ colabllm <service> logs -n 100
 
 Choose an instance explicitly with `-i ID` when needed, consistently for startup, calls and queries.
 IDs contain 1–64 ASCII letters, digits, underscores or hyphens, with no leading hyphen.
+In multi-account setups (`colab-ext`), select the compute account via `--account NAME_OR_EMAIL`
+(short `-a` also works on `up` and `doctor`; do NOT pass `-a` to business subcommands where `-a`
+may mean `--aspect`, use `--account` there) or `COLABLLM_ACCOUNT` / `COLAB_ACCOUNT`, and optionally
+override the shared Google Drive storage account via `up --drive-account NAME_OR_EMAIL`.
+Each launched instance pins its resolved `account` and `drive_account` in `state.json`, so subsequent
+`--auto-restart`, `status`, and `down` stay pinned to that account even if `colab account use`
+switches the active account later.
 `up` may allocate a paid GPU session and install/download large remote dependencies. Choose a GPU
 override only when requested or compatible with the runtime; do not silently downgrade hardware.
 

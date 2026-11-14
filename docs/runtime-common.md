@@ -9,11 +9,12 @@
 colabllm --version
 colabllm services
 colabllm doctor
+colabllm doctor -a ACCOUNT --online --timeout 10
 colabllm tunnel-config
 ```
 
-`colab` CLI、独立的 `colab dfs` 扩展和 Google/Drive 授权需要另行准备。
-`doctor` 默认离线检查；`doctor --online --timeout 10` 增加限时只读授权检查。
+`colab` CLI、独立的 `colab-ext` 扩展（提供 `colab drive`/`dfs`、多账户 `colab account` 与 `colab ext doctor`）以及 Google/Drive 授权需要另行准备。
+`doctor` 默认离线检查当前活动或指定账户与 Drive 授权文件；`doctor --online --timeout 10` 增加限时只读授权检查。
 固定域名需要 Cloudflare 授权；FRP 还需要用户配置的服务器及 SSH 认证。
 安装包和前置依赖的完整说明以发行版 README 为准。包内 Agent 技能可用 `colabllm skill --output <技能父目录>` 导出。
 
@@ -33,8 +34,10 @@ colabllm tunnel-config
 - `status --json` 返回运行、就绪、URL 和探测信息；`running: true` 只代表本地 runner 活着，不能替代模型就绪检查。
 - `logs -n 100` 查看近期日志，`logs -f` 跟随输出；日志可能含第三方程序打印的敏感信息，分享前应脱敏。
 - `-i ID` 可用于启动及后续调用。实例 ID 为 1–64 位字母、数字、下划线或连字符，不以连字符开头；默认实例不传 `-i`。
-- `ps --json` 列出该服务的各实例。独立实例使用独立 VM、隧道和凭据，但相同服务的 Drive 数据目录可能共享。
-- `down -i ID` 释放该实例 VM；`down --all` 停止该服务所有实例；`--delete-tunnel` 还删除该实例拥有的隧道/DNS。
+- `--account ACCOUNT`（`up` 与 `doctor` 同时支持 `-a/--account`，或设置 `COLABLLM_ACCOUNT` / `COLAB_ACCOUNT`）选择本次使用的 Colab 账户名或邮箱；`up --drive-account ACCOUNT`（或 `COLABLLM_DRIVE_ACCOUNT`）可覆写共享网盘凭据账户（否则按 `colab-ext` 的 `drive_account` 绑定或全局默认网盘账户解析）。业务子命令中的 `-a` 仍保留给各服务自有参数（如宽高比），前置覆盖请使用 `--account`。
+- `up` 会把解析到的 `account` 与 `drive_account` 写入实例 `state.json`；后续 `--auto-restart` 重拉、`status`、`down` 以及 `nemotron-transcribe` 网盘辅助命令会锁定原账户，不受之后终端 `colab account use` 切换活动账户影响。停止后重新 `up` 时恢复读取当前活动账户。
+- `ps --json` 列出该服务的各实例及其锁定账户。独立实例使用独立 VM、隧道和凭据；跨账户启动多张 GPU 时配合 `--drive-account`（或在 `colab account set-drive` 绑定共享账号），各实例即可共享同一份 `MyDrive/colab-llm/<服务>/` 模型缓存。
+- `down -i ID` 释放该实例 VM；`down --all` 停止该服务所有实例（按各自锁定的账户停止）；`--delete-tunnel` 还删除该实例拥有的隧道/DNS。
 
 本机必须持续联网且避免休眠，后台 runner 保持 `colab exec` 连接；断开后 VM 可能被回收。
 不要因客户端等待超时就重复 `up`。先查日志和会话，避免重复模型加载或提交任务。
@@ -58,7 +61,7 @@ TTS 和转写的 `--timeout` 是请求限时；OCR/Avatar/Openjutsu/MiniMax-H3-I
 
 ## 排错顺序
 
-依赖或授权错误先查 `doctor`。502 可能来自加载中、隧道断开或 VM 回收，不能只凭状态码决定重启。
-查 `logs`、`status --json`、`colab sessions`；最后一个 notebook cell 阻塞是保活设计，新的 `colab exec` 可能排队。
+依赖或授权错误先查 `doctor`（多账户环境可用 `colabllm doctor -a <账户>` 与 `colab ext doctor`）。502 可能来自加载中、隧道断开或 VM 回收，不能只凭状态码决定重启。
+查 `logs`、`status --json`、`colab sessions --all`、`colab account status`；最后一个 notebook cell 阻塞是保活设计，新的 `colab exec` 可能排队。
 DNS 归属冲突先核对 `tunnel-config` 与 `frp-status` 的项目 ID/服务路由；不能覆盖不明归属的记录。
 停止或重置前先确认没有正在生成、训练或转写的任务，并保留任务 ID、输出和恢复信息。

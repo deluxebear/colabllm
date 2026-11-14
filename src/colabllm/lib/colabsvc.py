@@ -49,6 +49,13 @@ from pathlib import Path
 
 from paths import private_dir, user_home
 from cli_support import CliError, UsageError, command_timeout, positive_seconds, diagnostic, safe_urlopen
+from colab_accounts import (
+    account_sessions_path,
+    colab_subprocess_env,
+    resolve_effective_account,
+    resolve_effective_drive_account,
+    validate_account,
+)
 from protocol import NotebookProtocol
 from processes import process_identity, runner_alive, stop_owned_process
 
@@ -76,6 +83,8 @@ class Service:
     base_name: str = ""             # base service name before --instance suffix
     base_default_hostname: str | None = None
     instance: str | None = None     # optional instance id (-i / --instance)
+    account: str | None = None      # optional Colab account name/email (--account)
+    drive_account: str | None = None  # optional shared Google Drive storage account (--drive-account)
 
     def __post_init__(self) -> None:
         if not self.base_name:
@@ -86,6 +95,35 @@ class Service:
     @property
     def tunnel_port(self) -> int:
         return self.public_port if self.auth == "caddy" else self.service_port
+
+
+def extract_account_arg(argv: list[str] | None = None) -> tuple[str | None, list[str]]:
+    """Extract `--account <acct>` / `--account=<acct>` from anywhere before `--`.
+
+    Short `-a` is intentionally NOT stripped here because business subcommands such as
+    `minimax-h3-image generate -a 16:9` use `-a` for `--aspect`.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    acct: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            cleaned.extend(args[i:])
+            break
+        if a == "--account":
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                raise UsageError("--account 需要有效的 Colab 账户名或邮箱")
+            acct = validate_account(args[i + 1])
+            i += 2
+        elif a.startswith("--account="):
+            acct = validate_account(a.split("=", 1)[1])
+            i += 1
+        else:
+            cleaned.append(a)
+            i += 1
+    return acct, cleaned
 
 
 def extract_instance_arg(argv: list[str] | None = None) -> tuple[str | None, list[str]]:
@@ -290,12 +328,31 @@ def list_service_instances(base_name: str) -> list[dict]:
             "restart_count": int(st.get("restart_count", 0)),
             "runner_pid": st.get("runner_pid"),
             "url": st.get("url"),
+            "account": st.get("account"),
+            "drive_account": st.get("drive_account"),
             "api_token": st.get("api_token"),
             "auth_user": st.get("auth_user"),
             "auth_pass": st.get("auth_pass"),
             "started": st.get("started"),
         })
     return items
+
+
+def colab_env_for(svc: Service) -> dict[str, str] | None:
+    return colab_subprocess_env(svc.account, svc.drive_account)
+
+
+def colab_env_for_session(session_name: str, explicit_account: str | None = None) -> dict[str, str] | None:
+    st: dict = {}
+    sp = STATE_ROOT / "services" / session_name / "state.json"
+    if sp.is_file():
+        with contextlib.suppress(OSError, ValueError, UnicodeError):
+            loaded = json.loads(sp.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                st = loaded
+    acct, _ = resolve_effective_account(explicit=explicit_account, saved=st.get("account"), prefer_saved=True)
+    drv = st.get("drive_account") if (not explicit_account or acct == st.get("account")) else None
+    return colab_subprocess_env(acct, drv)
 
 
 # --------------------------------------------------------------------------- utils
@@ -316,11 +373,20 @@ def banner(lines: list[str]) -> None:
     print("\n" + "=" * w + "\n" + "\n".join(f"    {line}" for line in lines) + "\n" + "=" * w + "\n", flush=True)
 
 
-def run(cmd: list[str], *, capture: bool = False, check: bool = True, input: str | None = None, timeout=None):
+def run(
+    cmd: list[str],
+    *,
+    capture: bool = False,
+    check: bool = True,
+    input: str | None = None,
+    timeout=None,
+    env: dict[str, str] | None = None,
+):
     res = subprocess.run(cmd, text=True, input=input,
                          stdout=subprocess.PIPE if capture else None,
                          stderr=subprocess.PIPE if capture else None,
-                         timeout=command_timeout() if timeout is None else timeout)
+                         timeout=command_timeout() if timeout is None else timeout,
+                         env=env)
     if check and res.returncode != 0:
         if capture:
             sys.stderr.write((res.stdout or "") + (res.stderr or ""))
@@ -590,7 +656,7 @@ def parse_colab_session_status(session_name: str, returncode: int, stdout: str =
 
 def check_remote_session(svc: Service, timeout: float = 30.0) -> str:
     try:
-        res = run(["colab", "status", "-s", svc.name], capture=True, check=False, timeout=timeout)
+        res = run(["colab", "status", "-s", svc.name], capture=True, check=False, timeout=timeout, env=colab_env_for(svc))
     except (OSError, subprocess.SubprocessError, CliError):
         return "unknown"
     return parse_colab_session_status(svc.name, res.returncode, res.stdout or "", res.stderr or "")
@@ -642,7 +708,13 @@ def _run_single_exec(
     half_open_reclaimed = False
     st = state.save(ready=bool(initially_ready))
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=colab_env_for(svc),
+        )
         child_identity = process_identity(proc.pid)
         st = state.save(exec_pid=proc.pid, exec_identity=child_identity)
         protocol = NotebookProtocol()
@@ -755,7 +827,10 @@ def _provision_session_for_restart(
             gpu=st["session_gpu"] if "session_gpu" in st else svc.gpu,
             tpu=st["session_tpu"] if "session_tpu" in st else svc.tpu,
             high_mem=bool(st["session_high_mem"]) if "session_high_mem" in st else svc.high_mem,
+            account=st.get("account") or svc.account,
+            drive_account=st.get("drive_account") or svc.drive_account,
         )
+        target_env = colab_env_for(target_svc)
         mount_drive = bool(st.get("mount_drive", True))
         try:
             remote = check_remote_session(target_svc)
@@ -765,7 +840,7 @@ def _provision_session_for_restart(
                 if mount_drive:
                     try:
                         log("colab dfs mount")
-                        run(["colab", "dfs", "mount", "-s", target_svc.name])
+                        run(["colab", "dfs", "mount", "-s", target_svc.name], env=target_env)
                     except (CliError, OSError, subprocess.SubprocessError) as err:
                         warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
                         remount_ok = False
@@ -779,11 +854,11 @@ def _provision_session_for_restart(
                             return "reattached_ready"
                     return "ready"
             log(f"[auto-restart] 远端会话 '{target_svc.name}' 已停机，正在清理残留记录并重新申请实例")
-            run(["colab", "stop", "-s", target_svc.name], capture=True, check=False)
+            run(["colab", "stop", "-s", target_svc.name], capture=True, check=False, env=target_env)
             ensure_session(target_svc, force_new=True)
             if mount_drive:
                 log("colab dfs mount")
-                run(["colab", "dfs", "mount", "-s", target_svc.name])
+                run(["colab", "dfs", "mount", "-s", target_svc.name], env=target_env)
             return "ready"
         except (CliError, OSError, subprocess.SubprocessError) as err:
             warn(f"[auto-restart] 会话恢复失败：{err}")
@@ -801,6 +876,8 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     """Own the Colab connection, reap its process group, and optionally supervise auto-restarts."""
     state = State(svc)
     st = state.load()
+    svc.account = svc.account or st.get("account")
+    svc.drive_account = svc.drive_account or st.get("drive_account")
     pid, identity = os.getpid(), process_identity(os.getpid())
     st = state.save(runner_pid=pid, runner_identity=identity)
     if nb_path.is_file() and st.get("env"):
@@ -960,9 +1037,10 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
 
 # --------------------------------------------------------------------------- commands
 def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
+    env = colab_env_for(svc)
     if not force_new:
         try:
-            sessions = json.loads((Path.home() / ".config/colab-cli/sessions.json").read_text())
+            sessions = json.loads(account_sessions_path(svc.account).read_text(encoding="utf-8"))
         except Exception:
             sessions = {}
         if svc.name in sessions:
@@ -970,7 +1048,7 @@ def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
                 log(f"reusing Colab session '{svc.name}'")
                 return True
             log(f"stale Colab session '{svc.name}' was reclaimed remotely; recreating")
-            run(["colab", "stop", "-s", svc.name], capture=True, check=False)
+            run(["colab", "stop", "-s", svc.name], capture=True, check=False, env=env)
     args = ["colab", "new", "-s", svc.name]
     if svc.tpu:
         args += ["--tpu", svc.tpu]
@@ -979,7 +1057,7 @@ def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
     if svc.high_mem:
         args += ["--high-mem"]
     log(" ".join(args))
-    run(args)
+    run(args, env=env)
     return False
 
 
@@ -1008,6 +1086,9 @@ def _start_up(svc: Service, script: Path, a):
     max_restarts = int(getattr(a, "max_restarts", 0) or 0)
     if (restart_delay is not None or idle_check is not None or max_restarts > 0) and not auto_restart:
         raise ValueError("--restart-delay、--idle-check 与 --max-restarts 需配合 --auto-restart 使用")
+    explicit_drive = getattr(a, "drive_account", None)
+    if explicit_drive and a.no_drive:
+        raise ValueError("--drive-account 不能与 --no-drive 同时使用")
     hostname = tunnel_hostname(svc, a)
     transport=tunnel_transport(a)
     frp_config=None
@@ -1030,11 +1111,35 @@ def _start_up(svc: Service, script: Path, a):
     if runner_alive(st):
         die(f"'{svc.name}' is already running (runner pid {st['runner_pid']}); use `down` first")
 
+    acct, _ = resolve_effective_account(
+        explicit=svc.account,
+        saved=st.get("account"),
+        prefer_saved=False,
+        reattach_session=svc.name,
+    )
+    svc.account = acct
+    if a.no_drive:
+        svc.drive_account = None
+    else:
+        saved_drv = st.get("drive_account") if (acct and acct == st.get("account")) else None
+        drv, _ = resolve_effective_drive_account(
+            acct,
+            explicit_drive=explicit_drive,
+            saved_drive=saved_drv,
+            prefer_saved=False,
+        )
+        svc.drive_account = drv
+
     nb_src = (script.parent / svc.notebook).resolve()
     skip = {int(x) for x in a.skip.split(",")} if a.skip else set()
     built, plan = build_notebook(nb_src, skip)
+    acct_desc = ""
+    if svc.account:
+        acct_desc = f", account {svc.account}"
+        if svc.drive_account and svc.drive_account != svc.account:
+            acct_desc += f" (drive {svc.drive_account})"
     log(f"service {svc.name}: notebook {nb_src.name}, gpu {svc.tpu or svc.gpu or 'cpu'}, auth {svc.auth}, "
-        f"transport {transport}, {'domain ' + hostname if hostname else 'quick tunnel'}")
+        f"transport {transport}, {'domain ' + hostname if hostname else 'quick tunnel'}{acct_desc}")
     print("\n".join(plan))
     if a.dry_run:
         return
@@ -1106,8 +1211,9 @@ def _start_up(svc: Service, script: Path, a):
     previous_url = st.get("url")
     reused_session = ensure_session(svc) is True
     if not a.no_drive:
-        log("colab dfs mount")
-        run(["colab", "dfs", "mount", "-s", svc.name])
+        drv_note = f" (drive {svc.drive_account})" if svc.drive_account and svc.drive_account != svc.account else ""
+        log(f"colab dfs mount{drv_note}")
+        run(["colab", "dfs", "mount", "-s", svc.name], env=colab_env_for(svc))
     initial_url = None
     initial_ready = False
     if reused_session and not a.new_credentials:
@@ -1120,6 +1226,8 @@ def _start_up(svc: Service, script: Path, a):
                 initial_ready = True
     st = state.save(
         base_service=svc.base_name or svc.name,
+        account=svc.account,
+        drive_account=svc.drive_account,
         env=env, url=initial_url, ready=initial_ready, last_cell_started=False, login_user=None, login_pass=None,
         runner_exit=None, ready_timeout=getattr(a, "ready_timeout", None) or svc.ready_timeout,
         started=time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1215,10 +1323,19 @@ def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, rem
     st = State(svc).load()
     alive = runner_alive(st)
     ready = bool(alive and st.get("ready") and remote_session != "missing")
+    acct = svc.account or st.get("account")
+    drv = svc.drive_account or (st.get("drive_account") if (not svc.account or svc.account == st.get("account")) else None)
     data = dict(service=svc.name, running=alive, ready=ready, url=st.get("url"))
+    if acct:
+        data["account"] = acct
+    if drv:
+        data["drive_account"] = drv
     mode_suffix = ", auto-restart" if st.get("auto_restart") else ""
-    lines = [f"service : {svc.name}   (runner {'alive' if alive else 'stopped'}{mode_suffix})",
-             f"ready   : {ready}"]
+    lines = [f"service : {svc.name}   (runner {'alive' if alive else 'stopped'}{mode_suffix})"]
+    if acct:
+        drv_note = f"   (drive: {drv})" if drv and drv != acct else ""
+        lines.append(f"account : {acct}{drv_note}")
+    lines.append(f"ready   : {ready}")
     if st.get("auto_restart"):
         data["auto_restart"] = True
         data["restart_count"] = int(st.get("restart_count") or 0)
@@ -1266,19 +1383,25 @@ def show_instances(svc: Service, reveal=False, output_json=False):
     if not items:
         log(f"no instances found for '{svc.base_name or svc.name}'")
         return
-    print(f"{'INSTANCE':<12} {'SESSION':<28} {'STATE':<12} URL" + (" / API TOKEN" if reveal else ""))
+    print(f"{'INSTANCE':<12} {'ACCOUNT':<18} {'SESSION':<28} {'STATE':<12} URL" + (" / API TOKEN" if reveal else ""))
     for item in items:
         label = "READY" if item["ready"] else ("STARTING" if item["alive"] else "STOPPED")
+        acct = item.get("account")
+        drv = item.get("drive_account")
+        acct_col = f"{acct}->{drv}" if (acct and drv and drv != acct) else (acct or drv or "-")
         suffix = f" / {item.get('api_token', '-')}" if reveal else ""
-        print(f"{item['instance']:<12} {item['name']:<28} {label:<12} {item.get('url') or '-'}{suffix}")
+        print(f"{item['instance']:<12} {acct_col:<18} {item['name']:<28} {label:<12} {item.get('url') or '-'}{suffix}")
 
 
 def cmd_down(svc: Service, a) -> None:
     if getattr(a, "all", False):
         items = list_service_instances(svc.base_name or svc.name)
+        target_filter = resolve_effective_account(explicit=svc.account)[0] if svc.account else None
         errors: list[tuple[str, Exception]] = []
         for it in items:
-            sub_svc = dataclasses.replace(svc)
+            if target_filter and it.get("account") and it.get("account") != target_filter:
+                continue
+            sub_svc = dataclasses.replace(svc, account=target_filter, drive_account=None)
             apply_instance(sub_svc, it["instance_arg"] or None)
             sub_a = argparse.Namespace(delete_tunnel=a.delete_tunnel, all=False)
             try:
@@ -1293,8 +1416,11 @@ def cmd_down(svc: Service, a) -> None:
     state = State(svc)
     with state.lock("operation", blocking=False):
         st = state.load()
-        log(f"colab stop -s {svc.name}")
-        result = run(["colab", "stop", "-s", svc.name], check=False)
+        acct, _ = resolve_effective_account(explicit=svc.account, saved=st.get("account"), prefer_saved=True)
+        drv = st.get("drive_account") if (not svc.account or acct == st.get("account")) else None
+        target_env = colab_subprocess_env(acct, drv)
+        log(f"colab stop -s {svc.name}" + (f" (account {acct})" if acct else ""))
+        result = run(["colab", "stop", "-s", svc.name], check=False, env=target_env)
         if result.returncode != 0:
             raise CliError(f"停止 {svc.name} 失败；已保留运行状态，可重试 down", result.returncode if result.returncode > 0 else 1)
         stop_owned_process(st.get("exec_pid"), st.get("exec_identity"), group=True)
@@ -1323,8 +1449,14 @@ def build_parser(svc: Service, configure=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False)
     p.add_argument("-i", "--instance", metavar="ID", type=validate_instance,
                    help="instance ID to create/manage multiple parallel instances (e.g. -i 1, -i 2)")
+    p.add_argument("--account", metavar="ACCOUNT", type=validate_account,
+                   help="Colab account name or email (from `colab account list`, or env COLABLLM_ACCOUNT / COLAB_ACCOUNT)")
     sub = p.add_subparsers(dest="cmd", required=True)
     u = sub.add_parser("up", help="session -> Drive -> (cf tunnel) -> run notebook, keep it alive")
+    u.add_argument("-a", "--account", default=argparse.SUPPRESS, metavar="ACCOUNT", type=validate_account,
+                   help="Colab account name or email for this session")
+    u.add_argument("--drive-account", metavar="ACCOUNT", type=validate_account,
+                   help="shared Google Drive storage account to mount")
     tunnel = u.add_mutually_exclusive_group()
     tunnel.add_argument("--domain", nargs="?", const=True, metavar="HOST", type=validate_domain,
                         help="完整固定域名；省略 HOST 时使用已配置的主域名，未配置则使用动态 URL")
@@ -1380,12 +1512,19 @@ def build_parser(svc: Service, configure=None):
 
 def main(svc: Service, *, configure=None, handlers=None, prepare_up=None) -> None:
     script = Path(sys.argv[0]).resolve()
-    inst, cleaned_argv = extract_instance_arg(sys.argv[1:])
+    inst, argv_after_inst = extract_instance_arg(sys.argv[1:])
+    acct, cleaned_argv = extract_account_arg(argv_after_inst)
     apply_instance(svc, inst)
+    svc.account = acct
+    svc.drive_account = None
     p = build_parser(svc, configure)
     a = p.parse_args(cleaned_argv)
     if getattr(a, "instance", None):
         apply_instance(svc, a.instance)
+    if getattr(a, "account", None):
+        svc.account = a.account
+    if getattr(a, "drive_account", None):
+        svc.drive_account = a.drive_account
     if handlers and a.cmd in handlers:
         code = handlers[a.cmd](a)
         if isinstance(code, int) and code:
@@ -1413,7 +1552,20 @@ def main(svc: Service, *, configure=None, handlers=None, prepare_up=None) -> Non
     elif a.cmd in ("ps", "list"):
         show_instances(svc, reveal=a.show_secrets, output_json=a.json)
     elif a.cmd == "status":
-        result = run(["colab", "status", "-s", svc.name], capture=True, check=False)
+        st_curr = State(svc).load()
+        explicit_acct = svc.account
+        resolved_acct, _ = resolve_effective_account(
+            explicit=explicit_acct,
+            saved=st_curr.get("account"),
+            prefer_saved=True,
+        )
+        svc.account = resolved_acct
+        svc.drive_account = (
+            st_curr.get("drive_account")
+            if (not explicit_acct or resolved_acct == st_curr.get("account"))
+            else None
+        )
+        result = run(["colab", "status", "-s", svc.name], capture=True, check=False, env=colab_env_for(svc))
         if result.returncode != 0:
             raise CliError((result.stderr or "Colab 状态查询失败").strip(), result.returncode if result.returncode > 0 else 1)
         remote_state = parse_colab_session_status(svc.name, result.returncode, result.stdout or "", result.stderr or "")

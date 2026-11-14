@@ -75,7 +75,7 @@ colabllm <name> down
 rsync -a --chmod=go-rwx ~/.colabllm/ <新电脑>:~/.colabllm/
 
 # 3. 新电脑：安装 colabllm，并完成外部工具授权
-#    colab 登录 + `colab dfs consent`；同一 Cloudflare 账号的 `cf` 登录；FRP 后端还需能 SSH 到服务器
+#    colab 登录 + `colab drive consent`；同一 Cloudflare 账号的 `cf` 登录；FRP 后端还需能 SSH 到服务器
 colabllm tunnel-config            # 确认主域名与 FRP 配置已带过来
 colabllm doctor
 
@@ -182,6 +182,7 @@ PyPI 上传失败时，GitHub Release 仍可下载；修复身份配置后在 Ac
 
 - `colabllm <服务> --help` 列出生命周期和服务专用命令；`colabllm help <服务> <命令>` 查看详细帮助。
 - `-i/--instance` 可放在服务参数的任意位置，`--` 之后按字面解析；实例 ID 必须为 1–64 位字母、数字、下划线或连字符，且不能以连字符开头。
+- `--account`（或环境 `COLABLLM_ACCOUNT` / `COLAB_ACCOUNT`）可指定本次使用的 Colab 账户（档案名或邮箱，`up` 与 `doctor` 同时支持 `-a/--account`）；`up --drive-account` 可额外指定共享网盘凭据账户。`up` 启动后会把解析到的账户与网盘绑定写入该实例 `state.json`，后续 `--auto-restart` 自动重拉、`status` 与 `down` 都会锁定原账户，不受之后终端 `colab account use` 切换活动账户影响。
 - 普通结果写入 stdout，进度和告警写入 stderr；`--json` 的 stdout 只包含 JSON。
 - `info`、`ps`、`list`、`status` 支持 `--json`，默认隐藏凭据；需要时显式加 `--show-secrets`。
 - `--quiet` 抑制诊断进度，错误仍然显示；`--no-color` 或 `NO_COLOR` 关闭诊断颜色。非终端输出自动关闭诊断颜色。
@@ -210,8 +211,9 @@ colabllm minimax-h3-image job JOB_ID --wait --timeout 300
 colabllm comfyui pull-workflow TEMPLATE --timeout 300 --poll 2
 colabllm longcat-avatar job JOB_ID --wait --timeout 300
 
-# 默认只检查本机依赖、Drive 扩展、授权文件存在性和用户配置
+# 默认只检查本机依赖、Drive 扩展、当前或指定账户授权文件与用户配置
 colabllm doctor
+colabllm doctor -a gpu2 --online --timeout 10
 colabllm doctor --json --transport quick --no-drive
 
 # 额外验证 Colab、Cloudflare、SSH 授权，按选中的后端执行限时只读检查
@@ -265,8 +267,8 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 
 | 阶段 / 职责 | 执行位置 | 说明 |
 | --- | --- | --- |
-| 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `src/colabllm/services/<name>.py` | 会话名与服务名一致 |
-| 免浏览器挂载网盘 (`colab dfs mount`) | 本地脚本 `src/colabllm/services/<name>.py` | 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
+| 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `src/colabllm/services/<name>.py` | 会话名与服务名一致，按选定账户注入 `COLAB_ACCOUNT` 隔离会话 |
+| 免浏览器挂载网盘 (`colab drive mount` / `dfs mount`) | 本地脚本 `src/colabllm/services/<name>.py` | 按账户或共享 `--drive-account` 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
 | Cloudflare 固定域名 | 本地脚本 (`cf` CLI) | 创建/复用 named tunnel、配置 ingress 和 DNS CNAME；未配置主域名时使用动态 URL |
 | FRP 固定域名 | 本地脚本 (`ssh` + `cf` CLI) | SSH 安装或复用服务端 frps/Caddy，通过 Cloudflare DNS 将域名指向服务器 IP |
 | 密钥生成与注入 | 本地脚本 -> `--env` | 自动生成账号密码与 Bearer Token，保存在 `~/.colabllm/services/<name>/state.json` (0600) |
@@ -344,7 +346,7 @@ tests_colab/                   # 仅在 Colab 模型环境运行的回归测试
 | Python 3.12+ | 必需 | 执行 `src/colabllm/services/*.py`、`src/colabllm/control.py`，满足 `google-colab-cli` 的 Python 要求 |
 | `uv` | 包安装与升级 | 隔离安装 colabllm 和 Colab CLI；Git 仅开发时需要 |
 | `colab` CLI | 必需 | PyPI 包 `google-colab-cli`，用于会话、文件操作及执行 Notebook |
-| `colab dfs` 扩展 | 默认网盘流程必需 | [colab-dfs-ext](https://github.com/deluxebear/colab-dfs-ext)，提供 `consent`、`mount`、`doctor`；需单独安装 |
+| `colab-ext` 扩展 | 默认网盘及多账户必需 | [colab-ext](https://github.com/deluxebear/colab-ext)，提供 `drive`（兼容别名 `dfs`）、多账户 `account` 与 `-a`、`ext doctor`；需单独安装 |
 | Node.js、npm、Cloudflare `cf` CLI | 固定域名或 FRP 模式 | 本机调用 Cloudflare API 管理 DNS；Cloudflare named tunnel 也由它配置。Quick Tunnel 不需要它 |
 | OpenSSH 客户端 `ssh` | FRP 模式；或 Colab SSH 排错 | 用于连接 FRP 服务器，复用 `~/.ssh/config` 的密钥、端口和跳板配置 |
 
@@ -369,34 +371,72 @@ colab sessions       # 确认可访问 Colab；不创建新 VM
 colab usage          # 查看账号计算单元用量/余额
 ```
 
-### 2. 安装并授权 `colab dfs` 扩展
+### 2. 安装并授权 `colab-ext` 扩展（免浏览器 Drive 挂载 + 原生多账户）
 
-本项目启动时默认调用 `colab dfs mount`，不依赖 Notebook 内交互式的 `drive.mount()`。扩展来自 [deluxebear/colab-dfs-ext](https://github.com/deluxebear/colab-dfs-ext)，需在安装 Colab CLI 后单独安装：
+本项目启动时默认通过免浏览器 DriveFS 挂载网盘（底层调用 `colab dfs mount`，`colab-ext` 中 `dfs` 与 `drive` 等价），不依赖 Notebook 内交互式的 `drive.mount()`；同时也全面兼容 `colab-ext` 的原生多账户会话隔离与共享网盘绑定。扩展来自 [deluxebear/colab-ext](https://github.com/deluxebear/colab-ext)，需在安装 Colab CLI 后单独安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-dfs-ext/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/deluxebear/colab-ext/main/install.sh | sh
 ```
 
-也可以克隆扩展仓库后运行 `python3 install.py`。安装器将源码保存到 `~/.colab-dfs-ext/`，并自动接入提供 `colab` 命令的 Python 环境；详细选项见[扩展中文说明](https://github.com/deluxebear/colab-dfs-ext/blob/main/README.zh-CN.md)。安装后检查并进行一次性 Drive 授权：
+也可以克隆扩展仓库后运行 `python3 install.py`。安装器将源码保存到 `~/.colab-ext/`（旧 `~/.colab-dfs-ext/` 会自动迁移），并自动接入提供 `colab` 命令的 Python 环境；详细选项见[扩展中文说明](https://github.com/deluxebear/colab-ext/blob/main/README.zh-CN.md)。安装后检查并进行一次性 Drive 授权：
 
 ```bash
-colab dfs --help
-colab dfs version
-colab dfs doctor
-colab dfs consent     # 浏览器完成一次授权，后续挂载无需再次交互
-colab dfs show        # 查看授权摘要，不打印 refresh token
+colab ext doctor
+colab ext version
+colab drive --help       # 旧命令 colab dfs 仍完全兼容
+colab drive consent      # 浏览器完成一次授权，后续挂载无需再次交互
+colab drive show         # 查看当前/共享 Drive 授权摘要，不打印 refresh token
 ```
 
-Drive 授权与 Colab 会话认证分别进行。扩展凭据保存在 `~/.config/colab-cli/dfs_credentials.json`。正常使用时，服务脚本自动挂载远端 `/content/drive`，无需手工调用 `mount`；已有空闲会话可用 `colab dfs mount -s <会话名>` 验证。
+Drive 授权与 Colab 会话认证分别进行。安装多账户扩展后，凭据与会话按账户隔离保存在 `~/.config/colab-cli/accounts/<账户名>/`（主注册表为 `~/.config/colab-cli/accounts.json`；未升级扩展前的单账户凭据位于 `~/.config/colab-cli/dfs_credentials.json`）。正常使用时，服务脚本自动按账户和共享 Drive 绑定挂载远端 `/content/drive`，无需手工调用 `mount`；已有空闲会话可用 `colab -a <账户> drive mount -s <会话名>` 验证。
 
-升级 Colab CLI 后，可执行 `colab dfs --help` 检查扩展是否仍在；命令可用时可运行 `colab dfs install` 重新接入。若出现 `No such command: dfs`，且扩展仍在 `~/.colab-dfs-ext/`，可重新运行安装器修复：
+升级 Colab CLI 后，可执行 `colab ext doctor` 检查扩展是否仍在；命令可用时可运行 `colab ext install` 重新接入。若出现 `No such command: drive` 或 `dfs`，且扩展仍在 `~/.colab-ext/`，可重新运行安装器修复：
 
 ```bash
-python3 "$HOME/.colab-dfs-ext/install.py"
-colab dfs --help
+python3 "$HOME/.colab-ext/install.py"
+colab ext doctor
 ```
 
 若扩展目录缺失，重新运行上面的安装命令。`up --no-drive` 可跳过自动挂载，但需要网盘音色、任务持久化和输出保存的功能仍依赖 Drive，不适合作为这些功能的替代配置。
+
+#### 多账户与共享 Google Drive 用法（多张 GPU / 配额轮换）
+
+一个拥有计算单元或 Pro 配额的 Google 账号可能与专门存放大模型缓存的 Google Drive 主账号分离，或需要同时使用多个 Google 账号并发运行多个 Colab GPU 实例并共享同一份网盘数据/模型权重。先在 `colab` CLI 中完成账户登记与共享网盘绑定：
+
+```bash
+# 1. 在主网盘账号完成登录与一次 Drive 授权
+colab account list
+colab -a main drive consent
+
+# 2. 添加用于跑 GPU 的副号并登录，然后将其默认 Drive 绑定到 main（只需一次）
+colab account add gpu2
+colab account set-drive gpu2 main
+# 或设置全账户兜底共享网盘：colab account set-drive --default main
+
+# 3. 检查全部账户会话与配额，或用 doctor 定向检查某个账户
+colab sessions --all
+colab usage --all
+colabllm doctor -a gpu2 --online
+```
+
+完成上述绑定后即可直接通过 `-a` / `--account` 与 `--drive-account` 在多个账户间无感切换或并发运行：
+
+```bash
+# 切换活动账户：之后不传 --account 的新 up 默认使用 gpu2，运行中的旧实例保持锁定原账户
+colab account use gpu2
+colabllm qwen-flash up --domain
+
+# 或单次显式指定算力账户与共享网盘账户（两者互不影响）
+colabllm qwen-flash up -a gpu2 --drive-account main --auto-restart --domain
+
+# 多账户多卡并发，同时共享同一份 MyDrive/colab-llm 模型缓存
+colabllm ollama up -i 1 -a main --domain                     # -> https://ollama-1.example.com（使用 main 算力与网盘）
+colabllm ollama up -i 2 -a gpu2 --drive-account main --domain  # -> https://ollama-2.example.com（使用 gpu2 算力 + main 网盘）
+colabllm ollama ps
+```
+
+> 说明：在 `minimax-h3-image` 的 `generate` / `edit` 等生图子命令中短参数 `-a` 已用于 `--aspect`（宽高比）；若需在业务子命令前置指定账户，请统一使用长参数 `--account <账户>`（例如 `colabllm nemotron-transcribe --account gpu2 ls-drive`），而在 `up` 与 `doctor` 子命令中 `-a` 与 `--account` 均可直接使用。
 
 ### 3. 安装 Cloudflare `cf` CLI
 
@@ -415,7 +455,7 @@ cf auth whoami
 
 安装和认证说明见 [Cloudflare 官方文档](https://developers.cloudflare.com/cf/get-started/)。账号需有目标域名的 Zone/DNS 管理权限；使用 named tunnel 时还需有隧道管理权限。`cf zones list` 可检查域名是否在当前账号中。只使用 Cloudflare 动态 URL 时，可跳过本节。
 
-本机已验证的组合为 `google-colab-cli 0.7.5`、`colab dfs 0.1.0`、`cf 1.0.0-beta.26` 和 Node.js `26.13.0`。其中该 `cf` 版本的 Node.js 要求为 `^22.23.0 || ^24.22.0 || ^26.12.0`；升级版本时以 npm 包的 `engines` 声明为准，避免仅按大版本判断兼容性。
+本机已验证的组合为 `google-colab-cli 0.7.5`、`colab-ext 0.3.0`、`cf 1.0.0-beta.26` 和 Node.js `26.13.0`。其中该 `cf` 版本的 Node.js 要求为 `^22.23.0 || ^24.22.0 || ^26.12.0`；升级版本时以 npm 包的 `engines` 声明为准，避免仅按大版本判断兼容性。
 
 ### 4. FRP 模式额外要求
 
@@ -436,8 +476,9 @@ ssh -o BatchMode=yes root@frpip 'id -u'
 python3 --version
 command -v colab
 colab version
-colab dfs --help
-colab dfs show
+colab ext doctor
+colab drive show
+colab account list
 colabllm tunnel-config
 # 固定域名 / FRP 模式还需检查
 command -v cf
@@ -528,13 +569,13 @@ colabllm ollama down --delete-tunnel
 | 实例参数 | Colab 会话名 (`-s`) | 状态目录 (`~/.colabllm/services/`) | 隧道名 (`--domain`) | 默认域名 (`--domain`) | 网盘共享目录 (`CT_DATA_DIR`) |
 | --- | --- | --- | --- | --- | --- |
 | 默认（不传 `-i`） | `<name>` | `~/.colabllm/services/<name>/` | `colab-<name>` | `<host>.example.com` | `/content/drive/MyDrive/colab-llm/<name>` |
-| `-i 1` | `<name>-1` | `~/.colabllm/services/<name>-1/` | `colab-<name>-1` | `<host>-1.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
-| `-i 2` | `<name>-2` | `~/.colabllm/services/<name>-2/` | `colab-<name>-2` | `<host>-2.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据） |
+| `-i 1` | `<name>-1` | `~/.colabllm/services/<name>-1/` | `colab-<name>-1` | `<host>-1.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据；可用 `-a`/`--drive-account` 跨号共享同一网盘） |
+| `-i 2` | `<name>-2` | `~/.colabllm/services/<name>-2/` | `colab-<name>-2` | `<host>-2.example.com` | `/content/drive/MyDrive/colab-llm/<name>`（共享缓存与数据；可用 `-a`/`--drive-account` 跨号共享同一网盘） |
 
 ```bash
-# 启动任意运行时的多个并发实例（各自拥有独立的 Colab GPU VM、Cloudflare 隧道与域名）
+# 启动任意运行时的多个并发实例（各自拥有独立的 Colab GPU VM、Cloudflare 隧道与域名；可绑定不同账户）
 colabllm comfyui up -i 1 --domain               # -> https://comfyui-1.example.com
-colabllm comfyui up -i 2 --domain               # -> https://comfyui-2.example.com
+colabllm comfyui up -i 2 -a gpu2 --domain       # -> https://comfyui-2.example.com（使用 gpu2 账户算力 + 其绑定或指定的 Drive）
 colabllm qwen-flash up -i 2 --domain            # -> https://qwen-2.example.com
 colabllm ollama up -i 2 --domain                # -> https://ollama-2.example.com
 colabllm unsloth-studio up -i 2 --domain        # -> https://unsloth-studio-2.example.com
