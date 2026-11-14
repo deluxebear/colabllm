@@ -115,6 +115,8 @@ def _infer_stage_hint(st: dict[str, Any], running: bool, log_path: Path) -> str:
             return "已就绪 (CT_READY)"
         if "CT_PUBLIC_URL=" in line:
             return "隧道已连通，等待服务健康检查"
+        if "预连接中断" in line:
+            return "连接闪断，正在自动重连 Colab..."
         if "colab dfs mount" in line:
             return "正在挂载 Google Drive"
         if "colab new" in line or "reusing Colab session" in line or "申请" in line:

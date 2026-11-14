@@ -57,9 +57,19 @@ if cmd == 'new':
     (root / 'session-missing').unlink(missing_ok=True)
     sys.exit(0)
 if cmd == 'exec':
+    (root / 'last-request-timeout').write_text(os.environ.get('REQUEST_TIMEOUT', ''))
     count_file = root / 'exec-count'
     count = int(count_file.read_text()) + 1 if count_file.exists() else 1
     count_file.write_text(str(count))
+    if (root / 'hang-preflight-once').exists():
+        (root / 'hang-preflight-once').unlink()
+        print("[colab] Parsing notebook 'ollama.ipynb'...", flush=True)
+        print("╭─── Traceback (most recent call last) ───╮", flush=True)
+        print("│ /fake/colab_cli/commands/execution.py:235 in exec_command │", flush=True)
+        print("╰──────────────────────────────────────────╯", flush=True)
+        print("RuntimeError: Connection was lost.", flush=True)
+        while True:
+            time.sleep(1)
     if (root / 'exit-before-ready').exists():
         sys.exit(0)
     if count >= 2 and (root / 'queued-behind-busy-kernel').exists():
@@ -90,6 +100,7 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
             'FAKE_COLAB_ROOT': str(self.root), 'FAKE_COLAB_URL': f'http://127.0.0.1:{self.server.server_port}',
             'PATH': str(self.root) + os.pathsep + os.environ.get('PATH', '')}
         self.env.pop('CT_INSTANCE', None)
+        self.env.pop('REQUEST_TIMEOUT', None)
         self.state_path = self.root/'profile/services/ollama-test/state.json'
         self.addCleanup(self.stop_children)
 
@@ -327,6 +338,21 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
         exec_calls = [c for c in self.colab_calls() if c[:1] == ['exec']]
         # 1 initial run + 1 allowed auto-restart = 2 total `colab exec` runs
         self.assertEqual(len(exec_calls), 2)
+
+    def test_hung_preflight_connection_lost_reaps_zombie_and_retries_without_auto_restart(self):
+        (self.root / 'hang-preflight-once').touch()
+        (self.root / 'session-alive').touch()
+        self.env['COLABLLM_PREFLIGHT_RETRY_DELAY'] = '0.05'
+        start = self.cli('up', '--quick-tunnel', '--no-drive', '--detach')
+        self.assertEqual(start.returncode, 0, start.stderr)
+        st = self.wait_ready()
+        self.assertTrue(st['ready'])
+        self.assertEqual((self.root / 'last-request-timeout').read_text().strip(), '60')
+        calls = self.colab_calls()
+        self.assertEqual(len([c for c in calls if c[:1] == ['exec']]), 2, calls)
+        self.assertEqual(len([c for c in calls if c[:1] == ['new']]), 1, calls)
+        self.assertEqual(len([c for c in calls if c[:1] == ['stop']]), 0, calls)
+        self.assertEqual(self.cli('down').returncode, 0)
 
 
 if __name__ == '__main__':

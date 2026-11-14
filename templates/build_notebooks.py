@@ -380,12 +380,15 @@ OLLAMA_CFG = dict(name="ollama", service_port=11434, auth="caddy", public_port=1
                   health_path="/api/version", ready_timeout=1800)
 OLLAMA_SETUP = (
     r'''# @title 1. Setup -- install Ollama and load runtime configuration (idempotent)
+import importlib
 from pathlib import Path
 (Path(WORK) / "ollama_runtime.py").write_text('''
     + repr((ROOT / "src/colabllm/lib/ollama_runtime.py").read_text())
     + r''', encoding="utf-8")
 if WORK not in sys.path:
     sys.path.insert(0, WORK)
+importlib.invalidate_caches()
+sys.modules.pop("ollama_runtime", None)
 
 from ollama_runtime import (
     COMPAT_APIS,
@@ -719,9 +722,11 @@ QWEN_FLASH_CFG = dict(name="qwen-flash", service_port=8000, auth="builtin", publ
 
 QWEN_FLASH_SETUP = (
     r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 sm_120 build/cache + 103.7 GiB UD-Q4_K_XL-V2 GGUF + BF16 mmproj + 1M G4 hardware plan
+import importlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+QWEN_SETUP_OK = False
 QWEN_WORK = Path(os.environ.get("CT_QWEN_WORK_DIR", "/content/qwen-flash"))
 QWEN_WORK.mkdir(parents=True, exist_ok=True)
 (QWEN_WORK / "qwen_flash_runtime.py").write_text('''
@@ -729,6 +734,8 @@ QWEN_WORK.mkdir(parents=True, exist_ok=True)
     + r''', encoding="utf-8")
 if str(QWEN_WORK) not in sys.path:
     sys.path.insert(0, str(QWEN_WORK))
+importlib.invalidate_caches()
+sys.modules.pop("qwen_flash_runtime", None)
 
 from qwen_flash_runtime import (
     DEFAULT_ALIAS,
@@ -1089,9 +1096,11 @@ DEEPSEEK_QWEN_9B_CFG = dict(name="deepseek-qwen-9b", service_port=8000, auth="bu
 
 DEEPSEEK_QWEN_9B_SETUP = (
     r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 CUDA cache + i1-Q4_K_M GGUF + native MTP Q8_0 sidecar + F16 mmproj + 256K L4/T4 plan
+import importlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+DS9B_SETUP_OK = False
 DS9B_WORK = Path(os.environ.get("CT_DS9B_WORK_DIR", "/content/deepseek-qwen-9b"))
 DS9B_WORK.mkdir(parents=True, exist_ok=True)
 (DS9B_WORK / "deepseek_qwen_9b_runtime.py").write_text('''
@@ -1099,6 +1108,8 @@ DS9B_WORK.mkdir(parents=True, exist_ok=True)
     + r''', encoding="utf-8")
 if str(DS9B_WORK) not in sys.path:
     sys.path.insert(0, str(DS9B_WORK))
+importlib.invalidate_caches()
+sys.modules.pop("deepseek_qwen_9b_runtime", None)
 
 from deepseek_qwen_9b_runtime import (
     DEFAULT_ALIAS,
@@ -3137,6 +3148,10 @@ OPENJUTSU_SETUP = (
     + ", encoding='utf-8')\n"
     "if str(OJ_WORK) not in sys.path:\n"
     "    sys.path.insert(0, str(OJ_WORK))\n"
+    "import importlib\n"
+    "importlib.invalidate_caches()\n"
+    "sys.modules.pop('colab_cache', None)\n"
+    "sys.modules.pop('openjutsu_runtime', None)\n"
     "from colab_cache import restore_cache, save_cache\n"
     "from openjutsu_runtime import (\n"
     "    detect_gpu_vram_mib,\n"
@@ -4317,6 +4332,7 @@ DEEPSEEK_CODER_CFG = dict(name="deepseek-coder", service_port=8001, auth="builti
 
 DEEPSEEK_CODER_SETUP = (
     r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 CUDA build/cache + 183.7 GB Coder GGUF + Engram shard-6 symlink + hardware-max context plan
+import importlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -4327,6 +4343,8 @@ DS_WORK.mkdir(parents=True, exist_ok=True)
     + r''', encoding="utf-8")
 if str(DS_WORK) not in sys.path:
     sys.path.insert(0, str(DS_WORK))
+importlib.invalidate_caches()
+sys.modules.pop("deepseek_coder_runtime", None)
 
 from deepseek_coder_runtime import (
     DEFAULT_ALIAS,

@@ -29,6 +29,31 @@ class NotebookProtocolTest(unittest.TestCase):
         self.assertNotIn('ready', parser.feed(b'CT_READY\n'))
         self.assertTrue(parser.feed(b'CT_READY', final=True)['ready'])
 
+    def test_preflight_crash_detected_only_before_first_cell(self):
+        parser = NotebookProtocol()
+        updates = parser.feed(
+            (
+                "[colab] Parsing notebook 'x.ipynb'...\n"
+                "╭─── Traceback (most recent call last) ───╮\n"
+                "│ /fake/colab_cli/commands/execution.py:235 in exec_command │\n"
+                "╰───╯\n"
+                "RuntimeError: Connection was lost.\n"
+            ).encode()
+        )
+        self.assertEqual(updates, {})
+        self.assertFalse(parser.cell_started)
+        self.assertEqual(parser.preflight_error, 'RuntimeError: Connection was lost.')
+
+        started = NotebookProtocol()
+        started.feed(
+            (
+                "[colab] Executing cell 1/7 - ct-0...\n"
+                "RuntimeError: Connection was lost.\n"
+            ).encode()
+        )
+        self.assertTrue(started.cell_started)
+        self.assertIsNone(started.preflight_error)
+
 
 if __name__ == '__main__':
     unittest.main()

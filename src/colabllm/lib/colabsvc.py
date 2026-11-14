@@ -344,6 +344,12 @@ def colab_env_for(svc: Service) -> dict[str, str] | None:
     return colab_subprocess_env(svc.account, svc.drive_account)
 
 
+def colab_runtime_env_for(svc: Service) -> dict[str, str]:
+    env = dict(colab_env_for(svc) or os.environ)
+    env.setdefault("REQUEST_TIMEOUT", str(DEFAULT_COLAB_REQUEST_TIMEOUT))
+    return env
+
+
 def colab_env_for_session(session_name: str, explicit_account: str | None = None) -> dict[str, str] | None:
     st: dict = {}
     sp = STATE_ROOT / "services" / session_name / "state.json"
@@ -629,6 +635,10 @@ DEFAULT_FAST_PROBE_TIMEOUT = 5.0
 DEFAULT_IDLE_CHECK_SECONDS = 300.0
 DEFAULT_SILENT_RECHECK_SECONDS = 60.0
 DEFAULT_MAX_STARTUP_RETRIES = 3
+DEFAULT_COLAB_REQUEST_TIMEOUT = 60
+DEFAULT_PREFLIGHT_RETRIES = 2
+DEFAULT_PREFLIGHT_RETRY_DELAY = 2.0
+DEFAULT_PREFLIGHT_HANG_GRACE = 0.5
 
 
 def nonnegative_int(value: str) -> int:
@@ -701,13 +711,15 @@ def _run_single_exec(
     idle_check_seconds: float,
     fast_probe_seconds: float = DEFAULT_FAST_PROBE_SECONDS,
     initially_ready: bool = False,
-) -> tuple[int, bool, bool]:
-    """Run one `colab exec` session and return `(exit_code, reached_ready, half_open_reclaimed)`."""
+) -> tuple[int, bool, bool, str | None]:
+    """Run one `colab exec` session and return `(exit_code, reached_ready, half_open_reclaimed, preflight_error)`."""
     proc = None
     child_identity = None
     selector = selectors.DefaultSelector()
     reached_ready = bool(initially_ready)
     half_open_reclaimed = False
+    preflight_dead_at: float | None = None
+    preflight_aborted = False
     st = state.save(ready=bool(initially_ready))
     try:
         proc = subprocess.Popen(
@@ -715,7 +727,7 @@ def _run_single_exec(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env=colab_env_for(svc),
+            env=colab_runtime_env_for(svc),
         )
         child_identity = process_identity(proc.pid)
         st = state.save(exec_pid=proc.pid, exec_identity=child_identity)
@@ -741,8 +753,16 @@ def _run_single_exec(
                     wakeups.append(next_fast_probe_at - now)
                 if wakeups:
                     wait_timeout = max(0.0, min(wakeups))
+            if preflight_dead_at is not None:
+                preflight_rem = max(0.0, preflight_dead_at - now)
+                wait_timeout = preflight_rem if wait_timeout is None else min(wait_timeout, preflight_rem)
             if not selector.select(wait_timeout):
                 now = time.monotonic()
+                if preflight_dead_at is not None and now >= preflight_dead_at:
+                    if proc.poll() is None:
+                        warn(f"colab exec 在启动首个 Cell 前连接中断且未退出 ({protocol.preflight_error})，正在终止残留进程")
+                        preflight_aborted = True
+                    break
                 if deadline is not None and not st.get("ready") and now >= deadline:
                     continue
                 if auto_restart and st.get("ready"):
@@ -784,20 +804,34 @@ def _run_single_exec(
                 st = state.save(**update)
                 if st.get("ready"):
                     reached_ready = True
+            if protocol.preflight_error and not protocol.cell_started and not reached_ready:
+                if preflight_dead_at is None:
+                    preflight_dead_at = time.monotonic() + DEFAULT_PREFLIGHT_HANG_GRACE
+            else:
+                preflight_dead_at = None
         update = protocol.feed(b"", final=True)
         if update:
             st = state.save(**update)
             if st.get("ready"):
                 reached_ready = True
-        if half_open_reclaimed:
+        preflight_error = (
+            protocol.preflight_error
+            if (protocol.preflight_error and not protocol.cell_started and not reached_ready)
+            else None
+        )
+        if half_open_reclaimed or preflight_aborted:
             stop_owned_process(proc.pid, child_identity, group=True)
             rc = 1
         else:
-            rc = proc.wait()
+            try:
+                rc = proc.wait(timeout=2.0 if preflight_error else None)
+            except subprocess.TimeoutExpired:
+                stop_owned_process(proc.pid, child_identity, group=True)
+                rc = 1
             if rc == 0 and not st.get("ready"):
                 warn("Colab 在 CT_READY 之前退出，请查看日志中的启动错误")
                 rc = 1
-        return (rc if rc >= 0 else 128 - rc), reached_ready, half_open_reclaimed
+        return (rc if rc >= 0 else 128 - rc), reached_ready, half_open_reclaimed, preflight_error
     finally:
         selector.close()
         if proc is not None:
@@ -833,6 +867,7 @@ def _provision_session_for_restart(
             drive_account=st.get("drive_account") or svc.drive_account,
         )
         target_env = colab_env_for(target_svc)
+        runtime_env = colab_runtime_env_for(target_svc)
         mount_drive = bool(st.get("mount_drive", True))
         try:
             remote = check_remote_session(target_svc)
@@ -842,7 +877,7 @@ def _provision_session_for_restart(
                 if mount_drive:
                     try:
                         log("colab dfs mount")
-                        run(["colab", "dfs", "mount", "-s", target_svc.name], env=target_env)
+                        run(["colab", "dfs", "mount", "-s", target_svc.name], env=runtime_env)
                     except (CliError, OSError, subprocess.SubprocessError) as err:
                         warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
                         remount_ok = False
@@ -860,7 +895,7 @@ def _provision_session_for_restart(
             ensure_session(target_svc, force_new=True)
             if mount_drive:
                 log("colab dfs mount")
-                run(["colab", "dfs", "mount", "-s", target_svc.name], env=target_env)
+                run(["colab", "dfs", "mount", "-s", target_svc.name], env=runtime_env)
             return "ready"
         except (CliError, OSError, subprocess.SubprocessError) as err:
             warn(f"[auto-restart] 会话恢复失败：{err}")
@@ -910,6 +945,14 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
     except ValueError:
         max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
+    try:
+        preflight_retries = max(0, int(os.environ.get("COLABLLM_PREFLIGHT_RETRIES", DEFAULT_PREFLIGHT_RETRIES)))
+    except ValueError:
+        preflight_retries = DEFAULT_PREFLIGHT_RETRIES
+    try:
+        preflight_retry_delay = max(0.0, float(os.environ.get("COLABLLM_PREFLIGHT_RETRY_DELAY", DEFAULT_PREFLIGHT_RETRY_DELAY)))
+    except ValueError:
+        preflight_retry_delay = DEFAULT_PREFLIGHT_RETRY_DELAY
 
     old_handler = signal.getsignal(signal.SIGTERM)
     def terminated(signum, frame):
@@ -922,15 +965,31 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
         already_ready = bool(st.get("ready") and st.get("url"))
         if not auto_restart:
             deadline = time.monotonic() + ready_timeout if (is_foreground and not already_ready) else None
-            rc, _, _ = _run_single_exec(
-                svc,
-                state,
-                cmd,
-                deadline=deadline,
-                auto_restart=False,
-                idle_check_seconds=0.0,
-                initially_ready=already_ready,
-            )
+            for preflight_attempt in range(preflight_retries + 1):
+                rc, reached_ready, _, preflight_error = _run_single_exec(
+                    svc,
+                    state,
+                    cmd,
+                    deadline=deadline,
+                    auto_restart=False,
+                    idle_check_seconds=0.0,
+                    initially_ready=already_ready,
+                )
+                if rc == 0 or reached_ready or not preflight_error or preflight_attempt >= preflight_retries:
+                    return rc
+                owned, _ = _runner_still_owned(state, pid, identity)
+                if not owned:
+                    return 0
+                if check_remote_session(svc) == "missing":
+                    warn(f"远端 Colab 会话 '{svc.name}' 已不存在，停止预连接重试")
+                    return rc
+                state.save(exec_pid=None, exec_identity=None)
+                warn(
+                    f"colab exec 预连接中断 ({preflight_error})；远端会话仍存活，"
+                    f"将在 {preflight_retry_delay:g}s 后自动重连 ({preflight_attempt + 1}/{preflight_retries})"
+                )
+                if preflight_retry_delay > 0:
+                    time.sleep(preflight_retry_delay)
             return rc
 
         ever_ready = already_ready
@@ -948,7 +1007,7 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
             reached_ready = False
             half_open_reclaimed = False
             try:
-                rc, reached_ready, half_open_reclaimed = _run_single_exec(
+                rc, reached_ready, half_open_reclaimed, _ = _run_single_exec(
                     svc,
                     state,
                     cmd,
@@ -1215,7 +1274,7 @@ def _start_up(svc: Service, script: Path, a):
     if not a.no_drive:
         drv_note = f" (drive {svc.drive_account})" if svc.drive_account and svc.drive_account != svc.account else ""
         log(f"colab dfs mount{drv_note}")
-        run(["colab", "dfs", "mount", "-s", svc.name], env=colab_env_for(svc))
+        run(["colab", "dfs", "mount", "-s", svc.name], env=colab_runtime_env_for(svc))
     initial_url = None
     initial_ready = False
     if reused_session and not a.new_credentials:

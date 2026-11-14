@@ -306,6 +306,77 @@ class DeepSeekQwen9BCliTest(unittest.TestCase):
         self.assertTrue(out["enable_mtp"])
         self.assertEqual(out["context"], 262_144)
 
+    def test_notebook_setup_evicts_stale_runtime_module_on_warm_kernel(self) -> None:
+        import pathlib
+
+        services_dir = pathlib.Path(__file__).resolve().parents[1] / "src/colabllm/services"
+        checks = [
+            (
+                "deepseek-qwen-9b.ipynb",
+                [
+                    "DS9B_SETUP_OK = False",
+                    "importlib.invalidate_caches()",
+                    'sys.modules.pop("deepseek_qwen_9b_runtime", None)',
+                ],
+                "from deepseek_qwen_9b_runtime import",
+            ),
+            (
+                "qwen-flash.ipynb",
+                [
+                    "QWEN_SETUP_OK = False",
+                    "importlib.invalidate_caches()",
+                    'sys.modules.pop("qwen_flash_runtime", None)',
+                ],
+                "from qwen_flash_runtime import",
+            ),
+            (
+                "deepseek-coder.ipynb",
+                [
+                    "importlib.invalidate_caches()",
+                    'sys.modules.pop("deepseek_coder_runtime", None)',
+                ],
+                "from deepseek_coder_runtime import",
+            ),
+            (
+                "ollama.ipynb",
+                [
+                    "importlib.invalidate_caches()",
+                    'sys.modules.pop("ollama_runtime", None)',
+                ],
+                "from ollama_runtime import",
+            ),
+            (
+                "openjutsu.ipynb",
+                [
+                    "importlib.invalidate_caches()",
+                    "sys.modules.pop('colab_cache', None)",
+                    "sys.modules.pop('openjutsu_runtime', None)",
+                ],
+                "from colab_cache import",
+            ),
+        ]
+        for filename, guards, import_stmt in checks:
+            with self.subTest(notebook=filename):
+                nb = json.loads((services_dir / filename).read_text(encoding="utf-8"))
+                code_cells = [
+                    "".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+                    for c in nb["cells"]
+                    if c.get("cell_type") == "code"
+                ]
+                matching = [src for src in code_cells if import_stmt in src]
+                self.assertEqual(len(matching), 1)
+                setup_src = matching[0]
+                import_pos = setup_src.find(import_stmt)
+                self.assertGreater(import_pos, 0)
+                for guard in guards:
+                    guard_pos = setup_src.find(guard)
+                    self.assertGreaterEqual(guard_pos, 0, f"missing {guard!r} in {filename}")
+                    self.assertLess(
+                        guard_pos,
+                        import_pos,
+                        f"{guard!r} must run before {import_stmt!r} in {filename}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
