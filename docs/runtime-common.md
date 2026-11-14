@@ -9,6 +9,9 @@
 colabllm --version
 colabllm services
 colabllm web
+colabllm web -d
+colabllm web --status
+colabllm web --stop
 colabllm web --port 8765 --read-only
 colabllm doctor
 colabllm doctor -a ACCOUNT --online --timeout 10

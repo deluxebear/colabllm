@@ -36,6 +36,7 @@ colabllm unlimited-ocr --help
 
 # 项目级配置与本地 Web 控制台也使用同一入口
 colabllm web
+colabllm web -d                         # 后台运行，并支持 --status / --stop
 colabllm web --port 8765 --read-only
 colabllm tunnel-config
 colabllm frp-config --help

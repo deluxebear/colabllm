@@ -17,7 +17,9 @@ class CompletionTest(unittest.TestCase):
     def test_real_commands_options_and_choices(self):
         self.assertIn('doctor', candidates(['d']))
         self.assertIn('web', candidates(['w']))
-        self.assertIn('--read-only', candidates(['web', '--']))
+        web_flags = candidates(['web', '--'])
+        for flag in ('--read-only', '--detach', '--status', '--stop', '--json'):
+            self.assertIn(flag, web_flags)
         self.assertIn('tts', candidates(['qwen3-tts', 't']))
         self.assertNotIn('_exec', candidates(['ollama', '']))
         self.assertEqual(candidates(['qwen3-tts', 'tts', '--format', 'm']), ['mp3'])

@@ -161,6 +161,10 @@ html[data-theme="dark"] {
   box-sizing: border-box;
 }
 
+[hidden]:not([hidden="until-found"]) {
+  display: none !important;
+}
+
 html {
   scrollbar-width: thin;
   scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);

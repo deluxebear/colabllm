@@ -9,11 +9,14 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / 'src'
@@ -85,6 +88,162 @@ class WebCliBindingTest(unittest.TestCase):
             self.assertFalse(colabllm_web._should_auto_open(False))
         with patch.dict(os.environ, {'DISPLAY': ':0', 'BROWSER': 'true'}, clear=True):
             self.assertFalse(colabllm_web._should_auto_open(False))
+
+    def test_detach_status_and_stop_lifecycle(self):
+        cli = str(ROOT / 'colabllm')
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'colabllm_home'
+            env = {**os.environ, 'COLABLLM_HOME': str(home)}
+
+            bad = subprocess.run([cli, 'web', '--json'], env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(bad.returncode, 2)
+
+            initial = subprocess.run([cli, 'web', '--status', '--json'], env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(initial.returncode, 0, initial.stderr)
+            self.assertEqual(json.loads(initial.stdout), {'running': False})
+
+            started = subprocess.run(
+                [cli, 'web', '--detach', '--port', '0', '--no-open', '--read-only', '--json'],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            payload = json.loads(started.stdout)
+            pid = int(payload['pid'])
+            try:
+                self.assertTrue(payload['running'])
+                self.assertTrue(payload['read_only'])
+                auth_url = payload['auth_url']
+                parsed = urllib.parse.urlsplit(auth_url)
+                token = urllib.parse.parse_qs(parsed.query)['token'][0]
+
+                state_file = home / 'web' / 'state.json'
+                log_file = home / 'web' / 'web.log'
+                self.assertEqual(stat.S_IMODE(state_file.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(log_file.stat().st_mode), 0o600)
+                self.assertNotIn(token, log_file.read_text(encoding='utf-8'))
+
+                # Verify the detached server serves HTTP requests and enforces read-only.
+                conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+                try:
+                    conn.request('GET', f'{parsed.path}?{parsed.query}')
+                    r = conn.getresponse()
+                    r.read()
+                    self.assertEqual(r.status, 303)
+                    jar = http.cookies.SimpleCookie()
+                    jar.load(r.getheader('Set-Cookie') or '')
+                    cookie_hdr = f"colabllm_sid={jar['colabllm_sid'].value}"
+
+                    conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie_hdr})
+                    boot_resp = conn.getresponse()
+                    boot = json.loads(boot_resp.read().decode('utf-8'))
+                    self.assertEqual(boot_resp.status, 200)
+                    self.assertTrue(boot['read_only'])
+                finally:
+                    conn.close()
+
+                # Second --detach and foreground start both refuse to start a second instance.
+                dup = subprocess.run(
+                    [cli, 'web', '--detach', '--port', '0', '--no-open'],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertNotEqual(dup.returncode, 0)
+                self.assertIn('--stop', dup.stderr)
+
+                fg_dup = subprocess.run(
+                    [cli, 'web', '--port', '0', '--no-open'],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+                self.assertNotEqual(fg_dup.returncode, 0)
+                self.assertIn('--stop', fg_dup.stderr)
+                self.assertIn(str(pid), fg_dup.stderr)
+
+                # --status reports live process & matching auth_url.
+                status = subprocess.run([cli, 'web', '--status', '--json'], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(status.returncode, 0, status.stderr)
+                status_payload = json.loads(status.stdout)
+                self.assertTrue(status_payload['running'])
+                self.assertEqual(status_payload['pid'], pid)
+                self.assertEqual(status_payload['mode'], 'background')
+                self.assertEqual(status_payload['auth_url'], auth_url)
+
+                # --stop cleanly stops the daemon and removes state.json.
+                stopped = subprocess.run([cli, 'web', '--stop', '--json'], env=env, text=True, capture_output=True, timeout=15)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertEqual(json.loads(stopped.stdout), {'stopped': True, 'running': False, 'pid': pid})
+                self.assertFalse(state_file.exists())
+
+                after = subprocess.run([cli, 'web', '--status', '--json'], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(after.returncode, 0, after.stderr)
+                self.assertEqual(json.loads(after.stdout), {'running': False})
+
+                # Foreground mode also holds the single-instance lock against both -d and foreground.
+                fg_proc = subprocess.Popen(
+                    [cli, 'web', '--port', '0', '--no-open'],
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    import time as _time
+
+                    deadline = _time.monotonic() + 5.0
+                    fg_status = {}
+                    while _time.monotonic() < deadline:
+                        res = subprocess.run([cli, 'web', '--status', '--json'], env=env, text=True, capture_output=True, timeout=5)
+                        fg_status = json.loads(res.stdout)
+                        if fg_status.get('running'):
+                            break
+                        self.assertIsNone(fg_proc.poll())
+                        _time.sleep(0.05)
+                    self.assertTrue(fg_status.get('running'))
+                    self.assertEqual(fg_status.get('mode'), 'foreground')
+
+                    bg_while_fg = subprocess.run(
+                        [cli, 'web', '--detach', '--port', '0', '--no-open'],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(bg_while_fg.returncode, 0)
+                    self.assertIn('--stop', bg_while_fg.stderr)
+
+                    fg_while_fg = subprocess.run(
+                        [cli, 'web', '--port', '0', '--no-open'],
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    self.assertNotEqual(fg_while_fg.returncode, 0)
+                    self.assertIn('--stop', fg_while_fg.stderr)
+
+                    stop_fg = subprocess.run([cli, 'web', '--stop', '--json'], env=env, text=True, capture_output=True, timeout=15)
+                    self.assertEqual(stop_fg.returncode, 0, stop_fg.stderr)
+                    self.assertTrue(json.loads(stop_fg.stdout)['stopped'])
+                    self.assertEqual(fg_proc.wait(timeout=5), 0)
+                    self.assertFalse(state_file.exists())
+                finally:
+                    if fg_proc.poll() is None:
+                        fg_proc.terminate()
+                        fg_proc.wait(timeout=5)
+                    if fg_proc.stdout:
+                        fg_proc.stdout.close()
+                    if fg_proc.stderr:
+                        fg_proc.stderr.close()
+            finally:
+                subprocess.run([cli, 'web', '--stop'], env=env, text=True, capture_output=True, timeout=10)
 
 
 class IntrospectionTest(unittest.TestCase):
@@ -533,6 +692,10 @@ class WebServerIntegrationTest(unittest.TestCase):
 
         self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')
+        self.assertRegex(
+            styles_css,
+            r'\[hidden\]:not\(\[hidden="until-found"\]\)\s*\{\s*display:\s*none\s*!important;',
+        )
 
 
 if __name__ == '__main__':
