@@ -263,10 +263,22 @@ class DeepSeekQwen9BCliTest(unittest.TestCase):
         self.assertEqual(svc.SERVICE.gpu, "L4")
         self.assertEqual(svc.SERVICE.default_hostname, "deepseek-9b")
         self.assertEqual(svc.SERVICE.auth, "builtin")
+        self.assertEqual(rt.DEFAULT_LLAMA_VERSION, "v1.0.0")
+        self.assertEqual(rt.DEFAULT_LLAMA_COMMIT, "b1b770d90d94cad9e9ea5b993bdbc383a522fb28")
+        self.assertEqual(rt.DEFAULT_REVISION, "a713868aa6cd2df2225dee8f77d1b8b07414d742")
+        self.assertEqual(rt.IMATRIX_REVISION, "c6453f674da4d30f5737092d9371114cae3ca063")
+        self.assertEqual(
+            rt.VISION_PROJECTOR_SPEC["sha256"],
+            "c516d999c4f0bba2e33a3695b4f18663a25bad7524417185c5c309f1d2cfe5de",
+        )
+        self.assertEqual(rt.PINNED_QUANT_SPECS["i1-Q4_K_M"]["size"], 5_780_093_088)
 
         parser = build_parser(svc.SERVICE, svc.configure_cli)
         parsed = parser.parse_args(
-            ["up", "--quant", "i1-Q6_K", "--context", "128k", "--no-vision", "--no-mtp", "--mtp-draft", "4"]
+            [
+                "up", "--quant", "i1-Q6_K", "--context", "128k",
+                "--no-vision", "--no-mtp", "--mtp-draft", "4", "--llama-commit", "v1.0.0",
+            ]
         )
         svc.prepare_up(parsed)
         self.assertEqual(svc.SERVICE.env["CT_DS9B_QUANT"], "i1-Q6_K")
@@ -274,6 +286,7 @@ class DeepSeekQwen9BCliTest(unittest.TestCase):
         self.assertEqual(svc.SERVICE.env["CT_DS9B_VISION"], "0")
         self.assertEqual(svc.SERVICE.env["CT_DS9B_MTP"], "off")
         self.assertEqual(svc.SERVICE.env["CT_DS9B_MTP_DRAFT"], "4")
+        self.assertEqual(svc.SERVICE.env["CT_LLAMA_COMMIT"], "v1.0.0")
 
         # Reset env when no flags passed
         parsed_default = parser.parse_args(["up"])
@@ -281,6 +294,7 @@ class DeepSeekQwen9BCliTest(unittest.TestCase):
         self.assertEqual(svc.SERVICE.env["CT_DS9B_QUANT"], "auto")
         self.assertEqual(svc.SERVICE.env["CT_DS9B_VISION"], "1")
         self.assertEqual(svc.SERVICE.env["CT_DS9B_MTP"], "auto")
+        self.assertEqual(svc.SERVICE.env["CT_LLAMA_COMMIT"], rt.DEFAULT_LLAMA_COMMIT)
 
         plan_args = parser.parse_args(["plan", "--preset", "L4"])
         buf = io.StringIO()

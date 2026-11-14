@@ -2,7 +2,7 @@
 
 # Qwen Flash：Qwen3.8-Flash-Next 1M 长上下文与多模态视觉推理
 
-默认 **G4**（RTX PRO 6000 Blackwell，`97,887 MiB ≈ 95.6 GiB` VRAM，`~176 GiB` DDR5 RAM），通过 `llama-server`（`b11540`）原生 Bearer 认证部署 `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF`（默认 `unsloth-UD-Q4_K_XL-V2` 校准 4-bit MoE 量化，磁盘共 4 分片 `103.69 GiB` + `mmproj-Qwen3.8-Flash-Next-BF16.gguf` 视觉投影器 `0.85 GiB`），默认开启满血 **1,048,576（1M）** 上下文窗口（YaRN `4.0x` + `q8_0` 压缩 KV/QSA Indexer Cache）与多模态视觉输入。
+默认 **G4**（RTX PRO 6000 Blackwell，`97,887 MiB ≈ 95.6 GiB` VRAM，`~176 GiB` DDR5 RAM），通过 `llama-server`（`v1.0.0`）原生 Bearer 认证部署 `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF`（默认 `unsloth-UD-Q4_K_XL-V2` 校准 4-bit MoE 量化，磁盘共 4 分片 `103.69 GiB` + `mmproj-Qwen3.8-Flash-Next-BF16.gguf` 视觉投影器 `0.85 GiB`），默认开启满血 **1,048,576（1M）** 上下文窗口（YaRN `4.0x` + `q8_0` 压缩 KV/QSA Indexer Cache）与多模态视觉输入。
 
 共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 

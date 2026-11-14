@@ -718,7 +718,7 @@ QWEN_FLASH_CFG = dict(name="qwen-flash", service_port=8000, auth="builtin", publ
                       health_path="/health", ready_timeout=5400)
 
 QWEN_FLASH_SETUP = (
-    r'''# @title 1. Setup -- parallel llama.cpp b11540 sm_120 build/cache + 103.7 GiB UD-Q4_K_XL-V2 GGUF + BF16 mmproj + 1M G4 hardware plan
+    r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 sm_120 build/cache + 103.7 GiB UD-Q4_K_XL-V2 GGUF + BF16 mmproj + 1M G4 hardware plan
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -1083,12 +1083,12 @@ ct_watchdog(
 )
 '''
 
-# --------------------------------------------------------------------------- deepseek-qwen-9b (L4 default / T4, llama.cpp b11540, i1-Q4_K_M + native MTP, 256K + q8_0 KV + F16 vision)
+# --------------------------------------------------------------------------- deepseek-qwen-9b (L4 default / T4, llama.cpp v1.0.0, i1-Q4_K_M + native MTP, 256K + q8_0 KV + F16 vision)
 DEEPSEEK_QWEN_9B_CFG = dict(name="deepseek-qwen-9b", service_port=8000, auth="builtin", public_port=8000,
                             health_path="/health", ready_timeout=2400)
 
 DEEPSEEK_QWEN_9B_SETUP = (
-    r'''# @title 1. Setup -- parallel llama.cpp b11540 CUDA cache + i1-Q4_K_M GGUF + native MTP Q8_0 sidecar + F16 mmproj + 256K L4/T4 plan
+    r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 CUDA cache + i1-Q4_K_M GGUF + native MTP Q8_0 sidecar + F16 mmproj + 256K L4/T4 plan
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -4316,7 +4316,7 @@ DEEPSEEK_CODER_CFG = dict(name="deepseek-coder", service_port=8001, auth="builti
                           health_path="/health", ready_timeout=5400)
 
 DEEPSEEK_CODER_SETUP = (
-    r'''# @title 1. Setup -- parallel llama.cpp CUDA build/cache + 183.7 GB Coder GGUF + Engram shard-6 symlink + hardware-max context plan
+    r'''# @title 1. Setup -- parallel llama.cpp v1.0.0 CUDA build/cache + 183.7 GB Coder GGUF + Engram shard-6 symlink + hardware-max context plan
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -4356,9 +4356,15 @@ if MOUNT_DRIVE and not Path("/content/drive/MyDrive").is_dir():
 DS_SERVICE_DIR = Path(DATA_DIR)
 DS_SERVICE_DIR.mkdir(parents=True, exist_ok=True)
 DS_DRIVE_BACKUP_ROOT = (
-    Path("/content/drive/MyDrive/models") if (MOUNT_DRIVE and Path("/content/drive/MyDrive").is_dir()) else None
+    Path(os.environ.get("CT_DS_MODEL_ROOT", "/content/drive/MyDrive/models"))
+    if (MOUNT_DRIVE and Path("/content/drive/MyDrive").is_dir())
+    else None
 )
-DS_RUNTIME_CACHE = DS_SERVICE_DIR / "runtime-cache"
+DS_RUNTIME_CACHE = (
+    (DS_DRIVE_BACKUP_ROOT / ".runtimes" / "llama.cpp")
+    if DS_DRIVE_BACKUP_ROOT is not None
+    else (DS_SERVICE_DIR / "runtime-cache")
+)
 
 DS_CFG = {
     "repo": os.environ.get("CT_DS_REPO", DEFAULT_REPO),
@@ -4427,11 +4433,11 @@ with ThreadPoolExecutor(max_workers=2) as _pool:
             f"model={'done' if _f_model.done() else 'running'} | free_ssd={_free_gb:.1f} GB"
         )
         time.sleep(30)
-    BIN_DIR, LLAMA_ENV, _ = _f_runtime.result()
+    BIN_DIR, LLAMA_ENV, PINNED_COMMIT = _f_runtime.result()
     MODEL_PATH, PROJECTOR_PATH = _f_model.result()
 
 CHAT_TEMPLATE_PATH = prepare_patched_chat_template(MODEL_PATH, DS_WORK / "chat_template.jinja")
-dslog(f"Setup complete: model={MODEL_PATH} projector={PROJECTOR_PATH} chat_template={CHAT_TEMPLATE_PATH}")
+dslog(f"Setup complete: commit={PINNED_COMMIT[:10]} model={MODEL_PATH} projector={PROJECTOR_PATH} chat_template={CHAT_TEMPLATE_PATH}")
 '''
 )
 

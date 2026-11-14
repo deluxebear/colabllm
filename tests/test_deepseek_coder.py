@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src/colabllm/lib"))
 
 import deepseek_coder_runtime as rt  # noqa: E402
 from cli_support import CliError  # noqa: E402
+from colabsvc import build_parser  # noqa: E402
 
 
 def load_deepseek_service():
@@ -292,18 +293,19 @@ class DeepSeekShardSymlinkAndArgsTest(unittest.TestCase):
 
 class DeepSeekServiceCliTest(unittest.TestCase):
     def test_prepare_up_applies_and_resets_overrides(self):
+        self.assertEqual(rt.DEFAULT_LLAMA_VERSION, "v1.0.0")
+        self.assertEqual(rt.DEFAULT_LLAMA_COMMIT, "b1b770d90d94cad9e9ea5b993bdbc383a522fb28")
         svc = load_deepseek_service()
         baseline = dict(svc.SERVICE.env)
-        svc.prepare_up(
-            types.SimpleNamespace(
-                up_CT_DS_CONTEXT="524288",
-                up_CT_DS_REASONING_EFFORT="75",
-                up_no_vision=True,
-            )
-        )
+        self.assertEqual(baseline["CT_LLAMA_COMMIT"], rt.DEFAULT_LLAMA_COMMIT)
+
+        parser = build_parser(svc.SERVICE, svc.configure_cli)
+        parsed = parser.parse_args(["up", "--context", "512k", "--reasoning-effort", "75", "--no-vision", "--llama-commit", "v1.0.0"])
+        svc.prepare_up(parsed)
         self.assertEqual(svc.SERVICE.env["CT_DS_CONTEXT"], "524288")
         self.assertEqual(svc.SERVICE.env["CT_DS_REASONING_EFFORT"], "75")
         self.assertEqual(svc.SERVICE.env["CT_DS_VISION"], "0")
+        self.assertEqual(svc.SERVICE.env["CT_LLAMA_COMMIT"], "v1.0.0")
 
         svc.prepare_up(types.SimpleNamespace())
         self.assertEqual(svc.SERVICE.env, baseline)

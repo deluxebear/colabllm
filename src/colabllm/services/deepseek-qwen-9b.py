@@ -5,7 +5,7 @@ Deploys `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` GGUF conversio
 (`mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-i1-GGUF` `i1-Q4_K_M` imatrix 4-bit by default,
 native Multi-Token Prediction `mtp-Q8_0.gguf` sidecar via `--spec-type draft-mtp`, plus
 `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.mmproj-f16.gguf` multimodal vision projector)
-via `llama-server` (`b11540`) with native `--api-key-file` Bearer authentication.
+via `llama-server` (`v1.0.0`) with native `--api-key-file` Bearer authentication.
 
 Key properties:
   * Hardware: `L4` (`NVIDIA L4` `sm_89`, `23,034 MiB ≈ 22.5 GiB` VRAM, `~53 GiB` RAM) by default;
@@ -15,10 +15,10 @@ Key properties:
       - `Qwen3.5-9B` hybrid architecture uses 24 Gated DeltaNet linear-attention layers (`O(1)` ~52 MiB state)
         and only 8 GQA full-attention layers (+ 1 `nextn` MTP draft attention layer), so a full `262,144` `q8_0`
         KV cache across both trunk and MTP draft takes just `4.83 GiB` VRAM (`4,948 MiB`).
-      - On `L4` (`23,034 MiB` VRAM): `i1-Q4_K_M` (`5.24 GiB`) + `mmproj-f16` (`0.86 GiB`) + `mtp-Q8_0` (`2.27 GiB`)
-        + `256K` `q8_0` KV (`4.83 GiB`) = `13.20 GiB` total, leaving `~9.30 GiB` clean VRAM headroom at 100% GPU offload.
+      - On `L4` (`23,034 MiB` VRAM): `i1-Q4_K_M` (`5.38 GiB`) + `mmproj-f16` (`0.86 GiB`) + `mtp-Q8_0` (`2.27 GiB`)
+        + `256K` `q8_0` KV (`4.83 GiB`) = `13.34 GiB` total, leaving `~9.16 GiB` clean VRAM headroom at 100% GPU offload.
       - Users wanting maximum 8-bit static precision can pass `--quant Q8_0` (`Q8_0` + `MTP` + `256K` also fits L4!).
-  * Runtime & MTP caches: pinned `llama.cpp` (`b11540`) built for the active GPU (`sm_89` on L4, `sm_75` on T4) and
+  * Runtime & MTP caches: pinned `llama.cpp` (`v1.0.0`) built for the active GPU (`sm_89` on L4, `sm_75` on T4) and
     cached at `/content/drive/MyDrive/models/.runtimes/llama.cpp/sm<arch>-<fingerprint>/runtime.tar`; standalone
     `mtp-Q8_0.gguf` exported once via HTTP Range and cached on Google Drive for ~3s restore on subsequent boots.
   * Auth: native `llama-server --api-key-file` (`auth="builtin"`).
@@ -83,7 +83,7 @@ SERVICE = Service(
     service_port=8000,
     auth="builtin",                   # llama-server --api-key-file handles Bearer auth natively
     public_port=8000,
-    gpu="L4",                         # L4 (24 GB) default: i1-Q4_K_M + MTP + 256K q8_0 KV + F16 vision (~9.3 GiB headroom)
+    gpu="L4",                         # L4 (24 GB) default: i1-Q4_K_M + MTP + 256K q8_0 KV + F16 vision (~9.2 GiB headroom)
     high_mem=False,
     default_hostname="deepseek-9b",
     ready_timeout=2400,
@@ -317,7 +317,7 @@ def configure_cli(
     up.add_argument(
         "--llama-commit",
         dest="up_CT_LLAMA_COMMIT",
-        help=f"Pinned ggml-org/llama.cpp commit or tag SHA (default: {DEFAULT_LLAMA_COMMIT[:12]} = b11540)",
+        help=f"Pinned ggml-org/llama.cpp commit or tag (default: {DEFAULT_LLAMA_COMMIT[:12]} = v1.0.0)",
     )
     up.add_argument(
         "--no-vision",

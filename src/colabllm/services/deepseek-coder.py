@@ -3,13 +3,15 @@
 
 Deploys `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` (50% expert-pruned 192-expert
 `IQ2_XXS` MoE trunk, 72.1 GB + 110.6 GB `IQ4_NL` Engram lookup table + BF16 `deepseek41v` vision
-projector) on Google Colab via `llama-server` with native `--api-key-file` Bearer authentication and
+projector) on Google Colab via `llama-server` (`v1.0.0`) with native `--api-key-file` Bearer authentication and
 hardware-adaptive maximum context window sizing (`CT_DS_CONTEXT=auto`, up to the full 1,048,576 native
 1M context on a 96 GB G4 GPU).
 
 Key properties:
   * Hardware default: `G4` (RTX PRO 6000 Blackwell `sm_120`, ~96 GB VRAM) -> 100% GPU layers (`n_cpu_moe=0`)
     + full `1,048,576` (1M) native context window (`f16` DSV4.1 compressed KV + fused lightning indexer).
+  * Runtime cache: pinned `llama.cpp` (`v1.0.0`) built for CUDA `sm_<arch>` and shared across runtimes at
+    `/content/drive/MyDrive/models/.runtimes/llama.cpp/sm<arch>-<fingerprint>/runtime.tar` (+ `sha256`).
   * Hardware-adaptive context (`--context auto`, default): inspects actual GPU VRAM & host/cgroup RAM at
     startup, computes exact `deepseek41` KV + graph workspace budget (`~640K` on 80 GB `H100`/`A100`,
     hybrid `--n-cpu-moe` + `~256K` on 40 GB `A100`), and steps down automatically on startup OOM.
@@ -111,6 +113,7 @@ UP_ENV_FLAGS = {
     "--cpu-moe-layers": "CT_DS_CPU_MOE",
     "--reasoning": "CT_DS_REASONING",
     "--reasoning-effort": "CT_DS_REASONING_EFFORT",
+    "--llama-commit": "CT_LLAMA_COMMIT",
 }
 _BASE_ENV = dict(SERVICE.env)
 
@@ -324,6 +327,11 @@ def configure_cli(
         dest="up_CT_DS_REASONING_EFFORT",
         type=_validate_reasoning_effort,
         help="Default thinking effort when thinking is active: minimal|low|medium|high|xhigh|max or 1..100 (template default: 50)",
+    )
+    up.add_argument(
+        "--llama-commit",
+        dest="up_CT_LLAMA_COMMIT",
+        help=f"Pinned ggml-org/llama.cpp commit or tag (default: {DEFAULT_LLAMA_COMMIT[:12]} = v1.0.0)",
     )
     up.add_argument(
         "--no-vision",

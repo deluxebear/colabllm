@@ -7,8 +7,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -299,6 +302,151 @@ class QwenFlashServerArgsAndStagingTest(unittest.TestCase):
             self.assertTrue(first_shard.is_file())
             self.assertIsNone(proj)
             self.assertFalse(any(p.exists() for p in seen_dirs))
+
+    def test_v100_pin_and_resolve_llama_commit_handles_sha_and_annotated_tags(self):
+        self.assertEqual(rt.DEFAULT_LLAMA_VERSION, "v1.0.0")
+        self.assertEqual(rt.DEFAULT_LLAMA_COMMIT, "b1b770d90d94cad9e9ea5b993bdbc383a522fb28")
+
+        with patch.object(rt, "_cmd_out", side_effect=AssertionError("should not shell out for 40-hex SHA")):
+            self.assertEqual(rt._resolve_llama_commit(rt.DEFAULT_LLAMA_REPO, rt.DEFAULT_LLAMA_COMMIT.upper()), rt.DEFAULT_LLAMA_COMMIT)
+
+        ls_remote_tag = (
+            "a6d1a74dbebce3a16f4f2ceddbf38c21a08d8674\trefs/tags/v1.0.0\n"
+            f"{rt.DEFAULT_LLAMA_COMMIT}\trefs/tags/v1.0.0^{{}}\n"
+        )
+        with patch.object(rt, "_cmd_out", return_value=ls_remote_tag) as mock_cmd:
+            self.assertEqual(rt._resolve_llama_commit(rt.DEFAULT_LLAMA_REPO, "v1.0.0"), rt.DEFAULT_LLAMA_COMMIT)
+            self.assertIn("refs/tags/v1.0.0^{}", mock_cmd.call_args.args[0])
+
+        with patch.object(rt, "_cmd_out", return_value=f"{rt.DEFAULT_LLAMA_COMMIT}\tHEAD\n"):
+            self.assertEqual(rt._resolve_llama_commit(rt.DEFAULT_LLAMA_REPO, ""), rt.DEFAULT_LLAMA_COMMIT)
+
+    def test_shared_v100_runtime_cache_across_services_and_soname_symlinks(self):
+        import deepseek_coder_runtime as ds_coder_rt
+        import deepseek_qwen_9b_runtime as ds_9b_rt
+
+        gpu_g4 = {
+            "present": True,
+            "name": "NVIDIA RTX PRO 6000 Blackwell",
+            "compute_cap": "12.0",
+            "cuda_arch": "120",
+            "vram_mib": 97_887,
+        }
+        all_flags = " ".join(rt._REQUIRED_SERVER_FLAGS)
+
+        def fake_cmd_out(command, **_kwargs):
+            cmd0 = str(command[0])
+            if cmd0 == "nvcc":
+                return "Cuda compilation tools, release 12.8"
+            if cmd0 == "git" and len(command) >= 2 and command[1] == "ls-remote":
+                return (
+                    "a6d1a74dbebce3a16f4f2ceddbf38c21a08d8674\trefs/tags/v1.0.0\n"
+                    f"{rt.DEFAULT_LLAMA_COMMIT}\trefs/tags/v1.0.0^{{}}\n"
+                )
+            if "--version" in command:
+                return "version: v1.0.0"
+            if "--list-devices" in command:
+                return "CUDA0: fake G4"
+            if "--help" in command:
+                return f"usage: llama-server {all_flags}"
+            raise AssertionError(f"unexpected _cmd_out command: {command}")
+
+        build_commands: list[list[str]] = []
+
+        def fake_run_logged(command, _log_file, env=None):
+            cmd = [str(x) for x in command]
+            build_commands.append(cmd)
+            if cmd[:2] == ["cmake", "-S"]:
+                self.assertNotIn("-DLLAMA_CURL=OFF", cmd)
+                self.assertIn("-DGGML_CUDA=ON", cmd)
+                self.assertIn("-DCMAKE_CUDA_ARCHITECTURES=120", cmd)
+                self.assertIn("-DGGML_NATIVE=OFF", cmd)
+            elif cmd[:2] == ["cmake", "--build"]:
+                build_dir = Path(cmd[cmd.index("--build") + 1])
+                out_bin = build_dir / "bin"
+                out_bin.mkdir(parents=True, exist_ok=True)
+                server = out_bin / "llama-server"
+                server.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                server.chmod(0o755)
+                lib_real = out_bin / "libggml-cuda.so.1.0.0"
+                lib_real.write_bytes(b"ELF-FAKE-CUDA-SO")
+                (out_bin / "libggml-cuda.so.1").symlink_to("libggml-cuda.so.1.0.0")
+                (out_bin / "libggml-cuda.so").symlink_to("libggml-cuda.so.1")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shared_cache = root / "drive" / ".runtimes" / "llama.cpp"
+            work_qwen = root / "work-qwen"
+            work_coder = root / "work-coder"
+            work_9b = root / "work-9b"
+            for d in (work_qwen, work_coder, work_9b):
+                d.mkdir(parents=True)
+
+            real_which = shutil.which
+            with (
+                patch.object(shutil, "which", side_effect=lambda name: "/usr/local/cuda/bin/nvcc" if name == "nvcc" else real_which(name)),
+                patch.object(rt, "_cmd_out", side_effect=fake_cmd_out),
+                patch.object(rt, "_run_logged", side_effect=fake_run_logged),
+            ):
+                qwen_bin, _qwen_env, qwen_commit = rt.prepare_llama_runtime(
+                    work_dir=work_qwen,
+                    cache_root=shared_cache,
+                    llama_repo=rt.DEFAULT_LLAMA_REPO,
+                    llama_commit=rt.DEFAULT_LLAMA_COMMIT,
+                    gpu_info=gpu_g4,
+                    log=lambda *_: None,
+                )
+
+            self.assertEqual(qwen_commit, rt.DEFAULT_LLAMA_COMMIT)
+            self.assertTrue(any(c[:2] == ["cmake", "--build"] for c in build_commands))
+            self.assertFalse((work_qwen / "llama.cpp-src").exists())
+            self.assertTrue((qwen_bin / "libggml-cuda.so.1.0.0").is_file())
+            self.assertTrue((qwen_bin / "libggml-cuda.so.1").is_symlink())
+            self.assertTrue((qwen_bin / "libggml-cuda.so").is_symlink())
+
+            cache_dirs = list(shared_cache.glob("sm120-*"))
+            self.assertEqual(len(cache_dirs), 1)
+            with tarfile.open(cache_dirs[0] / "runtime.tar", "r") as tf:
+                by_name = {m.name: m for m in tf.getmembers()}
+                self.assertTrue(by_name["bin/libggml-cuda.so.1.0.0"].isreg())
+                self.assertTrue(by_name["bin/libggml-cuda.so.1"].issym())
+                self.assertTrue(by_name["bin/libggml-cuda.so"].issym())
+
+            def fail_if_built(*_args, **_kwargs):
+                raise AssertionError("secondary service unexpectedly rebuilt instead of reusing shared cache")
+
+            with (
+                patch.object(shutil, "which", side_effect=lambda name: "/usr/local/cuda/bin/nvcc" if name == "nvcc" else real_which(name)),
+                patch.object(ds_coder_rt, "_cmd_out", side_effect=fake_cmd_out),
+                patch.object(ds_coder_rt, "_run_logged", side_effect=fail_if_built),
+                patch.object(ds_9b_rt, "_cmd_out", side_effect=fake_cmd_out),
+                patch.object(ds_9b_rt, "_run_logged", side_effect=fail_if_built),
+            ):
+                coder_bin, _coder_env, coder_commit = ds_coder_rt.prepare_llama_runtime(
+                    work_dir=work_coder,
+                    cache_root=shared_cache,
+                    llama_repo=ds_coder_rt.DEFAULT_LLAMA_REPO,
+                    llama_commit="v1.0.0",
+                    gpu_info=gpu_g4,
+                    log=lambda *_: None,
+                )
+                nineb_bin, _9b_env, nineb_commit = ds_9b_rt.prepare_llama_runtime(
+                    work_dir=work_9b,
+                    cache_root=shared_cache,
+                    llama_repo=ds_9b_rt.DEFAULT_LLAMA_REPO,
+                    llama_commit=ds_9b_rt.DEFAULT_LLAMA_COMMIT,
+                    gpu_info=gpu_g4,
+                    log=lambda *_: None,
+                )
+
+            self.assertEqual(coder_commit, rt.DEFAULT_LLAMA_COMMIT)
+            self.assertEqual(nineb_commit, rt.DEFAULT_LLAMA_COMMIT)
+            self.assertEqual(list(shared_cache.glob("sm120-*")), cache_dirs)
+            for restored_bin in (coder_bin, nineb_bin):
+                self.assertTrue((restored_bin / "llama-server").is_file())
+                self.assertTrue((restored_bin / "libggml-cuda.so.1").is_symlink())
+                self.assertTrue((restored_bin / "libggml-cuda.so").is_symlink())
+                self.assertEqual((restored_bin / "libggml-cuda.so").read_bytes(), b"ELF-FAKE-CUDA-SO")
 
 
 class QwenFlashServiceCliTest(unittest.TestCase):

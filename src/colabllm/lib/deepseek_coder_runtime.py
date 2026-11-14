@@ -2,7 +2,7 @@
 
 Targets `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF` (50% expert-pruned 192-expert
 `IQ2_XXS` MoE trunk + `IQ4_NL` Engram conditional memory lookup table + `BF16` `deepseek41v` vision
-projector) served via `llama-server` with native `--api-key-file` Bearer authentication.
+projector) served via `llama-server` (`v1.0.0`) with native `--api-key-file` Bearer authentication.
 
 Imported both locally (CLI `plan` / validation / unit tests, standard library only) and inside the
 generated Colab notebook (`src/colabllm/services/deepseek-coder.ipynb`).
@@ -23,14 +23,16 @@ import subprocess
 import sys
 import tarfile
 import time
-from typing import Any
+from typing import Any, Callable
 
 DEFAULT_REPO = "Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF"
 DEFAULT_REVISION = "cfe5da6df1b4e22baf864e33f5132a6202c821e3"
 DEFAULT_QUANT = "IQ2_XXS"
 DEFAULT_ALIAS = "deepseek-v4.1-flash-coder"
 DEFAULT_LLAMA_REPO = "https://github.com/ggml-org/llama.cpp.git"
-DEFAULT_LLAMA_COMMIT = "3259ab6e5dd86fad1931962d784702cb53c7877b"
+DEFAULT_LLAMA_VERSION = "v1.0.0"
+# ggml-org/llama.cpp tag v1.0.0 (upstream SemVer 1.0 release)
+DEFAULT_LLAMA_COMMIT = "b1b770d90d94cad9e9ea5b993bdbc383a522fb28"
 
 MODEL_MAX_CONTEXT = 1_048_576
 MIN_CONTEXT = 16_384
@@ -806,19 +808,115 @@ def _run_logged(command: list[str], log_file: Path, *, env: dict[str, str] | Non
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(command[:4])} (see {log_file})")
 
 
-def _restore_valid_bin(bin_dir: Path, env: dict[str, str], *, expect_cuda: bool) -> bool:
+_HEX40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_REQUIRED_SERVER_FLAGS = (
+    "--api-key-file",
+    "--ctx-checkpoints",
+    "--lazy-mode",
+    "--load-mode",
+    "--n-cpu-moe",
+    "--override-tensor",
+    "--reasoning",
+    "--spec-type",
+)
+
+
+def _resolve_llama_commit(llama_repo: str, llama_commit: str) -> str:
+    """Resolve an empty string, tag/branch ref, or commit SHA to a concrete git commit when possible."""
+    raw = (llama_commit or "").strip()
+    if _HEX40_RE.fullmatch(raw):
+        return raw.lower()
+    try:
+        if not raw or raw.upper() == "HEAD":
+            out = _cmd_out(["git", "ls-remote", llama_repo, "HEAD"], timeout=30)
+            return out.splitlines()[0].split()[0].lower()
+        clean = raw.removeprefix("refs/tags/").removeprefix("refs/heads/")
+        out = _cmd_out(
+            [
+                "git", "ls-remote", llama_repo,
+                f"refs/tags/{clean}^{{}}",
+                f"refs/tags/{clean}",
+                f"refs/heads/{clean}",
+            ],
+            timeout=30,
+        )
+        refs: dict[str, str] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                refs[parts[1]] = parts[0].lower()
+        for candidate in (f"refs/tags/{clean}^{{}}", f"refs/tags/{clean}", f"refs/heads/{clean}"):
+            if candidate in refs:
+                return refs[candidate]
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    return raw
+
+
+def _stage_runtime_bins(build_dir: Path, bin_dir: Path) -> None:
+    """Copy `llama-server` and shared libraries into `bin_dir`, preserving intra-dir SONAME symlinks."""
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    build_bin = build_dir / "bin"
+    if build_bin.is_dir():
+        shutil.copytree(build_bin, bin_dir, dirs_exist_ok=True, symlinks=True)
+
+    for lib_candidate in sorted(build_dir.rglob("*.so*")):
+        dest = bin_dir / lib_candidate.name
+        if dest.exists() or dest.is_symlink():
+            continue
+        if not lib_candidate.is_symlink() and lib_candidate.is_file():
+            shutil.copy2(lib_candidate, dest)
+
+    for lib_candidate in sorted(build_dir.rglob("*.so*")):
+        dest = bin_dir / lib_candidate.name
+        if dest.exists() or dest.is_symlink() or not lib_candidate.is_symlink():
+            continue
+        resolved = lib_candidate.resolve()
+        if resolved.is_file():
+            sibling = bin_dir / resolved.name
+            if sibling.is_file() and not sibling.is_symlink():
+                dest.symlink_to(resolved.name)
+            else:
+                shutil.copy2(resolved, dest)
+
+    bin_real = bin_dir.resolve()
+    for entry in sorted(bin_dir.iterdir()):
+        if not entry.is_symlink():
+            continue
+        resolved = entry.resolve()
+        if not resolved.exists():
+            entry.unlink()
+            continue
+        if resolved.parent == bin_real:
+            target_name = resolved.name
+            if os.readlink(entry) != target_name:
+                entry.unlink()
+                entry.symlink_to(target_name)
+        elif resolved.is_file():
+            sibling = bin_dir / resolved.name
+            entry.unlink()
+            if sibling.is_file() and not sibling.is_symlink():
+                entry.symlink_to(resolved.name)
+            else:
+                shutil.copy2(resolved, entry)
+        else:
+            entry.unlink()
+
+
+def _restore_valid_bin(bin_dir: Path, env: dict[str, str], require_cuda: bool = True) -> bool:
     server = bin_dir / "llama-server"
     if not server.is_file():
         return False
     try:
         server.chmod(0o755)
-        _cmd_out([str(server), "--version"], env=env, timeout=30)
-        if expect_cuda:
-            devices = _cmd_out([str(server), "--list-devices"], env=env, timeout=30)
+        _cmd_out([str(server), "--version"], env=env, timeout=20)
+        if require_cuda:
+            devices = _cmd_out([str(server), "--list-devices"], env=env, timeout=20)
             if "CUDA" not in devices:
                 return False
-        help_text = _cmd_out([str(server), "--help"], env=env, timeout=30)
-        return all(flag in help_text for flag in ("--lazy-mode", "--load-mode", "--api-key-file", "--n-cpu-moe"))
+        help_text = _cmd_out([str(server), "--help"], env=env, timeout=20)
+        return all(flag in help_text for flag in _REQUIRED_SERVER_FLAGS)
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -830,100 +928,115 @@ def prepare_llama_runtime(
     llama_repo: str = DEFAULT_LLAMA_REPO,
     llama_commit: str = DEFAULT_LLAMA_COMMIT,
     gpu_info: dict[str, Any] | None = None,
-    log=print,
-) -> tuple[Path, dict[str, str], dict[str, Any]]:
-    """Restore or compile pinned `llama-server` for the active GPU's CUDA architecture."""
+    log: Callable[[str], None] = print,
+) -> tuple[Path, dict[str, str], str]:
+    """Build or restore cached `llama-server` for the current GPU architecture and pinned `llama_commit`."""
     gpu = gpu_info or detect_gpu_info()
-    has_cuda = bool(gpu.get("present") and gpu.get("cuda_arch"))
-    cuda_arch = gpu["cuda_arch"] if has_cuda else "cpu"
-    nvcc_ver = _cmd_out(["nvcc", "--version"], timeout=30) if has_cuda else "no-cuda"
-    os_rel = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace") if Path("/etc/os-release").is_file() else platform.platform()
+    commit = _resolve_llama_commit(llama_repo, llama_commit)
+    require_cuda = bool(gpu.get("present") and gpu.get("cuda_arch"))
+    cuda_arch = str(gpu["cuda_arch"]) if require_cuda else "cpu"
+    nvcc_ver = _cmd_out(["nvcc", "--version"], timeout=30) if (require_cuda and shutil.which("nvcc")) else "no-nvcc"
+    os_rel = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace") if Path("/etc/os-release").is_file() else ""
     signature = {
-        "llama_commit": llama_commit,
+        "llama_commit": commit,
         "cuda_arch": cuda_arch,
         "cuda": nvcc_ver,
         "os_release": os_rel,
         "arch": platform.machine(),
         "glibc": list(platform.libc_ver()),
+        "ggml_native": False,
         "targets": ["llama-server"],
     }
-    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:20]
-    cache_dir = cache_root / f"sm{cuda_arch}-{key}"
+    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    cache_dir = Path(cache_root) / f"sm{cuda_arch}-{key}"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    bin_dir = work_dir / "runtime" / "bin"
+    work_root = Path(work_dir)
+    bin_dir = work_root / "runtime" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, LD_LIBRARY_PATH=str(bin_dir) + ":" + os.environ.get("LD_LIBRARY_PATH", ""))
-    local_manifest = work_dir / "runtime-manifest.json"
-    if bin_dir.exists() and any(bin_dir.iterdir()):
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = f"{bin_dir}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":")
+    local_manifest = work_root / "runtime-manifest.json"
+    if any(bin_dir.iterdir()):
         try:
             cached_sig = json.loads(local_manifest.read_text(encoding="utf-8")) if local_manifest.is_file() else None
         except (OSError, ValueError):
             cached_sig = None
         if cached_sig != signature:
-            shutil.rmtree(bin_dir)
+            shutil.rmtree(bin_dir, ignore_errors=True)
             bin_dir.mkdir(parents=True, exist_ok=True)
 
     archive = cache_dir / "runtime.tar"
     checksum = cache_dir / "runtime.sha256"
-    if not _restore_valid_bin(bin_dir, env, expect_cuda=has_cuda) and archive.is_file() and checksum.is_file():
-        log(f"Restoring prebuilt llama.cpp runtime archive from Drive: {cache_dir}")
-        local_tar = work_dir / "runtime.tar"
-        shutil.copyfile(archive, local_tar)
-        if digest_file(local_tar) != checksum.read_text(encoding="utf-8").strip():
+    if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda) and archive.is_file() and checksum.is_file():
+        log(f"Restoring cached llama.cpp runtime ({commit[:10]}) from Drive: {cache_dir}")
+        local_tar = work_root / "runtime.tar"
+        try:
+            shutil.copyfile(archive, local_tar)
+            expected_sha = checksum.read_text(encoding="utf-8").strip().split()[0].lower()
+            if digest_file(local_tar) == expected_sha:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(local_tar) as bundle:
+                    bundle.extractall(work_root / "runtime", filter="data")
+            else:
+                log("Warning: Drive build cache checksum mismatch; rebuilding from source")
+        except (OSError, tarfile.TarError, ValueError, IndexError) as err:
+            log(f"Warning: Drive build cache restore failed ({type(err).__name__}: {err}); rebuilding from source")
+            shutil.rmtree(bin_dir, ignore_errors=True)
+            bin_dir.mkdir(parents=True, exist_ok=True)
+        finally:
             local_tar.unlink(missing_ok=True)
-            raise RuntimeError("Drive runtime cache SHA256 mismatch; refusing corrupt archive")
-        with tarfile.open(local_tar) as bundle:
-            bundle.extractall(work_dir / "runtime", filter="data")
-        local_tar.unlink(missing_ok=True)
 
-    if not _restore_valid_bin(bin_dir, env, expect_cuda=has_cuda):
-        build_log = work_dir / "build.log"
-        log(f"Building llama.cpp ({llama_commit[:10]}) for target={cuda_arch}; log={build_log}")
-        source = work_dir / "llama.cpp-src"
-        if (source / ".git").exists():
-            shutil.rmtree(source)
+    if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda):
+        build_log = work_root / "build.log"
+        target_desc = f"CUDA sm_{cuda_arch}" if require_cuda else "CPU"
+        log(f"Building llama.cpp ({commit[:10]}) for {target_desc} (log: {build_log})...")
+        source = work_root / "llama.cpp-src"
+        shutil.rmtree(source, ignore_errors=True)
         _run_logged(["git", "clone", "--no-checkout", "--filter=blob:none", llama_repo, str(source)], build_log)
-        _run_logged(["git", "-C", str(source), "fetch", "--depth", "1", "origin", llama_commit], build_log)
-        _run_logged(["git", "-C", str(source), "checkout", "--detach", llama_commit], build_log)
+        _run_logged(["git", "-C", str(source), "fetch", "--depth", "1", "origin", commit], build_log)
+        _run_logged(["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"], build_log)
         cmake_args = [
             "cmake", "-S", str(source), "-B", str(source / "build"),
-            "-DGGML_NATIVE=OFF", "-DCMAKE_BUILD_TYPE=Release",
-            "-DLLAMA_CURL=OFF", "-DLLAMA_OPENSSL=OFF", "-DLLAMA_BUILD_TESTS=OFF",
+            f"-DGGML_CUDA={'ON' if require_cuda else 'OFF'}",
+            "-DGGML_NATIVE=OFF",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DLLAMA_OPENSSL=OFF",
+            "-DLLAMA_BUILD_TESTS=OFF",
             "-DLLAMA_BUILD_EXAMPLES=OFF",
         ]
-        if has_cuda:
-            cmake_args += ["-DGGML_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}"]
-        else:
-            cmake_args += ["-DGGML_CUDA=OFF"]
+        if require_cuda:
+            cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
         _run_logged(cmake_args, build_log)
-        jobs = str(min(12, os.cpu_count() or 4))
         _run_logged(
-            ["cmake", "--build", str(source / "build"), "--config", "Release", "-j", jobs, "--target", "llama-server"],
+            ["cmake", "--build", str(source / "build"), "--config", "Release", "--target", "llama-server",
+             "-j", str(min(12, os.cpu_count() or 4))],
             build_log,
         )
-        shutil.copytree(source / "build" / "bin", bin_dir, dirs_exist_ok=True, symlinks=False)
-        for lib_candidate in (source / "build").rglob("*.so*"):
-            if lib_candidate.is_file() and not (bin_dir / lib_candidate.name).exists():
-                shutil.copy2(lib_candidate, bin_dir / lib_candidate.name)
+        _stage_runtime_bins(source / "build", bin_dir)
         # Reclaim ~4-6 GB CUDA build artifacts immediately so local SSD has full room for 183.7 GB weights
         shutil.rmtree(source, ignore_errors=True)
-        if not _restore_valid_bin(bin_dir, env, expect_cuda=has_cuda):
-            raise RuntimeError(f"Compiled llama-server failed validation (expect_cuda={has_cuda})")
-        local_tar = work_dir / "runtime.tar"
-        with tarfile.open(local_tar, "w", dereference=True) as bundle:
-            bundle.add(bin_dir, arcname="bin")
-        sha = digest_file(local_tar)
-        partial = cache_dir / f".runtime.tar.{os.getpid()}.partial"
-        shutil.copyfile(local_tar, partial)
-        partial.replace(archive)
-        checksum.write_text(sha + "\n", encoding="utf-8")
-        write_json_atomic(cache_dir / "manifest.json", signature)
-        local_tar.unlink(missing_ok=True)
-        log(f"Archived llama-server runtime to {cache_dir}")
+        if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda):
+            raise RuntimeError("Built llama-server failed validation or did not detect CUDA")
+        local_tar = work_root / "runtime.tar"
+        try:
+            with tarfile.open(local_tar, "w", dereference=False) as bundle:
+                bundle.add(bin_dir, arcname="bin")
+            sha = digest_file(local_tar)
+            partial = cache_dir / f"runtime.tar.{os.getpid()}.partial"
+            shutil.copyfile(local_tar, partial)
+            partial.replace(archive)
+            checksum.write_text(sha + "\n", encoding="utf-8")
+            write_json_atomic(cache_dir / "manifest.json", signature)
+            log(f"Cached compiled llama.cpp runtime on Drive: {cache_dir}")
+        except OSError as err:
+            log(f"Runtime Drive cache save warning (non-fatal): {err}")
+        finally:
+            local_tar.unlink(missing_ok=True)
 
     write_json_atomic(local_manifest, signature)
-    return bin_dir, env, gpu
+    return bin_dir, env, commit
 
 
 def _hf_client(work_dir: Path):

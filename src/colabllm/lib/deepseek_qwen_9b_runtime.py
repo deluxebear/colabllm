@@ -1,13 +1,13 @@
 """Hardware-adaptive 256K-context planning, GGUF + MTP sidecar staging, and llama.cpp runtime helpers for DeepSeek-V4-Pro-Qwen3.5-9B.
 
 Targets `xtools-at/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic` GGUF conversions + native MTP speculative decoding:
-  - Default on L4 (`23,034 MiB` VRAM) and T4 (`15,360 MiB` VRAM): `i1-Q4_K_M` (`5.63 GB` / `5.24 GiB` imatrix-calibrated 4-bit)
+  - Default on L4 (`23,034 MiB` VRAM) and T4 (`15,360 MiB` VRAM): `i1-Q4_K_M` (`5.78 GB` / `5.38 GiB` imatrix-calibrated 4-bit)
     from `mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-i1-GGUF` (with `--quant Q8_0`, `i1-Q6_K`, `f16`, etc. optional)
   - Native Multi-Token Prediction (`MTP`) draft sidecar (`DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.mtp-Q8_0.gguf`, `~2.32 GiB`),
     remotely exported once via `convert_hf_to_gguf.py --remote ... --mtp --outtype q8_0`, cached on Google Drive,
     and served with `llama-server --spec-type draft-mtp`
   - Multimodal vision projector: `DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.mmproj-f16.gguf` (`0.92 GB` / `0.86 GiB`)
-served via `llama-server` (`b11540`) with native `--api-key-file` Bearer authentication on a Colab L4 GPU by default.
+served via `llama-server` (`v1.0.0`) with native `--api-key-file` Bearer authentication on a Colab L4 GPU by default.
 
 Imported both locally (`src/colabllm/services/deepseek-qwen-9b.py` CLI `plan` / validation / unit tests, stdlib only)
 and inside the generated Colab notebook (`src/colabllm/services/deepseek-qwen-9b.ipynb`).
@@ -34,9 +34,9 @@ from typing import Any, Callable
 _ENV_SPAWN_LOCK = threading.Lock()
 
 DEFAULT_REPO = "mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-GGUF"
-DEFAULT_REVISION = "2f01d0e8b732843d317e97165ff1c5f135b09147"
+DEFAULT_REVISION = "a713868aa6cd2df2225dee8f77d1b8b07414d742"
 IMATRIX_REPO = "mradermacher/DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic-i1-GGUF"
-IMATRIX_REVISION = "fff50f6bb44cefedd08217dbc285fb2c41213fff"
+IMATRIX_REVISION = "c6453f674da4d30f5737092d9371114cae3ca063"
 
 DEFAULT_QUANT = "auto"
 L4_DEFAULT_QUANT = "i1-Q4_K_M"
@@ -55,8 +55,9 @@ MIN_MTP_AUTO_KV_BUDGET_MIB = 2_048
 
 DEFAULT_ALIAS = "deepseek-v4-pro-qwen3.5-9b"
 DEFAULT_LLAMA_REPO = "https://github.com/ggml-org/llama.cpp.git"
-# ggml-org/llama.cpp tag b11540 (native qwen35 hybrid Gated DeltaNet + draft-mtp + qwen3vl_merger vision + enable_thinking)
-DEFAULT_LLAMA_COMMIT = "1e6f04a75e91da4bb66b5248f3fd4bdeff169d41"
+DEFAULT_LLAMA_VERSION = "v1.0.0"
+# ggml-org/llama.cpp tag v1.0.0 (native qwen35 hybrid Gated DeltaNet + draft-mtp + qwen3vl_merger vision + enable_thinking)
+DEFAULT_LLAMA_COMMIT = "b1b770d90d94cad9e9ea5b993bdbc383a522fb28"
 
 NATIVE_ORIG_CONTEXT = 262_144
 DEFAULT_CONTEXT = 262_144
@@ -83,7 +84,7 @@ VISION_PROJECTOR_SPEC: dict[str, Any] = {
     "revision": DEFAULT_REVISION,
     "name": "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.mmproj-f16.gguf",
     "size": 918_166_368,
-    "sha256": "1a2244e013aa758c5c3cf6b384400165aad63eac437ebb4314d21bced8f16862",
+    "sha256": "c516d999c4f0bba2e33a3695b4f18663a25bad7524417185c5c309f1d2cfe5de",
 }
 
 
@@ -103,78 +104,78 @@ PINNED_QUANT_SPECS: dict[str, dict[str, Any]] = {
     "Q8_0": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q8_0.gguf",
-        9_527_503_840, "0bc2a8896ff0929f07c50611e08abc7dfea847807c5ef89afd26ac2ea709b834",
+        9_786_062_688, "75109e50a24e435e0670b5d8154f5507207d1566bff85ba58c6f02dcc2fdb840",
     ),
     "f16": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.f16.gguf",
-        17_920_699_360, "4f1db3705cbef5143c24854a3bd82d7086f995c355a056326f477e17096e7bea",
+        18_407_323_488, "2c0ab130b9c377056e5a4fd3653fce364de2ef9bb6defb6151dfe13b937b1b05",
     ),
     "Q6_K": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q6_K.gguf",
-        7_359_261_664, "1c24a104546efc4b94e4b58cb06ce60fe47da3119b7211de816ec1da0ff1a1e0",
+        7_558_903_648, "a0abb45272377b819c80dcf666e32f5249e7afda1f22cd1bed930baa35a785da",
     ),
     "Q5_K_M": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_M.gguf",
-        6_467_972_064, "c7bb6c588557e9d7c07ec7161f6f6875ff08fd62632cebe6b026a98a38c05016",
+        6_642_546_528, "8c2d1fe7840b2e684b00190cbe5223ee9cdc13dca0501bee5a50a04c73985ab0",
     ),
     "Q5_K_S": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q5_K_S.gguf",
-        6_305_311_712, "4e01b5257e74442e36353c9374c98bbc43e330c43f4c3f0e228deefa9decda4d",
+        6_472_644_448, "b71474a7d4ea3829490ff81e828becb0ecb3962f3aeb02cd6bce4f1b8931884b",
     ),
     "Q4_K_M": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_M.gguf",
-        5_629_111_264, "a692de9520e4c0bb1512deb91e950f38e14854650aff43419112f87e6052c44b",
+        5_780_092_768, "b4363b5710a29a03cab49bc10df92ca688f891eba1a63cae912e4d96f3fd7a65",
     ),
     "Q4_K_S": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.Q4_K_S.gguf",
-        5_351_631_840, "70b98f788618673e7fced4e3b4fbd0e0af8aa33167b450f4a9fcae4db90bd85e",
+        5_488_555_872, "c11a17c15fa15300955139c3acdfd7eccc8b3192e33986299fe78dfb9de2032c",
     ),
     "IQ4_XS": _spec(
         DEFAULT_REPO, DEFAULT_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.IQ4_XS.gguf",
-        5_227_899_872, "0927462a1491c6b6e3cc1d9037df27b9a07ba574ba501ff432224e6c1205ea5c",
+        5_357_877_088, "4a6f3ad847692397fd9852f1b6799b75597c29e9a2205cbe292b97770404f00c",
     ),
     # Imatrix-calibrated GGUF repo (`i1-Q4_K_M` auto default on T4)
     "i1-Q6_K": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q6_K.gguf",
-        7_359_261_984, "c189016a38e7a27552bc72746982a3969a12f0eae321fd98400391e0cc10a969",
+        7_558_903_968, "045263b49d9acf467beaa81e0cb60d9b7c2224d58479628735c8ce4b50e7f04e",
     ),
     "i1-Q5_K_M": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q5_K_M.gguf",
-        6_467_972_384, "f892fa454357cbc76226a597e7095da3708556937d5c11e42475ca0314f1574d",
+        6_642_546_848, "fed0dd98a51917ffc46c0fa6c4999843d9b6a3c1719ff48928eb931e41dbf0dc",
     ),
     "i1-Q5_K_S": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q5_K_S.gguf",
-        6_305_312_032, "9f22cdd1fde1f7f83eccade347fec18c09683fe431a7e53b207e7e1b4c8ef89f",
+        6_472_644_768, "071a8dbd1b43a330f0d950417566a2d214d769e28a023818b1d614fb16ccea78",
     ),
     "i1-Q4_K_M": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q4_K_M.gguf",
-        5_629_111_584, "8cf793a36e62fb078ac05c2e1bdb2121ff94736dccbede7cf81b76346e868949",
+        5_780_093_088, "de3fea7a12b793a573df636eb1c16da3f7960af0377f79e04bfc04a8e65dfb4c",
     ),
     "i1-Q4_K_S": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-Q4_K_S.gguf",
-        5_351_632_160, "2a348bbc633cbc628d8e526340b6f88f4bef53bc2e5bc11919f16a861bfc4065",
+        5_488_556_192, "3ac9e5b85eaf9bec7a2f9ff4abad44d4afb3f64cc38ef8503046cbecc905183e",
     ),
     "i1-IQ4_NL": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-IQ4_NL.gguf",
-        5_418_216_736, "1ba41c2b6e49d50a4b00bcbf4146227d2d8f5d57e669ebcaa6401a556e0ab87b",
+        5_555_665_056, "022b4abd6a3ea167468afc97feb3d3a5b2618c813e8182e083c707193b89e0a6",
     ),
     "i1-IQ4_XS": _spec(
         IMATRIX_REPO, IMATRIX_REVISION,
         "DeepSeek-V4-Pro-Qwen3.5-9B-UNCENSORED-heretic.i1-IQ4_XS.gguf",
-        5_196_442_912, "55f51ef810a801849ab84f2ae029d1e6142bf83f563983f550d3ce4898750312",
+        5_326_420_128, "288d83e6fa4c950d5f05dc57f0bb67dbb2dad4598abef75e7c6c12563031dce4",
     ),
 }
 
@@ -218,18 +219,18 @@ def estimate_quant_weights_mib(quant: str) -> int:
         return int(spec["weights_mib"])
     upper = quant.upper()
     if "F16" in upper or "BF16" in upper:
-        return 17_091
+        return 17_555
     if "Q8" in upper:
-        return 9_087
+        return 9_333
     if "Q6" in upper:
-        return 7_019
+        return 7_209
     if "Q5" in upper:
-        return 6_169
+        return 6_335
     if "Q3" in upper:
-        return 4_410
+        return 4_519
     if "Q2" in upper:
-        return 3_650
-    return 5_369
+        return 3_734
+    return 5_513
 
 
 def _ggml_bytes_per_elem(cache_type: str) -> float:
@@ -630,6 +631,102 @@ def _run_logged(command: list[str], log_file: Path, env: dict[str, str] | None =
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(command[:4])}\n{tail}")
 
 
+_HEX40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_REQUIRED_SERVER_FLAGS = (
+    "--api-key-file",
+    "--ctx-checkpoints",
+    "--lazy-mode",
+    "--load-mode",
+    "--n-cpu-moe",
+    "--override-tensor",
+    "--reasoning",
+    "--spec-type",
+)
+
+
+def _resolve_llama_commit(llama_repo: str, llama_commit: str) -> str:
+    """Resolve an empty string, tag/branch ref, or commit SHA to a concrete git commit when possible."""
+    raw = (llama_commit or "").strip()
+    if _HEX40_RE.fullmatch(raw):
+        return raw.lower()
+    try:
+        if not raw or raw.upper() == "HEAD":
+            out = _cmd_out(["git", "ls-remote", llama_repo, "HEAD"], timeout=30)
+            return out.splitlines()[0].split()[0].lower()
+        clean = raw.removeprefix("refs/tags/").removeprefix("refs/heads/")
+        out = _cmd_out(
+            [
+                "git", "ls-remote", llama_repo,
+                f"refs/tags/{clean}^{{}}",
+                f"refs/tags/{clean}",
+                f"refs/heads/{clean}",
+            ],
+            timeout=30,
+        )
+        refs: dict[str, str] = {}
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                refs[parts[1]] = parts[0].lower()
+        for candidate in (f"refs/tags/{clean}^{{}}", f"refs/tags/{clean}", f"refs/heads/{clean}"):
+            if candidate in refs:
+                return refs[candidate]
+    except (OSError, subprocess.SubprocessError, IndexError):
+        pass
+    return raw
+
+
+def _stage_runtime_bins(build_dir: Path, bin_dir: Path) -> None:
+    """Copy `llama-server` and shared libraries into `bin_dir`, preserving intra-dir SONAME symlinks."""
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    build_bin = build_dir / "bin"
+    if build_bin.is_dir():
+        shutil.copytree(build_bin, bin_dir, dirs_exist_ok=True, symlinks=True)
+
+    for lib_candidate in sorted(build_dir.rglob("*.so*")):
+        dest = bin_dir / lib_candidate.name
+        if dest.exists() or dest.is_symlink():
+            continue
+        if not lib_candidate.is_symlink() and lib_candidate.is_file():
+            shutil.copy2(lib_candidate, dest)
+
+    for lib_candidate in sorted(build_dir.rglob("*.so*")):
+        dest = bin_dir / lib_candidate.name
+        if dest.exists() or dest.is_symlink() or not lib_candidate.is_symlink():
+            continue
+        resolved = lib_candidate.resolve()
+        if resolved.is_file():
+            sibling = bin_dir / resolved.name
+            if sibling.is_file() and not sibling.is_symlink():
+                dest.symlink_to(resolved.name)
+            else:
+                shutil.copy2(resolved, dest)
+
+    bin_real = bin_dir.resolve()
+    for entry in sorted(bin_dir.iterdir()):
+        if not entry.is_symlink():
+            continue
+        resolved = entry.resolve()
+        if not resolved.exists():
+            entry.unlink()
+            continue
+        if resolved.parent == bin_real:
+            target_name = resolved.name
+            if os.readlink(entry) != target_name:
+                entry.unlink()
+                entry.symlink_to(target_name)
+        elif resolved.is_file():
+            sibling = bin_dir / resolved.name
+            entry.unlink()
+            if sibling.is_file() and not sibling.is_symlink():
+                entry.symlink_to(resolved.name)
+            else:
+                shutil.copy2(resolved, entry)
+        else:
+            entry.unlink()
+
+
 def _restore_valid_bin(bin_dir: Path, env: dict[str, str], require_cuda: bool = True) -> bool:
     server = bin_dir / "llama-server"
     if not server.is_file():
@@ -642,7 +739,7 @@ def _restore_valid_bin(bin_dir: Path, env: dict[str, str], require_cuda: bool = 
             if "CUDA" not in devices:
                 return False
         help_text = _cmd_out([str(server), "--help"], env=env, timeout=20)
-        return all(flag in help_text for flag in ("--api-key-file", "--ctx-checkpoints", "--reasoning", "--spec-type"))
+        return all(flag in help_text for flag in _REQUIRED_SERVER_FLAGS)
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -651,26 +748,27 @@ def prepare_llama_runtime(
     *,
     work_dir: Path,
     cache_root: Path,
-    llama_repo: str,
-    llama_commit: str,
-    gpu_info: dict[str, Any],
-    log: Callable[[str], None],
+    llama_repo: str = DEFAULT_LLAMA_REPO,
+    llama_commit: str = DEFAULT_LLAMA_COMMIT,
+    gpu_info: dict[str, Any] | None = None,
+    log: Callable[[str], None] = print,
 ) -> tuple[Path, dict[str, str], str]:
     """Build or restore cached `llama-server` for the current GPU architecture and pinned `llama_commit`."""
-    commit = (llama_commit or "").strip() or _cmd_out(["git", "ls-remote", llama_repo, "HEAD"]).split()[0]
-    cuda_arch = gpu_info.get("cuda_arch") or "80"
-    require_cuda = bool(gpu_info.get("present"))
-    nvcc_ver = _cmd_out(["nvcc", "--version"]) if shutil.which("nvcc") else "no-nvcc"
+    gpu = gpu_info or detect_gpu_info()
+    commit = _resolve_llama_commit(llama_repo, llama_commit)
+    require_cuda = bool(gpu.get("present") and gpu.get("cuda_arch"))
+    cuda_arch = str(gpu["cuda_arch"]) if require_cuda else "cpu"
+    nvcc_ver = _cmd_out(["nvcc", "--version"], timeout=30) if (require_cuda and shutil.which("nvcc")) else "no-nvcc"
     os_rel = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace") if Path("/etc/os-release").is_file() else ""
     signature = {
         "llama_commit": commit,
-        "gpu": gpu_info.get("name", ""),
         "cuda_arch": cuda_arch,
         "cuda": nvcc_ver,
         "os_release": os_rel,
         "arch": platform.machine(),
         "glibc": list(platform.libc_ver()),
         "ggml_native": False,
+        "targets": ["llama-server"],
     }
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     cache_dir = Path(cache_root) / f"sm{cuda_arch}-{key}"
@@ -678,66 +776,76 @@ def prepare_llama_runtime(
 
     bin_dir = Path(work_dir) / "runtime" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
+    env = _snapshot_env()
     env["LD_LIBRARY_PATH"] = f"{bin_dir}:{env.get('LD_LIBRARY_PATH', '')}".rstrip(":")
     local_manifest = Path(work_dir) / "runtime-manifest.json"
 
     if any(bin_dir.iterdir()):
         try:
-            cached_sig = json.loads(local_manifest.read_text(encoding="utf-8"))
-        except Exception:
+            cached_sig = json.loads(local_manifest.read_text(encoding="utf-8")) if local_manifest.is_file() else None
+        except (OSError, ValueError):
             cached_sig = None
         if cached_sig != signature:
-            shutil.rmtree(bin_dir)
+            shutil.rmtree(bin_dir, ignore_errors=True)
             bin_dir.mkdir(parents=True, exist_ok=True)
 
     archive = cache_dir / "runtime.tar"
     checksum = cache_dir / "runtime.sha256"
-    if not _restore_valid_bin(bin_dir, env, require_cuda) and archive.is_file() and checksum.is_file():
+    if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda) and archive.is_file() and checksum.is_file():
         log(f"Restoring cached llama.cpp runtime ({commit[:10]}) from Drive: {cache_dir}")
         local_tar = Path(work_dir) / "runtime.tar"
-        shutil.copyfile(archive, local_tar)
-        if digest_file(local_tar) == checksum.read_text(encoding="utf-8").strip():
-            with tarfile.open(local_tar) as bundle:
-                bundle.extractall(Path(work_dir) / "runtime", filter="data")
-        else:
-            log("Warning: Drive build cache checksum mismatch; rebuilding from source")
-        local_tar.unlink(missing_ok=True)
+        try:
+            shutil.copyfile(archive, local_tar)
+            expected_sha = checksum.read_text(encoding="utf-8").strip().split()[0].lower()
+            if digest_file(local_tar) == expected_sha:
+                shutil.rmtree(bin_dir, ignore_errors=True)
+                bin_dir.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(local_tar) as bundle:
+                    bundle.extractall(Path(work_dir) / "runtime", filter="data")
+            else:
+                log("Warning: Drive build cache checksum mismatch; rebuilding from source")
+        except (OSError, tarfile.TarError, ValueError, IndexError) as err:
+            log(f"Warning: Drive build cache restore failed ({type(err).__name__}: {err}); rebuilding from source")
+            shutil.rmtree(bin_dir, ignore_errors=True)
+            bin_dir.mkdir(parents=True, exist_ok=True)
+        finally:
+            local_tar.unlink(missing_ok=True)
 
-    if not _restore_valid_bin(bin_dir, env, require_cuda):
+    if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda):
         build_log = Path(work_dir) / "build.log"
-        log(f"Building llama.cpp ({commit[:10]}) for CUDA sm_{cuda_arch} (log: {build_log})...")
-        source = Path(work_dir) / "llama.cpp"
-        if not (source / ".git").is_dir():
-            shutil.rmtree(source, ignore_errors=True)
-            _run_logged(["git", "clone", "--no-checkout", "--filter=blob:none", llama_repo, str(source)], build_log)
+        target_desc = f"CUDA sm_{cuda_arch}" if require_cuda else "CPU"
+        log(f"Building llama.cpp ({commit[:10]}) for {target_desc} (log: {build_log})...")
+        source = Path(work_dir) / "llama.cpp-src"
+        shutil.rmtree(source, ignore_errors=True)
+        _run_logged(["git", "clone", "--no-checkout", "--filter=blob:none", llama_repo, str(source)], build_log)
         _run_logged(["git", "-C", str(source), "fetch", "--depth", "1", "origin", commit], build_log)
-        _run_logged(["git", "-C", str(source), "checkout", "--detach", commit], build_log)
+        _run_logged(["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"], build_log)
         cmake_args = [
             "cmake", "-S", str(source), "-B", str(source / "build"),
             f"-DGGML_CUDA={'ON' if require_cuda else 'OFF'}",
-            f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}",
             "-DGGML_NATIVE=OFF",
             "-DCMAKE_BUILD_TYPE=Release",
-            "-DLLAMA_CURL=OFF",
             "-DLLAMA_OPENSSL=OFF",
             "-DLLAMA_BUILD_TESTS=OFF",
+            "-DLLAMA_BUILD_EXAMPLES=OFF",
         ]
+        if require_cuda:
+            cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={cuda_arch}")
         _run_logged(cmake_args, build_log)
         _run_logged(
             ["cmake", "--build", str(source / "build"), "--config", "Release", "--target", "llama-server",
              "-j", str(min(12, os.cpu_count() or 4))],
             build_log,
         )
-        shutil.copytree(source / "build" / "bin", bin_dir, dirs_exist_ok=True, symlinks=False)
-        shutil.rmtree(source / "build", ignore_errors=True)
-        if not _restore_valid_bin(bin_dir, env, require_cuda):
+        _stage_runtime_bins(source / "build", bin_dir)
+        shutil.rmtree(source, ignore_errors=True)
+        if not _restore_valid_bin(bin_dir, env, require_cuda=require_cuda):
             raise RuntimeError("Built llama-server failed validation or did not detect CUDA")
         local_tar = Path(work_dir) / "runtime.tar"
-        with tarfile.open(local_tar, "w", dereference=True) as bundle:
-            bundle.add(bin_dir, arcname="bin")
-        sha = digest_file(local_tar)
         try:
+            with tarfile.open(local_tar, "w", dereference=False) as bundle:
+                bundle.add(bin_dir, arcname="bin")
+            sha = digest_file(local_tar)
             partial = cache_dir / f"runtime.tar.{os.getpid()}.partial"
             shutil.copyfile(local_tar, partial)
             partial.replace(archive)
@@ -1056,11 +1164,7 @@ def _ensure_mtp_converter(
     llama_commit: str,
     conv_log: Path,
 ) -> Path:
-    commit = (llama_commit or "").strip() or DEFAULT_LLAMA_COMMIT
-    full_source = Path(work_dir) / "llama.cpp"
-    if (full_source / "convert_hf_to_gguf.py").is_file() and (full_source / "gguf-py").is_dir():
-        return full_source
-
+    commit = _resolve_llama_commit(llama_repo, (llama_commit or "").strip() or DEFAULT_LLAMA_COMMIT)
     conv_dir = Path(work_dir) / "llama-conv"
     stamp = conv_dir / ".ct_conv_commit"
     if (
@@ -1088,7 +1192,7 @@ def _ensure_mtp_converter(
         ["git", "-C", str(conv_dir), "fetch", "--depth", "1", "--filter=blob:none", "origin", commit],
         conv_log,
     )
-    _run_logged(["git", "-C", str(conv_dir), "checkout", "--detach", commit], conv_log)
+    _run_logged(["git", "-C", str(conv_dir), "checkout", "--detach", "FETCH_HEAD"], conv_log)
     stamp.write_text(commit + "\n", encoding="utf-8")
     return conv_dir
 

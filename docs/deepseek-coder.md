@@ -1,6 +1,6 @@
 # DeepSeek Coder：DeepSeek-V4.1-Flash 编程与视觉推理（硬件自适应最大上下文）
 
-默认 **G4**（RTX PRO 6000 Blackwell，96 GB VRAM），兼容 **H100**（80 GB HBM3）与 **A100**（80 GB / 40 GB）；通过 `llama-server` 原生 Bearer 认证部署 `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF`（50% 路由专家剪枝 `192` 专家/层 `IQ2_XXS` 主干 72.1 GB + `IQ4_NL` Engram 条件记忆表 110.6 GB + `BF16` `deepseek41v` 视觉投影器 0.97 GB），并在启动时根据实际 GPU 显存与系统内存自动设置最大安全上下文窗口（`G4` 默认满血 **1,048,576（1M）** 上下文 + **103 GiB Engram 全量常驻主机 DDR5 内存** + **默认开启思考，客户端按请求自行决定是否思考**）。
+默认 **G4**（RTX PRO 6000 Blackwell，96 GB VRAM），兼容 **H100**（80 GB HBM3）与 **A100**（80 GB / 40 GB）；通过 `llama-server`（`v1.0.0`）原生 Bearer 认证部署 `Abiray/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-Coder-GGUF`（50% 路由专家剪枝 `192` 专家/层 `IQ2_XXS` 主干 72.1 GB + `IQ4_NL` Engram 条件记忆表 110.6 GB + `BF16` `deepseek41v` 视觉投影器 0.97 GB），并在启动时根据实际 GPU 显存与系统内存自动设置最大安全上下文窗口（`G4` 默认满血 **1,048,576（1M）** 上下文 + **103 GiB Engram 全量常驻主机 DDR5 内存** + **默认开启思考，客户端按请求自行决定是否思考**）。
 
 共享的安装前置、域名、认证、超时和停止行为见 [运行时通用操作](runtime-common.md)。以下命令均在本机执行。
 
@@ -47,7 +47,7 @@ colabllm deepseek-coder info --json --show-secrets
 colabllm deepseek-coder logs -n 100
 ```
 
-首次启动需并发编译对应 GPU 架构的 `llama-server`（自动归档缓存至 `MyDrive/colab-llm/deepseek-coder/runtime-cache/`）并将约 183.7 GB 模型分片下载至 Colab 本地 NVMe SSD（`/content/deepseek-coder/model`，自动建立第 6 分片 `Engram` 软链接并开启 `HF_XET_CHUNK_CACHE_SIZE_BYTES=0` 防双倍占盘），建议保留 `--ready-timeout 5400`。
+首次启动需并发编译对应 GPU 架构的 `llama-server`（自动归档缓存至 `/content/drive/MyDrive/models/.runtimes/llama.cpp`，同 GPU 架构的 `llama.cpp` 服务可共用预编译产物）并将约 183.7 GB 模型分片下载至 Colab 本地 NVMe SSD（`/content/deepseek-coder/model`，自动建立第 6 分片 `Engram` 软链接并开启 `HF_XET_CHUNK_CACHE_SIZE_BYTES=0` 防双倍占盘），建议保留 `--ready-timeout 5400`。
 
 API Base URL 为返回的 `url` 后加 `/v1`；`colabllm deepseek-coder models` 会同时校验鉴权并返回服务端实际生效的模型 alias、`context_allocated`（`n_ctx`）和 `vision` 模态状态。`/health` 可无需认证返回 200，验证 API Key 请访问 `/v1/models`。
 
@@ -117,4 +117,4 @@ colabllm deepseek-coder down -i 2
 
 - **主机内存常驻 Engram 与 SSD 自动回退**：在系统内存充足的机型（如 `G4` ~176 GiB RAM、`H100` ~167 GiB RAM）上，110.6 GB 的 `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` 通过 `--load-mode none --lazy-mode off --override-tensor per_layer_token_embd.weight=CPU` 全量读入主机 DDR5 内存并释放重复的文件 Page Cache，彻底消除云盘随机缺页延迟；在较小内存机型（如 `A100-40G`）上自动切换为 `--load-mode mmap --lazy-mode on` 按需分页读取。切勿将工作目录改指 `/content/drive`。
 - **低显存机型限制**：`T4`（16 GB）与常规 `L4`（24 GB VRAM + ~53 GB RAM）总内存不足以容纳 72.1 GB 主干权重，请使用 `G4`、`H100` 或 `A100`。
-- **持久性**：编译好的 `llama-server` 归档与校验状态持久保存在 `MyDrive/colab-llm/deepseek-coder/`；执行 `down` 会释放 Colab VM 及本地 SSD 模型副本，聊天请求内容不会自动写入 Drive。
+- **持久性**：编译好的 `llama-server` 归档持久保存在 `/content/drive/MyDrive/models/.runtimes/llama.cpp`，校验与会话状态保存在 `MyDrive/colab-llm/deepseek-coder/`；执行 `down` 会释放 Colab VM 及本地 SSD 模型副本，聊天请求内容不会自动写入 Drive。

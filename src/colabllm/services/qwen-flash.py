@@ -3,7 +3,7 @@
 
 Deploys `huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-v2-GGUF` (`unsloth-UD-Q4_K_XL-V2` calibrated
 4-bit MoE + 26.82 GiB 3-gram PLE lookup table + `mmproj-Qwen3.8-Flash-Next-BF16.gguf` vision projector)
-via `llama-server` (`b11540`) with native `--api-key-file` Bearer authentication.
+via `llama-server` (`v1.0.0`) with native `--api-key-file` Bearer authentication.
 
 Key properties:
   * Hardware: `G4` (`RTX PRO 6000 Blackwell` `sm_120`, `97,887 MiB ≈ 95.6 GiB` VRAM, `176 GiB` DDR5 RAM)
@@ -17,7 +17,7 @@ Key properties:
       - Hardware-adaptive `--cpu-moe auto` offloads just `3/48` routed expert layers (`4.39 GiB`) to
         DDR5 host RAM while keeping `45/48` layers + all attention/SSM/shared-expert weights + BF16
         vision projector on GPU (`73.3 GiB` VRAM), leaving `~6.2 GiB` clean VRAM headroom.
-  * Runtime cache: pinned `llama.cpp` (`b11540`) built for CUDA `sm_120` and cached at
+  * Runtime cache: pinned `llama.cpp` (`v1.0.0`) built for CUDA `sm_120` and cached at
     `/content/drive/MyDrive/models/.runtimes/llama.cpp/sm120-<fingerprint>/runtime.tar` (+ `sha256`).
   * Model staging: concurrent resumable HF download (`HF_XET_CHUNK_CACHE_SIZE_BYTES=0`, excluding
     `imatrix_micro3.gguf`) to `/content/qwen-flash/model` with SHA256 verification, Drive backup
@@ -309,7 +309,7 @@ def configure_cli(
     up.add_argument(
         "--llama-commit",
         dest="up_CT_LLAMA_COMMIT",
-        help=f"Pinned ggml-org/llama.cpp commit or tag SHA (default: {DEFAULT_LLAMA_COMMIT[:12]} = b11540)",
+        help=f"Pinned ggml-org/llama.cpp commit or tag (default: {DEFAULT_LLAMA_COMMIT[:12]} = v1.0.0)",
     )
     up.add_argument(
         "--no-vision",
