@@ -324,7 +324,7 @@ def code(text):
     return {"cell_type": "code", "metadata": {}, "outputs": [], "execution_count": None, "source": text}
 
 
-def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunnel=None, auth_cell=None):
+def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunnel=None, auth_cell=None, accelerator="GPU"):
     cells = [md(f"# {title}\n\n{intro}\n\n"
                 "Run it with the service script (`colabllm <name> up`), which creates the Colab session, "
                 "mounts Drive with `colab dfs`, optionally creates a named Cloudflare tunnel, and injects "
@@ -336,9 +336,10 @@ def notebook(title, intro, cfg, setup, service, keepalive=None, extra_after_tunn
     cells.append(code(keepalive if keepalive is not None else render_keepalive(cfg)))
     for i, c in enumerate(cells):
         c["id"] = f"cell-{i}"
-    return {"cells": cells, "metadata": {"accelerator": "GPU", "colab": {"provenance": []},
-                                         "kernelspec": {"display_name": "Python 3", "name": "python3"}},
-            "nbformat": 4, "nbformat_minor": 5}
+    meta = {"accelerator": accelerator} if accelerator else {}
+    meta["colab"] = {"provenance": []}
+    meta["kernelspec"] = {"display_name": "Python 3", "name": "python3"}
+    return {"cells": cells, "metadata": meta, "nbformat": 4, "nbformat_minor": 5}
 
 
 def write(path, nb):
@@ -5981,6 +5982,133 @@ ct_watchdog(
 )
 '''
 
+
+# --------------------------------------------------------------------------- r2-migrate (Colab CPU -> Drive)
+R2_MIGRATE_CFG = dict(
+    name="r2-migrate",
+    service_port=8000,
+    auth="caddy",
+    public_port=18080,
+    health_path="/health",
+    ready_timeout=600,
+)
+R2_MIGRATE_SETUP = (
+    "# @title 1. Setup -- stage pure-stdlib R2 migration engine & verify Drive mount (CPU VM, zero pip install)\n"
+    "from pathlib import Path\n\n"
+    "R2_WORK = Path(os.environ.get('CT_R2_WORK_DIR', '/content/r2-migrate'))\n"
+    "R2_SRC = R2_WORK / 'src'\n"
+    "for _d in (R2_WORK, R2_SRC, R2_WORK / 'state', R2_WORK / 'spool'):\n"
+    "    _d.mkdir(parents=True, exist_ok=True)\n\n"
+    "if MOUNT_DRIVE and not os.path.isdir('/content/drive/MyDrive'):\n"
+    "    raise RuntimeError('Google Drive is not mounted at /content/drive/MyDrive; run `colab dfs mount` or pass `--no-drive` for local testing.')\n\n"
+    + embed_source("R2_SRC", "r2_s3.py", "src/colabllm/lib/r2_s3.py")
+    + embed_source("R2_SRC", "r2_migrate_engine.py", "templates/r2_migrate_engine.py")
+    + embed_source("R2_SRC", "r2_migrate_app.py", "templates/r2_migrate_app.py")
+    + "\n"
+    "R2_APP = R2_SRC / 'r2_migrate_app.py'\n"
+    "R2_DRIVE_MOUNT = Path('/content/drive/MyDrive') if (MOUNT_DRIVE and os.path.isdir('/content/drive/MyDrive')) else (Path(DATA_DIR) / 'outputs')\n"
+    "R2_DRIVE_MOUNT.mkdir(parents=True, exist_ok=True)\n"
+    "print(f\"r2-migrate setup ready: cpu_count={os.cpu_count()} free_ssd={shutil.disk_usage('/content').free / 1e9:.1f}GB \"\n"
+    "      f\"data={DATA_DIR} drive_mount={R2_DRIVE_MOUNT}\", flush=True)\n"
+)
+
+R2_MIGRATE_SERVICE = r'''# @title 2. Service -- start loopback R2 -> Drive migration API & Web UI on 127.0.0.1:8000
+if "R2_APP" not in globals():
+    raise RuntimeError("r2-migrate setup cell did not run; run Cell 1 first.")
+
+subprocess.run(["pkill", "-f", str(R2_APP)], check=False)
+
+def start_service():
+    return ct_spawn(
+        "service",
+        [sys.executable, str(R2_APP)],
+        cwd=str(R2_SRC),
+        env={
+            "PYTHONPATH": str(R2_SRC),
+            "PYTHONUNBUFFERED": "1",
+            "CT_SERVICE_PORT": str(SERVICE_PORT),
+            "CT_DATA_DIR": str(DATA_DIR),
+            "CT_R2_WORK_DIR": str(R2_WORK),
+            "CT_DRIVE_MOUNT": str(R2_DRIVE_MOUNT),
+            "CT_R2_WORKERS": os.environ.get("CT_R2_WORKERS", "48"),
+            "CT_R2_WRITER_WORKERS": os.environ.get("CT_R2_WRITER_WORKERS", "16"),
+            "CT_R2_SPOOL_GB": os.environ.get("CT_R2_SPOOL_GB", "4"),
+        },
+    )
+
+PROCS["service"] = (start_service(), start_service)
+ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=120, ok=lambda c: c == 200)
+print(f"r2-migrate API & Web UI listening on 127.0.0.1:{SERVICE_PORT}", flush=True)
+'''
+
+R2_MIGRATE_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify public Caddy Basic/Bearer auth before CT_READY
+def _r2_log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [r2-migrate] {msg}", flush=True)
+
+def _r2_public_probe():
+    req = urllib.request.Request(
+        PUBLIC_URL + "/health",
+        headers={"Authorization": f"Bearer {API_TOKEN}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if not data.get("ok"):
+            raise RuntimeError(f"Public /health returned not ok: {data}")
+        return resp.status
+
+def _r2_verify_auth():
+    req_unauth = urllib.request.Request(PUBLIC_URL + "/", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        urllib.request.urlopen(req_unauth, timeout=15)
+        raise RuntimeError("Unauthenticated public GET / unexpectedly succeeded!")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 without credentials, got {err.code}")
+        if err.headers.get("Set-Cookie"):
+            raise RuntimeError("Public 401 leaked Set-Cookie")
+    req_bad = urllib.request.Request(
+        PUBLIC_URL + "/health",
+        headers={"Authorization": "Bearer invalid-token", "User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        urllib.request.urlopen(req_bad, timeout=15)
+        raise RuntimeError("Invalid Bearer token unexpectedly succeeded!")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 for bad Bearer token, got {err.code}")
+
+ct_public_gate(PUBLIC_URL, _r2_public_probe, _r2_verify_auth, _r2_log, timeout=180, interval=8)
+if not CREDS_FROM_ENV:
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _r2_local_health():
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=10) as resp:
+        return resp.status == 200 and json.loads(resp.read().decode("utf-8")).get("ok")
+
+def _r2_heartbeat(uptime_s):
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=10) as resp:
+        info = json.loads(resp.read().decode("utf-8"))
+    u = info.get("usage") or {}
+    _r2_log(
+        f"heartbeat | up={uptime_s}s | active_jobs={info.get('active_jobs', 0)} | "
+        f"A={u.get('class_a_ops', 0)} B={u.get('class_b_ops', 0)} est=${u.get('estimated_cost_usd', 0.0):.4f} | "
+        f"free_ssd={shutil.disk_usage('/content').free / 1e9:.1f}GB"
+    )
+
+ct_watchdog(
+    _r2_local_health,
+    start_service,
+    _r2_log,
+    service_key="service",
+    log_name="service",
+    grace=60,
+    heartbeat=_r2_heartbeat,
+)
+'''
+
 if __name__ == "__main__":
     write(ROOT / "src/colabllm/services/minimax-h3-image.ipynb",
           notebook("MiniMax-H3-Image (G4 / H100 / A100 · SGLang Diffusion 6-Step PDD Native 4K T2I & 1–16 Ref I2I)",
@@ -6129,3 +6257,13 @@ if __name__ == "__main__":
                    "checkpoints, inputs, and custom LoRAs persist on Google Drive.",
                    OPENJUTSU_CFG, OPENJUTSU_SETUP, OPENJUTSU_SERVICE,
                    keepalive=OPENJUTSU_KEEPALIVE, auth_cell=OPENJUTSU_CADDY))
+    write(ROOT / "src/colabllm/services/r2-migrate.ipynb",
+          notebook("R2 Migrate (CPU · Resumable Cloudflare R2 → Google Drive Migration + Web UI)",
+                   "Runs a pure-stdlib, high-concurrency Cloudflare R2 S3 → Google Drive migration engine + Web UI "
+                   "on a zero-GPU Colab CPU runtime (`gpu=None`, optional `--high-mem`) behind Caddy Basic Auth and "
+                   "Bearer token auth. Preserves multi-bucket hierarchy, checkpoints local NVMe SQLite WAL state + "
+                   "`StartAfter` cursors to Google Drive for exact interruption resumption, verifies size + MD5 ETag "
+                   "before optional Free 1,000-key batch `DeleteObjects`, and minimizes R2 API costs (`free-first` / "
+                   "`free-only` / `unlimited` + CDN cache bypass).",
+                   R2_MIGRATE_CFG, R2_MIGRATE_SETUP, R2_MIGRATE_SERVICE,
+                   keepalive=R2_MIGRATE_KEEPALIVE, accelerator=None))

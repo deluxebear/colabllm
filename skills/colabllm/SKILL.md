@@ -3,8 +3,9 @@ name: colabllm
 description: >-
   Use installed colabllm runtimes on Google Colab for LLM inference, PDF/image OCR,
   speech transcription, speech synthesis, voice cloning, sound-effect/audio generation,
-  image generation, multi-reference image editing, avatar/video generation, ComfyUI and
-  Unsloth Studio. Use when the user asks to start, query, call or stop these runtimes,
+  image generation, multi-reference image editing, avatar/video generation, ComfyUI,
+  Unsloth Studio and Cloudflare R2 to Google Drive migration. Use when the user asks
+  to start, query, call or stop these runtimes,
   retrieve their API key, or troubleshoot a colabllm service. Intended for package users;
   runtime development and notebook editing are outside scope.
 ---
@@ -50,6 +51,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Native 4K 6-step PDD T2I, 1-16 `<Picture N>` editing & async jobs | `minimax-h3-image` | [MiniMax-H3-Image](references/minimax-h3-image.md) |
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
+| Resumable multi-bucket Cloudflare R2 -> Google Drive migration (CPU + Web UI) | `r2-migrate` | [R2 -> Drive Migration](references/r2-migrate.md) |
 
 Read the selected runtime reference before constructing its task commands. The [common operations
 guide](references/runtime-common.md) defines shared lifecycle, path and timeout semantics. These guides

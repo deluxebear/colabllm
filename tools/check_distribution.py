@@ -118,6 +118,7 @@ def check(artifact):
             'qwen-flash': ('models', 'plan'),
             'deepseek-coder': ('models', 'plan'),
             'deepseek-qwen-9b': ('models', 'plan'),
+            'r2-migrate': ('auth', 'buckets', 'sync', 'jobs', 'job', 'pause', 'resume', 'cleanup', 'cancel', 'usage', 'ls-drive'),
         }
         for service in services:
             help_text = run([command, service, '--help'])

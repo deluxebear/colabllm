@@ -102,10 +102,21 @@ class RepoHygieneTest(unittest.TestCase):
         h3_image.prepare_up(types.SimpleNamespace())
         self.assertEqual(h3_image.SERVICE.env, h3_baseline)
 
+        r2 = load_service("r2-migrate")
+        r2_baseline = dict(r2.SERVICE.env)
+        r2_hm = r2.SERVICE.high_mem
+        r2.prepare_up(types.SimpleNamespace(up_high_mem=True, up_CT_R2_WORKERS="32", up_CT_R2_SPOOL_GB="8"))
+        self.assertTrue(r2.SERVICE.high_mem)
+        self.assertEqual(r2.SERVICE.env["CT_R2_WORKERS"], "32")
+        self.assertEqual(r2.SERVICE.env["CT_R2_SPOOL_GB"], "8")
+        r2.prepare_up(types.SimpleNamespace())
+        self.assertEqual(r2.SERVICE.env, r2_baseline)
+        self.assertEqual(r2.SERVICE.high_mem, r2_hm)
+
     def test_service_default_hostnames_are_short_aliases(self):
         for name in (
             "qwen-flash", "deepseek-coder", "nemotron-transcribe",
-            "indextts", "qwen3-tts", "drama3", "tangoflux", "minimax-h3-image",
+            "indextts", "qwen3-tts", "drama3", "tangoflux", "minimax-h3-image", "r2-migrate",
         ):
             alias = load_service(name).SERVICE.default_hostname
             self.assertTrue(alias and "." not in alias, (name, alias))

@@ -31,6 +31,14 @@ Token. For `auth=builtin`, frpc targets the app's authenticated port directly.
 - Credentials are generated once per service by the script, kept in `~/.colabllm/services/<name>/state.json`
   (0600) and reused across restarts; rotate with `up --new-credentials`.
 
+### Browser Web UIs under each auth mode
+
+- **`auth="caddy"`** (`comfyui`, `openjutsu`, `longcat-video`, `unlimited-ocr`, `r2-migrate`): the same public URL accepts Basic Auth in browsers (`GET /` Web UI) and `Authorization: Bearer <CT_API_TOKEN>` for CLI/API automation. Pass `rewrite_host=False` to `render_caddy_cell` if the upstream app reads `Host` to construct links.
+- **`auth="builtin"` with `--api-key-file`** (`qwen-flash`, `deepseek-coder`, `deepseek-qwen-9b`): `llama-server` serves its built-in chat Web UI at `GET /` and requires `api_token` in `/v1/*`; users enter `api_token` in Web UI settings.
+- **`auth="builtin"` with native login** (`unsloth-studio`): login form is protected by `login_user`/`login_pass` reported via `CT_CREDENTIALS`.
+
+See [web-ui.md](web-ui.md) for registering runtime Web UIs in `colabllm web` and securing custom embedded Web UIs.
+
 Verified behaviour: no credentials → 401, wrong password → 401, basic auth → 200, Bearer → 200,
 wrong Bearer → 401.
 

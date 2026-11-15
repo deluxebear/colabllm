@@ -256,8 +256,9 @@ class IntrospectionTest(unittest.TestCase):
             self.assertIsInstance(schema['subcommands'], list)
         self.assertTrue(introspect.get_service_schema('qwen-flash')['subcommands'])
         self.assertTrue(introspect.get_service_schema('flux-klein')['subcommands'])
-        for web_svc in ('qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'unsloth-studio'):
+        for web_svc in ('qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'unsloth-studio', 'r2-migrate'):
             self.assertTrue(catalog[web_svc]['has_web_ui'], f'{web_svc} should expose has_web_ui')
+        self.assertIsNone(catalog['r2-migrate']['gpu'])
         self.assertFalse(catalog['ollama']['has_web_ui'])
         self.assertTrue(catalog['ollama']['chat_compatible'])
 
@@ -306,6 +307,15 @@ class IntrospectionTest(unittest.TestCase):
 
         qwen_argv, _ = introspect.build_cli_argv('qwen-flash', 'plan', values={'opt:--json': True})
         self.assertEqual(qwen_argv, ['plan', '--json'])
+
+        r2_argv, r2_preview = introspect.build_cli_argv(
+            'r2-migrate',
+            'auth',
+            values={'opt:--account-id': '0123456789abcdef0123456789abcdef', 'opt:--access-key-id': 'ak_test', 'opt:--secret-access-key': 'r2_super_secret_xyz'},
+        )
+        self.assertIn('r2_super_secret_xyz', r2_argv)
+        self.assertNotIn('r2_super_secret_xyz', r2_preview)
+        self.assertIn('***', r2_preview)
 
 
 class WebServerIntegrationTest(unittest.TestCase):

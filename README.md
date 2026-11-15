@@ -301,6 +301,7 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **DeepSeek-V4-Pro-Qwen3.5-9B (i1-Q4_K_M + MTP · 256K + Vision)** | `L4` | `llama-server` Bearer API Key | `https://deepseek-9b.example.com` | [docs/deepseek-qwen-9b.md](https://github.com/deluxebear/colabllm/blob/master/docs/deepseek-qwen-9b.md) |
 | **Ollama（含 Qwen3.8-27B BF16 预设）** | `T4` / `G4` | Caddy (Basic Auth + Bearer + `x-api-key`) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
 | **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](https://github.com/deluxebear/colabllm/blob/master/docs/unsloth-studio.md) |
+| **Cloudflare R2 → Google Drive 迁移 (`r2-migrate`)** | `CPU` (`--high-mem`) | Caddy + Web UI (`caddy`) | `https://r2-migrate.example.com` | [docs/r2-migrate.md](https://github.com/deluxebear/colabllm/blob/master/docs/r2-migrate.md) |
 
 ### 文本与编程大模型选型说明（Colab G4 硬件边界）
 

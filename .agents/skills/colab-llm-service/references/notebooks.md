@@ -18,8 +18,9 @@ python3 -m unittest tests/test_notebooks_sync.py
 | Compiler cache archives | `templates/colab_cache.py` | written to `<work>/colab_cache.py` and imported |
 | ASGI security / Drive helpers | `templates/colab_asgi_common.py` | written next to each middleware |
 | Service middlewares / workers | `templates/nemotron_middleware.py`, `indextts_middleware.py`, `qwen3_tts_middleware.py`, `qwen3_tts_aux_worker.py`, `drama3_middleware.py`, `tangoflux_service.py`, `flux_klein_middleware.py`, `qwen_image_middleware.py`, `minimax_h3_image_middleware.py` | written to the service work dir |
+| Service Web UI & job apps | `templates/unlimited_ocr_app.py`, `longcat_video_app.py`, `longcat_avatar_app.py`, `r2_migrate_app.py`, `r2_migrate_engine.py` | written to the service work dir (`GET /` + `/api/*`) |
 | ComfyUI helper, custom node, browser JS | `templates/comfyui_workflow_helper.py`, `comfyui_workflow_downloader.py`, `comfyui_ssd_downloader.js` | written under `/content/ComfyUI` |
-| Code shared with the local CLI | `src/colabllm/lib/` (e.g. `nemotron_audio.py`, `avatar_sampling.py`, `ocr_parameters.py`) | embedded the same way |
+| Code shared with the local CLI | `src/colabllm/lib/` (e.g. `nemotron_audio.py`, `avatar_sampling.py`, `ocr_parameters.py`, `r2_s3.py`) | embedded the same way |
 
 Rules:
 
@@ -78,6 +79,7 @@ warm up, save caches, call `ct_public_gate`, print `CT_READY`, then end in `ct_w
 - Scope vLLM `--allowed-local-media-path` to the service work dir, never `/content`.
 - Give every `subprocess.run` / `urlopen` a timeout.
 - ComfyUI model destinations go through `validate_model_destination` (confined to `models/`).
+- Embedded Web UIs (`templates/*_app.py` serving `GET /`) must enforce a per-request CSP `nonce`, load zero external CDN scripts/styles/fonts, update DOM via `textContent` (no untrusted `innerHTML`), and never echo saved secrets in `GET` JSON; see [web-ui.md](web-ui.md).
 
 ## Compiler cache standard (`colab_cache.py`)
 

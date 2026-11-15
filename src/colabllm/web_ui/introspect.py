@@ -41,6 +41,7 @@ WEB_UI_SERVICES = {
     "longcat-video",
     "unsloth-studio",
     "unlimited-ocr",
+    "r2-migrate",
     *LLAMA_SERVER_SERVICES,
 }
 CHAT_SERVICES = {*LLAMA_SERVER_SERVICES, "ollama"}
@@ -80,7 +81,7 @@ LIFECYCLE_SUBCOMMANDS = {
     "_exec",
 }
 
-_SENSITIVE_FLAGS = {"--hf-token", "--api-token", "--token"}
+_SENSITIVE_FLAGS = {"--hf-token", "--api-token", "--token", "--secret-access-key"}
 _SKIP_RE = re.compile(r"^[0-9]+(,[0-9]+)*$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 
@@ -177,7 +178,7 @@ def _serialize_action(action: argparse.Action, seen_ids: set[str]) -> dict[str, 
     else:
         kind = "text"
 
-    is_secret = any(f in _SENSITIVE_FLAGS for f in flags) or action.dest in ("hf_token", "api_token")
+    is_secret = any(f in _SENSITIVE_FLAGS for f in flags) or action.dest in ("hf_token", "api_token", "secret_access_key")
     help_text = ""
     if isinstance(action.help, str):
         # Expand %(default)s safely if present.
