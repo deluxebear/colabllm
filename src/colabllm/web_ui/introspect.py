@@ -34,8 +34,16 @@ CATEGORY_LABELS: dict[str, str] = {
     "other": "其他运行时",
 }
 
-WEB_UI_SERVICES = {"comfyui", "openjutsu", "longcat-video", "unsloth-studio", "unlimited-ocr"}
-CHAT_SERVICES = {"qwen-flash", "deepseek-coder", "deepseek-qwen-9b", "ollama"}
+LLAMA_SERVER_SERVICES = {"qwen-flash", "deepseek-coder", "deepseek-qwen-9b"}
+WEB_UI_SERVICES = {
+    "comfyui",
+    "openjutsu",
+    "longcat-video",
+    "unsloth-studio",
+    "unlimited-ocr",
+    *LLAMA_SERVER_SERVICES,
+}
+CHAT_SERVICES = {*LLAMA_SERVER_SERVICES, "ollama"}
 
 STANDARD_UP_DESTS = {
     "help",

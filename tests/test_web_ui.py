@@ -256,6 +256,10 @@ class IntrospectionTest(unittest.TestCase):
             self.assertIsInstance(schema['subcommands'], list)
         self.assertTrue(introspect.get_service_schema('qwen-flash')['subcommands'])
         self.assertTrue(introspect.get_service_schema('flux-klein')['subcommands'])
+        for web_svc in ('qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'unsloth-studio'):
+            self.assertTrue(catalog[web_svc]['has_web_ui'], f'{web_svc} should expose has_web_ui')
+        self.assertFalse(catalog['ollama']['has_web_ui'])
+        self.assertTrue(catalog['ollama']['chat_compatible'])
 
     def test_ordered_image_actions_and_special_argparse_types(self):
         flux = introspect.get_service_schema('flux-klein')
@@ -516,10 +520,13 @@ class WebServerIntegrationTest(unittest.TestCase):
             inst = next(i for i in boot['instances'] if i['service'] == 'qwen-flash')
             self.assertTrue(inst['has_api_token'])
             self.assertFalse(inst['has_basic_auth'])
+            self.assertTrue(inst['has_web_ui'])
+            self.assertTrue(inst['chat_compatible'])
             unsloth_inst = next(i for i in boot['instances'] if i['service'] == 'unsloth-studio')
             self.assertTrue(unsloth_inst['has_app_login'])
             self.assertFalse(unsloth_inst['has_api_token'])
             self.assertFalse(unsloth_inst['has_basic_auth'])
+            self.assertTrue(unsloth_inst['has_web_ui'])
             comfy_inst = next(i for i in boot['instances'] if i['service'] == 'comfyui')
             self.assertTrue(comfy_inst['has_basic_auth'])
 

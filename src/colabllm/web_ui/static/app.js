@@ -571,15 +571,19 @@ function renderInstances() {
     const titleText = inst.instance_arg ? `${inst.service} · #${inst.instance_arg}` : inst.service;
 
     const actions = [];
-    if (inst.has_web_ui && urlHref) {
+    if (inst.has_web_ui && inst.running && urlHref) {
       actions.push(
-        el("a", {
-          className: "btn sm primary",
-          href: urlHref,
-          target: "_blank",
-          rel: "noopener noreferrer",
-          textContent: "打开 Web UI",
-        }),
+        el(
+          "a",
+          {
+            className: "btn sm primary",
+            href: urlHref,
+            target: "_blank",
+            rel: "noopener noreferrer",
+          },
+          "打开 Web UI",
+          el("span", { className: "sr-only", textContent: ` (${titleText})` }),
+        ),
       );
     }
     actions.push(
@@ -1116,6 +1120,9 @@ function buildConnectMetaRows(inst, sec) {
       if (inst.has_app_login) {
         rows.push(["Web 登录凭据", "已生成（已脱敏，可按需获取）"]);
       }
+      if (inst.has_web_ui && inst.has_api_token) {
+        rows.push(["Web UI 鉴权", "打开 Web UI 后在页面设置中填入 API Token"]);
+      }
     }
     return rows;
   }
@@ -1139,6 +1146,9 @@ function buildConnectMetaRows(inst, sec) {
   if (sec.login_user || sec.login_pass || inst.has_app_login) {
     rows.push(["Web 登录用户名", sec.login_user || "无"]);
     rows.push(["Web 登录密码", sec.login_pass || "无"]);
+  }
+  if (inst.has_web_ui && (inst.has_api_token || sec.api_token)) {
+    rows.push(["Web UI 鉴权", "打开 Web UI 后在页面设置中填入 API Token"]);
   }
   return rows;
 }
@@ -1195,6 +1205,9 @@ function openConnectDialog(inst) {
   document.getElementById("connect-dialog-title").textContent = `连接信息 · ${inst.session_name}`;
   renderConnectMeta(inst, null);
   document.getElementById("connect-reveal-btn").disabled = state.readOnly;
+  const copyTokenBtn = document.getElementById("connect-copy-token");
+  copyTokenBtn.hidden = !inst.has_api_token;
+  copyTokenBtn.disabled = state.readOnly;
   renderConnectSnippets();
   document.getElementById("connect-dialog").showModal();
 }
@@ -1591,20 +1604,50 @@ function initInteractions() {
   });
 
   // Connect / secrets modal
+  const revealConnectSecrets = async (inst) => {
+    const sec = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/secret`, {
+      method: "POST",
+      json: { instance: inst.instance_arg || "" },
+    });
+    state.connectSecrets = sec;
+    renderConnectMeta(inst, sec);
+    renderConnectSnippets();
+    return sec;
+  };
   document.getElementById("connect-reveal-btn").addEventListener("click", async () => {
     const inst = state.connectTarget;
     if (!inst) return;
     try {
-      const sec = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/secret`, {
-        method: "POST",
-        json: { instance: inst.instance_arg || "" },
-      });
-      state.connectSecrets = sec;
-      renderConnectMeta(inst, sec);
-      renderConnectSnippets();
+      await revealConnectSecrets(inst);
     } catch (err) {
       showToast(`获取凭据失败: ${err.message}`, "danger");
     }
+  });
+  document.getElementById("connect-copy-token").addEventListener("click", async () => {
+    const inst = state.connectTarget;
+    if (!inst) return;
+    let token = state.connectSecrets?.api_token;
+    if (!token) {
+      try {
+        const sec = await revealConnectSecrets(inst);
+        token = sec?.api_token;
+      } catch (err) {
+        showToast(`获取凭据失败: ${err.message}`, "danger");
+        return;
+      }
+    }
+    if (!token) {
+      showToast("当前实例未配置 API Token", "warn");
+      return;
+    }
+    if (!navigator.clipboard?.writeText) {
+      showToast("浏览器不支持自动复制剪贴板，请手动复制", "warn");
+      return;
+    }
+    navigator.clipboard.writeText(token).then(
+      () => showToast("已复制 API Token", "ok", 2000),
+      () => showToast("浏览器拒绝剪贴板访问，请手动复制", "warn"),
+    );
   });
   const copyFromSnippet = (partIdx) => {
     const txt = document.getElementById("connect-snippet").textContent || "";
