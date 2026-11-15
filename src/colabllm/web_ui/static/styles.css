@@ -865,6 +865,50 @@ button.kpi-card.kpi-action[aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
 }
 
+.badge.is-busy::before {
+  content: "";
+  inline-size: 6px;
+  block-size: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+.btn.is-busy::before {
+  content: "";
+  inline-size: 12px;
+  block-size: 12px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-inline-end-color: transparent;
+  flex: none;
+}
+
+@keyframes colabllm-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes colabllm-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .badge.is-busy::before {
+    animation: colabllm-pulse 1.2s ease-in-out infinite;
+  }
+
+  .btn.is-busy::before {
+    animation: colabllm-spin 0.75s linear infinite;
+  }
+}
+
 /* Buttons */
 .btn {
   display: inline-flex;

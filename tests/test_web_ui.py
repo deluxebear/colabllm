@@ -1088,7 +1088,10 @@ class WebServerIntegrationTest(unittest.TestCase):
         self.assertIn('commandfor="connect-snippet"', index_html)
         self.assertIn('<span class="copy-tip" role="status"></span>', index_html)
         self.assertIn('inset: calc(4.5rem + var(--toast-offset, 0px)) 1.25rem auto auto;', styles_css)
+        self.assertIn('.badge.is-busy::before', styles_css)
         self.assertIn('popovertargetaction', app_js)
+        self.assertIn('reconcileTasksAndInstances', app_js)
+        self.assertIn('inferLifecycleTaskHint', app_js)
 
         self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')
