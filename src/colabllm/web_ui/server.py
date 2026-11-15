@@ -88,6 +88,7 @@ def _escape_html(text: str) -> str:
 class WebConsoleServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    EVENTS_SNAPSHOT_TTL = 0.75
 
     def __init__(
         self,
@@ -105,6 +106,10 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
         self.hmac_key = os.urandom(32)
         self.task_manager = runner_bridge.TaskManager()
         self.version = _package_version()
+        self._events_lock = threading.Lock()
+        self._events_compute_lock = threading.Lock()
+        self._events_gen = 0
+        self._events_cache: tuple[float, str, str] | None = None
 
         bound_host = server_address[0].strip().lower()
         self.wildcard_remote = bool(allow_remote and bound_host in ("0.0.0.0", "::"))
@@ -133,6 +138,36 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
             return None
         expected = hmac.new(self.hmac_key, nonce.encode("ascii"), "sha256").hexdigest()
         return nonce if hmac.compare_digest(sig, expected) else None
+
+    def invalidate_events_snapshot(self) -> None:
+        with self._events_lock:
+            self._events_gen += 1
+            self._events_cache = None
+
+    def get_events_snapshot(self) -> tuple[str, str]:
+        with self._events_compute_lock:
+            while True:
+                with self._events_lock:
+                    now = time.monotonic()
+                    if self._events_cache is not None:
+                        cached_ts, encoded, digest = self._events_cache
+                        if now - cached_ts < self.EVENTS_SNAPSHOT_TTL:
+                            return encoded, digest
+                    start_gen = self._events_gen
+
+                catalog = introspect.get_service_catalog()
+                payload = {
+                    "instances": state_store.list_all_instances(catalog),
+                    "tasks": self.task_manager.list_tasks(),
+                }
+                encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+                with self._events_lock:
+                    if self._events_gen != start_gen:
+                        continue
+                    self._events_cache = (time.monotonic(), encoded, digest)
+                    return encoded, digest
 
     def shutdown(self) -> None:
         self.stop_event.set()
@@ -394,6 +429,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     argv=argv,
                     command_preview=preview,
                 )
+                self.server.invalidate_events_snapshot()
                 self._send_json(202, task)
                 return
 
@@ -548,13 +584,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         ticks = 0
         try:
             while not self.server.stop_event.is_set():
-                catalog = introspect.get_service_catalog()
-                payload = {
-                    "instances": state_store.list_all_instances(catalog),
-                    "tasks": self.server.task_manager.list_tasks(),
-                }
-                encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-                digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+                encoded, digest = self.server.get_events_snapshot()
                 if digest != last_digest:
                     last_digest = digest
                     self.wfile.write(f"event: state\ndata: {encoded}\n\n".encode("utf-8"))
@@ -570,6 +600,24 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_instances_route(self, method: str, tail: str, query: dict[str, list[str]]) -> None:
         parts = [urllib.parse.unquote(p) for p in tail.strip("/").split("/") if p]
+        if parts == ["prune"] and method == "POST":
+            if self._require_api_auth(require_csrf=True, write_action=True) is None:
+                return
+            body = self._read_json_body()
+            catalog = introspect.get_service_catalog()
+            raw_replicas_only = body.get("replicas_only")
+            replicas_only = True if raw_replicas_only is None else bool(raw_replicas_only)
+            raw_svc = body.get("service")
+            svc_filter = (str(raw_svc).strip() or None) if raw_svc is not None else None
+            res = state_store.prune_stopped_instances(
+                catalog,
+                replicas_only=replicas_only,
+                service_name=svc_filter,
+            )
+            self.server.invalidate_events_snapshot()
+            self._send_json(200, res)
+            return
+
         if len(parts) != 2:
             self._send_json(404, {"error": "无效的实例操作路径"})
             return
@@ -597,6 +645,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     argv=argv,
                     command_preview=preview,
                 )
+                self.server.invalidate_events_snapshot()
                 self._send_json(202, task)
             return
 
@@ -630,7 +679,18 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 argv=argv,
                 command_preview=preview,
             )
+            self.server.invalidate_events_snapshot()
             self._send_json(202, task)
+            return
+
+        if action == "remove" and method == "POST":
+            if self._require_api_auth(require_csrf=True, write_action=True) is None:
+                return
+            body = self._read_json_body()
+            inst = str(body.get("instance") or "").strip()
+            res = state_store.remove_stopped_instance(svc_name, inst, catalog)
+            self.server.invalidate_events_snapshot()
+            self._send_json(200, res)
             return
 
         if action == "probe" and method == "GET":
@@ -714,7 +774,9 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         if len(parts) == 2 and parts[1] == "cancel" and method == "POST":
             if self._require_api_auth(require_csrf=True, write_action=True) is None:
                 return
-            self._send_json(200, self.server.task_manager.cancel(parts[0]))
+            cancelled = self.server.task_manager.cancel(parts[0])
+            self.server.invalidate_events_snapshot()
+            self._send_json(200, cancelled)
             return
 
         if len(parts) == 2 and parts[1] == "stream" and method == "GET":

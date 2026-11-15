@@ -6,9 +6,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import stat
+import threading
 from typing import Any
 
-from cli_support import UsageError
+from cli_support import CliError, UsageError
 from colab_accounts import (
     account_dfs_credentials_path,
     list_account_names,
@@ -146,17 +149,134 @@ def _match_service_name(dir_name: str, st: dict[str, Any], known_names: set[str]
     return base, inst
 
 
+_INSTANCE_CACHE_LOCK = threading.Lock()
+_INSTANCE_CACHE: dict[
+    Path,
+    tuple[tuple[int, int, int | None, int | None, Any], dict[str, Any], dict[str, Any]],
+] = {}
+
+
+def _evict_instance_cache(path: Path) -> None:
+    resolved = path.resolve()
+    with _INSTANCE_CACHE_LOCK:
+        _INSTANCE_CACHE.pop(resolved, None)
+
+
+def _prune_stale_cache_locked(root_resolved: Path, seen_keys: set[Path]) -> None:
+    stale = [
+        key
+        for key in _INSTANCE_CACHE
+        if (key.is_relative_to(root_resolved) and key not in seen_keys)
+        or (not key.is_relative_to(root_resolved) and not (key / "state.json").is_file())
+    ]
+    for key in stale:
+        _INSTANCE_CACHE.pop(key, None)
+
+
+def _compute_status_fields(
+    st: dict[str, Any],
+    running: bool,
+    corrupt_error: str | None,
+    log_path: Path,
+) -> dict[str, Any]:
+    ready = bool(st.get("ready") and running)
+    state_label = "ERROR" if corrupt_error else ("READY" if ready else ("STARTING" if running else "STOPPED"))
+    failed_exit = bool(not running and not corrupt_error and st.get("runner_exit") not in (None, 0))
+    if corrupt_error or failed_exit:
+        status_rank = 2
+    elif running and ready:
+        status_rank = 0
+    elif running:
+        status_rank = 1
+    else:
+        status_rank = 3
+    stage_hint = corrupt_error if corrupt_error else _infer_stage_hint(st, running, log_path)
+    return {
+        "running": running,
+        "ready": ready,
+        "state_label": state_label,
+        "stage_hint": stage_hint,
+        "failed_exit": failed_exit,
+        "status_rank": status_rank,
+    }
+
+
+def _apply_catalog_meta(item: dict[str, Any], st: dict[str, Any], meta: dict[str, Any]) -> None:
+    item["category"] = meta.get("category", "other")
+    item["category_label"] = meta.get("category_label", "其他运行时")
+    item["has_web_ui"] = bool(meta.get("has_web_ui"))
+    item["chat_compatible"] = bool(meta.get("chat_compatible"))
+    item["session_gpu"] = st.get("session_gpu") or meta.get("gpu")
+
+
 def list_all_instances(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     root = _services_root()
+    root_resolved = root.resolve()
     if not root.is_dir():
+        with _INSTANCE_CACHE_LOCK:
+            _prune_stale_cache_locked(root_resolved, set())
         return []
     known_names = set(catalog.keys())
     items: list[dict[str, Any]] = []
+    seen_keys: set[Path] = set()
 
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
         state_path = entry / "state.json"
+        try:
+            state_stat = state_path.stat()
+        except OSError:
+            continue
+        if not stat.S_ISREG(state_stat.st_mode):
+            continue
+
+        resolved_entry = entry.resolve()
+        seen_keys.add(resolved_entry)
+
+        log_path = entry / "run.log"
+        try:
+            log_stat = log_path.stat()
+            if not stat.S_ISREG(log_stat.st_mode):
+                log_stat = None
+        except OSError:
+            log_stat = None
+
+        log_mtime_ns = log_stat.st_mtime_ns if log_stat is not None else None
+        log_size = log_stat.st_size if log_stat is not None else None
+        raw_mtime = state_stat.st_mtime if log_stat is None else max(state_stat.st_mtime, log_stat.st_mtime)
+        updated_ts = round(float(raw_mtime), 3)
+
+        with _INSTANCE_CACHE_LOCK:
+            cached = _INSTANCE_CACHE.get(resolved_entry)
+
+        if cached is not None:
+            cached_fp, cached_item, cached_st = cached
+            if cached_item.get("session_name") == entry.name:
+                matched = _match_service_name(entry.name, cached_st, known_names)
+                if matched is not None:
+                    service_name, inst_arg = matched
+                    meta = catalog[service_name]
+                    fp = (state_stat.st_mtime_ns, state_stat.st_size, log_mtime_ns, log_size, meta.get("auth"))
+                    if (
+                        fp == cached_fp
+                        and cached_item.get("service") == service_name
+                        and cached_item.get("instance_arg") == inst_arg
+                    ):
+                        item = dict(cached_item)
+                        _apply_catalog_meta(item, cached_st, meta)
+                        item["updated_ts"] = updated_ts
+                        if not item["corrupt"] and cached_st.get("runner_pid"):
+                            alive = runner_alive(cached_st)
+                            if alive != item["running"]:
+                                item.update(_compute_status_fields(cached_st, alive, None, log_path))
+                                with _INSTANCE_CACHE_LOCK:
+                                    current = _INSTANCE_CACHE.get(resolved_entry)
+                                    if current is not None and current[0] == fp:
+                                        _INSTANCE_CACHE[resolved_entry] = (fp, dict(item), cached_st)
+                        items.append(item)
+                        continue
+
         if not state_path.is_file():
             continue
         try:
@@ -168,25 +288,22 @@ def list_all_instances(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any
 
         matched = _match_service_name(entry.name, st, known_names)
         if matched is None:
+            with _INSTANCE_CACHE_LOCK:
+                _INSTANCE_CACHE.pop(resolved_entry, None)
             continue
         service_name, inst_arg = matched
         meta = catalog[service_name]
-        allowed_keys = _allowed_secret_keys(service_name, meta.get("auth"))
+        auth_mode = meta.get("auth")
+        allowed_keys = _allowed_secret_keys(service_name, auth_mode)
         running = runner_alive(st) if not corrupt_error else False
-        ready = bool(st.get("ready") and running)
-        state_label = "ERROR" if corrupt_error else ("READY" if ready else ("STARTING" if running else "STOPPED"))
-        log_path = entry / "run.log"
-        stage_hint = corrupt_error if corrupt_error else _infer_stage_hint(st, running, log_path)
+        status_fields = _compute_status_fields(st, running, corrupt_error, log_path)
 
-        items.append({
+        item = {
             "service": service_name,
             "instance": inst_arg or "default",
             "instance_arg": inst_arg,
             "session_name": entry.name,
-            "running": running,
-            "ready": ready,
-            "state_label": state_label,
-            "stage_hint": stage_hint,
+            **status_fields,
             "auto_restart": bool(st.get("auto_restart")),
             "restart_count": int(st.get("restart_count") or 0),
             "url": st.get("url"),
@@ -198,7 +315,7 @@ def list_all_instances(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any
             "session_gpu": st.get("session_gpu") or meta.get("gpu"),
             "mount_drive": bool(st.get("mount_drive", True)),
             "runner_exit": st.get("runner_exit"),
-            "log_exists": log_path.is_file(),
+            "log_exists": log_stat is not None,
             "has_api_token": bool(st.get("api_token")) and "api_token" in allowed_keys,
             "has_basic_auth": (
                 bool(st.get("auth_user") and st.get("auth_pass"))
@@ -210,12 +327,114 @@ def list_all_instances(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any
                 and "login_user" in allowed_keys
                 and "login_pass" in allowed_keys
             ),
-            "auth_mode": meta.get("auth"),
+            "auth_mode": auth_mode,
             "has_web_ui": bool(meta.get("has_web_ui")),
             "chat_compatible": bool(meta.get("chat_compatible")),
             "corrupt": bool(corrupt_error),
-        })
+            "category": meta.get("category", "other"),
+            "category_label": meta.get("category_label", "其他运行时"),
+            "updated_ts": updated_ts,
+        }
+        fp = (state_stat.st_mtime_ns, state_stat.st_size, log_mtime_ns, log_size, auth_mode)
+        with _INSTANCE_CACHE_LOCK:
+            _INSTANCE_CACHE[resolved_entry] = (fp, dict(item), dict(st))
+        items.append(item)
+
+    with _INSTANCE_CACHE_LOCK:
+        _prune_stale_cache_locked(root_resolved, seen_keys)
+
+    items.sort(key=lambda item: (item["status_rank"], -item["updated_ts"], item["service"], item["instance_arg"]))
     return items
+
+
+def _inspect_instance_running(state_path: Path) -> tuple[dict[str, Any], bool, bool]:
+    """Return (state_dict, is_corrupt, is_running) for an instance state file."""
+    if not state_path.is_file():
+        return {}, False, False
+    try:
+        st = _load_state_json(state_path)
+        return st, False, runner_alive(st)
+    except (RuntimeError, ValueError):
+        with contextlib.suppress(OSError, UnicodeError):
+            raw = state_path.read_text(encoding="utf-8", errors="replace")
+            pid_m = re.search(r'"runner_pid"\s*:\s*(\d+)', raw)
+            id_m = re.search(r'"runner_identity"\s*:\s*"([^"]+)"', raw)
+            if pid_m:
+                probe: dict[str, Any] = {"runner_pid": int(pid_m.group(1))}
+                if id_m:
+                    probe["runner_identity"] = id_m.group(1)
+                if runner_alive(probe):
+                    return {}, True, True
+        return {}, True, False
+
+
+def remove_stopped_instance(
+    service_name: str,
+    instance_arg: str,
+    catalog: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Remove a single stopped instance's local state directory under COLABLLM_HOME/services."""
+    _, session_name, target = resolve_instance_dir(service_name, instance_arg, set(catalog))
+    services_root = _services_root().resolve()
+    raw_target = services_root / session_name
+    if raw_target.is_symlink() or target.is_symlink():
+        raise UsageError(f"拒绝移除符号链接目录：{session_name}")
+    if target == services_root or not target.is_relative_to(services_root):
+        raise UsageError("非法的实例目录路径")
+    if not target.is_dir():
+        raise UsageError(f"未找到实例目录：{session_name}")
+
+    _, _, is_running = _inspect_instance_running(target / "state.json")
+    if is_running:
+        raise CliError(f"实例 {session_name} 仍在运行，请先停止后再移除")
+
+    shutil.rmtree(target)
+    _evict_instance_cache(target)
+    return {"ok": True, "removed": [session_name], "count": 1}
+
+
+def prune_stopped_instances(
+    catalog: dict[str, dict[str, Any]],
+    *,
+    replicas_only: bool = True,
+    service_name: str | None = None,
+) -> dict[str, Any]:
+    """Remove local state directories for stopped instances (never running sessions or Drive data)."""
+    if service_name is not None and service_name not in catalog:
+        raise UsageError(f"未知运行时服务: {service_name}")
+
+    root = _services_root()
+    if not root.is_dir():
+        return {"ok": True, "removed": [], "count": 0}
+
+    services_root = root.resolve()
+    known_names = set(catalog.keys())
+    removed: list[str] = []
+
+    for entry in sorted(root.iterdir()):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        resolved = entry.resolve()
+        if resolved == services_root or not resolved.is_relative_to(services_root):
+            continue
+
+        st, _, is_running = _inspect_instance_running(entry / "state.json")
+        matched = _match_service_name(entry.name, st, known_names)
+        if matched is None:
+            continue
+        svc_name, inst_arg = matched
+        if service_name is not None and svc_name != service_name:
+            continue
+        if replicas_only and inst_arg == "":
+            continue
+        if is_running:
+            continue
+
+        shutil.rmtree(resolved)
+        _evict_instance_cache(resolved)
+        removed.append(entry.name)
+
+    return {"ok": True, "removed": removed, "count": len(removed)}
 
 
 def load_instance_state(

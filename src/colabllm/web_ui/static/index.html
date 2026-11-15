@@ -58,37 +58,159 @@
         <!-- View 1: Fleet & Instances -->
         <section id="view-fleet" class="view-section">
           <div class="kpi-strip" id="kpi-strip">
-            <div class="kpi-card"><span class="kpi-label">运行中实例</span><strong id="kpi-running">0</strong></div>
-            <div class="kpi-card"><span class="kpi-label">已就绪服务</span><strong id="kpi-ready">0</strong></div>
-            <div class="kpi-card"><span class="kpi-label">全局传输后端</span><strong id="kpi-transport">-</strong></div>
-            <div class="kpi-card"><span class="kpi-label">可用运行时</span><strong id="kpi-services">0</strong></div>
+            <button type="button" class="kpi-card kpi-action" id="kpi-card-running" data-kpi-action="running" aria-pressed="false">
+              <span class="kpi-label">运行中实例</span>
+              <strong id="kpi-running">0</strong>
+            </button>
+            <button type="button" class="kpi-card kpi-action" id="kpi-card-ready" data-kpi-action="ready" aria-pressed="false">
+              <span class="kpi-label">已就绪服务</span>
+              <strong id="kpi-ready">0</strong>
+            </button>
+            <div class="kpi-card">
+              <span class="kpi-label">全局传输后端</span>
+              <strong id="kpi-transport">-</strong>
+            </div>
+            <button type="button" class="kpi-card kpi-action" id="kpi-card-services" data-kpi-action="catalog" aria-pressed="false">
+              <span class="kpi-label">可用运行时</span>
+              <strong id="kpi-services">0</strong>
+            </button>
           </div>
 
-          <section class="block">
-            <div class="block-header">
-              <h2>活跃与历史实例</h2>
-              <span class="muted" id="instances-count">0 个实例</span>
+          <div class="tabs-shell" id="fleet-tabs-shell">
+            <div class="tablist" focusgroup="tablist nomemory" aria-label="舰队视图">
+              <button type="button" class="tab-btn" id="fleet-tab-instances" aria-selected="true" focusgroupstart data-panel="fleet-panel-instances">活跃与历史实例</button>
+              <button type="button" class="tab-btn" id="fleet-tab-catalog" aria-selected="false" data-panel="fleet-panel-catalog">全部运行时目录</button>
             </div>
-            <div id="instances-grid" class="cards-grid"></div>
-          </section>
 
-          <section class="block">
-            <div class="block-header">
-              <h2>全部运行时目录</h2>
-              <div class="filter-bar">
-                <input id="service-search" type="search" placeholder="筛选服务名称或说明..." aria-label="筛选运行时">
-                <select id="category-filter" aria-label="按分类筛选">
-                  <option value="all">全部分类</option>
-                  <option value="llm">LLM 与推理</option>
-                  <option value="image">图像生成与编辑</option>
-                  <option value="audio">语音合成 / 转写 / 音效</option>
-                  <option value="video">视频与原生工作流 UI</option>
-                  <option value="ocr">文档 OCR</option>
-                </select>
+            <div role="tabpanel" id="fleet-panel-instances" aria-labelledby="fleet-tab-instances" tabindex="0">
+              <div class="panel-body">
+                <div class="block-header">
+                  <div class="block-title-row">
+                    <h2>活跃与历史实例</h2>
+                    <span class="muted" id="instances-count">0 个实例</span>
+                  </div>
+                  <div class="fleet-header-actions">
+                    <div class="segmented-group" role="group" aria-label="实例视图切换">
+                      <button type="button" class="seg-btn" data-fleet-view="cards" aria-pressed="true">卡片</button>
+                      <button type="button" class="seg-btn" data-fleet-view="table" aria-pressed="false">紧凑表格</button>
+                      <button type="button" class="seg-btn" data-fleet-view="grouped" aria-pressed="false">按服务聚合</button>
+                    </div>
+                    <button type="button" id="prune-replicas-btn" class="btn sm secondary" disabled>清理临时副本</button>
+                  </div>
+                </div>
+
+                <div class="instance-toolbar">
+                  <div class="instance-toolbar-row">
+                    <input id="instance-search" type="search" placeholder="搜索服务、#实例、域名或账户... (按 / 聚焦)" aria-label="搜索实例">
+                    <select id="instance-account-filter" aria-label="按账户筛选">
+                      <option value="all">全部账户</option>
+                    </select>
+                    <select id="instance-category-filter" aria-label="按分类筛选">
+                      <option value="all">全部分类</option>
+                    </select>
+                    <select id="instance-sort" aria-label="排序方式">
+                      <option value="status">状态优先</option>
+                      <option value="updated">最近活跃</option>
+                      <option value="name">名称 A–Z</option>
+                    </select>
+                  </div>
+                  <div class="instance-toolbar-row instance-toolbar-sub">
+                    <div class="status-pills" role="group" aria-label="按运行状态筛选">
+                      <button type="button" class="filter-pill" data-status-filter="all" aria-pressed="true">
+                        <span>全部</span><span class="pill-count" data-count-for="all">0</span>
+                      </button>
+                      <button type="button" class="filter-pill" data-status-filter="running" aria-pressed="false">
+                        <span>运行中</span><span class="pill-count" data-count-for="running">0</span>
+                      </button>
+                      <button type="button" class="filter-pill" data-status-filter="ready" aria-pressed="false">
+                        <span>已就绪</span><span class="pill-count" data-count-for="ready">0</span>
+                      </button>
+                      <button type="button" class="filter-pill" data-status-filter="error" aria-pressed="false">
+                        <span>异常</span><span class="pill-count" data-count-for="error">0</span>
+                      </button>
+                      <button type="button" class="filter-pill" data-status-filter="stopped" aria-pressed="false">
+                        <span>已停止</span><span class="pill-count" data-count-for="stopped">0</span>
+                      </button>
+                    </div>
+                    <label id="collapse-stopped-wrap" class="switch-row compact-switch">
+                      <span>折叠已停止</span>
+                      <input id="collapse-stopped-toggle" type="checkbox" switch>
+                    </label>
+                  </div>
+                </div>
+
+                <div id="empty-all-instances" class="card empty-state-card" hidden>
+                  <p class="muted">尚无运行中或历史记录的 Colab 实例。点击右上角“启动新实例”即可创建。</p>
+                </div>
+
+                <div id="empty-filtered-instances" class="card empty-state-card" hidden>
+                  <p class="muted">没有符合当前搜索或筛选条件的实例。</p>
+                  <div>
+                    <button type="button" id="reset-instance-filters-btn" class="btn sm secondary">重置筛选条件</button>
+                  </div>
+                </div>
+
+                <div id="instances-grid" class="cards-grid"></div>
+
+                <details id="stopped-instances-drawer" class="stopped-drawer" hidden>
+                  <summary id="stopped-instances-summary">已折叠 0 个已停止实例</summary>
+                  <div id="stopped-instances-grid" class="cards-grid"></div>
+                </details>
+
+                <div id="instances-table-wrap" class="table-wrap" role="region" aria-labelledby="instances-table-caption" tabindex="0" hidden>
+                  <table id="instances-table">
+                    <caption id="instances-table-caption" class="sr-only">活跃与历史实例列表</caption>
+                    <thead>
+                      <tr>
+                        <th scope="col" data-sort-key="status" data-type="number" aria-sort="ascending">
+                          <button type="button" class="th-sort-btn"><span>状态</span><span class="sort-indicator" aria-hidden="true"></span></button>
+                        </th>
+                        <th scope="col" data-sort-key="name" data-type="text">
+                          <button type="button" class="th-sort-btn"><span>服务 / 实例</span><span class="sort-indicator" aria-hidden="true"></span></button>
+                        </th>
+                        <th scope="col" data-sort-key="account" data-type="text">
+                          <button type="button" class="th-sort-btn"><span>账户 / Drive</span><span class="sort-indicator" aria-hidden="true"></span></button>
+                        </th>
+                        <th scope="col" data-sort-key="gpu" data-type="text">
+                          <button type="button" class="th-sort-btn"><span>GPU / 传输</span><span class="sort-indicator" aria-hidden="true"></span></button>
+                        </th>
+                        <th scope="col" data-sort-key="updated" data-type="number">
+                          <button type="button" class="th-sort-btn"><span>最近活跃</span><span class="sort-indicator" aria-hidden="true"></span></button>
+                        </th>
+                        <th scope="col">公网地址</th>
+                        <th scope="col">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody id="instances-tbody"></tbody>
+                  </table>
+                </div>
+
+                <div id="instances-grouped" class="grouped-list" hidden></div>
+                <p id="reorder-status" role="status" class="sr-only"></p>
               </div>
             </div>
-            <div id="services-grid" class="cards-grid"></div>
-          </section>
+
+            <div role="tabpanel" id="fleet-panel-catalog" aria-labelledby="fleet-tab-catalog" tabindex="0" hidden="until-found">
+              <div class="panel-body">
+                <div class="block-header">
+                  <h2>全部运行时目录</h2>
+                  <div class="filter-bar">
+                    <input id="service-search" type="search" placeholder="筛选服务名称或说明..." aria-label="筛选运行时">
+                    <select id="category-filter" aria-label="按分类筛选">
+                      <option value="all">全部分类</option>
+                      <option value="llm">LLM 与推理</option>
+                      <option value="image">图像生成与编辑</option>
+                      <option value="audio">语音合成 / 转写 / 音效</option>
+                      <option value="video">视频与原生工作流 UI</option>
+                      <option value="ocr">文档 OCR</option>
+                      <option value="other">其他运行时</option>
+                    </select>
+                  </div>
+                </div>
+                <div id="services-grid" class="cards-grid"></div>
+              </div>
+            </div>
+          </div>
         </section>
 
         <!-- View 2: Workbench (Tabs inside view) -->
@@ -453,6 +575,39 @@
     </form>
   </dialog>
 
+  <!-- Remove Stopped Instance Record Confirmation Modal Dialog -->
+  <dialog id="remove-dialog" aria-labelledby="remove-dialog-title">
+    <div class="dialog-header">
+      <h2 id="remove-dialog-title">确认移除实例记录</h2>
+      <button type="button" class="btn icon-btn" commandfor="remove-dialog" command="close" aria-label="关闭窗口">✕</button>
+    </div>
+    <form method="dialog" id="remove-form" class="dialog-body">
+      <p id="remove-dialog-desc"></p>
+      <p class="muted">仅删除本机状态目录 (~/.colabllm/services/...)，不会影响 Google Drive 数据或运行中的会话。</p>
+      <div class="dialog-actions">
+        <button value="cancel" autofocus class="btn secondary">取消</button>
+        <button value="confirm" class="btn danger">确认移除</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Prune Stopped Replicas Confirmation Modal Dialog -->
+  <dialog id="prune-dialog" aria-labelledby="prune-dialog-title">
+    <div class="dialog-header">
+      <h2 id="prune-dialog-title">确认清理临时副本</h2>
+      <button type="button" class="btn icon-btn" commandfor="prune-dialog" command="close" aria-label="关闭窗口">✕</button>
+    </div>
+    <form method="dialog" id="prune-form" class="dialog-body">
+      <p id="prune-dialog-desc"></p>
+      <div id="prune-targets-list" class="prune-targets-list"></div>
+      <p class="muted">仅清理已停止的编号副本 (#*) 本地状态目录，保留默认实例与全部运行中实例。</p>
+      <div class="dialog-actions">
+        <button value="cancel" autofocus class="btn secondary">取消</button>
+        <button value="confirm" class="btn danger">确认清理</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Live Logs Modal Dialog -->
   <dialog id="logs-dialog" class="wide-dialog" aria-labelledby="logs-dialog-title">
     <div class="dialog-header">
@@ -469,6 +624,13 @@
       </div>
       <pre id="logs-viewer" class="log-viewer tall"></pre>
       <div class="dialog-actions">
+        <span class="copy-wrap">
+          <button type="button" id="logs-copy-btn" class="btn secondary copy-btn" command="--copy" commandfor="logs-viewer">
+            <span class="copy-icon" aria-hidden="true"></span>
+            <span>复制当前日志</span>
+          </button>
+          <span class="copy-tip" role="status"></span>
+        </span>
         <button type="button" id="logs-download-btn" class="btn secondary">导出当前日志</button>
         <button type="button" class="btn primary" commandfor="logs-dialog" command="close">关闭</button>
       </div>
@@ -485,9 +647,27 @@
       <div id="connect-meta" class="kv-list"></div>
       <div class="form-actions">
         <button type="button" id="connect-reveal-btn" class="btn primary">按需获取完整凭据 (--show-secrets)</button>
-        <button type="button" id="connect-copy-token" class="btn secondary" hidden>复制 API Token</button>
-        <button type="button" id="connect-copy-curl" class="btn secondary">复制 curl 示例</button>
-        <button type="button" id="connect-copy-py" class="btn secondary">复制 OpenAI SDK 示例</button>
+        <span class="copy-wrap">
+          <button type="button" id="connect-copy-token" class="btn secondary copy-btn" command="--copy-token" commandfor="connect-snippet" hidden>
+            <span class="copy-icon" aria-hidden="true"></span>
+            <span>复制 API Token</span>
+          </button>
+          <span class="copy-tip" role="status"></span>
+        </span>
+        <span class="copy-wrap">
+          <button type="button" id="connect-copy-curl" class="btn secondary copy-btn" command="--copy-curl" commandfor="connect-snippet">
+            <span class="copy-icon" aria-hidden="true"></span>
+            <span>复制 curl 示例</span>
+          </button>
+          <span class="copy-tip" role="status"></span>
+        </span>
+        <span class="copy-wrap">
+          <button type="button" id="connect-copy-py" class="btn secondary copy-btn" command="--copy-py" commandfor="connect-snippet">
+            <span class="copy-icon" aria-hidden="true"></span>
+            <span>复制 OpenAI SDK 示例</span>
+          </button>
+          <span class="copy-tip" role="status"></span>
+        </span>
       </div>
       <pre id="connect-snippet" class="log-viewer"></pre>
     </div>

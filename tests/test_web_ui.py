@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import stat
 import subprocess
@@ -27,7 +28,7 @@ for _p in (str(SRC), str(LIB)):
 
 from cli_support import CliError, UsageError  # noqa: E402
 from colabllm import web as colabllm_web  # noqa: E402
-from colabllm.web_ui import introspect, server as web_server  # noqa: E402
+from colabllm.web_ui import introspect, server as web_server, state_store  # noqa: E402
 
 
 def _read_sse_until(resp: http.client.HTTPResponse, predicate, *, timeout: float = 10.0) -> list[tuple[str, str]]:
@@ -698,6 +699,377 @@ class WebServerIntegrationTest(unittest.TestCase):
             up_th.join(timeout=2.0)
             upstream.server_close()
 
+    def test_instance_sorting_and_enriched_metadata(self):
+        catalog = introspect.get_service_catalog()
+        svc_root = self.home_dir / 'services'
+
+        def _make_inst(name: str, state: dict | str, *, mtime: float, log_mtime: float | None = None) -> None:
+            d = svc_root / name
+            d.mkdir(parents=True, exist_ok=True)
+            st_file = d / 'state.json'
+            if isinstance(state, str):
+                st_file.write_text(state, encoding='utf-8')
+            else:
+                st_file.write_text(json.dumps(state), encoding='utf-8')
+            os.utime(st_file, (mtime, mtime))
+            if log_mtime is not None:
+                log_file = d / 'run.log'
+                log_file.write_text('boot line\n', encoding='utf-8')
+                os.utime(log_file, (log_mtime, log_mtime))
+
+        _make_inst('r2-migrate', {'runner_exit': 0}, mtime=1700000100.1234)
+        _make_inst('r2-migrate-2', {'runner_exit': None}, mtime=1700000200.0, log_mtime=1700000300.4567)
+        _make_inst('ollama-3', {'runner_exit': 0}, mtime=1700000050.0)
+        _make_inst('ollama-2', {'runner_exit': 0}, mtime=1700000050.0)
+        _make_inst('comfyui', {'runner_exit': 1}, mtime=1700000010.0)
+        _make_inst('flux-klein', '{corrupt json', mtime=1700000020.0)
+        _make_inst('ollama', {'runner_pid': 102, 'runner_identity': 'live:102', 'ready': False}, mtime=1700000005.0)
+        _make_inst('qwen-flash', {'runner_pid': 101, 'runner_identity': 'live:101', 'ready': True}, mtime=1700000001.0)
+
+        live_pids = {101, 102}
+        with patch.object(state_store, 'runner_alive', side_effect=lambda st: st.get('runner_pid') in live_pids):
+            items = state_store.list_all_instances(catalog)
+            self.assertEqual(
+                [i['session_name'] for i in items],
+                [
+                    'qwen-flash',    # status_rank 0 (READY)
+                    'ollama',        # status_rank 1 (STARTING)
+                    'flux-klein',    # status_rank 2 (corrupt, newer mtime)
+                    'comfyui',       # status_rank 2 (failed_exit, older mtime)
+                    'r2-migrate-2',  # status_rank 3 (clean STOPPED, run.log mtime 300.457)
+                    'r2-migrate',    # status_rank 3 (clean STOPPED, mtime 100.123)
+                    'ollama-2',      # status_rank 3 (tie on mtime 50.0 -> service, instance_arg)
+                    'ollama-3',      # status_rank 3
+                ],
+            )
+
+            required_keys = {
+                'service', 'instance', 'instance_arg', 'session_name', 'running', 'ready',
+                'state_label', 'stage_hint', 'auto_restart', 'restart_count', 'url', 'hostname',
+                'transport', 'account', 'drive_account', 'started', 'session_gpu', 'mount_drive',
+                'runner_exit', 'log_exists', 'has_api_token', 'has_basic_auth', 'has_app_login',
+                'auth_mode', 'has_web_ui', 'chat_compatible', 'corrupt',
+                'category', 'category_label', 'failed_exit', 'updated_ts', 'status_rank',
+            }
+            by_name = {i['session_name']: i for i in items}
+            for item in items:
+                self.assertTrue(required_keys.issubset(item.keys()))
+
+            self.assertEqual(by_name['qwen-flash']['status_rank'], 0)
+            self.assertEqual(by_name['qwen-flash']['category'], 'llm')
+            self.assertEqual(by_name['qwen-flash']['category_label'], 'LLM 与推理')
+            self.assertFalse(by_name['qwen-flash']['failed_exit'])
+
+            self.assertEqual(by_name['ollama']['status_rank'], 1)
+            self.assertEqual(by_name['ollama']['state_label'], 'STARTING')
+
+            self.assertEqual(by_name['comfyui']['status_rank'], 2)
+            self.assertTrue(by_name['comfyui']['failed_exit'])
+            self.assertEqual(by_name['comfyui']['state_label'], 'STOPPED')
+
+            self.assertEqual(by_name['flux-klein']['status_rank'], 2)
+            self.assertTrue(by_name['flux-klein']['corrupt'])
+            self.assertFalse(by_name['flux-klein']['failed_exit'])
+            self.assertEqual(by_name['flux-klein']['state_label'], 'ERROR')
+
+            self.assertEqual(by_name['r2-migrate']['status_rank'], 3)
+            self.assertEqual(by_name['r2-migrate']['category'], 'other')
+            self.assertEqual(by_name['r2-migrate']['category_label'], '其他运行时')
+            self.assertAlmostEqual(by_name['r2-migrate']['updated_ts'], 1700000100.123, places=3)
+            self.assertAlmostEqual(by_name['r2-migrate-2']['updated_ts'], 1700000300.457, places=3)
+            self.assertTrue(by_name['r2-migrate-2']['log_exists'])
+
+            srv, port = self._start_console(read_only=False)
+            cookie_hdr, _ = self._authenticate(srv, port)
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+            try:
+                conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie_hdr})
+                r = conn.getresponse()
+                boot = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(
+                    [i['session_name'] for i in boot['instances']],
+                    [i['session_name'] for i in items],
+                )
+            finally:
+                conn.close()
+
+    def test_instance_mtime_cache_invalidation_and_runner_flip(self):
+        catalog = introspect.get_service_catalog()
+        svc_root = self.home_dir / 'services'
+
+        stopped_dir = svc_root / 'ollama'
+        stopped_dir.mkdir(parents=True, exist_ok=True)
+        stopped_state = stopped_dir / 'state.json'
+        stopped_state.write_text(json.dumps({'runner_exit': 0}), encoding='utf-8')
+
+        ready_dir = svc_root / 'qwen-flash'
+        ready_dir.mkdir(parents=True, exist_ok=True)
+        (ready_dir / 'state.json').write_text(
+            json.dumps({'runner_pid': 202, 'runner_identity': 'live:202', 'ready': True}),
+            encoding='utf-8',
+        )
+
+        starting_dir = svc_root / 'ollama-2'
+        starting_dir.mkdir(parents=True, exist_ok=True)
+        (starting_dir / 'state.json').write_text(
+            json.dumps({'runner_pid': 203, 'runner_identity': 'live:203', 'ready': False}),
+            encoding='utf-8',
+        )
+        starting_log = starting_dir / 'run.log'
+        starting_log.write_text('cell 1\n', encoding='utf-8')
+
+        live_pids = {202, 203}
+        with (
+            patch.object(state_store, 'runner_alive', side_effect=lambda st: st.get('runner_pid') in live_pids),
+            patch.object(state_store, '_load_state_json', wraps=state_store._load_state_json) as load_spy,
+            patch.object(state_store, '_read_tail_bytes', wraps=state_store._read_tail_bytes) as tail_spy,
+        ):
+            items1 = state_store.list_all_instances(catalog)
+            self.assertEqual(len(items1), 3)
+            self.assertEqual(load_spy.call_count, 3)
+            self.assertEqual(tail_spy.call_count, 1)
+
+            # Unchanged files: zero state.json or run.log reads.
+            items2 = state_store.list_all_instances(catalog)
+            self.assertEqual(load_spy.call_count, 3)
+            self.assertEqual(tail_spy.call_count, 1)
+            self.assertEqual([i['session_name'] for i in items2], [i['session_name'] for i in items1])
+
+            # Mutating state.json invalidates only that entry immediately.
+            stopped_state.write_text(json.dumps({'runner_exit': 2}), encoding='utf-8')
+            items3 = state_store.list_all_instances(catalog)
+            self.assertEqual(load_spy.call_count, 4)
+            ollama_item = next(i for i in items3 if i['session_name'] == 'ollama')
+            self.assertTrue(ollama_item['failed_exit'])
+            self.assertEqual(ollama_item['status_rank'], 2)
+
+            # Mutating run.log invalidates only that entry immediately.
+            starting_log.write_text('cell 1\nCT_PUBLIC_URL=https://demo.trycloudflare.com\n', encoding='utf-8')
+            items4 = state_store.list_all_instances(catalog)
+            self.assertEqual(load_spy.call_count, 5)
+            self.assertEqual(tail_spy.call_count, 2)
+            ol2_item = next(i for i in items4 if i['session_name'] == 'ollama-2')
+            self.assertIn('隧道已连通', ol2_item['stage_hint'])
+
+            # Recorded runner_pid death flips running->stopped promptly without re-reading files.
+            live_pids.remove(202)
+            items5 = state_store.list_all_instances(catalog)
+            self.assertEqual(load_spy.call_count, 5)
+            self.assertEqual(tail_spy.call_count, 2)
+            qwen_item = next(i for i in items5 if i['session_name'] == 'qwen-flash')
+            self.assertFalse(qwen_item['running'])
+            self.assertFalse(qwen_item['ready'])
+            self.assertEqual(qwen_item['state_label'], 'STOPPED')
+            self.assertEqual(qwen_item['status_rank'], 3)
+
+            # Deleting an instance directory evicts it from cache.
+            resolved_starting = starting_dir.resolve()
+            shutil.rmtree(starting_dir)
+            items6 = state_store.list_all_instances(catalog)
+            self.assertNotIn('ollama-2', [i['session_name'] for i in items6])
+            self.assertNotIn(resolved_starting, state_store._INSTANCE_CACHE)
+
+    def test_events_sse_snapshot_cache_and_invalidation(self):
+        svc_dir = self.home_dir / 'services' / 'ollama-2'
+        svc_dir.mkdir(parents=True, exist_ok=True)
+        (svc_dir / 'state.json').write_text(json.dumps({'runner_exit': 0}), encoding='utf-8')
+
+        srv, port = self._start_console(read_only=False)
+        self.assertEqual(web_server.WebConsoleServer.EVENTS_SNAPSHOT_TTL, 0.75)
+
+        fake_now = [100.0]
+        with (
+            patch.object(web_server.time, 'monotonic', side_effect=lambda: fake_now[0]),
+            patch.object(state_store, 'list_all_instances', wraps=state_store.list_all_instances) as list_spy,
+        ):
+            enc1, dig1 = srv.get_events_snapshot()
+            enc2, dig2 = srv.get_events_snapshot()
+            self.assertEqual((enc1, dig1), (enc2, dig2))
+            self.assertEqual(list_spy.call_count, 1)
+
+            # Still within 0.75s TTL.
+            fake_now[0] = 100.50
+            srv.get_events_snapshot()
+            self.assertEqual(list_spy.call_count, 1)
+
+            # Explicit invalidation forces immediate recompute even within TTL.
+            srv.invalidate_events_snapshot()
+            srv.get_events_snapshot()
+            self.assertEqual(list_spy.call_count, 2)
+
+            # Crossing 0.75s TTL expires cache.
+            fake_now[0] = 101.30
+            srv.get_events_snapshot()
+            self.assertEqual(list_spy.call_count, 3)
+
+        cookie_hdr, csrf = self._authenticate(srv, port)
+        sse1 = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        sse2 = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        ctrl = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+        try:
+            sse1.request('GET', '/api/events', headers={'Cookie': cookie_hdr})
+            sse2.request('GET', '/api/events', headers={'Cookie': cookie_hdr})
+            r1 = sse1.getresponse()
+            r2 = sse2.getresponse()
+            self.assertEqual(r1.status, 200)
+            self.assertEqual(r2.status, 200)
+
+            ev1 = _read_sse_until(r1, lambda evs: any(e[0] == 'state' for e in evs), timeout=5.0)
+            ev2 = _read_sse_until(r2, lambda evs: any(e[0] == 'state' for e in evs), timeout=5.0)
+            p1 = json.loads(ev1[0][1])
+            p2 = json.loads(ev2[0][1])
+            self.assertEqual([i['session_name'] for i in p1['instances']], ['ollama-2'])
+            self.assertEqual(p1, p2)
+            self.assertIn('status_rank', p1['instances'][0])
+            self.assertIn('category', p1['instances'][0])
+
+            # Removing instance invalidates snapshot cache and pushes updated SSE state frame.
+            ctrl.request(
+                'POST',
+                '/api/instances/ollama/remove',
+                body=json.dumps({'instance': '2'}),
+                headers={'Cookie': cookie_hdr, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'},
+            )
+            rm_resp = ctrl.getresponse()
+            rm_resp.read()
+            self.assertEqual(rm_resp.status, 200)
+
+            ev1_next = _read_sse_until(r1, lambda evs: any(e[0] == 'state' for e in evs), timeout=5.0)
+            self.assertEqual(json.loads(ev1_next[0][1])['instances'], [])
+        finally:
+            ctrl.close()
+            sse1.close()
+            sse2.close()
+
+    def test_remove_and_prune_stopped_instance_endpoints(self):
+        catalog = introspect.get_service_catalog()
+        svc_root = self.home_dir / 'services'
+
+        def _create(name: str, payload: dict | str) -> Path:
+            d = svc_root / name
+            d.mkdir(parents=True, exist_ok=True)
+            content = payload if isinstance(payload, str) else json.dumps(payload)
+            (d / 'state.json').write_text(content, encoding='utf-8')
+            return d
+
+        ol_default = _create('ollama', {'runner_exit': 0})
+        ol_rep2 = _create('ollama-2', {'runner_exit': 0})
+        ol_corrupt = _create('ollama-3', '{corrupt json')
+        qw_default = _create('qwen-flash', {'runner_exit': 1})
+        qw_rep1 = _create('qwen-flash-r1', {'runner_exit': 0})
+        comfy_running = _create('comfyui-2', {'runner_pid': 303, 'runner_identity': 'live:303', 'ready': True})
+        corrupt_running = _create('flux-klein-live', '{"runner_pid": 303, "runner_identity": "live:303"')
+        unknown_dir = _create('custom-unknown', {'runner_exit': 0})
+
+        with patch.object(state_store, 'runner_alive', side_effect=lambda st: st.get('runner_pid') == 303):
+            # Symlink directory must be rejected even if pointing inside services_root.
+            sym_dir = svc_root / 'ollama-sym'
+            sym_dir.symlink_to(ol_default)
+            with self.assertRaises(UsageError):
+                state_store.remove_stopped_instance('ollama', 'sym', catalog)
+            self.assertTrue(ol_default.is_dir())
+            sym_dir.unlink()
+
+            # Corrupt JSON that still contains a live runner PID is refused.
+            with self.assertRaises(CliError):
+                state_store.remove_stopped_instance('flux-klein', 'live', catalog)
+            self.assertTrue(corrupt_running.is_dir())
+            shutil.rmtree(corrupt_running)
+
+            srv, port = self._start_console(read_only=False)
+            cookie_hdr, csrf = self._authenticate(srv, port)
+            hdrs = {'Cookie': cookie_hdr, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'}
+
+            ro_srv, ro_port = self._start_console(read_only=True)
+            ro_cookie, ro_csrf = self._authenticate(ro_srv, ro_port)
+            ro_hdrs = {'Cookie': ro_cookie, 'X-ColabLLM-CSRF': ro_csrf, 'Content-Type': 'application/json'}
+
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+            ro_conn = http.client.HTTPConnection('127.0.0.1', ro_port, timeout=5)
+            try:
+                # Missing CSRF -> 403; unauthenticated -> 401; read-only -> 403.
+                for path, body in (
+                    ('/api/instances/ollama/remove', {'instance': '2'}),
+                    ('/api/instances/prune', {'replicas_only': True}),
+                ):
+                    conn.request('POST', path, body=json.dumps(body))
+                    r = conn.getresponse()
+                    r.read()
+                    self.assertEqual(r.status, 401)
+
+                    conn.request('POST', path, body=json.dumps(body), headers={'Cookie': cookie_hdr, 'Content-Type': 'application/json'})
+                    r = conn.getresponse()
+                    r.read()
+                    self.assertEqual(r.status, 403)
+
+                    ro_conn.request('POST', path, body=json.dumps(body), headers=ro_hdrs)
+                    r = ro_conn.getresponse()
+                    r.read()
+                    self.assertEqual(r.status, 403)
+
+                # Running instance refusal -> 502 from CliError.
+                conn.request('POST', '/api/instances/comfyui/remove', body=json.dumps({'instance': '2'}), headers=hdrs)
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 502)
+                self.assertTrue(comfy_running.is_dir())
+
+                # Remove stopped replica succeeds -> 200.
+                conn.request('POST', '/api/instances/ollama/remove', body=json.dumps({'instance': '2'}), headers=hdrs)
+                r = conn.getresponse()
+                rm_payload = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(rm_payload, {'ok': True, 'removed': ['ollama-2'], 'count': 1})
+                self.assertFalse(ol_rep2.exists())
+                self.assertTrue(ol_default.is_dir())
+
+                # Removing already-deleted dir fails with 400 (UsageError).
+                conn.request('POST', '/api/instances/ollama/remove', body=json.dumps({'instance': '2'}), headers=hdrs)
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 400)
+
+                # Prune default (replicas_only=True) removes stopped replicas incl. corrupt, keeps defaults & running.
+                conn.request('POST', '/api/instances/prune', body=b'', headers=hdrs)
+                r = conn.getresponse()
+                prune_payload = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(prune_payload['ok'], True)
+                self.assertEqual(prune_payload['removed'], ['ollama-3', 'qwen-flash-r1'])
+                self.assertEqual(prune_payload['count'], 2)
+                self.assertFalse(ol_corrupt.exists())
+                self.assertFalse(qw_rep1.exists())
+                self.assertTrue(ol_default.is_dir())
+                self.assertTrue(qw_default.is_dir())
+                self.assertTrue(comfy_running.is_dir())
+                self.assertTrue(unknown_dir.is_dir())
+
+                # Prune with unknown service -> 400.
+                conn.request('POST', '/api/instances/prune', body=json.dumps({'service': 'unknown-svc'}), headers=hdrs)
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 400)
+
+                # Prune with replicas_only=False and service='ollama' removes stopped default ollama only.
+                conn.request(
+                    'POST',
+                    '/api/instances/prune',
+                    body=json.dumps({'replicas_only': False, 'service': 'ollama'}),
+                    headers=hdrs,
+                )
+                r = conn.getresponse()
+                prune2 = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(prune2, {'ok': True, 'removed': ['ollama'], 'count': 1})
+                self.assertFalse(ol_default.exists())
+                self.assertTrue(qw_default.is_dir())
+                self.assertTrue(comfy_running.is_dir())
+                self.assertTrue(unknown_dir.is_dir())
+            finally:
+                conn.close()
+                ro_conn.close()
+
     def test_static_frontend_offline_and_trusted_types_hygiene(self):
         static_dir = SRC / 'colabllm' / 'web_ui' / 'static'
         index_html = (static_dir / 'index.html').read_text(encoding='utf-8')
@@ -706,6 +1078,17 @@ class WebServerIntegrationTest(unittest.TestCase):
 
         for forbidden_sink in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write'):
             self.assertNotIn(forbidden_sink, app_js)
+
+        self.assertIn('id="logs-copy-btn"', index_html)
+        self.assertIn('command="--copy"', index_html)
+        self.assertIn('commandfor="logs-viewer"', index_html)
+        self.assertIn('command="--copy-token"', index_html)
+        self.assertIn('command="--copy-curl"', index_html)
+        self.assertIn('command="--copy-py"', index_html)
+        self.assertIn('commandfor="connect-snippet"', index_html)
+        self.assertIn('<span class="copy-tip" role="status"></span>', index_html)
+        self.assertIn('inset: calc(4.5rem + var(--toast-offset, 0px)) 1.25rem auto auto;', styles_css)
+        self.assertIn('popovertargetaction', app_js)
 
         self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')

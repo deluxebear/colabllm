@@ -3,14 +3,29 @@ const readOnlyMeta = document.querySelector('meta[name="colabllm-readonly"]');
 const CSRF_TOKEN = csrfMeta ? csrfMeta.content : "";
 const READ_ONLY = readOnlyMeta ? readOnlyMeta.content === "true" : false;
 
+const CATEGORY_ORDER = ["llm", "image", "audio", "video", "ocr", "other"];
+
 const CATEGORY_LABELS = {
   llm: "LLM 与推理",
   image: "图像生成与编辑",
-  audio: "语音与音效",
-  video: "视频与原生工作流",
+  audio: "语音合成 / 转写 / 音效",
+  video: "视频与原生工作流 UI",
   ocr: "文档 OCR",
-  other: "其他服务",
+  other: "其他运行时",
 };
+
+const FLEET_VIEW_STORAGE_KEY = "colabllm-fleet-view";
+const SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+function loadSavedFleetView() {
+  try {
+    const saved = localStorage.getItem(FLEET_VIEW_STORAGE_KEY);
+    if (saved === "cards" || saved === "table" || saved === "grouped") return saved;
+  } catch {
+    // Ignore storage restrictions.
+  }
+  return "cards";
+}
 
 const VIEW_META = {
   fleet: ["舰队与实例", "管理 Google Colab 运行时生命周期、实时日志与公网隧道"],
@@ -56,19 +71,30 @@ const state = {
   tunnel: null,
   tasks: [],
   activeView: "fleet",
+  activeFleetPanel: "fleet-panel-instances",
+  fleetView: loadSavedFleetView(),
+  instanceStatusFilter: "all",
+  instanceSortKey: "status",
+  instanceSortDir: "ascending",
   activeTaskId: null,
   activeTaskSource: null,
   eventsSource: null,
   logsSource: null,
   logsRawText: "",
+  logsDisplayedText: "",
   logsTarget: null,
   downTarget: null,
+  removeTarget: null,
   connectTarget: null,
   connectSecrets: null,
   chatHistory: [],
   deferredToasts: [],
   themeMq: window.matchMedia("(prefers-color-scheme: dark)"),
 };
+
+const instanceNodeCache = new Map();
+const groupNodeCache = new Map();
+let instanceSlotSeq = 0;
 
 function el(tag, attrs = null, ...children) {
   const node = document.createElement(tag);
@@ -82,6 +108,10 @@ function el(tag, attrs = null, ...children) {
       } else if (k === "dataset" && typeof v === "object") {
         for (const [dk, dv] of Object.entries(v)) {
           if (dv !== undefined && dv !== null) node.dataset[dk] = String(dv);
+        }
+      } else if (k === "styleProps" && typeof v === "object") {
+        for (const [sk, sv] of Object.entries(v)) {
+          if (sv !== undefined && sv !== null) node.style.setProperty(sk, String(sv));
         }
       } else if (k.startsWith("on") && typeof v === "function") {
         node.addEventListener(k.slice(2).toLowerCase(), v);
@@ -130,6 +160,16 @@ function enhanceSwitch(input) {
   return input;
 }
 
+function closePopover(pop) {
+  if (!pop) return;
+  try {
+    pop.hidePopover?.();
+  } catch {
+    // Ignore if not open or unsupported.
+  }
+  pop.classList.remove(":popover-open");
+}
+
 function setupFeatureFallbacks() {
   if (!("switch" in HTMLInputElement.prototype)) {
     document.documentElement.classList.add("no-native-switch");
@@ -151,6 +191,49 @@ function setupFeatureFallbacks() {
         if (cmd === "toggle-popover") target.togglePopover?.();
         else if (cmd === "show-popover") target.showPopover?.();
         else if (cmd === "hide-popover") target.hidePopover?.();
+      }
+    });
+  }
+
+  if (!Object.hasOwn(HTMLElement.prototype, "popover")) {
+    const closeAllAutoPopovers = (except = null) => {
+      document.querySelectorAll('[popover="auto"]').forEach((node) => {
+        if (node !== except) node.classList.remove(":popover-open");
+      });
+    };
+    document.addEventListener("click", (evt) => {
+      const trigger = evt.target instanceof Element ? evt.target.closest("[popovertarget]") : null;
+      if (trigger) {
+        const targetId = trigger.getAttribute("popovertarget");
+        const target = targetId ? document.getElementById(targetId) : null;
+        if (!target || !target.hasAttribute("popover")) return;
+        const action = trigger.getAttribute("popovertargetaction") || "toggle";
+        const isOpen = target.classList.contains(":popover-open");
+        if (action === "hide" || (action === "toggle" && isOpen)) {
+          target.classList.remove(":popover-open");
+        } else {
+          if (target.getAttribute("popover") === "auto") closeAllAutoPopovers(target);
+          target.classList.add(":popover-open");
+        }
+        return;
+      }
+      const insideAuto = evt.target instanceof Element ? evt.target.closest('[popover="auto"]') : null;
+      if (!insideAuto) {
+        closeAllAutoPopovers();
+      }
+    });
+    document.addEventListener("keydown", (evt) => {
+      if (evt.key === "Escape") closeAllAutoPopovers();
+    });
+  }
+
+  if (!("onbeforematch" in HTMLElement.prototype)) {
+    document.querySelectorAll('[hidden="until-found"]').forEach((node) => {
+      if (node.getAttribute("role") === "tabpanel") {
+        // Keep inactive tabpanels cleanly hidden so Workbench & Fleet tab exclusivity remains intact.
+        node.setAttribute("hidden", "");
+      } else {
+        node.removeAttribute("hidden");
       }
     });
   }
@@ -185,10 +268,12 @@ function setupFeatureFallbacks() {
 }
 
 /* Modal-aware Toast Notifications (popover="manual") */
+let toastSeq = 0;
+
 function repositionToasts() {
   const region = document.getElementById("toast-region");
   if (!region) return;
-  const items = Array.from(region.querySelectorAll(".toast-item"));
+  const items = Array.from(region.querySelectorAll(".toast-item:not([data-closing='1'])"));
   let offset = 0;
   for (const item of items) {
     item.style.setProperty("--toast-offset", `${offset}px`);
@@ -210,13 +295,40 @@ function announceScreenReader(text) {
   }
 }
 
-function dismissToast(item) {
-  if (!item || !item.isConnected) return;
+function dismissToast(item, { restoreFocus = false, priorFocus = null } = {}) {
+  if (!item || !item.isConnected || item.dataset.closing === "1") return;
+  const wasFocused = restoreFocus || item.contains(document.activeElement);
+  item.dataset.closing = "1";
+
+  let nextFocus = null;
+  if (wasFocused) {
+    const region = document.getElementById("toast-region");
+    const remaining = region
+      ? Array.from(region.querySelectorAll(".toast-item:not([data-closing='1'])"))
+      : [];
+    const nextBtn = remaining[0]?.querySelector("button");
+    if (nextBtn instanceof HTMLElement) {
+      nextFocus = nextBtn;
+    } else if (priorFocus instanceof HTMLElement && priorFocus.isConnected) {
+      nextFocus = priorFocus;
+    }
+  }
+
   try {
-    item.hidePopover?.();
+    if (typeof item.matches === "function" && item.matches(":popover-open")) {
+      item.hidePopover?.();
+    } else {
+      item.classList.remove(":popover-open");
+    }
   } catch {
     item.classList.remove(":popover-open");
   }
+  repositionToasts();
+
+  if (nextFocus) {
+    nextFocus.focus({ preventScroll: true });
+  }
+
   window.setTimeout(() => {
     item.remove();
     repositionToasts();
@@ -227,19 +339,26 @@ function renderToastNow(message, tone = "info", duration = 4500) {
   const region = document.getElementById("toast-region");
   if (!region) return;
 
+  const priorFocus =
+    document.activeElement instanceof HTMLElement && !region.contains(document.activeElement)
+      ? document.activeElement
+      : null;
+  const toastId = `toast-item-${++toastSeq}`;
   const closeBtn = el("button", {
     type: "button",
     className: "btn icon-btn sm",
+    popovertarget: toastId,
+    popovertargetaction: "hide",
     "aria-label": "关闭通知",
     textContent: "✕",
   });
   const item = el(
     "div",
-    { className: "toast-item", popover: "manual", "data-tone": tone, role: "status" },
+    { id: toastId, className: "toast-item", popover: "manual", "data-tone": tone },
     el("span", { textContent: message }),
     closeBtn,
   );
-  region.appendChild(item);
+  region.prepend(item);
 
   try {
     if (typeof item.showPopover === "function") item.showPopover();
@@ -251,10 +370,11 @@ function renderToastNow(message, tone = "info", duration = 4500) {
   announceScreenReader(message);
 
   let timer = null;
+  let focusInsideBeforeHide = false;
   const startTimer = () => {
     if (duration <= 0) return;
     window.clearTimeout(timer);
-    timer = window.setTimeout(() => dismissToast(item), duration);
+    timer = window.setTimeout(() => dismissToast(item, { priorFocus }), duration);
   };
   const pauseTimer = () => window.clearTimeout(timer);
 
@@ -262,9 +382,23 @@ function renderToastNow(message, tone = "info", duration = 4500) {
   item.addEventListener("pointerleave", startTimer);
   item.addEventListener("focusin", pauseTimer);
   item.addEventListener("focusout", startTimer);
+  item.addEventListener("beforetoggle", (event) => {
+    if (event.newState === "closed") {
+      focusInsideBeforeHide = focusInsideBeforeHide || item.contains(document.activeElement);
+    }
+  });
+  item.addEventListener("toggle", (event) => {
+    if (event.newState === "closed") {
+      pauseTimer();
+      dismissToast(item, { restoreFocus: focusInsideBeforeHide, priorFocus });
+    }
+  });
   closeBtn.addEventListener("click", () => {
     pauseTimer();
-    dismissToast(item);
+    focusInsideBeforeHide = focusInsideBeforeHide || item.contains(document.activeElement);
+    if (!Object.hasOwn(HTMLElement.prototype, "popover") || typeof item.hidePopover !== "function") {
+      dismissToast(item, { restoreFocus: focusInsideBeforeHide, priorFocus });
+    }
   });
   startTimer();
 }
@@ -358,6 +492,23 @@ function initTheme() {
 }
 
 /* Navigation & Tabs */
+function syncKpiStates() {
+  const onInstances = state.activeFleetPanel === "fleet-panel-instances";
+  const onCatalog = state.activeFleetPanel === "fleet-panel-catalog";
+  document.getElementById("kpi-card-running")?.setAttribute(
+    "aria-pressed",
+    onInstances && state.instanceStatusFilter === "running" ? "true" : "false",
+  );
+  document.getElementById("kpi-card-ready")?.setAttribute(
+    "aria-pressed",
+    onInstances && state.instanceStatusFilter === "ready" ? "true" : "false",
+  );
+  document.getElementById("kpi-card-services")?.setAttribute(
+    "aria-pressed",
+    onCatalog ? "true" : "false",
+  );
+}
+
 function switchView(viewName) {
   state.activeView = viewName;
   document.querySelectorAll(".nav-btn").forEach((btn) => {
@@ -373,7 +524,12 @@ function switchView(viewName) {
 }
 
 function activateTab(panelId) {
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
+  const targetPanel = document.getElementById(panelId);
+  if (!targetPanel) return;
+  const scope = targetPanel.closest(".tabs-shell") || document;
+  const inactiveHiddenVal = "onbeforematch" in HTMLElement.prototype ? "until-found" : "";
+
+  scope.querySelectorAll(".tab-btn").forEach((btn) => {
     const active = btn.dataset.panel === panelId;
     btn.setAttribute("aria-selected", active ? "true" : "false");
     if (active) btn.setAttribute("focusgroupstart", "");
@@ -382,10 +538,15 @@ function activateTab(panelId) {
       btn.tabIndex = active ? 0 : -1;
     }
   });
-  document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
+  scope.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
     if (panel.id === panelId) panel.removeAttribute("hidden");
-    else panel.setAttribute("hidden", "until-found");
+    else panel.setAttribute("hidden", inactiveHiddenVal);
   });
+
+  if (scope.closest("#view-fleet")) {
+    state.activeFleetPanel = panelId;
+    syncKpiStates();
+  }
 }
 
 function initNavigation() {
@@ -397,7 +558,11 @@ function initNavigation() {
   });
   document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
     panel.addEventListener("beforematch", () => {
-      switchView("workbench");
+      if (panel.closest("#view-fleet")) {
+        switchView("fleet");
+      } else if (panel.closest("#view-workbench")) {
+        switchView("workbench");
+      }
       activateTab(panel.id);
     });
   });
@@ -544,139 +709,1125 @@ function renderKPIs() {
   document.getElementById("kpi-ready").textContent = String(ready);
   document.getElementById("kpi-transport").textContent = state.tunnel?.transport || "cloudflare";
   document.getElementById("kpi-services").textContent = String(state.services.length);
+  syncKpiStates();
 }
 
-function renderInstances() {
-  const grid = document.getElementById("instances-grid");
-  document.getElementById("instances-count").textContent = `${state.instances.length} 个实例`;
+function isInstanceError(inst) {
+  if (inst.corrupt) return true;
+  if (typeof inst.failed_exit === "boolean") return inst.failed_exit;
+  return Boolean(!inst.running && inst.runner_exit !== null && inst.runner_exit !== undefined && inst.runner_exit !== 0);
+}
 
-  if (state.instances.length === 0) {
-    grid.replaceChildren(
-      el(
-        "div",
-        { className: "card" },
-        el("p", { className: "muted", textContent: "尚无运行中或历史记录的 Colab 实例。点击右上角“启动新实例”即可创建。" }),
-      ),
+function getInstanceStatusRank(inst) {
+  if (typeof inst.status_rank === "number" && Number.isFinite(inst.status_rank)) {
+    return inst.status_rank;
+  }
+  if (inst.running && inst.ready) return 0;
+  if (inst.running) return 1;
+  if (isInstanceError(inst)) return 2;
+  return 3;
+}
+
+function getInstanceUpdatedTs(inst) {
+  if (typeof inst.updated_ts === "number" && Number.isFinite(inst.updated_ts)) {
+    return inst.updated_ts;
+  }
+  if (inst.started) {
+    const n = Number(inst.started);
+    if (Number.isFinite(n) && n > 0) return n;
+    const parsed = Date.parse(String(inst.started));
+    if (Number.isFinite(parsed)) return parsed / 1000;
+  }
+  return 0;
+}
+
+function getInstanceCategory(inst) {
+  if (inst.category) return inst.category;
+  return state.servicesMap.get(inst.service)?.category || "other";
+}
+
+function getInstanceCategoryLabel(inst) {
+  if (inst.category_label) return inst.category_label;
+  const cat = getInstanceCategory(inst);
+  return state.servicesMap.get(inst.service)?.category_label || CATEGORY_LABELS[cat] || cat;
+}
+
+function getInstanceVisualState(inst) {
+  if (isInstanceError(inst)) return { stateKey: "error", badgeTone: "danger" };
+  if (inst.running && inst.ready) return { stateKey: "ready", badgeTone: "ok" };
+  if (inst.running) return { stateKey: "starting", badgeTone: "warn" };
+  return { stateKey: "stopped", badgeTone: "" };
+}
+
+function formatRelativeTime(ts) {
+  if (!ts || !Number.isFinite(ts) || ts <= 0) return { short: "-", full: "" };
+  const date = new Date(ts * 1000);
+  const full = Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN");
+  const diffSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  let short;
+  if (diffSec < 60) short = "刚刚";
+  else if (diffSec < 3600) short = `${Math.floor(diffSec / 60)} 分钟前`;
+  else if (diffSec < 86400) short = `${Math.floor(diffSec / 3600)} 小时前`;
+  else if (diffSec < 86400 * 7) short = `${Math.floor(diffSec / 86400)} 天前`;
+  else short = date.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  return { short, full };
+}
+
+function copyTextToClipboard(text, successMsg) {
+  if (!navigator.clipboard?.writeText) {
+    showToast("浏览器不支持自动复制剪贴板，请手动复制", "warn");
+    return;
+  }
+  navigator.clipboard.writeText(text).then(
+    () => showToast(successMsg, "ok", 2000),
+    () => showToast("浏览器拒绝剪贴板访问，请手动复制", "warn"),
+  );
+}
+
+const copyTimers = new WeakMap();
+let lastCopyAnnouncement = "";
+
+function legacyCopyText(text) {
+  const field = document.createElement("textarea");
+  field.value = text;
+  field.setAttribute("readonly", "");
+  field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+  document.body.append(field);
+  field.select();
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+  }
+}
+
+function resetCopyButtonState(button) {
+  if (!button) return;
+  window.clearTimeout(copyTimers.get(button));
+  copyTimers.delete(button);
+  button.removeAttribute("data-copied");
+  button.removeAttribute("data-failed");
+  const tip = button.nextElementSibling;
+  if (tip && tip.classList.contains("copy-tip")) {
+    tip.textContent = "";
+  }
+}
+
+function reportCopyButton(button, ok, label) {
+  if (!button) return;
+  const tip = button.nextElementSibling;
+  window.clearTimeout(copyTimers.get(button));
+  button.removeAttribute("data-copied");
+  button.removeAttribute("data-failed");
+  let message = label || (ok ? "已复制" : "复制失败");
+  if (message === lastCopyAnnouncement) message += "\u00A0";
+  lastCopyAnnouncement = message;
+  if (tip && tip.classList.contains("copy-tip")) {
+    tip.textContent = "";
+  }
+  void button.offsetWidth;
+  button.setAttribute(ok ? "data-copied" : "data-failed", "");
+  if (tip && tip.classList.contains("copy-tip")) {
+    window.requestAnimationFrame(() => {
+      tip.textContent = message;
+    });
+  }
+  copyTimers.set(
+    button,
+    window.setTimeout(() => {
+      button.removeAttribute("data-copied");
+      button.removeAttribute("data-failed");
+      if (tip && tip.classList.contains("copy-tip")) {
+        tip.textContent = "";
+      }
+    }, 2000),
+  );
+}
+
+async function handleCopyCommand(button, target, command = "--copy") {
+  if (!button || !target || !command?.startsWith("--copy")) return;
+  let text = "";
+  if (command === "--copy-token") {
+    const inst = state.connectTarget;
+    if (!inst) return;
+    let token = state.connectSecrets?.api_token;
+    if (!token) {
+      try {
+        const sec = await revealConnectSecrets(inst);
+        token = sec?.api_token;
+      } catch {
+        reportCopyButton(button, false, "获取凭据失败");
+        return;
+      }
+    }
+    if (!token) {
+      reportCopyButton(button, false, "未配置 Token");
+      return;
+    }
+    text = token;
+  } else if (command === "--copy-curl" || command === "--copy-py") {
+    const raw = target.textContent || "";
+    const parts = raw.split("\n\n# Python OpenAI SDK\n");
+    text =
+      command === "--copy-curl"
+        ? parts[0].replace(/^# curl[^\n]*\n/, "").trim()
+        : (parts[1] || raw).trim();
+  } else if (target.id === "logs-viewer") {
+    text = target.dataset.copyEmpty === "1" ? "" : state.logsDisplayedText || "";
+  } else {
+    text = target.matches("input, textarea") ? target.value : target.innerText.trim();
+  }
+  if (!text) {
+    reportCopyButton(
+      button,
+      false,
+      target.id === "logs-viewer" ? "暂无可复制日志" : "暂无可复制内容",
     );
     return;
   }
+  try {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(text);
+    reportCopyButton(button, true, "已复制");
+  } catch {
+    if (legacyCopyText(text)) {
+      reportCopyButton(button, true, "已复制");
+    } else {
+      reportCopyButton(button, false, "复制失败");
+    }
+  }
+}
 
-  const cards = state.instances.map((inst) => {
-    let badgeTone = "";
-    if (inst.corrupt) badgeTone = "danger";
-    else if (inst.running && inst.ready) badgeTone = "ok";
-    else if (inst.running) badgeTone = "warn";
+function jumpToWorkbench(inst) {
+  switchView("workbench");
+  activateTab("panel-cli");
+  document.getElementById("wb-instance").value = inst.instance_arg || "";
+  if (inst.account) {
+    const acctSel = document.getElementById("wb-account");
+    if (Array.from(acctSel.options).some((o) => o.value === inst.account)) {
+      acctSel.value = inst.account;
+    }
+  }
+  selectWorkbenchService(inst.service);
+}
 
+function openRemoveDialog(inst) {
+  if (state.readOnly) {
+    showToast("当前处于只读模式 (--read-only)，禁止移除实例记录", "warn");
+    return;
+  }
+  if (inst.running) {
+    showToast("运行中的实例不可移除记录，请先停止实例", "warn");
+    return;
+  }
+  state.removeTarget = inst;
+  document.getElementById("remove-dialog-desc").textContent = `确定移除已停止实例 ${inst.session_name} 的本地状态记录吗？`;
+  document.getElementById("remove-dialog").showModal();
+}
+
+function getPrunableReplicas() {
+  return state.instances.filter((i) => !i.running && Boolean(i.instance_arg));
+}
+
+function openPruneDialog() {
+  if (state.readOnly) {
+    showToast("当前处于只读模式 (--read-only)，禁止清理临时副本", "warn");
+    return;
+  }
+  const replicas = getPrunableReplicas();
+  if (!replicas.length) {
+    showToast("当前没有可清理的已停止编号副本 (#*)", "info");
+    return;
+  }
+  document.getElementById("prune-dialog-desc").textContent = `即将清理 ${replicas.length} 个已停止编号副本的本地状态目录：`;
+  const listEl = document.getElementById("prune-targets-list");
+  listEl.replaceChildren(...replicas.map((r) => el("span", { className: "badge", textContent: r.session_name })));
+  document.getElementById("prune-dialog").showModal();
+}
+
+function reorderContainer(container, desiredNodes) {
+  const wanted = new Set(desiredNodes);
+  for (const child of Array.from(container.children)) {
+    if (!wanted.has(child)) {
+      child.remove();
+    }
+  }
+  const current = container.children;
+  if (current.length === desiredNodes.length) {
+    let same = true;
+    for (let i = 0; i < desiredNodes.length; i += 1) {
+      if (current[i] !== desiredNodes[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return;
+  }
+  const hasMoveBefore = Object.hasOwn(Element.prototype, "moveBefore");
+  const move = hasMoveBefore
+    ? (n) => (n.isConnected && container.isConnected ? container.moveBefore(n, null) : container.append(n))
+    : (n) => container.append(n);
+  for (const node of desiredNodes) {
+    move(node);
+  }
+}
+
+function createActionCluster(surface, idSeq, getInst) {
+  const popId = `inst-pop-${surface}-${idSeq}`;
+  const anchorName = `--anc-${surface}-${idSeq}`;
+  const moreBtn = el("button", {
+    type: "button",
+    className: "btn sm secondary icon-btn",
+    popovertarget: popId,
+    "aria-label": "更多操作",
+    styleProps: { "anchor-name": anchorName },
+    textContent: "⋯",
+  });
+  const popEl = el("div", {
+    id: popId,
+    popover: "auto",
+    className: "action-popover",
+    styleProps: { "position-anchor": anchorName },
+  });
+  const actionsEl = el(
+    "div",
+    { className: surface === "table" ? "table-actions-cell" : "card-actions" },
+    moreBtn,
+    popEl,
+  );
+
+  let lastInlineSig = "";
+  let lastPopSig = "";
+
+  const sync = (inst) => {
     const urlHref = safeExternalUrl(inst.url);
     const titleText = inst.instance_arg ? `${inst.service} · #${inst.instance_arg}` : inst.service;
-
-    const actions = [];
-    if (inst.has_web_ui && inst.running && urlHref) {
-      actions.push(
-        el(
-          "a",
-          {
-            className: "btn sm primary",
-            href: urlHref,
-            target: "_blank",
-            rel: "noopener noreferrer",
-          },
-          "打开 Web UI",
-          el("span", { className: "sr-only", textContent: ` (${titleText})` }),
-        ),
-      );
+    const inlineSig = `${Boolean(inst.running)}|${urlHref || ""}|${Boolean(inst.has_web_ui)}|${Boolean(inst.chat_compatible)}|${Boolean(state.readOnly)}|${titleText}`;
+    if (inlineSig !== lastInlineSig) {
+      lastInlineSig = inlineSig;
+      const inlineButtons = [];
+      if (inst.running) {
+        if (urlHref && inst.has_web_ui) {
+          inlineButtons.push(
+            el(
+              "a",
+              {
+                className: "btn sm primary",
+                href: urlHref,
+                target: "_blank",
+                rel: "noopener noreferrer",
+              },
+              "打开 Web UI",
+              el("span", { className: "sr-only", textContent: ` (${titleText})` }),
+            ),
+          );
+        } else if (urlHref && inst.chat_compatible) {
+          inlineButtons.push(
+            el("button", {
+              type: "button",
+              className: "btn sm primary",
+              textContent: "对话",
+              onClick: () => jumpToProxy(getInst()),
+            }),
+          );
+        }
+        inlineButtons.push(
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: "实时日志",
+            onClick: () => openLogsDialog(getInst()),
+          }),
+          el("button", {
+            type: "button",
+            className: "btn sm danger",
+            disabled: state.readOnly,
+            textContent: "停止",
+            onClick: () => openDownDialog(getInst()),
+          }),
+        );
+      } else {
+        inlineButtons.push(
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            disabled: state.readOnly,
+            textContent: "重新启动",
+            onClick: () => {
+              const cur = getInst();
+              openUpDialog(cur.service, cur.instance_arg, cur.account || "");
+            },
+          }),
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: "实时日志",
+            onClick: () => openLogsDialog(getInst()),
+          }),
+        );
+      }
+      while (actionsEl.firstChild && actionsEl.firstChild !== moreBtn) {
+        actionsEl.firstChild.remove();
+      }
+      actionsEl.prepend(...inlineButtons);
+      moreBtn.setAttribute("aria-label", `更多操作 (${titleText})`);
     }
-    actions.push(
-      el("button", {
-        type: "button",
-        className: "btn sm secondary",
-        textContent: "连接/凭据",
-        onClick: () => openConnectDialog(inst),
-      }),
-      el("button", {
-        type: "button",
-        className: "btn sm secondary",
-        textContent: "实时日志",
-        onClick: () => openLogsDialog(inst),
-      }),
-      el("button", {
-        type: "button",
-        className: "btn sm secondary",
-        textContent: "探活",
-        onClick: () => runProbeInstance(inst),
-      }),
-    );
-    if (inst.url) {
-      actions.push(
+
+    const popSig = `${Boolean(inst.running)}|${Boolean(inst.url)}|${Boolean(inst.chat_compatible)}|${Boolean(state.readOnly)}`;
+    if (popSig !== lastPopSig) {
+      lastPopSig = popSig;
+      const popItems = [
         el("button", {
           type: "button",
           className: "btn sm secondary",
-          textContent: inst.chat_compatible ? "对话" : "代理",
-          onClick: () => jumpToProxy(inst),
+          textContent: "连接/凭据",
+          onClick: () => {
+            closePopover(popEl);
+            openConnectDialog(getInst());
+          },
         }),
-      );
-    }
-    if (inst.running) {
-      actions.push(
+      ];
+      if (inst.running) {
+        popItems.push(
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: "探活",
+            onClick: () => {
+              closePopover(popEl);
+              runProbeInstance(getInst());
+            },
+          }),
+        );
+      }
+      if (inst.url) {
+        popItems.push(
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: inst.chat_compatible ? "对话" : "代理",
+            onClick: () => {
+              closePopover(popEl);
+              jumpToProxy(getInst());
+            },
+          }),
+        );
+      }
+      popItems.push(
         el("button", {
           type: "button",
-          className: "btn sm danger",
-          disabled: state.readOnly,
-          textContent: "停止",
-          onClick: () => openDownDialog(inst),
+          className: "btn sm secondary",
+          textContent: "工作台命令",
+          onClick: () => {
+            closePopover(popEl);
+            jumpToWorkbench(getInst());
+          },
         }),
       );
-    } else {
-      actions.push(
-        el("button", {
-          type: "button",
-          className: "btn sm primary",
-          disabled: state.readOnly,
-          textContent: "重新启动",
-          onClick: () => openUpDialog(inst.service, inst.instance_arg, inst.account || ""),
-        }),
-      );
+      if (!inst.running) {
+        popItems.push(
+          el("div", { className: "action-popover-divider", "aria-hidden": "true" }),
+          el("button", {
+            type: "button",
+            className: "btn sm danger",
+            disabled: state.readOnly,
+            textContent: "移除记录",
+            onClick: () => {
+              closePopover(popEl);
+              openRemoveDialog(getInst());
+            },
+          }),
+        );
+      }
+      popEl.replaceChildren(...popItems);
     }
+  };
 
-    const card = el(
+  return { el: actionsEl, sync };
+}
+
+function getOrUpdateInstanceNodes(inst) {
+  let entry = instanceNodeCache.get(inst.session_name);
+  if (!entry) {
+    instanceSlotSeq += 1;
+    const idSeq = instanceSlotSeq;
+
+    // 1. Card node
+    const cardTitleEl = el("strong");
+    const cardStageEl = el("span", { className: "muted" });
+    const cardBadgeEl = el("span", { className: "badge" });
+    const metaAccountEl = el("span");
+    const metaDriveEl = el("span");
+    const metaTransportEl = el("span");
+    const metaGpuEl = el("span");
+    const metaUpdatedEl = el("span");
+    const cardUrlBox = el("div");
+    const cardActions = createActionCluster("card", idSeq, () => entry.inst);
+    const cardArticle = el(
       "article",
       { className: "card instance-card" },
       el(
         "div",
         { className: "card-head" },
-        el(
-          "div",
-          { className: "card-title-group" },
-          el("strong", { textContent: titleText }),
-          el("span", { className: "muted", textContent: inst.stage_hint || inst.state_label }),
-        ),
-        el("span", { className: `badge ${badgeTone}`, textContent: inst.state_label }),
+        el("div", { className: "card-title-group" }, cardTitleEl, cardStageEl),
+        cardBadgeEl,
       ),
       el(
         "div",
         { className: "card-layout" },
         el(
           "div",
-          null,
+          { className: "card-info" },
           el(
             "div",
             { className: "card-meta" },
-            el("span", { textContent: `账户: ${inst.account || "-"}` }),
-            el("span", { textContent: `Drive: ${inst.drive_account || "无"}` }),
-            el("span", { textContent: `传输: ${inst.transport || "-"}` }),
-            el("span", { textContent: `GPU: ${inst.session_gpu || "-"}` }),
+            metaAccountEl,
+            metaDriveEl,
+            metaTransportEl,
+            metaGpuEl,
+            metaUpdatedEl,
           ),
-          urlHref
-            ? el("div", { className: "card-url", textContent: urlHref })
-            : el("div", { className: "muted", textContent: inst.hostname ? `预设域名: ${inst.hostname}` : "暂无公网 URL" }),
+          cardUrlBox,
         ),
-        el("div", { className: "card-actions" }, ...actions),
+        cardActions.el,
       ),
     );
-    return el("div", { className: "card-slot" }, card);
+    const cardSlot = el("div", { className: "card-slot" }, cardArticle);
+
+    // 2. Table row node
+    const tdStatusBadge = el("span", { className: "badge" });
+    const tdStatusStage = el("span", { className: "table-subline" });
+    const tdStatus = el("td", null, tdStatusBadge, tdStatusStage);
+
+    const tdNameTitle = el("strong");
+    const tdNameCat = el("span", { className: "table-subline" });
+    const tdName = el("td", null, tdNameTitle, tdNameCat);
+
+    const tdAcctMain = el("span");
+    const tdAcctDrive = el("span", { className: "table-subline" });
+    const tdAccount = el("td", null, tdAcctMain, tdAcctDrive);
+
+    const tdGpuMain = el("span");
+    const tdGpuTrans = el("span", { className: "table-subline" });
+    const tdGpu = el("td", null, tdGpuMain, tdGpuTrans);
+
+    const tdUpdatedText = el("span");
+    const tdUpdated = el("td", null, tdUpdatedText);
+
+    const tdUrl = el("td");
+    const rowActions = createActionCluster("table", idSeq, () => entry.inst);
+    const tdActions = el("td", null, rowActions.el);
+
+    const row = el("tr", null, tdStatus, tdName, tdAccount, tdGpu, tdUpdated, tdUrl, tdActions);
+
+    // 3. Grouped replica row node
+    const grpInstLabel = el("strong");
+    const grpBadgeEl = el("span", { className: "badge" });
+    const grpStageEl = el("span", { className: "muted" });
+    const grpMetaEl = el("div", { className: "card-meta" });
+    const grpUrlBox = el("div");
+    const groupActions = createActionCluster("group", idSeq, () => entry.inst);
+    const groupRow = el(
+      "div",
+      { className: "grouped-replica-row" },
+      el(
+        "div",
+        { className: "grouped-replica-main" },
+        el("div", { className: "grouped-replica-head" }, grpInstLabel, grpBadgeEl, grpStageEl),
+        grpMetaEl,
+        grpUrlBox,
+      ),
+      groupActions.el,
+    );
+
+    entry = {
+      idSeq,
+      inst,
+      urlSig: null,
+      cardSlot,
+      cardArticle,
+      cardTitleEl,
+      cardStageEl,
+      cardBadgeEl,
+      metaAccountEl,
+      metaDriveEl,
+      metaTransportEl,
+      metaGpuEl,
+      metaUpdatedEl,
+      cardUrlBox,
+      cardActions,
+      row,
+      tdStatus,
+      tdStatusBadge,
+      tdStatusStage,
+      tdName,
+      tdNameTitle,
+      tdNameCat,
+      tdAccount,
+      tdAcctMain,
+      tdAcctDrive,
+      tdGpu,
+      tdGpuMain,
+      tdGpuTrans,
+      tdUpdated,
+      tdUpdatedText,
+      tdUrl,
+      rowActions,
+      groupRow,
+      grpInstLabel,
+      grpBadgeEl,
+      grpStageEl,
+      grpMetaEl,
+      grpUrlBox,
+      groupActions,
+    };
+    instanceNodeCache.set(inst.session_name, entry);
+  }
+
+  entry.inst = inst;
+  const { stateKey, badgeTone } = getInstanceVisualState(inst);
+  const urlHref = safeExternalUrl(inst.url);
+  const titleText = inst.instance_arg ? `${inst.service} · #${inst.instance_arg}` : inst.service;
+  const stageText = inst.stage_hint || inst.state_label || "";
+  const statusRank = getInstanceStatusRank(inst);
+  const updatedTs = getInstanceUpdatedTs(inst);
+  const relTime = formatRelativeTime(updatedTs);
+  const catLabel = getInstanceCategoryLabel(inst);
+
+  // Patch Card
+  entry.cardArticle.dataset.state = stateKey;
+  entry.cardTitleEl.textContent = titleText;
+  entry.cardStageEl.textContent = stageText;
+  entry.cardBadgeEl.className = badgeTone ? `badge ${badgeTone}` : "badge";
+  entry.cardBadgeEl.textContent = inst.state_label || "";
+  entry.metaAccountEl.textContent = `账户: ${inst.account || "-"}`;
+  entry.metaDriveEl.textContent = `Drive: ${inst.drive_account || "无"}`;
+  entry.metaTransportEl.textContent = `传输: ${inst.transport || "-"}`;
+  entry.metaGpuEl.textContent = `GPU: ${inst.session_gpu || "-"}`;
+  entry.metaUpdatedEl.textContent = `活跃: ${relTime.short}`;
+  if (relTime.full) entry.metaUpdatedEl.title = relTime.full;
+  else entry.metaUpdatedEl.removeAttribute("title");
+
+  // Patch Table Row
+  entry.tdStatus.dataset.value = String(statusRank);
+  entry.tdStatusBadge.className = badgeTone ? `badge ${badgeTone}` : "badge";
+  entry.tdStatusBadge.textContent = inst.state_label || "";
+  entry.tdStatusStage.textContent = stageText;
+
+  const nameSortVal = inst.instance_arg ? `${inst.service} #${inst.instance_arg}` : inst.service;
+  entry.tdName.dataset.value = nameSortVal;
+  entry.tdNameTitle.textContent = titleText;
+  entry.tdNameCat.textContent = catLabel;
+
+  const acctSortVal = `${inst.account || ""} ${inst.drive_account || ""}`.trim();
+  entry.tdAccount.dataset.value = acctSortVal;
+  entry.tdAcctMain.textContent = inst.account || "-";
+  entry.tdAcctDrive.textContent = `Drive: ${inst.drive_account || "无"}`;
+
+  const gpuSortVal = `${inst.session_gpu || ""} ${inst.transport || ""}`.trim();
+  entry.tdGpu.dataset.value = gpuSortVal;
+  entry.tdGpuMain.textContent = inst.session_gpu || "-";
+  entry.tdGpuTrans.textContent = inst.transport || "-";
+
+  entry.tdUpdated.dataset.value = String(updatedTs);
+  entry.tdUpdatedText.textContent = relTime.short;
+  if (relTime.full) entry.tdUpdatedText.title = relTime.full;
+  else entry.tdUpdatedText.removeAttribute("title");
+
+  // Patch Grouped Row
+  entry.grpInstLabel.textContent = inst.instance_arg ? `#${inst.instance_arg}` : "默认实例";
+  entry.grpBadgeEl.className = badgeTone ? `badge ${badgeTone}` : "badge";
+  entry.grpBadgeEl.textContent = inst.state_label || "";
+  entry.grpStageEl.textContent = stageText;
+  entry.grpMetaEl.replaceChildren(
+    el("span", { textContent: `账户: ${inst.account || "-"}` }),
+    el("span", { textContent: `Drive: ${inst.drive_account || "无"}` }),
+    el("span", { textContent: `GPU: ${inst.session_gpu || "-"}` }),
+    el("span", { textContent: `传输: ${inst.transport || "-"}` }),
+    el("span", { textContent: `活跃: ${relTime.short}`, title: relTime.full || undefined }),
+  );
+
+  // Patch URL displays only if changed
+  const nextUrlSig = `${urlHref || ""}|${inst.hostname || ""}`;
+  if (entry.urlSig !== nextUrlSig) {
+    entry.urlSig = nextUrlSig;
+    if (urlHref) {
+      entry.cardUrlBox.className = "card-url";
+      entry.cardUrlBox.textContent = urlHref;
+
+      entry.tdUrl.replaceChildren(
+        el(
+          "div",
+          { className: "table-url-cell" },
+          el("a", {
+            className: "table-url-link",
+            href: urlHref,
+            target: "_blank",
+            rel: "noopener noreferrer",
+            title: urlHref,
+            textContent: urlHref,
+          }),
+          el("button", {
+            type: "button",
+            className: "btn sm secondary icon-btn",
+            "aria-label": `复制公网地址 (${titleText})`,
+            title: "复制公网地址",
+            textContent: "复制",
+            onClick: () => copyTextToClipboard(urlHref, "已复制公网地址"),
+          }),
+        ),
+      );
+
+      entry.grpUrlBox.className = "card-url";
+      entry.grpUrlBox.textContent = urlHref;
+    } else {
+      const noUrlMsg = inst.hostname ? `预设域名: ${inst.hostname}` : "暂无公网 URL";
+      entry.cardUrlBox.className = "muted";
+      entry.cardUrlBox.textContent = noUrlMsg;
+
+      entry.tdUrl.replaceChildren(
+        el("span", {
+          className: "muted",
+          textContent: inst.hostname ? `预设: ${inst.hostname}` : "-",
+        }),
+      );
+
+      entry.grpUrlBox.className = "muted";
+      entry.grpUrlBox.textContent = noUrlMsg;
+    }
+  }
+
+  entry.cardActions.sync(inst);
+  entry.rowActions.sync(inst);
+  entry.groupActions.sync(inst);
+
+  return entry;
+}
+
+function populateInstanceFilterSelects() {
+  const acctSel = document.getElementById("instance-account-filter");
+  const catSel = document.getElementById("instance-category-filter");
+  if (!acctSel || !catSel) return;
+
+  const accts = new Set();
+  let hasEmptyAcct = false;
+  const catCounts = new Map();
+  const catLabels = new Map();
+
+  for (const inst of state.instances) {
+    if (inst.account) accts.add(inst.account);
+    else hasEmptyAcct = true;
+    const cat = getInstanceCategory(inst);
+    catCounts.set(cat, (catCounts.get(cat) || 0) + 1);
+    if (!catLabels.has(cat)) catLabels.set(cat, getInstanceCategoryLabel(inst));
+  }
+
+  const sortedAccts = Array.from(accts).sort((a, b) => SORT_COLLATOR.compare(a, b));
+  const acctSig = `${sortedAccts.join(",")}|${hasEmptyAcct}`;
+  if (acctSel.dataset.optSig !== acctSig) {
+    acctSel.dataset.optSig = acctSig;
+    const prevAcct = acctSel.value || "all";
+    const acctOpts = [el("option", { value: "all", textContent: "全部账户" })];
+    for (const name of sortedAccts) {
+      acctOpts.push(el("option", { value: name, textContent: name }));
+    }
+    if (hasEmptyAcct) {
+      acctOpts.push(el("option", { value: "__none__", textContent: "未指定账户" }));
+    }
+    acctSel.replaceChildren(...acctOpts);
+    acctSel.value = Array.from(acctSel.options).some((o) => o.value === prevAcct) ? prevAcct : "all";
+  }
+
+  const cats = [
+    ...CATEGORY_ORDER.filter((c) => catCounts.has(c)),
+    ...Array.from(catCounts.keys()).filter((c) => !CATEGORY_ORDER.includes(c)),
+  ];
+  const catSig = cats.map((c) => `${c}:${catCounts.get(c)}`).join(",");
+  if (catSel.dataset.optSig !== catSig) {
+    catSel.dataset.optSig = catSig;
+    const prevCat = catSel.value || "all";
+    const catOpts = [el("option", { value: "all", textContent: `全部分类 (${state.instances.length})` })];
+    for (const c of cats) {
+      const label = catLabels.get(c) || CATEGORY_LABELS[c] || c;
+      catOpts.push(el("option", { value: c, textContent: `${label} (${catCounts.get(c)})` }));
+    }
+    catSel.replaceChildren(...catOpts);
+    catSel.value = Array.from(catSel.options).some((o) => o.value === prevCat) ? prevCat : "all";
+  }
+}
+
+function matchesInstanceStatus(inst, statusFilter) {
+  if (statusFilter === "all") return true;
+  if (statusFilter === "running") return Boolean(inst.running);
+  if (statusFilter === "ready") return Boolean(inst.running && inst.ready);
+  if (statusFilter === "error") return isInstanceError(inst);
+  if (statusFilter === "stopped") return Boolean(!inst.running && !isInstanceError(inst));
+  return true;
+}
+
+function sortInstancesList(items) {
+  const key = state.instanceSortKey;
+  const dirMult = state.instanceSortDir === "descending" ? -1 : 1;
+  const entries = items.map((inst) => ({ inst, node: getOrUpdateInstanceNodes(inst) }));
+
+  entries.sort((a, b) => {
+    let cmp = 0;
+    if (key === "status") {
+      const valA = Number(a.node.tdStatus.dataset.value);
+      const valB = Number(b.node.tdStatus.dataset.value);
+      cmp = valA - valB;
+    } else if (key === "updated") {
+      const valA = Number(a.node.tdUpdated.dataset.value);
+      const valB = Number(b.node.tdUpdated.dataset.value);
+      cmp = valA - valB;
+    } else if (key === "name") {
+      cmp = SORT_COLLATOR.compare(a.node.tdName.dataset.value || "", b.node.tdName.dataset.value || "");
+    } else if (key === "account") {
+      cmp = SORT_COLLATOR.compare(a.node.tdAccount.dataset.value || "", b.node.tdAccount.dataset.value || "");
+    } else if (key === "gpu") {
+      cmp = SORT_COLLATOR.compare(a.node.tdGpu.dataset.value || "", b.node.tdGpu.dataset.value || "");
+    }
+    if (cmp !== 0) return cmp * dirMult;
+
+    // Deterministic tie-breakers
+    const rankDiff = getInstanceStatusRank(a.inst) - getInstanceStatusRank(b.inst);
+    if (rankDiff !== 0) return rankDiff;
+    const updDiff = getInstanceUpdatedTs(b.inst) - getInstanceUpdatedTs(a.inst);
+    if (updDiff !== 0) return updDiff;
+    return SORT_COLLATOR.compare(a.inst.session_name, b.inst.session_name);
   });
 
-  grid.replaceChildren(...cards);
+  return entries;
+}
+
+function syncTableSortHeaders() {
+  document.querySelectorAll("#instances-table thead th[data-sort-key]").forEach((th) => {
+    if (th.dataset.sortKey === state.instanceSortKey) {
+      th.setAttribute("aria-sort", state.instanceSortDir);
+    } else {
+      th.removeAttribute("aria-sort");
+    }
+  });
+}
+
+function syncFleetViewControls() {
+  document.querySelectorAll("[data-fleet-view]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.dataset.fleetView === state.fleetView ? "true" : "false");
+  });
+  const collapseWrap = document.getElementById("collapse-stopped-wrap");
+  if (collapseWrap) {
+    collapseWrap.hidden = state.fleetView !== "cards";
+  }
+}
+
+function syncStatusFilterPills(baseItems) {
+  const counts = {
+    all: baseItems.length,
+    running: 0,
+    ready: 0,
+    error: 0,
+    stopped: 0,
+  };
+  for (const inst of baseItems) {
+    if (inst.running) counts.running += 1;
+    if (inst.running && inst.ready) counts.ready += 1;
+    if (isInstanceError(inst)) counts.error += 1;
+    else if (!inst.running) counts.stopped += 1;
+  }
+
+  document.querySelectorAll("[data-status-filter]").forEach((btn) => {
+    const f = btn.dataset.statusFilter;
+    btn.setAttribute("aria-pressed", f === state.instanceStatusFilter ? "true" : "false");
+    const countSpan = btn.querySelector("[data-count-for]");
+    if (countSpan && Object.hasOwn(counts, f)) {
+      countSpan.textContent = String(counts[f]);
+    }
+  });
+}
+
+function renderGroupedInstances(sortedEntries) {
+  const container = document.getElementById("instances-grouped");
+  const groupsMap = new Map();
+  for (const item of sortedEntries) {
+    const svc = item.inst.service;
+    if (!groupsMap.has(svc)) groupsMap.set(svc, []);
+    groupsMap.get(svc).push(item);
+  }
+
+  const desiredDetails = [];
+  for (const [svcName, items] of groupsMap.entries()) {
+    const runningCount = items.filter((x) => x.inst.running).length;
+    const errorCount = items.filter((x) => isInstanceError(x.inst)).length;
+    const anyRunning = runningCount > 0;
+
+    let grp = groupNodeCache.get(svcName);
+    if (!grp) {
+      const titleName = el("strong", { textContent: svcName });
+      const summaryText = el("span", { className: "muted" });
+      const runningBadge = el("span", { className: "badge ok" });
+      const errorBadge = el("span", { className: "badge danger" });
+      const totalBadge = el("span", { className: "badge" });
+      const listEl = el("div", { className: "grouped-replica-list" });
+      const detailsEl = el(
+        "details",
+        { className: "service-group-card", open: anyRunning },
+        el(
+          "summary",
+          { className: "service-group-summary" },
+          el("div", { className: "service-group-title" }, titleName, summaryText),
+          el("div", { className: "service-group-badges" }, runningBadge, errorBadge, totalBadge),
+        ),
+        listEl,
+      );
+      grp = { detailsEl, summaryText, runningBadge, errorBadge, totalBadge, listEl, wasRunning: anyRunning };
+      groupNodeCache.set(svcName, grp);
+    }
+
+    if (anyRunning && !grp.wasRunning) {
+      grp.detailsEl.open = true;
+    }
+    grp.wasRunning = anyRunning;
+
+    const svcMeta = state.servicesMap.get(svcName);
+    grp.summaryText.textContent = svcMeta?.summary || svcMeta?.category_label || "";
+    grp.runningBadge.hidden = runningCount === 0;
+    grp.runningBadge.textContent = `${runningCount} 运行中`;
+    grp.errorBadge.hidden = errorCount === 0;
+    grp.errorBadge.textContent = `${errorCount} 异常`;
+    grp.totalBadge.textContent = `共 ${items.length} 个实例`;
+
+    reorderContainer(grp.listEl, items.map((x) => x.node.groupRow));
+    desiredDetails.push(grp.detailsEl);
+  }
+
+  for (const [svcName, grp] of groupNodeCache.entries()) {
+    if (!groupsMap.has(svcName)) {
+      grp.detailsEl.remove();
+      groupNodeCache.delete(svcName);
+    }
+  }
+
+  reorderContainer(container, desiredDetails);
+}
+
+function renderInstances() {
+  const activeSessionNames = new Set(state.instances.map((i) => i.session_name));
+  for (const [sess, cached] of instanceNodeCache.entries()) {
+    if (!activeSessionNames.has(sess)) {
+      cached.cardSlot.remove();
+      cached.row.remove();
+      cached.groupRow.remove();
+      instanceNodeCache.delete(sess);
+    }
+  }
+
+  const pruneBtn = document.getElementById("prune-replicas-btn");
+  const prunableReplicas = getPrunableReplicas();
+  if (pruneBtn) {
+    pruneBtn.disabled = state.readOnly || prunableReplicas.length === 0;
+    pruneBtn.textContent = prunableReplicas.length > 0 ? `清理临时副本 (${prunableReplicas.length})` : "清理临时副本";
+  }
+
+  populateInstanceFilterSelects();
+  syncFleetViewControls();
+  syncTableSortHeaders();
+
+  const q = (document.getElementById("instance-search")?.value || "").trim().toLowerCase();
+  const acctFilter = document.getElementById("instance-account-filter")?.value || "all";
+  const catFilter = document.getElementById("instance-category-filter")?.value || "all";
+
+  const baseMatched = state.instances.filter((inst) => {
+    if (acctFilter !== "all") {
+      if (acctFilter === "__none__") {
+        if (inst.account) return false;
+      } else if (inst.account !== acctFilter) {
+        return false;
+      }
+    }
+    if (catFilter !== "all" && getInstanceCategory(inst) !== catFilter) return false;
+    if (!q) return true;
+    const haystack = [
+      inst.service,
+      inst.instance_arg ? `#${inst.instance_arg}` : "",
+      inst.instance_arg || "",
+      inst.session_name,
+      inst.url || "",
+      inst.hostname || "",
+      inst.account || "",
+      inst.drive_account || "",
+      inst.state_label || "",
+      inst.stage_hint || "",
+      getInstanceCategoryLabel(inst),
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+
+  syncStatusFilterPills(baseMatched);
+
+  const filtered = baseMatched.filter((inst) => matchesInstanceStatus(inst, state.instanceStatusFilter));
+  const countEl = document.getElementById("instances-count");
+  if (state.instances.length === 0) {
+    countEl.textContent = "0 个实例";
+  } else if (filtered.length === state.instances.length) {
+    countEl.textContent = `${state.instances.length} 个实例`;
+  } else {
+    countEl.textContent = `显示 ${filtered.length} / ${state.instances.length} 个实例`;
+  }
+
+  const emptyAllEl = document.getElementById("empty-all-instances");
+  const emptyFilteredEl = document.getElementById("empty-filtered-instances");
+  const grid = document.getElementById("instances-grid");
+  const stoppedDrawer = document.getElementById("stopped-instances-drawer");
+  const stoppedGrid = document.getElementById("stopped-instances-grid");
+  const tableWrap = document.getElementById("instances-table-wrap");
+  const tbody = document.getElementById("instances-tbody");
+  const groupedEl = document.getElementById("instances-grouped");
+
+  if (state.instances.length === 0) {
+    emptyAllEl.hidden = false;
+    emptyFilteredEl.hidden = true;
+    grid.hidden = true;
+    stoppedDrawer.hidden = true;
+    tableWrap.hidden = true;
+    groupedEl.hidden = true;
+    return;
+  }
+
+  emptyAllEl.hidden = true;
+  if (filtered.length === 0) {
+    emptyFilteredEl.hidden = false;
+    grid.hidden = true;
+    stoppedDrawer.hidden = true;
+    tableWrap.hidden = true;
+    groupedEl.hidden = true;
+    return;
+  }
+
+  emptyFilteredEl.hidden = true;
+  const sortedEntries = sortInstancesList(filtered);
+
+  if (state.fleetView === "table") {
+    grid.hidden = true;
+    stoppedDrawer.hidden = true;
+    groupedEl.hidden = true;
+    tableWrap.hidden = false;
+    reorderContainer(tbody, sortedEntries.map((x) => x.node.row));
+  } else if (state.fleetView === "grouped") {
+    grid.hidden = true;
+    stoppedDrawer.hidden = true;
+    tableWrap.hidden = true;
+    groupedEl.hidden = false;
+    renderGroupedInstances(sortedEntries);
+  } else {
+    tableWrap.hidden = true;
+    groupedEl.hidden = true;
+    const collapseStopped =
+      Boolean(document.getElementById("collapse-stopped-toggle")?.checked) &&
+      state.instanceStatusFilter !== "stopped";
+    if (collapseStopped) {
+      const primaryCards = [];
+      const stoppedCards = [];
+      for (const item of sortedEntries) {
+        if (!item.inst.running && !isInstanceError(item.inst)) {
+          stoppedCards.push(item.node.cardSlot);
+        } else {
+          primaryCards.push(item.node.cardSlot);
+        }
+      }
+      if (primaryCards.length > 0) {
+        grid.hidden = false;
+        reorderContainer(grid, primaryCards);
+      } else {
+        grid.hidden = true;
+        grid.replaceChildren();
+      }
+      if (stoppedCards.length > 0) {
+        stoppedDrawer.hidden = false;
+        document.getElementById("stopped-instances-summary").textContent = `已折叠 ${stoppedCards.length} 个已停止实例`;
+        reorderContainer(stoppedGrid, stoppedCards);
+      } else {
+        stoppedDrawer.hidden = true;
+        stoppedGrid.replaceChildren();
+      }
+    } else {
+      stoppedDrawer.hidden = true;
+      stoppedGrid.replaceChildren();
+      grid.hidden = false;
+      reorderContainer(grid, sortedEntries.map((x) => x.node.cardSlot));
+    }
+  }
+}
+
+function populateCatalogCategoryFilter() {
+  const select = document.getElementById("category-filter");
+  if (!select) return;
+  const counts = new Map();
+  const labels = new Map();
+  for (const svc of state.services) {
+    const cat = svc.category || "other";
+    counts.set(cat, (counts.get(cat) || 0) + 1);
+    if (!labels.has(cat)) labels.set(cat, svc.category_label || CATEGORY_LABELS[cat] || cat);
+  }
+  const orderedCats = [
+    ...CATEGORY_ORDER.filter((c) => counts.has(c)),
+    ...Array.from(counts.keys()).filter((c) => !CATEGORY_ORDER.includes(c)),
+  ];
+  const sig = orderedCats.map((c) => `${c}:${counts.get(c)}`).join(",");
+  if (select.dataset.catSig === sig) return;
+  select.dataset.catSig = sig;
+
+  const prev = select.value || "all";
+  const opts = [el("option", { value: "all", textContent: `全部分类 (${state.services.length})` })];
+  for (const cat of orderedCats) {
+    opts.push(el("option", { value: cat, textContent: `${labels.get(cat)} (${counts.get(cat)})` }));
+  }
+  select.replaceChildren(...opts);
+  select.value = Array.from(select.options).some((o) => o.value === prev) ? prev : "all";
+}
+
+function populateGroupedServiceSelect(selectEl) {
+  if (!selectEl) return;
+  const runningServices = new Set(state.instances.filter((i) => i.running).map((i) => i.service));
+  const sig = `${state.services.map((s) => s.name).join(",")}|${Array.from(runningServices).sort().join(",")}`;
+  if (selectEl.dataset.groupSig === sig) return;
+  selectEl.dataset.groupSig = sig;
+
+  const prev = selectEl.value;
+  const grouped = new Map();
+  const labels = new Map();
+  for (const svc of state.services) {
+    const cat = svc.category || "other";
+    if (!grouped.has(cat)) grouped.set(cat, []);
+    grouped.get(cat).push(svc);
+    if (!labels.has(cat)) labels.set(cat, svc.category_label || CATEGORY_LABELS[cat] || cat);
+  }
+  const orderedCats = [
+    ...CATEGORY_ORDER.filter((c) => grouped.has(c)),
+    ...Array.from(grouped.keys()).filter((c) => !CATEGORY_ORDER.includes(c)),
+  ];
+
+  const groups = orderedCats.map((cat) => {
+    const opts = grouped.get(cat).map((svc) => {
+      const runningMark = runningServices.has(svc.name) ? " (● 运行中)" : "";
+      const summary = svc.summary || svc.category_label || "";
+      return el("option", {
+        value: svc.name,
+        textContent: `${svc.name}${runningMark} — ${summary}`,
+      });
+    });
+    return el("optgroup", { label: labels.get(cat) || cat }, ...opts);
+  });
+
+  selectEl.replaceChildren(...groups);
+  if (prev && Array.from(selectEl.options).some((o) => o.value === prev)) {
+    selectEl.value = prev;
+  }
 }
 
 function renderServices() {
@@ -684,13 +1835,44 @@ function renderServices() {
   const cat = document.getElementById("category-filter").value;
   const grid = document.getElementById("services-grid");
 
+  const runningCountBySvc = new Map();
+  for (const inst of state.instances) {
+    if (inst.running) {
+      runningCountBySvc.set(inst.service, (runningCountBySvc.get(inst.service) || 0) + 1);
+    }
+  }
+
   const filtered = state.services.filter((svc) => {
-    if (cat !== "all" && svc.category !== cat) return false;
+    const svcCat = svc.category || "other";
+    if (cat !== "all" && svcCat !== cat) return false;
     if (!q) return true;
-    return `${svc.name} ${svc.summary} ${svc.category_label}`.toLowerCase().includes(q);
+    return `${svc.name} ${svc.summary || ""} ${svc.category_label || ""}`.toLowerCase().includes(q);
   });
 
+  if (filtered.length === 0) {
+    grid.replaceChildren(
+      el(
+        "div",
+        { className: "card empty-state-card" },
+        el("p", { className: "muted", textContent: "没有匹配当前筛选条件的运行时服务。" }),
+      ),
+    );
+    return;
+  }
+
   const cards = filtered.map((svc) => {
+    const runningNum = runningCountBySvc.get(svc.name) || 0;
+    const badges = [];
+    if (runningNum > 0) {
+      badges.push(el("span", { className: "badge ok", textContent: `● ${runningNum} 运行中` }));
+    }
+    badges.push(
+      el("span", {
+        className: "badge",
+        textContent: svc.category_label || CATEGORY_LABELS[svc.category || "other"] || svc.category || "other",
+      }),
+    );
+
     const card = el(
       "article",
       { className: "card service-card" },
@@ -703,7 +1885,7 @@ function renderServices() {
           el("strong", { textContent: svc.name }),
           el("span", { className: "muted", textContent: svc.summary || svc.category_label }),
         ),
-        el("span", { className: "badge", textContent: svc.category_label || CATEGORY_LABELS[svc.category] || svc.category }),
+        el("div", { className: "card-badges" }, ...badges),
       ),
       el(
         "div",
@@ -863,15 +2045,9 @@ async function loadBootstrap() {
     btn.disabled = state.readOnly;
   });
 
-  fillSelectOptions(document.getElementById("up-service"), state.services, {
-    valueFn: (s) => s.name,
-    labelFn: (s) => `${s.name} — ${s.summary || s.category_label}`,
-  });
-  fillSelectOptions(document.getElementById("wb-service"), state.services, {
-    valueFn: (s) => s.name,
-    labelFn: (s) => `${s.name} — ${s.summary || s.category_label}`,
-  });
-
+  populateGroupedServiceSelect(document.getElementById("up-service"));
+  populateGroupedServiceSelect(document.getElementById("wb-service"));
+  populateCatalogCategoryFilter();
   populateAccountSelectors();
   renderKPIs();
   renderInstances();
@@ -881,7 +2057,8 @@ async function loadBootstrap() {
   renderTunnelAndAccounts();
 
   if (state.services.length && !document.getElementById("wb-subcommand").options.length) {
-    await selectWorkbenchService(state.services[0].name);
+    const initialWbSvc = document.getElementById("wb-service").value || state.services[0].name;
+    await selectWorkbenchService(initialWbSvc);
   }
 }
 
@@ -906,8 +2083,11 @@ function connectEventsSse() {
       const payload = JSON.parse(evt.data);
       state.instances = payload.instances || [];
       state.tasks = payload.tasks || [];
+      populateGroupedServiceSelect(document.getElementById("up-service"));
+      populateGroupedServiceSelect(document.getElementById("wb-service"));
       renderKPIs();
       renderInstances();
+      renderServices();
       renderProxyTargets();
       renderTasksList();
     } catch {
@@ -1051,12 +2231,29 @@ function renderLogsFiltered() {
   const viewer = document.getElementById("logs-viewer");
   const filter = (document.getElementById("logs-filter").value || "").trim().toLowerCase();
   const autoScroll = document.getElementById("logs-autoscroll").checked;
-  let text = state.logsRawText || "(日志文件为空或尚未生成)";
-  if (filter) {
-    const lines = text.split(/\r?\n/).filter((line) => line.toLowerCase().includes(filter));
-    text = lines.length ? lines.join("\n") : "(无匹配过滤关键词的日志行)";
+  if (!state.logsRawText) {
+    state.logsDisplayedText = "";
+    viewer.dataset.copyEmpty = "1";
+    viewer.textContent = "(日志文件为空或尚未生成)";
+  } else if (filter) {
+    const lines = state.logsRawText
+      .replace(/\r?\n$/, "")
+      .split(/\r?\n/)
+      .filter((line) => line.toLowerCase().includes(filter));
+    if (lines.length) {
+      state.logsDisplayedText = lines.join("\n");
+      delete viewer.dataset.copyEmpty;
+      viewer.textContent = state.logsDisplayedText;
+    } else {
+      state.logsDisplayedText = "";
+      viewer.dataset.copyEmpty = "1";
+      viewer.textContent = "(无匹配过滤关键词的日志行)";
+    }
+  } else {
+    state.logsDisplayedText = state.logsRawText.replace(/\r?\n$/, "");
+    delete viewer.dataset.copyEmpty;
+    viewer.textContent = state.logsRawText;
   }
-  viewer.textContent = text;
   if (autoScroll) {
     viewer.scrollTop = viewer.scrollHeight;
   }
@@ -1065,9 +2262,13 @@ function renderLogsFiltered() {
 function openLogsDialog(inst) {
   state.logsTarget = inst;
   state.logsRawText = "";
+  state.logsDisplayedText = "";
+  const viewer = document.getElementById("logs-viewer");
+  viewer.dataset.copyEmpty = "1";
+  resetCopyButtonState(document.getElementById("logs-copy-btn"));
   document.getElementById("logs-dialog-title").textContent = `实时日志 · ${inst.session_name}`;
   document.getElementById("logs-filter").value = "";
-  document.getElementById("logs-viewer").textContent = "正在连接日志流...";
+  viewer.textContent = "正在连接日志流...";
   document.getElementById("logs-dialog").showModal();
 
   if (state.logsSource) {
@@ -1079,7 +2280,8 @@ function openLogsDialog(inst) {
   src.addEventListener("init", (evt) => {
     try {
       const data = JSON.parse(evt.data);
-      state.logsRawText = data.content || "";
+      const initContent = data.content || "";
+      state.logsRawText = initContent && !initContent.endsWith("\n") ? `${initContent}\n` : initContent;
       renderLogsFiltered();
     } catch {
       // Ignore parse error.
@@ -1199,9 +2401,22 @@ function renderConnectSnippets() {
   document.getElementById("connect-snippet").textContent = `# curl\n${curl}\n\n# Python OpenAI SDK\n${pySnippet}`;
 }
 
+async function revealConnectSecrets(inst) {
+  const sec = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/secret`, {
+    method: "POST",
+    json: { instance: inst.instance_arg || "" },
+  });
+  state.connectSecrets = sec;
+  renderConnectMeta(inst, sec);
+  renderConnectSnippets();
+  return sec;
+}
+
 function openConnectDialog(inst) {
   state.connectTarget = inst;
   state.connectSecrets = null;
+  const dlg = document.getElementById("connect-dialog");
+  dlg.querySelectorAll(".copy-btn").forEach(resetCopyButtonState);
   document.getElementById("connect-dialog-title").textContent = `连接信息 · ${inst.session_name}`;
   renderConnectMeta(inst, null);
   document.getElementById("connect-reveal-btn").disabled = state.readOnly;
@@ -1209,7 +2424,7 @@ function openConnectDialog(inst) {
   copyTokenBtn.hidden = !inst.has_api_token;
   copyTokenBtn.disabled = state.readOnly;
   renderConnectSnippets();
-  document.getElementById("connect-dialog").showModal();
+  dlg.showModal();
 }
 
 async function runProbeInstance(inst) {
@@ -1503,17 +2718,136 @@ function initInteractions() {
     }
   });
 
+  // KPI quick-filter cards
+  document.getElementById("kpi-card-running").addEventListener("click", () => {
+    switchView("fleet");
+    activateTab("fleet-panel-instances");
+    state.instanceStatusFilter = "running";
+    syncKpiStates();
+    renderInstances();
+  });
+  document.getElementById("kpi-card-ready").addEventListener("click", () => {
+    switchView("fleet");
+    activateTab("fleet-panel-instances");
+    state.instanceStatusFilter = "ready";
+    syncKpiStates();
+    renderInstances();
+  });
+  document.getElementById("kpi-card-services").addEventListener("click", () => {
+    switchView("fleet");
+    activateTab("fleet-panel-catalog");
+    document.getElementById("service-search")?.focus();
+  });
+
+  // Instance filter / search / sort / view switcher / prune toolbar
+  const announceReorderStatus = (colLabel) => {
+    const statusEl = document.getElementById("reorder-status");
+    if (!statusEl) return;
+    const dirLabel = state.instanceSortDir === "descending" ? "降序" : "升序";
+    statusEl.textContent = `已按${colLabel}${dirLabel}排列实例列表`;
+  };
+
+  document.getElementById("instance-search").addEventListener("input", renderInstances);
+  document.getElementById("instance-account-filter").addEventListener("change", renderInstances);
+  document.getElementById("instance-category-filter").addEventListener("change", renderInstances);
+  document.getElementById("instance-sort").addEventListener("change", (e) => {
+    const mode = e.target.value;
+    if (mode === "updated") {
+      state.instanceSortKey = "updated";
+      state.instanceSortDir = "descending";
+      announceReorderStatus("最近活跃");
+    } else if (mode === "name") {
+      state.instanceSortKey = "name";
+      state.instanceSortDir = "ascending";
+      announceReorderStatus("服务 / 实例");
+    } else {
+      state.instanceSortKey = "status";
+      state.instanceSortDir = "ascending";
+      announceReorderStatus("状态");
+    }
+    renderInstances();
+  });
+
+  document.querySelectorAll("[data-status-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.instanceStatusFilter = btn.dataset.statusFilter || "all";
+      syncKpiStates();
+      renderInstances();
+    });
+  });
+
+  document.querySelectorAll("[data-fleet-view]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const nextView = btn.dataset.fleetView;
+      if (nextView !== "cards" && nextView !== "table" && nextView !== "grouped") return;
+      state.fleetView = nextView;
+      try {
+        localStorage.setItem(FLEET_VIEW_STORAGE_KEY, nextView);
+      } catch {
+        // Ignore storage restrictions.
+      }
+      renderInstances();
+    });
+  });
+
+  document.getElementById("collapse-stopped-toggle").addEventListener("change", renderInstances);
+  document.getElementById("prune-replicas-btn").addEventListener("click", openPruneDialog);
+  document.getElementById("reset-instance-filters-btn").addEventListener("click", () => {
+    document.getElementById("instance-search").value = "";
+    document.getElementById("instance-account-filter").value = "all";
+    document.getElementById("instance-category-filter").value = "all";
+    state.instanceStatusFilter = "all";
+    syncKpiStates();
+    renderInstances();
+  });
+
+  document.querySelectorAll("#instances-table thead th[data-sort-key] .th-sort-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const th = btn.closest("th[data-sort-key]");
+      if (!th) return;
+      const key = th.dataset.sortKey;
+      if (state.instanceSortKey === key) {
+        state.instanceSortDir = state.instanceSortDir === "ascending" ? "descending" : "ascending";
+      } else {
+        state.instanceSortKey = key;
+        state.instanceSortDir = key === "updated" ? "descending" : "ascending";
+      }
+      const sortSel = document.getElementById("instance-sort");
+      if (sortSel && (key === "status" || key === "updated" || key === "name")) {
+        sortSel.value = key;
+      }
+      renderInstances();
+      announceReorderStatus(btn.textContent.trim());
+    });
+  });
+
+  document.addEventListener("keydown", (evt) => {
+    if (evt.key !== "/" || evt.ctrlKey || evt.metaKey || evt.altKey) return;
+    if (document.querySelector("dialog[open]")) return;
+    const target = evt.target;
+    if (target instanceof Element && (target.closest("input, textarea, select") || target.isContentEditable)) {
+      return;
+    }
+    evt.preventDefault();
+    if (state.activeView !== "fleet") switchView("fleet");
+    if (state.activeFleetPanel !== "fleet-panel-instances") activateTab("fleet-panel-instances");
+    const searchEl = document.getElementById("instance-search");
+    searchEl?.focus();
+    searchEl?.select?.();
+  });
+
   document.getElementById("service-search").addEventListener("input", renderServices);
   document.getElementById("category-filter").addEventListener("change", renderServices);
 
   // Clean up modal dialog state and flush deferred toasts on close
   document.querySelectorAll("dialog").forEach((dlg) => {
     dlg.addEventListener("close", () => {
+      dlg.querySelectorAll(".copy-btn").forEach(resetCopyButtonState);
       if (dlg.id === "logs-dialog" && state.logsSource) {
         state.logsSource.close();
         state.logsSource = null;
       }
-      if (dlg.id !== "down-dialog") {
+      if (dlg.id !== "down-dialog" && dlg.id !== "remove-dialog" && dlg.id !== "prune-dialog") {
         dlg.returnValue = "";
       }
       window.setTimeout(flushDeferredToasts, 10);
@@ -1540,6 +2874,43 @@ function initInteractions() {
       showToast(`已提交停止任务: ${task.command_preview}`, "ok");
     } catch (err) {
       showToast(`停止失败: ${err.message}`, "danger");
+    }
+  });
+
+  document.getElementById("remove-dialog").addEventListener("close", async () => {
+    const dlg = document.getElementById("remove-dialog");
+    const confirmed = dlg.returnValue === "confirm";
+    dlg.returnValue = "";
+    const target = state.removeTarget;
+    state.removeTarget = null;
+    if (!confirmed || !target) return;
+    try {
+      const res = await apiFetch(`/api/instances/${encodeURIComponent(target.service)}/remove`, {
+        method: "POST",
+        json: { instance: target.instance_arg || "" },
+      });
+      showToast(`已移除实例记录 (${res.count || 1})`, "ok");
+      await loadBootstrap();
+    } catch (err) {
+      showToast(`移除记录失败: ${err.message}`, "danger");
+    }
+  });
+
+  document.getElementById("prune-dialog").addEventListener("close", async () => {
+    const dlg = document.getElementById("prune-dialog");
+    const confirmed = dlg.returnValue === "confirm";
+    dlg.returnValue = "";
+    if (!confirmed) return;
+    try {
+      const res = await apiFetch("/api/instances/prune", {
+        method: "POST",
+        json: { replicas_only: true },
+      });
+      const count = Number(res.count || 0);
+      showToast(count > 0 ? `已清理 ${count} 个已停止临时副本` : "没有可清理的已停止副本", "ok");
+      await loadBootstrap();
+    } catch (err) {
+      showToast(`清理失败: ${err.message}`, "danger");
     }
   });
 
@@ -1594,6 +2965,25 @@ function initInteractions() {
   // Logs modal filters & export
   document.getElementById("logs-filter").addEventListener("input", renderLogsFiltered);
   document.getElementById("logs-autoscroll").addEventListener("change", renderLogsFiltered);
+  if ("CommandEvent" in window) {
+    document.addEventListener(
+      "command",
+      (evt) => {
+        if (evt.command?.startsWith("--copy") && evt.source instanceof HTMLButtonElement) {
+          handleCopyCommand(evt.source, evt.target, evt.command);
+        }
+      },
+      true,
+    );
+  } else {
+    document.addEventListener("click", (evt) => {
+      const btn = evt.target instanceof Element ? evt.target.closest('button[command^="--copy"]') : null;
+      if (!btn || btn.disabled) return;
+      const targetId = btn.getAttribute("commandfor");
+      const target = targetId ? document.getElementById(targetId) : null;
+      if (target) handleCopyCommand(btn, target, btn.getAttribute("command"));
+    });
+  }
   document.getElementById("logs-download-btn").addEventListener("click", () => {
     const blob = new Blob([state.logsRawText || ""], { type: "text/plain;charset=utf-8" });
     const a = document.createElement("a");
@@ -1604,16 +2994,6 @@ function initInteractions() {
   });
 
   // Connect / secrets modal
-  const revealConnectSecrets = async (inst) => {
-    const sec = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/secret`, {
-      method: "POST",
-      json: { instance: inst.instance_arg || "" },
-    });
-    state.connectSecrets = sec;
-    renderConnectMeta(inst, sec);
-    renderConnectSnippets();
-    return sec;
-  };
   document.getElementById("connect-reveal-btn").addEventListener("click", async () => {
     const inst = state.connectTarget;
     if (!inst) return;
@@ -1623,43 +3003,6 @@ function initInteractions() {
       showToast(`获取凭据失败: ${err.message}`, "danger");
     }
   });
-  document.getElementById("connect-copy-token").addEventListener("click", async () => {
-    const inst = state.connectTarget;
-    if (!inst) return;
-    let token = state.connectSecrets?.api_token;
-    if (!token) {
-      try {
-        const sec = await revealConnectSecrets(inst);
-        token = sec?.api_token;
-      } catch (err) {
-        showToast(`获取凭据失败: ${err.message}`, "danger");
-        return;
-      }
-    }
-    if (!token) {
-      showToast("当前实例未配置 API Token", "warn");
-      return;
-    }
-    if (!navigator.clipboard?.writeText) {
-      showToast("浏览器不支持自动复制剪贴板，请手动复制", "warn");
-      return;
-    }
-    navigator.clipboard.writeText(token).then(
-      () => showToast("已复制 API Token", "ok", 2000),
-      () => showToast("浏览器拒绝剪贴板访问，请手动复制", "warn"),
-    );
-  });
-  const copyFromSnippet = (partIdx) => {
-    const txt = document.getElementById("connect-snippet").textContent || "";
-    const parts = txt.split("\n\n# Python OpenAI SDK\n");
-    const chosen = partIdx === 0 ? parts[0].replace(/^# curl[^\n]*\n/, "") : parts[1] || txt;
-    navigator.clipboard?.writeText(chosen).then(
-      () => showToast("已复制到剪贴板", "ok", 2000),
-      () => showToast("浏览器拒绝剪贴板访问，请手动复制", "warn"),
-    );
-  };
-  document.getElementById("connect-copy-curl").addEventListener("click", () => copyFromSnippet(0));
-  document.getElementById("connect-copy-py").addEventListener("click", () => copyFromSnippet(1));
 
   // Workbench CLI
   document.getElementById("wb-service").addEventListener("change", (e) => selectWorkbenchService(e.target.value));
