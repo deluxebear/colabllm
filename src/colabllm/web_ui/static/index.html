@@ -9,6 +9,7 @@
   <title>ColabLLM Web 控制台</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/copilot.css">
   <script nonce="__CSP_NONCE__" type="module" src="/static/app.js"></script>
 </head>
 <body>
@@ -24,6 +25,7 @@
 
       <nav aria-label="主导航" class="side-nav">
         <button type="button" class="nav-btn" data-view="fleet" aria-current="page">舰队与实例</button>
+        <button type="button" class="nav-btn" data-view="copilot">AI 演练场</button>
         <button type="button" class="nav-btn" data-view="workbench">工作台与命令</button>
         <button type="button" class="nav-btn" data-view="network">隧道与账户</button>
         <button type="button" class="nav-btn" data-view="doctor">环境体检</button>
@@ -49,6 +51,7 @@
         </div>
         <div class="topbar-actions">
           <span id="readonly-badge" class="badge warn" hidden>只读模式 (--read-only)</span>
+          <button type="button" id="copilot-sidebar-btn" class="btn secondary">快捷 Copilot</button>
           <button type="button" id="refresh-btn" class="btn secondary">刷新状态</button>
           <button type="button" class="btn primary" commandfor="up-dialog" command="show-modal" data-open-up>启动新实例</button>
         </div>
@@ -213,12 +216,218 @@
           </div>
         </section>
 
-        <!-- View 2: Workbench (Tabs inside view) -->
+        <!-- View 2: Copilot Studio (Universal OpenAI + Multimodal + Native API Playground) -->
+        <section id="view-copilot" class="view-section ck-studio" hidden>
+          <div class="card ck-context-card">
+            <div class="ck-context-row">
+              <div class="ck-field">
+                <label for="ck-target">目标实例 (同源代理)</label>
+                <select id="ck-target"></select>
+              </div>
+              <div class="ck-field">
+                <label for="ck-model">模型 ID / 别名</label>
+                <input id="ck-model" type="text" list="ck-model-options" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="自动读取或手填 model ID">
+                <datalist id="ck-model-options"></datalist>
+              </div>
+              <div class="ck-context-actions">
+                <button type="button" id="ck-probe-btn" class="btn secondary">探测 /v1/models</button>
+                <button type="button" id="ck-health-btn" class="btn secondary">健康检查</button>
+                <button type="button" id="ck-all-surfaces-btn" class="btn secondary" aria-pressed="false">显示全部面板</button>
+                <button type="button" id="ck-code-btn" class="btn secondary" popovertarget="ck-code-popover">导出 SDK / cURL</button>
+              </div>
+            </div>
+            <div class="ck-context-meta">
+              <span id="ck-status-pill" class="badge neutral">等待选择实例</span>
+              <span id="ck-proxy-url-hint" class="muted ck-mono"></span>
+              <p id="ck-capabilities-summary" class="muted ck-cap-summary"></p>
+            </div>
+          </div>
+
+          <div id="ck-code-popover" popover="auto" class="ck-popover">
+            <div class="ck-popover-header">
+              <div class="ck-field inline">
+                <label for="ck-code-lang">代码模板</label>
+                <select id="ck-code-lang">
+                  <option value="curl-proxy">cURL (本机同源代理)</option>
+                  <option value="curl-direct">cURL (公网直连)</option>
+                  <option value="python-openai">Python OpenAI SDK</option>
+                </select>
+              </div>
+              <button type="button" id="ck-code-copy" class="btn small secondary">复制代码</button>
+            </div>
+            <pre role="region" tabindex="0" aria-label="生成代码片段" class="ck-code-pre"><code id="ck-code-output"></code></pre>
+          </div>
+
+          <div class="tabs-shell ck-tabs-shell">
+            <div class="tablist ck-tablist" id="ck-surface-tablist" focusgroup="tablist nomemory" aria-label="AI 演练场能力面板">
+              <button type="button" class="tab-btn" id="ck-tab-chat" aria-selected="true" focusgroupstart data-panel="ck-panel-chat" data-surface="chat">对话与推理</button>
+              <button type="button" class="tab-btn" id="ck-tab-image" aria-selected="false" data-panel="ck-panel-image" data-surface="image">图像生成与编辑</button>
+              <button type="button" class="tab-btn" id="ck-tab-audio" aria-selected="false" data-panel="ck-panel-audio" data-surface="audio">语音与音效合成</button>
+              <button type="button" class="tab-btn" id="ck-tab-transcribe" aria-selected="false" data-panel="ck-panel-transcribe" data-surface="transcribe">音频转写与理解</button>
+              <button type="button" class="tab-btn" id="ck-tab-embeddings" aria-selected="false" data-panel="ck-panel-embeddings" data-surface="embeddings">向量嵌入</button>
+              <button type="button" class="tab-btn" id="ck-tab-specialized" aria-selected="false" data-panel="ck-panel-specialized" data-surface="specialized">专有 API 控制台</button>
+              <button type="button" class="tab-btn" id="ck-tab-inspector" aria-selected="false" data-panel="ck-panel-inspector" data-surface="inspector">同源 HTTP 探针</button>
+            </div>
+
+            <div role="tabpanel" id="ck-panel-chat" aria-labelledby="ck-tab-chat" tabindex="0">
+              <div class="panel-body ck-chat-workspace">
+                <aside class="ck-threads-pane" id="ck-threads-pane" aria-label="会话历史抽屉">
+                  <div class="ck-pane-header">
+                    <strong>会话历史</strong>
+                    <button type="button" id="ck-new-thread-btn" class="btn small primary">新建对话</button>
+                  </div>
+                  <search class="ck-thread-search-wrap">
+                    <label class="sr-only" for="ck-thread-search">过滤会话历史</label>
+                    <input id="ck-thread-search" type="search" placeholder="过滤会话...">
+                  </search>
+                  <ul id="ck-threads-list" class="ck-threads-list"></ul>
+                  <div class="ck-pane-footer">
+                    <button type="button" id="ck-clear-thread-btn" class="btn small secondary">清空当前</button>
+                    <button type="button" id="ck-export-thread-btn" class="btn small secondary">导出 JSON</button>
+                  </div>
+                </aside>
+
+                <div class="ck-chat-main">
+                  <div class="ck-chat-toolbar">
+                    <button type="button" id="ck-toggle-threads-btn" class="btn small secondary" aria-expanded="true">会话抽屉</button>
+                    <div class="ck-endpoint-pick">
+                      <label for="ck-chat-endpoint">协议端点</label>
+                      <select id="ck-chat-endpoint">
+                        <option value="chat_completions">OpenAI /v1/chat/completions</option>
+                        <option value="responses">OpenAI /v1/responses</option>
+                        <option value="completions">OpenAI /v1/completions</option>
+                        <option value="anthropic_messages">Anthropic /v1/messages</option>
+                        <option value="ollama_chat">Ollama /api/chat</option>
+                      </select>
+                    </div>
+                    <button type="button" id="ck-toggle-params-btn" class="btn small secondary" aria-expanded="true">参数与工具</button>
+                  </div>
+
+                  <div id="ck-welcome-screen" class="ck-welcome">
+                    <div class="ck-welcome-badge">CopilotKit 交互架构 · 同源安全代理</div>
+                    <h2 id="ck-welcome-title">ColabLLM Copilot Studio</h2>
+                    <p id="ck-welcome-desc" class="muted">支持思考过程折叠、Generative UI 工具卡片、多模态视觉/音频输入，并自动通过本机同源代理注入 Bearer/Basic 认证。</p>
+                    <div id="ck-suggestions" class="ck-suggestions"></div>
+                  </div>
+
+                  <div id="ck-chat-feed" class="ck-feed" aria-live="polite"></div>
+
+                  <form id="ck-chat-form" class="ck-composer">
+                    <div id="ck-attachments-preview" class="ck-attachments" hidden></div>
+                    <label class="sr-only" for="ck-chat-input">输入问题或指令</label>
+                    <textarea id="ck-chat-input" class="ck-autosize" rows="2" placeholder="输入问题或指令（Enter 发送，Shift+Enter 换行，支持粘贴图片）"></textarea>
+                    <div class="ck-composer-bar">
+                      <div class="ck-composer-left">
+                        <label for="ck-attach-file" class="btn small secondary">添加图片/音频</label>
+                        <input id="ck-attach-file" type="file" accept="image/*,audio/*" multiple hidden>
+                        <button type="button" id="ck-drive-btn" class="btn small secondary" popovertarget="ck-drive-popover">从 Drive 导入</button>
+                      </div>
+                      <div class="ck-composer-right">
+                        <progress id="ck-chat-progress" class="ck-progress" hidden></progress>
+                        <button type="button" id="ck-chat-stop" class="btn small danger" hidden>停止生成</button>
+                        <button type="submit" id="ck-chat-send" class="btn small primary">发送</button>
+                      </div>
+                    </div>
+                  </form>
+
+                  <div id="ck-drive-popover" popover="auto" class="ck-popover">
+                    <div class="ck-popover-header">
+                      <strong>Google Drive 文件快捷引用</strong>
+                      <button type="button" id="ck-drive-refresh" class="btn small secondary">刷新列表</button>
+                    </div>
+                    <p class="muted">点击条目插入 <code>drive://...</code> 引用到输入框或附件队列。</p>
+                    <ul id="ck-drive-list" class="ck-drive-list"></ul>
+                  </div>
+                </div>
+
+                <aside class="ck-params-pane" id="ck-params-pane" aria-label="采样参数与 Generative UI 工具">
+                  <details open class="ck-accordion">
+                    <summary>推理与采样配置</summary>
+                    <div class="ck-acc-body">
+                      <div class="ck-field">
+                        <label for="ck-chat-system">System 提示词</label>
+                        <textarea id="ck-chat-system" class="ck-autosize" rows="2" placeholder="You are a helpful assistant."></textarea>
+                      </div>
+                      <label class="switch-row">
+                        <span>启用流式输出 (stream)</span>
+                        <input id="ck-chat-stream" type="checkbox" switch checked>
+                      </label>
+                      <label class="switch-row">
+                        <span>启用思考模式 (enable_thinking)</span>
+                        <input id="ck-chat-thinking" type="checkbox" switch checked>
+                      </label>
+                      <div class="ck-two-col">
+                        <div class="ck-field">
+                          <label for="ck-chat-reasoning-effort">思考强度 (effort)</label>
+                          <select id="ck-chat-reasoning-effort">
+                            <option value="">默认</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                          </select>
+                        </div>
+                        <div class="ck-field">
+                          <label for="ck-chat-reasoning-budget">思考预算 (tokens)</label>
+                          <input id="ck-chat-reasoning-budget" type="number" min="0" step="128" placeholder="可选">
+                        </div>
+                      </div>
+                      <div class="ck-two-col">
+                        <div class="ck-field">
+                          <label for="ck-chat-temp">Temperature</label>
+                          <input id="ck-chat-temp" type="number" min="0" max="2" step="0.1" value="0.7">
+                        </div>
+                        <div class="ck-field">
+                          <label for="ck-chat-max-tokens">Max Tokens</label>
+                          <input id="ck-chat-max-tokens" type="number" min="1" max="131072" step="128" value="2048">
+                        </div>
+                      </div>
+                    </div>
+                  </details>
+
+                  <details open class="ck-accordion">
+                    <summary>Generative UI 与工具调用</summary>
+                    <div class="ck-acc-body">
+                      <label class="switch-row">
+                        <span>向模型注入前端工具 (tools)</span>
+                        <input id="ck-tools-enable" type="checkbox" switch checked>
+                      </label>
+                      <label class="switch-row">
+                        <span>自动执行只读与 UI 工具</span>
+                        <input id="ck-tools-auto-exec" type="checkbox" switch checked>
+                      </label>
+                      <div id="ck-tools-catalog" class="ck-tools-list"></div>
+                    </div>
+                  </details>
+                </aside>
+              </div>
+            </div>
+
+            <div role="tabpanel" id="ck-panel-image" aria-labelledby="ck-tab-image" hidden="until-found">
+              <div class="panel-body" id="ck-image-root"></div>
+            </div>
+            <div role="tabpanel" id="ck-panel-audio" aria-labelledby="ck-tab-audio" hidden="until-found">
+              <div class="panel-body" id="ck-audio-root"></div>
+            </div>
+            <div role="tabpanel" id="ck-panel-transcribe" aria-labelledby="ck-tab-transcribe" hidden="until-found">
+              <div class="panel-body" id="ck-transcribe-root"></div>
+            </div>
+            <div role="tabpanel" id="ck-panel-embeddings" aria-labelledby="ck-tab-embeddings" hidden="until-found">
+              <div class="panel-body" id="ck-embeddings-root"></div>
+            </div>
+            <div role="tabpanel" id="ck-panel-specialized" aria-labelledby="ck-tab-specialized" hidden="until-found">
+              <div class="panel-body" id="ck-specialized-root"></div>
+            </div>
+            <div role="tabpanel" id="ck-panel-inspector" aria-labelledby="ck-tab-inspector" hidden="until-found">
+              <div class="panel-body" id="ck-inspector-root"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- View 3: Workbench (CLI Forms & Task History) -->
         <section id="view-workbench" class="view-section" hidden>
           <div class="tabs-shell">
             <div class="tablist" focusgroup="tablist nomemory" aria-label="工作台模式">
               <button type="button" class="tab-btn" id="tab-cli" aria-selected="true" focusgroupstart data-panel="panel-cli">通用命令表单</button>
-              <button type="button" class="tab-btn" id="tab-chat" aria-selected="false" data-panel="panel-chat">对话与同源代理</button>
               <button type="button" class="tab-btn" id="tab-tasks" aria-selected="false" data-panel="panel-tasks">任务执行记录</button>
             </div>
 
@@ -261,74 +470,6 @@
                     <span id="wb-task-status" class="badge">待命</span>
                   </div>
                   <pre id="wb-output" class="log-viewer">选择服务与子命令后可在此直接预览参数并执行。</pre>
-                </div>
-              </div>
-            </div>
-
-            <div role="tabpanel" id="panel-chat" aria-labelledby="tab-chat" hidden="until-found">
-              <div class="panel-body">
-                <div class="workbench-controls">
-                  <label>
-                    <span>目标实例</span>
-                    <select id="proxy-target"></select>
-                  </label>
-                  <label>
-                    <span>模型别名 (OpenAI /v1/models)</span>
-                    <input id="chat-model" type="text" placeholder="自动读取或手填模型 ID">
-                  </label>
-                  <div class="inline-btn-wrap">
-                    <button type="button" id="chat-load-models" class="btn secondary">探测模型列表</button>
-                  </div>
-                </div>
-
-                <div class="chat-grid">
-                  <div class="card">
-                    <h3>OpenAI 兼容流式对话 (/v1/chat/completions)</h3>
-                    <div id="chat-messages" class="chat-messages"></div>
-                    <form id="chat-form" class="chat-form">
-                      <label>
-                        <span>System 提示词（可选）</span>
-                        <input id="chat-system" type="text" placeholder="You are a helpful assistant.">
-                      </label>
-                      <label>
-                        <span>用户输入</span>
-                        <textarea id="chat-input" rows="3" placeholder="输入问题或指令..." required></textarea>
-                      </label>
-                      <div class="chat-options">
-                        <label class="switch-row">
-                          <span>启用思考模式 (enable_thinking)</span>
-                          <input id="chat-thinking" type="checkbox" switch>
-                        </label>
-                        <button type="submit" id="chat-send-btn" class="btn primary">发送流式请求</button>
-                      </div>
-                    </form>
-                  </div>
-
-                  <div class="card">
-                    <h3>同源认证 HTTP 代理调试 (/api/proxy/...)</h3>
-                    <p class="muted">由本机后端自动补全 Bearer / Basic Auth 凭据并安全转发，浏览器端不保存密钥。</p>
-                    <form id="proxy-http-form" class="schema-form">
-                      <div class="two-col">
-                        <label>
-                          <span>HTTP 方法</span>
-                          <select id="proxy-method">
-                            <option value="GET">GET</option>
-                            <option value="POST">POST</option>
-                          </select>
-                        </label>
-                        <label>
-                          <span>远端相对路径</span>
-                          <input id="proxy-path" type="text" value="v1/models" placeholder="v1/models 或 api/tags">
-                        </label>
-                      </div>
-                      <label>
-                        <span>JSON 请求体（POST 时可选）</span>
-                        <textarea id="proxy-body" rows="4" placeholder='{"model": "..."}'></textarea>
-                      </label>
-                      <button type="submit" class="btn secondary">发送代理请求</button>
-                    </form>
-                    <pre id="proxy-output" class="log-viewer">响应内容将显示在这里。</pre>
-                  </div>
                 </div>
               </div>
             </div>
@@ -670,6 +811,45 @@
         </span>
       </div>
       <pre id="connect-snippet" class="log-viewer"></pre>
+    </div>
+  </dialog>
+
+  <!-- Slide-out CopilotSidebar Drawer (Swipe-to-Dismiss) -->
+  <dialog id="copilot-drawer" class="ck-drawer" aria-labelledby="ck-drawer-title">
+    <div class="ck-drawer-scrim" aria-hidden="true"></div>
+    <div class="ck-drawer-panel" tabindex="-1">
+      <header class="ck-drawer-header">
+        <div>
+          <h2 id="ck-drawer-title">快捷 Copilot 助手</h2>
+          <p class="muted">随时唤起的 CopilotSidebar（右侧滑出 / 右滑关闭）</p>
+        </div>
+        <div class="ck-drawer-header-actions">
+          <button type="button" id="ck-drawer-expand-btn" class="btn small secondary">在演练场展开</button>
+          <button type="button" id="ck-drawer-close-btn" class="btn icon-btn" aria-label="关闭 Copilot 侧边栏">✕</button>
+        </div>
+      </header>
+      <div class="ck-drawer-target-bar">
+        <label class="sr-only" for="ck-drawer-target">快捷 Copilot 目标实例</label>
+        <select id="ck-drawer-target"></select>
+        <span id="ck-drawer-model-badge" class="badge neutral">auto</span>
+      </div>
+      <div id="ck-drawer-suggestions" class="ck-suggestions ck-drawer-suggestions"></div>
+      <div id="ck-drawer-feed" class="ck-feed ck-drawer-feed" aria-live="polite"></div>
+      <form id="ck-drawer-form" class="ck-composer ck-drawer-composer">
+        <label class="sr-only" for="ck-drawer-input">向快捷 Copilot 提问</label>
+        <textarea id="ck-drawer-input" class="ck-autosize" rows="2" placeholder="快速提问或让 AI 调用当前舰队运行时..."></textarea>
+        <div class="ck-composer-bar">
+          <label class="switch-row">
+            <span>Tools</span>
+            <input id="ck-drawer-tools" type="checkbox" switch checked>
+          </label>
+          <div class="ck-composer-right">
+            <progress id="ck-drawer-progress" class="ck-progress" hidden></progress>
+            <button type="button" id="ck-drawer-stop" class="btn small danger" hidden>停止</button>
+            <button type="submit" id="ck-drawer-send" class="btn small primary">发送</button>
+          </div>
+        </div>
+      </form>
     </div>
   </dialog>
 

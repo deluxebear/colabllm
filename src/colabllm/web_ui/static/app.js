@@ -1,3 +1,5 @@
+import { initCopilotStudio } from "./copilot.js";
+
 const csrfMeta = document.querySelector('meta[name="colabllm-csrf"]');
 const readOnlyMeta = document.querySelector('meta[name="colabllm-readonly"]');
 const CSRF_TOKEN = csrfMeta ? csrfMeta.content : "";
@@ -29,7 +31,8 @@ function loadSavedFleetView() {
 
 const VIEW_META = {
   fleet: ["舰队与实例", "管理 Google Colab 运行时生命周期、实时日志与公网隧道"],
-  workbench: ["工作台与命令", "动态解析 CLI 子命令表单、后台任务流与同源推理代理"],
+  copilot: ["AI 演练场 · Copilot Studio", "基于同源代理的 OpenAI 兼容、多模态与运行时原生 API 演练场"],
+  workbench: ["工作台与命令", "动态解析 CLI 子命令表单与后台任务执行流"],
   network: ["隧道与账户", "配置项目全局主域名、核验 FRP 与只读查看多账户 Drive 状态"],
   doctor: ["环境体检", "一键核验本机依赖、隧道后端与 Google Drive 授权状态"],
 };
@@ -93,10 +96,10 @@ const state = {
   removeTarget: null,
   connectTarget: null,
   connectSecrets: null,
-  chatHistory: [],
   deferredToasts: [],
   themeMq: window.matchMedia("(prefers-color-scheme: dark)"),
 };
+let copilotController = null;
 
 const instanceNodeCache = new Map();
 const groupNodeCache = new Map();
@@ -535,7 +538,7 @@ function activateTab(panelId) {
   const scope = targetPanel.closest(".tabs-shell") || document;
   const inactiveHiddenVal = "onbeforematch" in HTMLElement.prototype ? "until-found" : "";
 
-  scope.querySelectorAll(".tab-btn").forEach((btn) => {
+  scope.querySelectorAll(":scope > .tablist > .tab-btn").forEach((btn) => {
     const active = btn.dataset.panel === panelId;
     btn.setAttribute("aria-selected", active ? "true" : "false");
     if (active) btn.setAttribute("focusgroupstart", "");
@@ -544,7 +547,7 @@ function activateTab(panelId) {
       btn.tabIndex = active ? 0 : -1;
     }
   });
-  scope.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
+  scope.querySelectorAll(':scope > [role="tabpanel"]').forEach((panel) => {
     if (panel.id === panelId) panel.removeAttribute("hidden");
     else panel.setAttribute("hidden", inactiveHiddenVal);
   });
@@ -559,13 +562,15 @@ function initNavigation() {
   document.querySelectorAll(".nav-btn").forEach((btn) => {
     btn.addEventListener("click", () => switchView(btn.dataset.view));
   });
-  document.querySelectorAll(".tab-btn").forEach((btn) => {
+  document.querySelectorAll(".tabs-shell:not(.ck-tabs-shell) > .tablist > .tab-btn").forEach((btn) => {
     btn.addEventListener("click", () => activateTab(btn.dataset.panel));
   });
   document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
     panel.addEventListener("beforematch", () => {
       if (panel.closest("#view-fleet")) {
         switchView("fleet");
+      } else if (panel.closest("#view-copilot")) {
+        switchView("copilot");
       } else if (panel.closest("#view-workbench")) {
         switchView("workbench");
       }
@@ -1024,7 +1029,7 @@ function refreshEffectiveFleet() {
   renderKPIs();
   renderInstances();
   renderServices();
-  renderProxyTargets();
+  copilotController?.syncCopilotState();
   renderTasksList();
 }
 
@@ -1533,13 +1538,13 @@ function createActionCluster(surface, idSeq, getInst) {
               el("span", { className: "sr-only", textContent: ` (${titleText})` }),
             ),
           );
-        } else if (urlHref && inst.chat_compatible) {
+        } else if (urlHref) {
           inlineButtons.push(
             el("button", {
               type: "button",
               className: "btn sm primary",
-              textContent: "对话",
-              onClick: () => jumpToProxy(getInst()),
+              textContent: "AI 演练场",
+              onClick: () => copilotController?.openInstanceInCopilot(getInst()),
             }),
           );
         }
@@ -1620,10 +1625,19 @@ function createActionCluster(surface, idSeq, getInst) {
           el("button", {
             type: "button",
             className: "btn sm secondary",
-            textContent: inst.chat_compatible ? "对话" : "代理",
+            textContent: "AI 演练场",
             onClick: () => {
               closePopover(popEl);
-              jumpToProxy(getInst());
+              copilotController?.openInstanceInCopilot(getInst());
+            },
+          }),
+          el("button", {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: "快捷 Copilot",
+            onClick: () => {
+              closePopover(popEl);
+              copilotController?.openDrawer(getInst().session_name);
             },
           }),
         );
@@ -2395,6 +2409,9 @@ function renderServices() {
     if (runningNum > 0) {
       badges.push(el("span", { className: "badge ok", textContent: `● ${runningNum} 运行中` }));
     }
+    if (svc.openai_compatible) {
+      badges.push(el("span", { className: "badge ok", textContent: "OpenAI /v1" }));
+    }
     badges.push(
       el("span", {
         className: "badge",
@@ -2436,6 +2453,12 @@ function renderServices() {
         el("button", {
           type: "button",
           className: "btn sm secondary",
+          textContent: "AI 演练场",
+          onClick: () => copilotController?.openServiceInCopilot(svc.name),
+        }),
+        el("button", {
+          type: "button",
+          className: "btn sm secondary",
           textContent: "工作台命令",
           onClick: () => {
             switchView("workbench");
@@ -2449,25 +2472,6 @@ function renderServices() {
   });
 
   grid.replaceChildren(...cards);
-}
-
-function renderProxyTargets() {
-  const select = document.getElementById("proxy-target");
-  const prev = select.value;
-  const readyOnes = state.instances.filter((i) => i.url);
-  if (readyOnes.length === 0) {
-    select.replaceChildren(el("option", { value: "", textContent: "暂无已分配公网 URL 的实例" }));
-    return;
-  }
-  const opts = readyOnes.map((i) => {
-    const val = JSON.stringify({ service: i.service, instance: i.instance_arg || "default" });
-    const label = `${i.session_name} (${i.ready ? "就绪" : i.state_label}) - ${i.url}`;
-    return el("option", { value: val, textContent: label });
-  });
-  select.replaceChildren(...opts);
-  if (prev && Array.from(select.options).some((o) => o.value === prev)) {
-    select.value = prev;
-  }
 }
 
 function renderTasksList() {
@@ -2582,7 +2586,7 @@ async function loadBootstrap() {
   renderKPIs();
   renderInstances();
   renderServices();
-  renderProxyTargets();
+  copilotController?.syncCopilotState();
   renderTasksList();
   renderTunnelAndAccounts();
 
@@ -2617,7 +2621,7 @@ function connectEventsSse() {
       renderKPIs();
       renderInstances();
       renderServices();
-      renderProxyTargets();
+      copilotController?.syncCopilotState();
       renderTasksList();
     } catch {
       // Ignore malformed frame.
@@ -3169,143 +3173,6 @@ function attachTaskStream(taskId, initialSummary = null) {
   });
 }
 
-/* Same-origin Chat & Proxy Playground */
-function jumpToProxy(inst) {
-  switchView("workbench");
-  activateTab("panel-chat");
-  const sel = document.getElementById("proxy-target");
-  const val = JSON.stringify({ service: inst.service, instance: inst.instance_arg || "default" });
-  if (Array.from(sel.options).some((o) => o.value === val)) {
-    sel.value = val;
-  }
-  document.getElementById("proxy-path").value = inst.chat_compatible ? "v1/models" : "";
-}
-
-function getSelectedProxyTarget() {
-  const raw = document.getElementById("proxy-target").value;
-  if (!raw) throw new Error("请先选择一个已有公网 URL 的运行实例");
-  return JSON.parse(raw);
-}
-
-function renderChatMessages() {
-  const box = document.getElementById("chat-messages");
-  if (!state.chatHistory.length) {
-    box.replaceChildren(el("p", { className: "muted", textContent: "在此直接通过本机同源代理测试 OpenAI /v1/chat/completions 流式响应。" }));
-    return;
-  }
-  const nodes = state.chatHistory.map((m) =>
-    el(
-      "div",
-      { className: `chat-msg ${m.role}` },
-      el("span", { className: "chat-msg-role", textContent: m.role === "user" ? "用户" : "模型响应" }),
-      el("div", { textContent: m.text }),
-    ),
-  );
-  box.replaceChildren(...nodes);
-  box.scrollTop = box.scrollHeight;
-}
-
-async function sendStreamingChat(evt) {
-  evt.preventDefault();
-  if (state.readOnly) {
-    showToast("只读模式禁止发送推理请求", "warn");
-    return;
-  }
-  let target;
-  try {
-    target = getSelectedProxyTarget();
-  } catch (err) {
-    showToast(err.message, "warn");
-    return;
-  }
-  const userText = document.getElementById("chat-input").value.trim();
-  if (!userText) return;
-  const sysText = document.getElementById("chat-system").value.trim();
-  const model = document.getElementById("chat-model").value.trim() || "default";
-  const thinking = document.getElementById("chat-thinking").checked;
-
-  const messages = [];
-  if (sysText) messages.push({ role: "system", content: sysText });
-  for (const h of state.chatHistory) {
-    messages.push({ role: h.role, content: h.rawContent ?? h.text });
-  }
-  messages.push({ role: "user", content: userText });
-
-  state.chatHistory.push({ role: "user", text: userText, rawContent: userText });
-  const assistantTurn = { role: "assistant", text: "", rawContent: "", reasoning: "" };
-  state.chatHistory.push(assistantTurn);
-  document.getElementById("chat-input").value = "";
-  renderChatMessages();
-
-  const sendBtn = document.getElementById("chat-send-btn");
-  sendBtn.disabled = true;
-  try {
-    const url = `/api/proxy/${encodeURIComponent(target.service)}/${encodeURIComponent(target.instance)}/v1/chat/completions`;
-    const body = {
-      model,
-      messages,
-      stream: true,
-      chat_template_kwargs: { enable_thinking: thinking },
-    };
-    const resp = await fetch(url, {
-      method: "POST",
-      credentials: "same-origin",
-      headers: {
-        "Content-Type": "application/json",
-        "X-ColabLLM-CSRF": CSRF_TOKEN,
-      },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) {
-      const errTxt = await resp.text();
-      throw new Error(`HTTP ${resp.status}: ${errTxt}`);
-    }
-    const ct = resp.headers.get("Content-Type") || "";
-    if (!ct.includes("text/event-stream") || !resp.body) {
-      const json = await resp.json();
-      const msg = json?.choices?.[0]?.message || {};
-      assistantTurn.rawContent = msg.content || JSON.stringify(json, null, 2);
-      assistantTurn.text = msg.reasoning_content ? `[思考]\n${msg.reasoning_content}\n\n${assistantTurn.rawContent}` : assistantTurn.rawContent;
-      renderChatMessages();
-      return;
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.startsWith("data:")) continue;
-        const payload = line.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-        try {
-          const chunk = JSON.parse(payload);
-          const delta = chunk?.choices?.[0]?.delta || {};
-          if (delta.reasoning_content) assistantTurn.reasoning += delta.reasoning_content;
-          if (delta.content) assistantTurn.rawContent += delta.content;
-          assistantTurn.text = assistantTurn.reasoning
-            ? `[思考]\n${assistantTurn.reasoning}\n\n[回答]\n${assistantTurn.rawContent}`
-            : assistantTurn.rawContent;
-          renderChatMessages();
-        } catch {
-          // Ignore non-JSON chunk.
-        }
-      }
-    }
-  } catch (err) {
-    assistantTurn.text = `请求失败: ${err.message}`;
-    renderChatMessages();
-    showToast(err.message, "danger");
-  } finally {
-    sendBtn.disabled = false;
-  }
-}
-
 /* Wire all event handlers */
 function initInteractions() {
   document.getElementById("refresh-btn").addEventListener("click", async () => {
@@ -3697,51 +3564,6 @@ function initInteractions() {
     }
   });
 
-  // Chat & proxy
-  document.getElementById("chat-load-models").addEventListener("click", async () => {
-    try {
-      const target = getSelectedProxyTarget();
-      const res = await apiFetch(`/api/proxy/${encodeURIComponent(target.service)}/${encodeURIComponent(target.instance)}/v1/models`);
-      const firstId = res?.data?.[0]?.id;
-      if (firstId) {
-        document.getElementById("chat-model").value = firstId;
-        showToast(`已发现模型: ${firstId}`, "ok");
-      } else {
-        showToast("已连通，但未返回模型列表", "info");
-      }
-    } catch (err) {
-      showToast(`探测模型失败: ${err.message}`, "danger");
-    }
-  });
-  document.getElementById("chat-form").addEventListener("submit", sendStreamingChat);
-
-  document.getElementById("proxy-http-form").addEventListener("submit", async (evt) => {
-    evt.preventDefault();
-    if (state.readOnly) {
-      showToast("只读模式禁止发送代理请求", "warn");
-      return;
-    }
-    const out = document.getElementById("proxy-output");
-    out.textContent = "请求中...";
-    try {
-      const target = getSelectedProxyTarget();
-      const method = document.getElementById("proxy-method").value;
-      const rel = document.getElementById("proxy-path").value.trim().replace(/^\/+/, "");
-      const bodyRaw = document.getElementById("proxy-body").value.trim();
-      const res = await apiFetch(
-        `/api/proxy/${encodeURIComponent(target.service)}/${encodeURIComponent(target.instance)}/${rel}`,
-        {
-          method,
-          headers: method === "POST" && bodyRaw ? { "Content-Type": "application/json" } : {},
-          body: method === "POST" && bodyRaw ? bodyRaw : undefined,
-        },
-      );
-      out.textContent = typeof res === "string" ? res : JSON.stringify(res, null, 2);
-    } catch (err) {
-      out.textContent = `代理请求失败: ${err.message}`;
-    }
-  });
-
   // Tunnel & FRP
   document.getElementById("tunnel-form").addEventListener("submit", async (evt) => {
     evt.preventDefault();
@@ -3837,7 +3659,33 @@ async function main() {
   initTheme();
   initNavigation();
   initInteractions();
-  renderChatMessages();
+  copilotController = initCopilotStudio({
+    appState: state,
+    el(tag, attrs = null, ...children) {
+      const node = el(tag, attrs, ...children);
+      if (attrs && tag === "textarea" && attrs.value !== undefined) {
+        node.value = String(attrs.value);
+      }
+      if (attrs && tag === "input" && (attrs.type === "checkbox" || attrs.type === "radio") && attrs.checked !== undefined) {
+        node.checked = Boolean(attrs.checked);
+      }
+      return node;
+    },
+    toast(message, tone = "info") {
+      showToast(message, tone === "error" ? "danger" : tone);
+    },
+    copyText(text, successMsg = "已复制到剪贴板") {
+      if (!navigator.clipboard?.writeText) {
+        showToast("当前浏览器不支持剪贴板写入", "warn");
+        return Promise.resolve();
+      }
+      return navigator.clipboard.writeText(String(text || "")).then(
+        () => showToast(successMsg, "ok", 2200),
+        () => showToast("复制失败，请手动复制", "warn"),
+      );
+    },
+    switchView,
+  });
   try {
     await loadBootstrap();
     connectEventsSse();

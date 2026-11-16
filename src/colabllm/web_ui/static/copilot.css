@@ -1,0 +1,986 @@
+/* ColabLLM Copilot Studio & Slide-out CopilotSidebar Styles */
+
+.ck-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.82rem;
+}
+
+.ck-studio {
+  display: grid;
+  gap: 14px;
+}
+
+.ck-context-card {
+  padding: 14px 16px;
+  display: grid;
+  gap: 10px;
+}
+
+.ck-context-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: end;
+}
+
+.ck-field {
+  display: grid;
+  gap: 4px;
+  min-inline-size: 160px;
+  flex: 1 1 200px;
+}
+
+.ck-field.inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 1 auto;
+}
+
+.ck-field.inline label {
+  white-space: nowrap;
+}
+
+.ck-field label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.ck-field input,
+.ck-field select,
+.ck-field textarea {
+  inline-size: 100%;
+  box-sizing: border-box;
+}
+
+.ck-context-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ck-context-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.ck-cap-summary {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+/* Single-row scrollable Copilot capability tabs */
+.ck-tabs-shell {
+  min-inline-size: 0;
+}
+
+.ck-tablist {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 4px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  border-block-end: 1px solid var(--border);
+  padding-block-end: 2px;
+}
+
+.ck-tablist .tab-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  border-block-end: 2px solid transparent;
+}
+
+.ck-tablist .tab-btn[aria-selected="true"] {
+  border-block-end-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ck-tablist .tab-btn[hidden] {
+  display: none;
+}
+
+/* Viewport-aware popovers */
+#ck-code-btn {
+  anchor-name: --ck-code-anchor;
+}
+
+#ck-code-popover {
+  position-anchor: --ck-code-anchor;
+}
+
+#ck-drive-btn {
+  anchor-name: --ck-drive-anchor;
+}
+
+#ck-drive-popover {
+  position-anchor: --ck-drive-anchor;
+}
+
+.ck-popover[popover] {
+  inline-size: min(92dvw, 640px);
+  max-block-size: min(75dvh, 520px);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 12px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.24);
+}
+
+@supports (position-area: block-end) {
+  .ck-popover[popover] {
+    inset: auto;
+    margin: 0;
+    position-area: block-end span-inline-start;
+    position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+  }
+}
+
+.ck-popover-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin-block-end: 8px;
+}
+
+/* 3-pane Copilot Chat workspace */
+.ck-chat-workspace {
+  display: grid;
+  grid-template-columns: 248px minmax(0, 1fr) 292px;
+  gap: 14px;
+  align-items: stretch;
+  min-block-size: 560px;
+}
+
+.ck-chat-workspace.hide-threads {
+  grid-template-columns: minmax(0, 1fr) 292px;
+}
+
+.ck-chat-workspace.hide-params {
+  grid-template-columns: 248px minmax(0, 1fr);
+}
+
+.ck-chat-workspace.hide-threads.hide-params {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.ck-chat-workspace.hide-threads .ck-threads-pane,
+.ck-chat-workspace.hide-params .ck-params-pane {
+  display: none;
+}
+
+@media (max-width: 1120px) {
+  .ck-chat-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .ck-threads-pane,
+  .ck-params-pane {
+    max-block-size: 300px;
+  }
+}
+
+.ck-threads-pane,
+.ck-params-pane {
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-inline-size: 0;
+  overflow: auto;
+}
+
+.ck-pane-header,
+.ck-pane-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+
+.ck-thread-search-wrap input {
+  inline-size: 100%;
+  box-sizing: border-box;
+}
+
+.ck-threads-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+
+.ck-thread-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 4px;
+  background: var(--surface);
+}
+
+.ck-thread-item[data-active="true"] {
+  border-color: var(--accent);
+}
+
+.ck-thread-select {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  text-align: start;
+  background: none;
+  border: 0;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 6px;
+  display: grid;
+  gap: 2px;
+}
+
+.ck-thread-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.86rem;
+  font-weight: 600;
+}
+
+.ck-thread-meta {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.ck-chat-main {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 0;
+  min-block-size: 560px;
+  max-block-size: 76dvh;
+}
+
+.ck-chat-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-block-end: 1px solid var(--border);
+  background: var(--surface-subtle);
+  border-start-start-radius: 12px;
+  border-start-end-radius: 12px;
+}
+
+.ck-endpoint-pick {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ck-endpoint-pick label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* Welcome & Starter Suggestion Pills */
+.ck-welcome {
+  padding: 18px 16px 10px;
+  display: grid;
+  gap: 8px;
+  border-block-end: 1px dashed var(--border);
+}
+
+.ck-welcome[hidden] {
+  display: none;
+}
+
+.ck-welcome-badge {
+  justify-self: start;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  color: var(--accent);
+}
+
+.ck-welcome h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.ck-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-suggestion-pill {
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 5px 11px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  text-align: start;
+}
+
+.ck-suggestion-pill:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Size-aware message feed */
+.ck-feed {
+  container-type: inline-size;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ck-msg {
+  display: grid;
+  gap: 6px;
+  max-inline-size: 92%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+.ck-msg[data-role="user"] {
+  align-self: flex-end;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+}
+
+.ck-msg[data-role="assistant"] {
+  align-self: flex-start;
+  background: var(--surface-subtle);
+}
+
+.ck-msg-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.76rem;
+  color: var(--text-muted);
+}
+
+.ck-msg-body {
+  display: grid;
+  gap: 8px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.ck-msg-body p {
+  margin: 0;
+}
+
+.ck-msg-body ul,
+.ck-msg-body ol {
+  margin: 0;
+  padding-inline-start: 20px;
+}
+
+.ck-code-block-wrap {
+  display: grid;
+  gap: 4px;
+}
+
+.ck-code-block-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.ck-code-pre,
+.ck-msg-body pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: light-dark(#0f172a, #090d16);
+  color: #e2e8f0;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.ck-msg-body pre code,
+.ck-code-pre code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.ck-inline-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.86em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+}
+
+/* Native <details> Accordions (Reasoning, Tool Calls, Parameter sections) */
+@supports (interpolate-size: allow-keywords) {
+  details.ck-accordion,
+  details.ck-reasoning-card,
+  details.ck-tool-card {
+    interpolate-size: allow-keywords;
+  }
+}
+
+details.ck-accordion,
+details.ck-reasoning-card,
+details.ck-tool-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 6px 10px;
+}
+
+details.ck-reasoning-card {
+  border-inline-start: 3px solid var(--warn);
+}
+
+details.ck-tool-card {
+  border-inline-start: 3px solid var(--accent);
+}
+
+details.ck-accordion > summary,
+details.ck-reasoning-card > summary,
+details.ck-tool-card > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+}
+
+details.ck-accordion > summary::-webkit-details-marker,
+details.ck-reasoning-card > summary::-webkit-details-marker,
+details.ck-tool-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.ck-accordion > summary::before,
+details.ck-reasoning-card > summary::before,
+details.ck-tool-card > summary::before {
+  content: "▸";
+  display: inline-block;
+  font-size: 0.8em;
+  transition: transform 0.2s ease;
+}
+
+details.ck-accordion[open] > summary::before,
+details.ck-reasoning-card[open] > summary::before,
+details.ck-tool-card[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+details.ck-accordion::details-content,
+details.ck-reasoning-card::details-content,
+details.ck-tool-card::details-content {
+  overflow: clip;
+  contain: layout;
+  block-size: 0;
+  transition: block-size 0.22s ease, content-visibility 0.22s allow-discrete;
+}
+
+details.ck-accordion[open]::details-content,
+details.ck-reasoning-card[open]::details-content,
+details.ck-tool-card[open]::details-content {
+  block-size: auto;
+}
+
+.ck-acc-body {
+  display: grid;
+  gap: 8px;
+  padding-block-start: 8px;
+}
+
+/* Generative UI A2UI Cards */
+.ck-genui-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--surface);
+  display: grid;
+  gap: 8px;
+}
+
+.ck-genui-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@container (min-width: 640px) {
+  .ck-msg {
+    max-inline-size: 86%;
+  }
+  .ck-genui-kpi-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@container (max-width: 460px) {
+  .ck-msg {
+    max-inline-size: 96%;
+  }
+  .ck-genui-kpi-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ck-kpi-tile {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  display: grid;
+  gap: 2px;
+}
+
+.ck-kpi-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.ck-kpi-value {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+.ck-table-wrap {
+  overflow-x: auto;
+}
+
+.ck-data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.ck-data-table th,
+.ck-data-table td {
+  padding: 6px 8px;
+  border-block-end: 1px solid var(--border);
+  text-align: start;
+}
+
+.ck-media-thumb {
+  max-inline-size: 100%;
+  max-block-size: 320px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+}
+
+/* Composer & Auto-sizing Textareas */
+.ck-composer {
+  border-block-start: 1px solid var(--border);
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+  background: var(--surface);
+  border-end-start-radius: 12px;
+  border-end-end-radius: 12px;
+}
+
+textarea.ck-autosize {
+  field-sizing: content;
+  height: auto;
+  inline-size: 100%;
+  min-block-size: 2.5lh;
+  max-block-size: 10lh;
+  resize: none;
+  overflow-y: auto;
+  box-sizing: border-box;
+}
+
+.ck-composer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.ck-composer-left,
+.ck-composer-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.ck-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 0.78rem;
+}
+
+.ck-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ck-tools-list {
+  container-type: inline-size;
+  display: grid;
+  gap: 6px;
+}
+
+.ck-tool-badge-item {
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  display: grid;
+  gap: 2px;
+  font-size: 0.78rem;
+}
+
+.ck-drive-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  max-block-size: 260px;
+  overflow-y: auto;
+}
+
+.ck-drive-item-btn {
+  inline-size: 100%;
+  text-align: start;
+  justify-content: flex-start;
+}
+
+/* Progress Element Styling (-webkit- and -moz- strictly separated) */
+@keyframes ck-indeterminate {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 40px 0;
+  }
+}
+
+progress.ck-progress {
+  container-type: inline-size;
+  appearance: none;
+  inline-size: 110px;
+  block-size: 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+  background-color: var(--surface-subtle);
+}
+
+progress.ck-progress[hidden] {
+  display: none;
+}
+
+progress.ck-progress::-webkit-progress-bar {
+  background-color: var(--surface-subtle);
+  border-radius: 999px;
+}
+
+progress.ck-progress::-webkit-progress-value {
+  background-color: var(--accent);
+  border-radius: 999px;
+}
+
+progress.ck-progress::-moz-progress-bar {
+  background-color: var(--accent);
+  border-radius: 999px;
+}
+
+progress.ck-progress:indeterminate {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    var(--accent) 0 10px,
+    color-mix(in srgb, var(--accent) 30%, transparent) 10px 20px
+  );
+  background-size: 40px 40px;
+  animation: ck-indeterminate 1s linear infinite;
+}
+
+progress.ck-progress:indeterminate::-webkit-progress-bar {
+  background: transparent;
+}
+
+progress.ck-progress:indeterminate::-moz-progress-bar {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  progress.ck-progress:indeterminate {
+    animation-duration: 10s;
+  }
+  details.ck-accordion::details-content,
+  details.ck-reasoning-card::details-content,
+  details.ck-tool-card::details-content,
+  details.ck-accordion > summary::before,
+  details.ck-reasoning-card > summary::before,
+  details.ck-tool-card > summary::before {
+    transition-duration: 0.01ms;
+  }
+}
+
+/* Multimodal & Specialized Studios */
+.ck-studio-grid {
+  container-type: inline-size;
+  display: grid;
+  grid-template-columns: minmax(280px, 420px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 980px) {
+  .ck-studio-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.ck-studio-form-card,
+.ck-studio-output-card {
+  display: grid;
+  gap: 12px;
+}
+
+.ck-presets-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-gallery-wrap {
+  container-type: inline-size;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.ck-media-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px;
+  background: var(--surface-subtle);
+  display: grid;
+  gap: 6px;
+}
+
+.ck-media-card img,
+.ck-media-card video {
+  inline-size: 100%;
+  border-radius: 8px;
+  max-block-size: 320px;
+  object-fit: contain;
+  background: #00000018;
+}
+
+.ck-media-card audio {
+  inline-size: 100%;
+}
+
+.ck-ctc-segments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-ctc-btn {
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.ck-ctc-btn[data-active="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 16%, var(--surface));
+}
+
+.ck-emo-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ck-matrix-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Right-edge Scroll-Snap Swipe-to-Dismiss CopilotSidebar Drawer */
+dialog.ck-drawer {
+  --drawer-backdrop: 0.45;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  inline-size: 100dvw;
+  max-inline-size: 100dvw;
+  block-size: 100dvh;
+  max-block-size: 100dvh;
+}
+
+dialog.ck-drawer[open] {
+  display: grid;
+  grid-template-columns: 100dvw min(92dvw, 480px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-snap-type: x mandatory;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+}
+
+dialog.ck-drawer[open]::-webkit-scrollbar {
+  display: none;
+}
+
+dialog.ck-drawer::backdrop {
+  background: rgba(15, 23, 42, var(--drawer-backdrop, 0.45));
+}
+
+@supports (animation-timeline: scroll()) {
+  @property --drawer-backdrop {
+    syntax: "<number>";
+    inherits: false;
+    initial-value: 0.45;
+  }
+
+  @keyframes ck-drawer-scrim-fade {
+    0% {
+      --drawer-backdrop: 0;
+    }
+    40% {
+      --drawer-backdrop: 0.45;
+    }
+    100% {
+      --drawer-backdrop: 0.45;
+    }
+  }
+
+  dialog.ck-drawer[open]::backdrop {
+    animation: ck-drawer-scrim-fade linear both;
+    animation-timeline: --drawer;
+  }
+}
+
+.ck-drawer-scrim {
+  scroll-snap-align: start;
+  inline-size: 100dvw;
+  block-size: 100dvh;
+}
+
+.ck-drawer-panel {
+  scroll-snap-align: end;
+  view-timeline: --drawer x;
+  inline-size: min(92dvw, 480px);
+  block-size: 100dvh;
+  background: var(--surface);
+  border-inline-start: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  box-shadow: -12px 0 36px rgba(0, 0, 0, 0.2);
+}
+
+.ck-drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 8px;
+  padding: 12px 14px;
+  border-block-end: 1px solid var(--border);
+}
+
+.ck-drawer-header h2 {
+  margin: 0;
+  font-size: 1.02rem;
+}
+
+.ck-drawer-header p {
+  margin: 2px 0 0;
+  font-size: 0.78rem;
+}
+
+.ck-drawer-header-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.ck-drawer-target-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 14px;
+  background: var(--surface-subtle);
+  border-block-end: 1px solid var(--border);
+}
+
+.ck-drawer-target-bar select {
+  flex: 1 1 auto;
+  min-inline-size: 0;
+}
+
+.ck-drawer-suggestions {
+  padding: 8px 14px;
+  border-block-end: 1px dashed var(--border);
+}
+
+.ck-drawer-feed {
+  flex: 1 1 auto;
+}
+
+.ck-drawer-composer {
+  margin-block-start: auto;
+}

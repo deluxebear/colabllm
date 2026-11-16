@@ -24,12 +24,16 @@ from . import introspect, runner_bridge, state_store
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_FILES: dict[str, str] = {
     "styles.css": "text/css; charset=utf-8",
+    "copilot.css": "text/css; charset=utf-8",
     "app.js": "application/javascript; charset=utf-8",
+    "copilot.js": "application/javascript; charset=utf-8",
+    "copilot_studios.js": "application/javascript; charset=utf-8",
     "favicon.svg": "image/svg+xml",
 }
 _PROXY_SAFE_TYPES = (
     "application/json",
     "text/event-stream",
+    "application/x-ndjson",
     "text/plain",
     "application/octet-stream",
     "image/png",
@@ -39,7 +43,18 @@ _PROXY_SAFE_TYPES = (
     "audio/",
     "video/",
 )
+_PROXY_PASSTHROUGH_HEADERS = (
+    "X-Audio-Sample-Rate",
+    "X-Saved-Drive-Path",
+    "X-Audio-Duration",
+    "Content-Disposition",
+    "ETag",
+    "X-Request-Id",
+    "X-Queue-Position",
+    "X-Job-Id",
+)
 _MAX_BODY_BYTES = 16 * 1024 * 1024
+_MAX_PROXY_BODY_BYTES = 128 * 1024 * 1024
 
 
 def _package_version() -> str:
@@ -277,7 +292,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             raise UsageError("JSON 请求体必须是对象")
         return parsed
 
-    def _read_raw_body(self) -> bytes:
+    def _read_raw_body(self, max_bytes: int = _MAX_BODY_BYTES) -> bytes:
         raw_len = self.headers.get("Content-Length")
         if not raw_len:
             return b""
@@ -285,7 +300,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             length = int(raw_len)
         except ValueError:
             raise UsageError("无效的 Content-Length") from None
-        if length < 0 or length > _MAX_BODY_BYTES:
+        if length < 0 or length > max_bytes:
             raise UsageError("请求体大小超出限制")
         return self.rfile.read(length) if length else b""
 
@@ -348,6 +363,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._dispatch("POST")
+
+    def do_PUT(self) -> None:
+        self._dispatch("PUT")
+
+    def do_DELETE(self) -> None:
+        self._dispatch("DELETE")
 
     def _dispatch(self, method: str) -> None:
         parsed = urllib.parse.urlsplit(self.path)
@@ -484,8 +505,8 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, runner_bridge.run_frp_status())
                 return
 
-            if path.startswith("/api/proxy/") and method in ("GET", "POST"):
-                require_csrf = method == "POST"
+            if path.startswith("/api/proxy/") and method in ("GET", "HEAD", "POST", "PUT", "DELETE"):
+                require_csrf = method in ("POST", "PUT", "DELETE")
                 if self._require_api_auth(require_csrf=require_csrf, write_action=True) is None:
                     return
                 self._handle_proxy(method, path[len("/api/proxy/") :], parsed.query)
@@ -564,6 +585,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             "version": self.server.version,
             "read_only": self.server.read_only,
             "default_account": self.server.default_account,
+            "capability_surfaces": list(introspect.CAPABILITY_SURFACES),
             "services": services_list,
             "instances": instances,
             "accounts": accounts,
@@ -858,13 +880,16 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         req_headers: dict[str, str] = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
         }
-        if self.headers.get("Content-Type"):
-            req_headers["Content-Type"] = self.headers["Content-Type"]
-        if self.headers.get("Accept"):
-            req_headers["Accept"] = self.headers["Accept"]
+        for hdr in ("Content-Type", "Accept", "Range", "If-None-Match"):
+            val = self.headers.get(hdr)
+            if val:
+                req_headers[hdr] = val
 
+        custom_auth = (self.headers.get("X-ColabLLM-Proxy-Authorization") or "").strip()
         auth_mode = catalog[svc_name]["auth"]
-        if st.get("api_token") and (
+        if custom_auth:
+            req_headers["Authorization"] = custom_auth
+        elif st.get("api_token") and (
             auth_mode == "builtin" or subpath.startswith(("v1/", "api/")) or not st.get("auth_pass")
         ):
             req_headers["Authorization"] = f"Bearer {st['api_token']}"
@@ -874,35 +899,89 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         elif st.get("api_token"):
             req_headers["Authorization"] = f"Bearer {st['api_token']}"
 
-        body = self._read_raw_body() if method == "POST" else None
+        body: bytes | None = None
+        if method in ("POST", "PUT"):
+            body = self._read_raw_body(max_bytes=_MAX_PROXY_BODY_BYTES)
+            if (
+                svc_name == "unsloth-studio"
+                and subpath == "api/auth/login"
+                and method == "POST"
+                and st.get("login_user")
+                and st.get("login_pass")
+            ):
+                should_inject = not body.strip()
+                if not should_inject:
+                    with contextlib.suppress(UnicodeDecodeError, json.JSONDecodeError):
+                        parsed_body = json.loads(body.decode("utf-8"))
+                        should_inject = isinstance(parsed_body, dict) and not parsed_body
+                if should_inject:
+                    body = json.dumps(
+                        {"username": st["login_user"], "password": st["login_pass"]},
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    req_headers["Content-Type"] = "application/json"
+
         req = urllib.request.Request(target_url, data=body, headers=req_headers, method=method)
+        head_only = method == "HEAD"
 
         try:
             with safe_urlopen(req, timeout=180) as resp:
-                self._stream_proxy_response(resp.status, resp.headers.get("Content-Type", ""), resp)
+                self._stream_proxy_response(
+                    resp.status,
+                    resp.headers.get("Content-Type", ""),
+                    resp,
+                    head_only=head_only,
+                )
         except urllib.error.HTTPError as err:
-            raw_err = err.read()
+            raw_err = b"" if head_only else err.read()
             ct = _sanitize_proxy_content_type(err.headers.get("Content-Type", "text/plain; charset=utf-8"))
             self.send_response(err.code)
             self._add_common_headers()
             self.send_header("Content-Type", ct)
             self.send_header("Content-Security-Policy", "sandbox")
-            self.send_header("Content-Length", str(len(raw_err)))
+            for hdr in _PROXY_PASSTHROUGH_HEADERS:
+                val = err.headers.get(hdr)
+                if val:
+                    self.send_header(hdr, val)
+            if not head_only:
+                self.send_header("Content-Length", str(len(raw_err)))
+            elif err.headers.get("Content-Length"):
+                self.send_header("Content-Length", err.headers.get("Content-Length"))
             self.end_headers()
-            self.wfile.write(raw_err)
+            if not head_only:
+                self.wfile.write(raw_err)
         except urllib.error.URLError as err:
             raise CliError(f"远端代理请求失败: {err.reason}") from None
 
-    def _stream_proxy_response(self, status: int, upstream_ct: str, resp: Any) -> None:
+    def _stream_proxy_response(
+        self,
+        status: int,
+        upstream_ct: str,
+        resp: Any,
+        *,
+        head_only: bool = False,
+    ) -> None:
         safe_ct = _sanitize_proxy_content_type(upstream_ct)
-        is_sse = safe_ct.lower().startswith("text/event-stream")
+        base_ct = safe_ct.split(";", 1)[0].strip().lower()
+        is_stream = base_ct in ("text/event-stream", "application/x-ndjson")
         self.send_response(status)
         self._add_common_headers()
         self.send_header("Content-Type", safe_ct)
         self.send_header("Content-Security-Policy", "sandbox")
         self.send_header("Cache-Control", "no-store")
+        for hdr in _PROXY_PASSTHROUGH_HEADERS:
+            val = resp.headers.get(hdr)
+            if val:
+                self.send_header(hdr, val)
 
-        if is_sse:
+        raw_cl = (resp.headers.get("Content-Length") or "").strip()
+        if head_only:
+            if raw_cl.isdigit():
+                self.send_header("Content-Length", raw_cl)
+            self.end_headers()
+            return
+
+        if is_stream:
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -912,6 +991,14 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     break
                 self.wfile.write(line)
                 self.wfile.flush()
+        elif raw_cl.isdigit() and int(raw_cl) > 8 * 1024 * 1024:
+            self.send_header("Content-Length", raw_cl)
+            self.end_headers()
+            while not self.server.stop_event.is_set():
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
         else:
             data = resp.read()
             self.send_header("Content-Length", str(len(data)))

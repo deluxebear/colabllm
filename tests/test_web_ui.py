@@ -28,7 +28,7 @@ for _p in (str(SRC), str(LIB)):
 
 from cli_support import CliError, UsageError  # noqa: E402
 from colabllm import web as colabllm_web  # noqa: E402
-from colabllm.web_ui import introspect, server as web_server, state_store  # noqa: E402
+from colabllm.web_ui import api_catalog, introspect, server as web_server, state_store  # noqa: E402
 
 
 def _read_sse_until(resp: http.client.HTTPResponse, predicate, *, timeout: float = 10.0) -> list[tuple[str, str]]:
@@ -262,6 +262,60 @@ class IntrospectionTest(unittest.TestCase):
         self.assertIsNone(catalog['r2-migrate']['gpu'])
         self.assertFalse(catalog['ollama']['has_web_ui'])
         self.assertTrue(catalog['ollama']['chat_compatible'])
+
+        valid_surfaces = set(api_catalog.SURFACE_IDS)
+        for name, svc_meta in catalog.items():
+            self.assertIn('openai_compatible', svc_meta)
+            profile = svc_meta.get('api_profile')
+            self.assertIsInstance(profile, dict, f'{name} missing api_profile')
+            self.assertIn(profile.get('primary_surface'), valid_surfaces, f'{name} invalid primary_surface')
+            self.assertTrue(profile.get('surfaces'), f'{name} missing surfaces')
+            self.assertTrue(set(profile['surfaces']).issubset(valid_surfaces), f'{name} unknown surface')
+            self.assertIsInstance(profile.get('features'), dict)
+            self.assertIsInstance(profile.get('suggestions'), list)
+            self.assertIsInstance(profile.get('endpoint_presets'), list)
+
+        for oai_svc in (
+            'qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'ollama',
+            'flux-klein', 'qwen-image', 'minimax-h3-image',
+            'qwen3-tts', 'indextts', 'drama3', 'tangoflux', 'nemotron-transcribe',
+        ):
+            self.assertTrue(catalog[oai_svc]['openai_compatible'], f'{oai_svc} should be openai_compatible')
+
+        for native_svc in ('comfyui', 'unlimited-ocr', 'unsloth-studio', 'r2-migrate'):
+            self.assertFalse(catalog[native_svc]['openai_compatible'], f'{native_svc} should be native API')
+            self.assertEqual(catalog[native_svc]['api_profile']['primary_surface'], 'specialized')
+
+        h3_profile = catalog['minimax-h3-image']['api_profile']
+        self.assertTrue(h3_profile['features']['rejects_negative_prompt'])
+        self.assertEqual(h3_profile['features']['fixed_steps'], 6)
+
+        nemotron_profile = catalog['nemotron-transcribe']['api_profile']
+        self.assertTrue(nemotron_profile['features']['salm_chat_audio'])
+        self.assertEqual(nemotron_profile['primary_surface'], 'transcribe')
+
+    def test_auto_discovery_for_future_openai_and_custom_runtimes(self):
+        oai_profile = api_catalog.build_api_profile(
+            'future-vllm-omni',
+            doc='OpenAI compatible /v1/chat/completions, /v1/embeddings and /v1/images/generations server.',
+            subcommand_names=['up', 'down', 'status'],
+            auth='builtin',
+        )
+        self.assertTrue(oai_profile['openai_compatible'])
+        self.assertIn('chat', oai_profile['surfaces'])
+        self.assertIn('embeddings', oai_profile['surfaces'])
+        self.assertIn('image', oai_profile['surfaces'])
+        self.assertIn('inspector', oai_profile['surfaces'])
+
+        custom_profile = api_catalog.build_api_profile(
+            'future-custom-tool',
+            doc='Specialized internal /api/jobs workflow runner.',
+            subcommand_names=['up', 'jobs'],
+            auth='caddy',
+        )
+        self.assertFalse(custom_profile['openai_compatible'])
+        self.assertEqual(custom_profile['primary_surface'], 'specialized')
+        self.assertIn('inspector', custom_profile['surfaces'])
 
     def test_ordered_image_actions_and_special_argparse_types(self):
         flux = introspect.get_service_schema('flux-klein')
@@ -699,6 +753,187 @@ class WebServerIntegrationTest(unittest.TestCase):
             up_th.join(timeout=2.0)
             upstream.server_close()
 
+    def test_proxy_extended_methods_streaming_headers_and_unsloth_login(self):
+        recorded: list[tuple[str, str, str, bytes]] = []
+
+        class _MockExtendedUpstream(http.server.BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, format, *args):
+                return
+
+            def do_HEAD(self):
+                recorded.append(('HEAD', self.path, self.headers.get('Authorization', ''), b''))
+                self.send_response(200)
+                self.send_header('Content-Type', 'audio/wav')
+                self.send_header('X-Audio-Sample-Rate', '44100')
+                self.send_header('X-Saved-Drive-Path', '/colabllm/out.wav')
+                self.send_header('Content-Length', '128')
+                self.end_headers()
+
+            def do_PUT(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                body = self.rfile.read(length) if length else b''
+                recorded.append(('PUT', self.path, self.headers.get('Authorization', ''), body))
+                out = json.dumps({'updated': True}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def do_DELETE(self):
+                recorded.append(('DELETE', self.path, self.headers.get('Authorization', ''), b''))
+                out = json.dumps({'deleted': True}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                body = self.rfile.read(length) if length else b''
+                recorded.append(('POST', self.path, self.headers.get('Authorization', ''), body))
+                if self.path == '/api/pull':
+                    lines = b'{"status":"pulling"}\n{"status":"success"}\n'
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/x-ndjson')
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+                    self.wfile.write(lines)
+                    return
+                out = json.dumps({'received': json.loads(body.decode('utf-8')) if body else None}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _MockExtendedUpstream)
+        up_th = threading.Thread(target=upstream.serve_forever, daemon=True)
+        up_th.start()
+        try:
+            up_port = upstream.server_address[1]
+            unsloth_dir = self.home_dir / 'services' / 'unsloth-studio'
+            unsloth_dir.mkdir(parents=True, exist_ok=True)
+            (unsloth_dir / 'state.json').write_text(
+                json.dumps({
+                    'url': f'http://127.0.0.1:{up_port}',
+                    'login_user': 'studio_admin',
+                    'login_pass': 'studio_pass_99',
+                }),
+                encoding='utf-8',
+            )
+            ollama_dir = self.home_dir / 'services' / 'ollama'
+            ollama_dir.mkdir(parents=True, exist_ok=True)
+            (ollama_dir / 'state.json').write_text(
+                json.dumps({
+                    'url': f'http://127.0.0.1:{up_port}',
+                    'api_token': 'tok-ollama-1',
+                }),
+                encoding='utf-8',
+            )
+
+            srv, port = self._start_console(read_only=False)
+            cookie, csrf = self._authenticate(srv, port)
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+            try:
+                # 1. Bootstrap includes capability_surfaces + new static files are served.
+                conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie})
+                boot_resp = conn.getresponse()
+                boot = json.loads(boot_resp.read().decode('utf-8'))
+                self.assertEqual(boot_resp.status, 200)
+                self.assertEqual(len(boot['capability_surfaces']), 7)
+                for asset in ('copilot.css', 'copilot.js', 'copilot_studios.js'):
+                    conn.request('GET', f'/static/{asset}', headers={'Cookie': cookie})
+                    sr = conn.getresponse()
+                    sr.read()
+                    self.assertEqual(sr.status, 200, f'/static/{asset} failed')
+
+                # 2. CSRF enforcement on PUT / DELETE.
+                conn.request('PUT', '/api/proxy/ollama/default/v1/item', body='{}', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 403)
+
+                conn.request('DELETE', '/api/proxy/ollama/default/v1/audio/voices/demo', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 403)
+
+                # 3. HEAD preserves passthrough headers & sandbox CSP.
+                conn.request('HEAD', '/api/proxy/ollama/default/api/ct/jobs/1', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                body = r.read()
+                self.assertEqual(r.status, 200)
+                self.assertEqual(body, b'')
+                self.assertEqual(r.getheader('Content-Security-Policy'), 'sandbox')
+                self.assertEqual(r.getheader('X-Audio-Sample-Rate'), '44100')
+                self.assertEqual(r.getheader('X-Saved-Drive-Path'), '/colabllm/out.wav')
+
+                # 4. PUT & DELETE with CSRF + X-ColabLLM-Proxy-Authorization override.
+                conn.request(
+                    'PUT',
+                    '/api/proxy/ollama/default/v1/item',
+                    body=b'{"x":1}',
+                    headers={
+                        'Cookie': cookie,
+                        'X-ColabLLM-CSRF': csrf,
+                        'Content-Type': 'application/json',
+                        'X-ColabLLM-Proxy-Authorization': 'Bearer custom-jwt-xyz',
+                    },
+                )
+                r = conn.getresponse()
+                self.assertEqual(r.status, 200)
+                self.assertTrue(json.loads(r.read().decode('utf-8'))['updated'])
+                self.assertEqual(recorded[-1][2], 'Bearer custom-jwt-xyz')
+
+                conn.request(
+                    'DELETE',
+                    '/api/proxy/ollama/default/v1/audio/voices/demo',
+                    headers={'Cookie': cookie, 'X-ColabLLM-CSRF': csrf},
+                )
+                r = conn.getresponse()
+                self.assertEqual(r.status, 200)
+                self.assertTrue(json.loads(r.read().decode('utf-8'))['deleted'])
+                self.assertEqual(recorded[-1][2], 'Bearer tok-ollama-1')
+
+                # 5. NDJSON streaming passthrough.
+                conn.request(
+                    'POST',
+                    '/api/proxy/ollama/default/api/pull',
+                    body=b'{"model":"qwen3"}',
+                    headers={'Cookie': cookie, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'},
+                )
+                r = conn.getresponse()
+                ndjson_body = r.read().decode('utf-8')
+                self.assertEqual(r.status, 200)
+                self.assertIn('application/x-ndjson', r.getheader('Content-Type') or '')
+                self.assertEqual(len(ndjson_body.strip().splitlines()), 2)
+
+                # Need a fresh HTTP connection after streaming Connection: close.
+                conn.close()
+                conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+
+                # 6. Unsloth Studio /api/auth/login credential injection on empty {} body.
+                conn.request(
+                    'POST',
+                    '/api/proxy/unsloth-studio/default/api/auth/login',
+                    body=b'{}',
+                    headers={'Cookie': cookie, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'},
+                )
+                r = conn.getresponse()
+                res = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(res['received'], {'username': 'studio_admin', 'password': 'studio_pass_99'})
+            finally:
+                conn.close()
+        finally:
+            upstream.shutdown()
+            up_th.join(timeout=2.0)
+            upstream.server_close()
+
     def test_instance_sorting_and_enriched_metadata(self):
         catalog = introspect.get_service_catalog()
         svc_root = self.home_dir / 'services'
@@ -748,8 +983,8 @@ class WebServerIntegrationTest(unittest.TestCase):
                 'state_label', 'stage_hint', 'auto_restart', 'restart_count', 'url', 'hostname',
                 'transport', 'account', 'drive_account', 'started', 'session_gpu', 'mount_drive',
                 'runner_exit', 'log_exists', 'has_api_token', 'has_basic_auth', 'has_app_login',
-                'auth_mode', 'has_web_ui', 'chat_compatible', 'corrupt',
-                'category', 'category_label', 'failed_exit', 'updated_ts', 'status_rank',
+                'auth_mode', 'has_web_ui', 'chat_compatible', 'openai_compatible', 'primary_surface',
+                'corrupt', 'category', 'category_label', 'failed_exit', 'updated_ts', 'status_rank',
             }
             by_name = {i['session_name']: i for i in items}
             for item in items:
@@ -758,6 +993,8 @@ class WebServerIntegrationTest(unittest.TestCase):
             self.assertEqual(by_name['qwen-flash']['status_rank'], 0)
             self.assertEqual(by_name['qwen-flash']['category'], 'llm')
             self.assertEqual(by_name['qwen-flash']['category_label'], 'LLM 与推理')
+            self.assertTrue(by_name['qwen-flash']['openai_compatible'])
+            self.assertEqual(by_name['qwen-flash']['primary_surface'], 'chat')
             self.assertFalse(by_name['qwen-flash']['failed_exit'])
 
             self.assertEqual(by_name['ollama']['status_rank'], 1)
@@ -766,6 +1003,8 @@ class WebServerIntegrationTest(unittest.TestCase):
             self.assertEqual(by_name['comfyui']['status_rank'], 2)
             self.assertTrue(by_name['comfyui']['failed_exit'])
             self.assertEqual(by_name['comfyui']['state_label'], 'STOPPED')
+            self.assertFalse(by_name['comfyui']['openai_compatible'])
+            self.assertEqual(by_name['comfyui']['primary_surface'], 'specialized')
 
             self.assertEqual(by_name['flux-klein']['status_rank'], 2)
             self.assertTrue(by_name['flux-klein']['corrupt'])
@@ -1074,10 +1313,14 @@ class WebServerIntegrationTest(unittest.TestCase):
         static_dir = SRC / 'colabllm' / 'web_ui' / 'static'
         index_html = (static_dir / 'index.html').read_text(encoding='utf-8')
         styles_css = (static_dir / 'styles.css').read_text(encoding='utf-8')
+        copilot_css = (static_dir / 'copilot.css').read_text(encoding='utf-8')
         app_js = (static_dir / 'app.js').read_text(encoding='utf-8')
+        copilot_js = (static_dir / 'copilot.js').read_text(encoding='utf-8')
+        copilot_studios_js = (static_dir / 'copilot_studios.js').read_text(encoding='utf-8')
 
-        for forbidden_sink in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write'):
-            self.assertNotIn(forbidden_sink, app_js)
+        for js_name, js_src in (('app.js', app_js), ('copilot.js', copilot_js), ('copilot_studios.js', copilot_studios_js)):
+            for forbidden_sink in ('innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write'):
+                self.assertNotIn(forbidden_sink, js_src, f'{js_name} must not contain {forbidden_sink}')
 
         self.assertIn('id="logs-copy-btn"', index_html)
         self.assertIn('command="--copy"', index_html)
@@ -1087,14 +1330,24 @@ class WebServerIntegrationTest(unittest.TestCase):
         self.assertIn('command="--copy-py"', index_html)
         self.assertIn('commandfor="connect-snippet"', index_html)
         self.assertIn('<span class="copy-tip" role="status"></span>', index_html)
+        self.assertIn('id="view-copilot"', index_html)
+        self.assertIn('id="copilot-drawer"', index_html)
+        self.assertIn('id="ck-surface-tablist"', index_html)
         self.assertIn('inset: calc(4.5rem + var(--toast-offset, 0px)) 1.25rem auto auto;', styles_css)
         self.assertIn('.badge.is-busy::before', styles_css)
+        self.assertIn('field-sizing: content', copilot_css)
+        self.assertIn('@supports (position-area: block-end)', copilot_css)
+        self.assertIn('@supports (animation-timeline: scroll())', copilot_css)
+        self.assertIn('::-webkit-progress-value', copilot_css)
+        self.assertIn('::-moz-progress-bar', copilot_css)
         self.assertIn('popovertargetaction', app_js)
         self.assertIn('reconcileTasksAndInstances', app_js)
         self.assertIn('inferLifecycleTaskHint', app_js)
+        self.assertIn('initCopilotStudio', app_js)
 
         self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')
+        self.assertNotRegex(copilot_css, r'(?i)(@import|url\()\s*["\']?https?://')
         self.assertRegex(
             styles_css,
             r'\[hidden\]:not\(\[hidden="until-found"\]\)\s*\{\s*display:\s*none\s*!important;',

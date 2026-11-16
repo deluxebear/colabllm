@@ -3,6 +3,12 @@
 在 Google Colab GPU 上运行大模型服务，通过 Cloudflare Tunnel（默认）或 FRP + Caddy 提供公网访问。
 遵循 **“一个服务 = 一个 notebook (`src/colabllm/services/<name>.ipynb`) + 一个执行脚本 (`src/colabllm/services/<name>.py`)”** 的约定。
 
+## 功能实操视频
+
+[![ColabLLM 全景实操与 Copilot Studio 有声演示视频](https://github.com/deluxebear/colabllm/blob/master/docs/assets/colabllm-walkthrough-poster.png?raw=true)](https://github.com/deluxebear/colabllm/blob/master/docs/assets/colabllm-walkthrough.mp4)
+
+> **有声全景导览（02:22 · IndexTTS-2.5 配音）**：点击上方预览图打开 [GitHub 在线视频播放器](https://github.com/deluxebear/colabllm/blob/master/docs/assets/colabllm-walkthrough.mp4)，查看统一 CLI、Web 舰队管控与 **AI 演练场（Copilot Studio · 同源安全代理 · 多模态与专有 API 控制台）** 完整实操演示（[直接下载 MP4](https://github.com/deluxebear/colabllm/raw/master/docs/assets/colabllm-walkthrough.mp4)）。
+
 ## 统一命令入口
 
 用户通过分发包安装，无需克隆源码。从 [GitHub Releases](https://github.com/deluxebear/colabllm/releases) 下载 wheel 后安装（私有仓库需要相应访问权限）：

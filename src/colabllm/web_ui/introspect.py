@@ -14,6 +14,8 @@ from cli_support import UsageError, nonnegative_seconds, positive_seconds
 from colab_accounts import validate_account
 from colabsvc import build_parser, nonnegative_int, validate_domain, validate_instance
 
+from .api_catalog import CAPABILITY_SURFACES, build_api_profile
+
 PKG_ROOT = Path(__file__).resolve().parents[1]
 SERVICES_DIR = PKG_ROOT / "services"
 
@@ -248,6 +250,15 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
 
     doc = (module.get("__doc__") or "").strip()
     cat = _category_for(name)
+    subcommand_names = [s["name"] for s in subcommands]
+    has_web_ui = name in WEB_UI_SERVICES
+    api_profile = build_api_profile(
+        name,
+        doc=doc,
+        subcommand_names=subcommand_names,
+        auth=svc_orig.auth,
+        has_web_ui=has_web_ui,
+    )
     meta = {
         "name": name,
         "script_path": str(path),
@@ -263,9 +274,11 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
         "public_port": svc_orig.public_port,
         "default_hostname": svc_orig.default_hostname,
         "ready_timeout": svc_orig.ready_timeout,
-        "has_web_ui": name in WEB_UI_SERVICES,
+        "has_web_ui": has_web_ui,
         "chat_compatible": name in CHAT_SERVICES,
-        "subcommand_names": [s["name"] for s in subcommands],
+        "openai_compatible": bool(api_profile.get("openai_compatible")),
+        "api_profile": api_profile,
+        "subcommand_names": subcommand_names,
         "has_plan": any(s["name"] == "plan" for s in subcommands),
     }
     schema = {

@@ -202,10 +202,13 @@ def _compute_status_fields(
 
 
 def _apply_catalog_meta(item: dict[str, Any], st: dict[str, Any], meta: dict[str, Any]) -> None:
+    api_profile = meta.get("api_profile") or {}
     item["category"] = meta.get("category", "other")
     item["category_label"] = meta.get("category_label", "其他运行时")
     item["has_web_ui"] = bool(meta.get("has_web_ui"))
     item["chat_compatible"] = bool(meta.get("chat_compatible"))
+    item["openai_compatible"] = bool(meta.get("openai_compatible"))
+    item["primary_surface"] = api_profile.get("primary_surface", "inspector")
     item["session_gpu"] = st.get("session_gpu") or meta.get("gpu")
 
 
@@ -330,6 +333,8 @@ def list_all_instances(catalog: dict[str, dict[str, Any]]) -> list[dict[str, Any
             "auth_mode": auth_mode,
             "has_web_ui": bool(meta.get("has_web_ui")),
             "chat_compatible": bool(meta.get("chat_compatible")),
+            "openai_compatible": bool(meta.get("openai_compatible")),
+            "primary_surface": (meta.get("api_profile") or {}).get("primary_surface", "inspector"),
             "corrupt": bool(corrupt_error),
             "category": meta.get("category", "other"),
             "category_label": meta.get("category_label", "其他运行时"),
