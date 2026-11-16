@@ -30,8 +30,9 @@ for _p in (ROOT / "src" / "colabllm" / "lib", ROOT / "templates"):
 
 import colabsvc  # noqa: E402
 from r2_migrate_app import create_server  # noqa: E402
+import r2_migrate_engine  # noqa: E402
 from r2_migrate_engine import MigrationManager  # noqa: E402
-from r2_s3 import R2Client, R2Credentials, R2UsageLedger, map_object_to_drive_relpath  # noqa: E402
+from r2_s3 import R2Client, R2Credentials, R2Error, R2UsageLedger, map_object_to_drive_relpath  # noqa: E402
 
 
 class _MockR2State:
@@ -205,7 +206,15 @@ def _make_mock_r2_handler(state: _MockR2State):
                     state.get_calls.append((bucket, key))
                 get_hook = state.on_get_object
             if get_hook is not None and obj is not None:
-                get_hook(bucket, key)
+                override = get_hook(bucket, key)
+                if isinstance(override, bytes):
+                    self._send_bytes(
+                        200,
+                        override,
+                        "application/octet-stream",
+                        {"ETag": f'"{hashlib.md5(override).hexdigest()}"'},
+                    )
+                    return
             if obj is None:
                 self._send_bytes(404, b"<Error><Code>NoSuchKey</Code><Message>No such key</Message></Error>")
                 return
@@ -543,8 +552,10 @@ class R2MigrationTest(unittest.TestCase):
         with urllib.request.urlopen(app_url + "/health", timeout=10) as resp:
             self.assertEqual(resp.status, 200)
             health_json = json.loads(resp.read().decode("utf-8"))
-            self.assertEqual(health_json.get("version"), "2.0")
+            self.assertEqual(health_json.get("version"), "2.1")
             self.assertIn("tar", health_json.get("capabilities", []))
+            self.assertIn("cloud_sync_verify", health_json.get("capabilities", []))
+            self.assertIn("adaptive_delete", health_json.get("capabilities", []))
 
         with urllib.request.urlopen(app_url + "/", timeout=10) as resp:
             self.assertEqual(resp.status, 200)
@@ -787,6 +798,217 @@ class R2MigrationTest(unittest.TestCase):
         self.assertEqual((restore_dir / "bucket-b" / "a" / "b" / "__r2_object__").read_bytes(), expected_b["a/b"])
         self.assertEqual((restore_dir / "bucket-b" / "a" / "b" / "c.txt").read_bytes(), expected_b["a/b/c.txt"])
         self.assertEqual((restore_dir / "bucket-b" / "z_bad" / "corrupt.dat").read_bytes(), expected_b["z_bad/corrupt.dat"])
+
+    def test_truncated_read_retries_while_etag_mismatch_fails_fast(self) -> None:
+        full_payload = b"TRUNCATE-RETRY-TEST-" * 200
+        state = _MockR2State(
+            {
+                "retry-b": {
+                    "trunc.bin": (full_payload, "STANDARD", ""),
+                    "bad_etag.bin": (b"corrupted-payload", "STANDARD", "0123456789abcdef0123456789abcdef"),
+                }
+            }
+        )
+        attempts: dict[str, int] = {}
+
+        def on_get(bucket: str, key: str):
+            attempts[key] = attempts.get(key, 0) + 1
+            if key == "trunc.bin" and attempts[key] == 1:
+                return full_payload[:512]
+            return None
+
+        state.on_get_object = on_get
+        endpoint, _ = self._start_mock_r2(state)
+        mgr, _ = self._new_manager(endpoint)
+        with mock.patch.object(R2Client, "_retry_sleep", return_value=None):
+            job = mgr.create_or_resume_job(buckets=["retry-b"], output_dir="retry-out", delete_source=True, workers=2)
+            done = _wait_for_job(mgr, job["id"], timeout=20.0)
+
+        self.assertEqual(done["status"], "failed", done)
+        self.assertEqual(done["progress"]["objects_deleted"], 1)
+        self.assertEqual(done["progress"]["objects_failed"], 1)
+        self.assertEqual(attempts.get("trunc.bin"), 2)
+        self.assertEqual(attempts.get("bad_etag.bin"), 1)
+        self.assertNotIn("trunc.bin", state.buckets["retry-b"])
+        self.assertIn("bad_etag.bin", state.buckets["retry-b"])
+        self.assertEqual((self.drive_mount / "retry-out" / "retry-b" / "trunc.bin").read_bytes(), full_payload)
+
+    def test_deleter_survives_ledger_io_error_and_updates_in_place(self) -> None:
+        ledger_dir = self.tmp / "ledger_io"
+        ledger = R2UsageLedger(ledger_dir, flush_interval=0.01)
+        ledger.record_class_a(1)
+        ledger.flush()
+        usage_files = list(ledger_dir.glob("r2-usage-*.json"))
+        self.assertEqual(len(usage_files), 1)
+        ino_before = usage_files[0].stat().st_ino
+
+        ledger.record_free(deleted_objects=5)
+        ledger.flush()
+        self.assertEqual(usage_files[0].stat().st_ino, ino_before)
+        self.assertEqual(list(ledger_dir.glob("*.tmp")), [])
+
+        bucket_objs = {f"k_{i:04d}.txt": (f"val-{i}".encode("utf-8"), "STANDARD", "") for i in range(1050)}
+        state = _MockR2State({"del-b": bucket_objs})
+        endpoint, _ = self._start_mock_r2(state)
+        mgr, _ = self._new_manager(endpoint, page_size=500)
+
+        fail_writes = [True]
+        orig_write = mgr.ledger._write_locked
+
+        def flaky_write() -> None:
+            if fail_writes[0]:
+                raise FileNotFoundError("Simulated DriveFUSE disconnect")
+            orig_write()
+
+        with mock.patch.object(mgr.ledger, "_write_locked", side_effect=flaky_write):
+            job = mgr.create_or_resume_job(buckets=["del-b"], output_dir="del-io-out", delete_source=True, workers=16)
+            done = _wait_for_job(mgr, job["id"], timeout=30.0)
+
+        self.assertEqual(done["status"], "completed", done)
+        self.assertEqual(done["progress"]["objects_deleted"], 1050)
+        self.assertEqual(len(state.buckets["del-b"]), 0)
+
+    def test_cloud_sync_verify_gate_defers_pending_shards(self) -> None:
+        payload = b"S" * 6144
+        bucket_objs = {f"item_{i:04d}.bin": (f"{i:04d}:".encode("utf-8") + payload, "STANDARD", "") for i in range(260)}
+        state = _MockR2State({"sync-b": bucket_objs})
+        endpoint, _ = self._start_mock_r2(state)
+        mgr, _ = self._new_manager(endpoint, page_size=200)
+
+        job = mgr.create_or_resume_job(
+            buckets=["sync-b"],
+            output_dir="sync-gate-out",
+            storage_mode="tar",
+            tar_shard_mb=1,
+            delete_source=False,
+            workers=8,
+        )
+        migrated = _wait_for_job(mgr, job["id"], timeout=30.0)
+        self.assertEqual(migrated["status"], "completed", migrated)
+        self.assertGreaterEqual(migrated["progress"]["tar_shards"], 2)
+
+        allow_all = [False]
+
+        def fake_verify(_self, full_path: Path, expected_size: int) -> str:
+            if not full_path.is_file() or full_path.stat().st_size != int(expected_size):
+                return "missing"
+            if allow_all[0] or "part-00001.tar" in full_path.name:
+                return "synced"
+            return "pending_sync"
+
+        with mock.patch.object(r2_migrate_engine._DriveCloudSyncVerifier, "verify_file", autospec=True, side_effect=fake_verify):
+            partial_clean = mgr.cleanup_job(job["id"])
+            self.assertEqual(partial_clean["status"], "paused_quota", partial_clean)
+            self.assertGreater(partial_clean["progress"]["objects_deleted"], 0)
+            self.assertGreater(partial_clean["progress"]["objects_copied_pending_delete"], 0)
+            self.assertEqual(
+                partial_clean["progress"]["objects_deleted"] + partial_clean["progress"]["objects_copied_pending_delete"],
+                260,
+            )
+            self.assertGreater(len(state.buckets["sync-b"]), 0)
+
+            allow_all[0] = True
+            full_clean = mgr.cleanup_job(job["id"])
+            self.assertEqual(full_clean["status"], "completed", full_clean)
+            self.assertEqual(full_clean["progress"]["objects_deleted"], 260)
+            self.assertEqual(full_clean["progress"]["objects_copied_pending_delete"], 0)
+            self.assertEqual(len(state.buckets["sync-b"]), 0)
+
+    def test_reconcile_missing_drive_shards_resets_copied_to_pending(self) -> None:
+        payload = b"R" * 6144
+        bucket_objs = {f"rec_{i:04d}.bin": (f"{i:04d}:".encode("utf-8") + payload, "STANDARD", "") for i in range(260)}
+        expected = {k: v[0] for k, v in bucket_objs.items()}
+        state = _MockR2State({"rec-b": bucket_objs})
+        endpoint, _ = self._start_mock_r2(state)
+        mgr1, _ = self._new_manager(endpoint, work_dir=self.tmp / "rec_w1", page_size=200)
+
+        job = mgr1.create_or_resume_job(
+            buckets=["rec-b"],
+            output_dir="rec-out",
+            storage_mode="tar",
+            tar_shard_mb=1,
+            delete_source=False,
+            workers=8,
+        )
+        first_done = _wait_for_job(mgr1, job["id"], timeout=30.0)
+        self.assertEqual(first_done["status"], "completed", first_done)
+        shards = sorted((self.drive_mount / "rec-out" / "archives" / "rec-b").glob("*.tar"))
+        self.assertGreaterEqual(len(shards), 2)
+        mgr1.shutdown()
+
+        # Simulate VM preemption losing part-00002.tar before DriveFS uploaded it
+        shards[1].unlink()
+
+        mgr2, _ = self._new_manager(endpoint, work_dir=self.tmp / "rec_w2", page_size=200)
+        resumed = mgr2.resume_job(job["id"], storage_mode="tar", tar_shard_mb=1, workers=8)
+        done = _wait_for_job(mgr2, resumed["id"], timeout=30.0)
+        self.assertEqual(done["status"], "completed", done)
+        self.assertEqual(done["progress"]["objects_migrated"], 260)
+        self.assertEqual(done["progress"]["objects_failed"], 0)
+
+        restore_dir = self.tmp / "rec_restored"
+        restore_dir.mkdir(parents=True, exist_ok=True)
+        for tf_p in sorted((self.drive_mount / "rec-out" / "archives" / "rec-b").glob("*.tar")):
+            with tarfile.open(tf_p, "r") as tf:
+                tf.extractall(restore_dir, filter="data")
+        for k, raw in expected.items():
+            self.assertEqual((restore_dir / "rec-b" / k).read_bytes(), raw)
+
+    def test_adaptive_delete_falls_back_on_batch_timeout(self) -> None:
+        keys1 = [f"k_{i:03d}.bin" for i in range(40)]
+        keys2 = [f"s_{i:03d}.bin" for i in range(25)]
+        state = _MockR2State(
+            {
+                "b1": {k: (b"x", "STANDARD", "") for k in keys1},
+                "b2": {k: (b"y", "STANDARD", "") for k in keys2},
+            }
+        )
+        endpoint, _ = self._start_mock_r2(state)
+        creds = R2Credentials(
+            access_key_id="AKIAIOSFODNN7EXAMPLE",
+            secret_access_key="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            endpoint_url=endpoint,
+        )
+
+        # Tier 2: >15-key DeleteObjects batches time out -> adapts to <=15-key batches
+        c1 = R2Client(creds)
+        try:
+            orig_xml_batch = c1._delete_xml_batch
+
+            def timeout_large_batch(bucket: str, batch, **kwargs):
+                if len(batch) > 15:
+                    raise R2Error("R2 S3 request failed: The read operation timed out")
+                return orig_xml_batch(bucket, batch, **kwargs)
+
+            logs1: list[str] = []
+            with mock.patch.object(c1, "_delete_xml_batch", side_effect=timeout_large_batch):
+                res1 = c1.delete_objects("b1", keys1, batch_size=250, concurrency=2, log=logs1.append)
+            self.assertEqual(sorted(res1.deleted), sorted(keys1))
+            self.assertEqual(res1.errors, {})
+            self.assertEqual(len(state.buckets["b1"]), 0)
+            self.assertTrue(any("15-key batches" in m for m in logs1), logs1)
+            b1_batches = [sz for b, sz in state.delete_batches if b == "b1"]
+            self.assertGreaterEqual(len(b1_batches), 3)
+            self.assertTrue(all(sz <= 15 for sz in b1_batches))
+        finally:
+            c1.close()
+
+        # Tier 3: all DeleteObjects XML batches time out -> falls back to concurrent single DELETE
+        c2 = R2Client(creds)
+        try:
+            logs2: list[str] = []
+            with mock.patch.object(
+                c2,
+                "_delete_xml_batch",
+                side_effect=R2Error("R2 S3 request failed: The read operation timed out"),
+            ):
+                res2 = c2.delete_objects("b2", keys2, batch_size=250, concurrency=4, log=logs2.append)
+            self.assertEqual(sorted(res2.deleted), sorted(keys2))
+            self.assertEqual(res2.errors, {})
+            self.assertEqual(len(state.buckets["b2"]), 0)
+            self.assertTrue(any("single DELETE" in m for m in logs2), logs2)
+        finally:
+            c2.close()
 
 
 if __name__ == "__main__":

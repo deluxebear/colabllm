@@ -81,8 +81,8 @@ colabllm r2-migrate cancel JOB_ID
 ```
 
 - **默认不删除 R2 原文件**（`--no-delete-source` 为默认）。
-- **严格校验门槛**：仅当 R2 下载返回 HTTP 200、字节数精确一致、单分片非加密标准 MD5 ETag 校验通过、且本地持久化写入 Drive 大小校验一致后，才允许进入待删队列；任何校验失败或分段上传仅做迁移标记的保护策略（或需显式先完成迁移核查）都不会误删原文件。
-- **零调用费批量删除**：自动按每批最多 **1,000 个 Key** 聚合调用 S3 `DeleteObjects`（含 `Content-MD5`），属于 R2 免费操作。未开 `--delete-source` 完成迁移后，也可随时用 `cleanup JOB_ID` 分批补删已验证迁移的 R2 原文件。
+- **严格校验门槛与云端同步门控**：仅当 R2 下载返回 HTTP 200、字节数精确一致、单分片非加密标准 MD5 ETag 校验通过、本地持久化写入 Drive 大小校验一致，**且 Google Drive 云端 API 确认分卷/文件已真实完成上传（含非零大小与 `md5Checksum`）** 后，才允许进入待删队列；若触发 Google Drive 单账号 **750 GB / 24h 上传限流**（`userRateLimitExceeded`）或本地 DriveFS 上传缓存剩余空间不足，任务会自动切换为 `paused_quota` 并安全暂停，未完成云端同步的 R2 原文件绝不会被误删。
+- **零调用费批量删除**：自动按每批最多 **1,000 个 Key** 聚合调用 S3 `DeleteObjects`（含 `Content-MD5`），属于 R2 免费操作。未开 `--delete-source` 完成迁移、或待 Drive 24h 限流窗口解锁并同步完成后，可随时用 `cleanup JOB_ID --wait` 分批核验补删已落云的 R2 原文件。
 
 ## Web UI 与远端 API
 

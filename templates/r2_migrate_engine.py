@@ -5,6 +5,7 @@ from collections import OrderedDict, deque
 import concurrent.futures
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import io
 import json
@@ -20,6 +21,9 @@ import tarfile
 import threading
 import time
 from typing import Any, Callable
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 from r2_s3 import (
@@ -28,6 +32,7 @@ from r2_s3 import (
     DeleteBatchResult,
     R2Client,
     R2Credentials,
+    R2Error,
     R2HttpError,
     R2UsageLedger,
     map_object_to_drive_relpath,
@@ -38,13 +43,33 @@ from r2_s3 import (
 
 COST_MODES = ("free-first", "free-only", "unlimited")
 STORAGE_MODES = ("files", "tar")
-TERMINAL_JOB_STATUSES = {"completed", "cancelled", "failed", "paused", "paused_budget", "paused_credentials", "interrupted"}
-RESUMABLE_JOB_STATUSES = {"queued", "running", "paused", "paused_budget", "paused_credentials", "interrupted", "failed"}
+TERMINAL_JOB_STATUSES = {
+    "completed",
+    "cancelled",
+    "failed",
+    "paused",
+    "paused_budget",
+    "paused_quota",
+    "paused_credentials",
+    "interrupted",
+}
+RESUMABLE_JOB_STATUSES = {
+    "queued",
+    "running",
+    "paused",
+    "paused_budget",
+    "paused_quota",
+    "paused_credentials",
+    "interrupted",
+    "failed",
+}
 DEFAULT_WORKERS = 48
 DEFAULT_WRITER_WORKERS = 16
 DEFAULT_TAR_SHARD_MB = 512
 DEFAULT_SPOOL_BYTES = 4 * 1024 * 1024 * 1024
-DEFAULT_CHECKPOINT_INTERVAL = 60.0
+DEFAULT_CHECKPOINT_INTERVAL = 300.0
+TAR_DEFAULT_CHECKPOINT_INTERVAL = 900.0
+_MIN_DRIVEFS_WORK_FREE_BYTES = 6 * 1024 * 1024 * 1024
 DEFAULT_PAGE_SIZE = 1000
 MAX_LISTED_BUFFER = 250_000
 _LARGE_FILE_FSYNC_BYTES = 16 * 1024 * 1024
@@ -55,14 +80,27 @@ _DIR_ENTRY_CAP = 250_000
 
 def _atomic_write_json(path: Path, payload: dict[str, Any], *, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    if mode is None and path.is_file():
+        with path.open("r+b") as fh:
+            fh.seek(0)
+            fh.write(raw)
+            fh.truncate()
+            fh.flush()
+        return
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
-    if mode is not None:
+    try:
+        tmp.write_bytes(raw)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+        if mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(path, mode)
+    except Exception:
         with contextlib.suppress(OSError):
-            os.chmod(path, mode)
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 class ByteBudgetSemaphore:
@@ -97,6 +135,256 @@ class _BudgetPaused(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class _QuotaPaused(Exception):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def _detect_fuse_drive_mydrive(path: Path) -> Path | None:
+    """Return resolved `<mount>/MyDrive` if `path` resides on a `fuse.drive` mount, else None."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        resolved = Path(path)
+    try:
+        mounts_text = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in mounts_text.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mnt_point = parts[1].replace("\\040", " ")
+        fstype = parts[2]
+        if fstype != "fuse.drive":
+            continue
+        for candidate_name in ("MyDrive", "My Drive"):
+            mydrive = Path(mnt_point) / candidate_name
+            try:
+                mydrive_res = mydrive.resolve()
+            except OSError:
+                mydrive_res = mydrive
+            if resolved == mydrive_res or resolved.is_relative_to(mydrive_res):
+                return mydrive_res
+    return None
+
+
+def _gdrive_escape_q(val: str) -> str:
+    return val.replace("\\", "\\\\").replace("'", "\\'")
+
+
+class _DriveCloudSyncVerifier:
+    """Verifies whether files on a `fuse.drive` mount have completed upload to Google Drive Cloud."""
+
+    _TOKEN_TTL_SKEW = 60.0
+    _LIST_CACHE_TTL = 30.0
+    _FILE_CACHE_TTL = 30.0
+
+    def __init__(self, dest_root: Path, log: Callable[[str], None] | None = None) -> None:
+        self.dest_root = Path(dest_root)
+        self._log = log or (lambda _msg: None)
+        self._mydrive_root = _detect_fuse_drive_mydrive(self.dest_root)
+        self._lock = threading.Lock()
+        self._access_token: str = ""
+        self._token_expires_mono: float = 0.0
+        self._folder_ids: dict[str, str] = {"": "root"}
+        self._dir_cache: dict[str, tuple[float, dict[str, list[tuple[int, bool]]]]] = {}
+        self._file_cache: dict[tuple[Path, int], tuple[float, str]] = {}
+
+    @property
+    def is_fuse_drive(self) -> bool:
+        return self._mydrive_root is not None
+
+    def invalidate_cache(self) -> None:
+        with self._lock:
+            self._dir_cache.clear()
+            self._file_cache.clear()
+
+    def _get_access_token_locked(self) -> str:
+        now = time.monotonic()
+        if self._access_token and now < self._token_expires_mono:
+            return self._access_token
+        candidates = ["127.0.0.1:8012"]
+        for env_key in ("TBE_EPHEM_CREDS_ADDR", "TBE_CREDS_ADDR"):
+            addr = (os.environ.get(env_key) or "").strip()
+            if addr and addr not in candidates:
+                candidates.append(addr)
+        last_err: Exception | None = None
+        for host_port in candidates:
+            url = f"http://{host_port}/computeMetadata/v1/instance/service-accounts/default/token"
+            req = urllib.request.Request(url, headers={"Metadata-Flavor": "Google"})
+            try:
+                with urllib.request.urlopen(req, timeout=5.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                tok = str(data.get("access_token") or "")
+                if not tok:
+                    raise RuntimeError("empty access_token")
+                expires_in = max(120, int(data.get("expires_in") or 3599))
+                self._access_token = tok
+                self._token_expires_mono = time.monotonic() + max(30.0, expires_in - self._TOKEN_TTL_SKEW)
+                return tok
+            except Exception as err:
+                last_err = err
+        raise RuntimeError(f"Drive token shim unreachable: {last_err}")
+
+    def _gdrive_list(self, query: str, fields: str) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            with self._lock:
+                tok = self._get_access_token_locked()
+            params = {
+                "q": query,
+                "fields": f"nextPageToken,{fields}",
+                "pageSize": "1000",
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            url = "https://www.googleapis.com/drive/v3/files?" + urllib.parse.urlencode(params)
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+            try:
+                with urllib.request.urlopen(req, timeout=20.0) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as err:
+                if err.code == 401:
+                    with self._lock:
+                        self._access_token = ""
+                        self._token_expires_mono = 0.0
+                        tok = self._get_access_token_locked()
+                    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+                    with urllib.request.urlopen(req, timeout=20.0) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                else:
+                    raise
+            items.extend(data.get("files") or [])
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    def _resolve_folder_id(self, parent_parts: tuple[str, ...]) -> str | None:
+        cur_rel = ""
+        cur_id = "root"
+        for seg in parent_parts:
+            nxt_rel = f"{cur_rel}/{seg}" if cur_rel else seg
+            with self._lock:
+                cached = self._folder_ids.get(nxt_rel)
+            if cached is not None:
+                cur_id = cached
+                cur_rel = nxt_rel
+                continue
+            q = (
+                f"'{_gdrive_escape_q(cur_id)}' in parents and trashed = false "
+                "and mimeType = 'application/vnd.google-apps.folder' "
+                f"and name = '{_gdrive_escape_q(seg)}'"
+            )
+            matches = self._gdrive_list(q, "files(id,name)")
+            if not matches:
+                return None
+            fid = str(matches[0]["id"])
+            with self._lock:
+                self._folder_ids[nxt_rel] = fid
+            cur_id = fid
+            cur_rel = nxt_rel
+        return cur_id
+
+    def _cloud_dir_listing(self, parent_parts: tuple[str, ...]) -> dict[str, list[tuple[int, bool]]] | None:
+        rel_dir = "/".join(parent_parts)
+        now = time.monotonic()
+        with self._lock:
+            cached = self._dir_cache.get(rel_dir)
+            if cached is not None and (now - cached[0]) < self._LIST_CACHE_TTL:
+                return cached[1]
+        folder_id = self._resolve_folder_id(parent_parts)
+        if folder_id is None:
+            return None
+        q = f"'{_gdrive_escape_q(folder_id)}' in parents and trashed = false"
+        files = self._gdrive_list(q, "files(name,size,md5Checksum)")
+        listing: dict[str, list[tuple[int, bool]]] = {}
+        for item in files:
+            fname = str(item.get("name") or "")
+            if not fname:
+                continue
+            try:
+                sz = int(item.get("size") or 0)
+            except (TypeError, ValueError):
+                sz = 0
+            has_md5 = bool(item.get("md5Checksum"))
+            listing.setdefault(fname, []).append((sz, has_md5))
+        with self._lock:
+            self._dir_cache[rel_dir] = (time.monotonic(), listing)
+        return listing
+
+    def _fallback_check(self, full_path: Path, expected_size: int) -> str:
+        try:
+            raw = os.getxattr(full_path, "user.drive.md5")  # type: ignore[attr-defined]
+            val = raw.decode("utf-8", errors="ignore").strip()
+            if val or expected_size == 0:
+                return "synced"
+            return "pending_sync"
+        except OSError as err:
+            if err.errno == getattr(errno, "ENODATA", 61):
+                return "pending_sync"
+            if err.errno not in (errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP), errno.ENOSYS):
+                return "pending_sync"
+        except AttributeError:
+            pass
+        with contextlib.suppress(OSError):
+            for log_p in Path("/tmp").glob("drive*.ERROR*"):
+                try:
+                    sz = log_p.stat().st_size
+                    with log_p.open("rb") as lf:
+                        if sz > 512 * 1024:
+                            lf.seek(sz - 512 * 1024)
+                        tail = lf.read().decode("utf-8", errors="replace")
+                    if "userRateLimitExceeded" in tail:
+                        return "pending_sync"
+                except OSError:
+                    continue
+        return "synced"
+
+    def verify_file(self, full_path: Path, expected_size: int) -> str:
+        """Return `'synced'`, `'pending_sync'`, or `'missing'`."""
+        expected = int(expected_size)
+        try:
+            if not full_path.is_file() or full_path.stat().st_size != expected:
+                return "missing"
+        except OSError:
+            return "missing"
+
+        if self._mydrive_root is None:
+            return "synced"
+
+        now = time.monotonic()
+        key = (full_path, expected)
+        with self._lock:
+            cached = self._file_cache.get(key)
+            if cached is not None and (now - cached[0]) < self._FILE_CACHE_TTL:
+                return cached[1]
+
+        try:
+            rel = full_path.resolve().relative_to(self._mydrive_root)
+            parent_parts = rel.parts[:-1]
+            filename = rel.name
+            listing = self._cloud_dir_listing(parent_parts)
+            if listing is None:
+                res = "pending_sync"
+            else:
+                entries = listing.get(filename) or []
+                if any(sz == expected and (expected == 0 or has_md5) for sz, has_md5 in entries):
+                    res = "synced"
+                else:
+                    res = "pending_sync"
+        except Exception as err:
+            self._log(f"Drive Cloud verify fallback for {full_path.name}: {err}")
+            res = self._fallback_check(full_path, expected)
+
+        with self._lock:
+            self._file_cache[key] = (time.monotonic(), res)
+        return res
 
 
 class DriveDirCache:
@@ -411,30 +699,67 @@ def _backup_sqlite_to_drive(
     src_conn: sqlite3.Connection,
     local_backup_tmp: Path,
     drive_checkpoint: Path,
+    *,
+    db_path: Path | None = None,
 ) -> None:
-    """Snapshot local NVMe SQLite WAL DB -> local file -> single sequential atomic replace on Drive."""
+    """Snapshot local NVMe SQLite WAL DB -> local file (or direct WAL checkpoint) -> in-place/atomic sync on Drive."""
+    drive_checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        for stale in drive_checkpoint.parent.iterdir():
+            if stale.is_file() and stale.name.startswith(f".{drive_checkpoint.name}.") and stale.name.endswith(".tmp"):
+                with contextlib.suppress(OSError):
+                    stale.unlink(missing_ok=True)
+
     local_backup_tmp.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         local_backup_tmp.unlink(missing_ok=True)
-    dst = sqlite3.connect(str(local_backup_tmp))
-    try:
-        src_conn.backup(dst)
-        dst.commit()
-    finally:
-        dst.close()
 
-    drive_checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    drive_tmp = drive_checkpoint.with_name(f".{drive_checkpoint.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
-    try:
-        with local_backup_tmp.open("rb") as src_f, drive_tmp.open("wb") as dst_f:
-            shutil.copyfileobj(src_f, dst_f, length=1024 * 1024)
-            dst_f.flush()
-            with contextlib.suppress(OSError):
-                os.fsync(dst_f.fileno())
-        os.replace(drive_tmp, drive_checkpoint)
-    finally:
+    use_direct_db = False
+    if db_path is not None and db_path.is_file():
         with contextlib.suppress(OSError):
-            drive_tmp.unlink(missing_ok=True)
+            db_sz = db_path.stat().st_size
+            free_sz = shutil.disk_usage(local_backup_tmp.parent).free
+            if free_sz < db_sz + 256 * 1024 * 1024:
+                use_direct_db = True
+
+    src_file: Path
+    if use_direct_db and db_path is not None:
+        src_conn.commit()
+        src_conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        src_file = db_path
+    else:
+        dst = sqlite3.connect(str(local_backup_tmp))
+        try:
+            src_conn.backup(dst)
+            dst.commit()
+        finally:
+            dst.close()
+        src_file = local_backup_tmp
+
+    drive_tmp: Path | None = None
+    try:
+        if drive_checkpoint.is_file():
+            with src_file.open("rb") as src_f, drive_checkpoint.open("r+b") as dst_f:
+                dst_f.seek(0)
+                shutil.copyfileobj(src_f, dst_f, length=4 * 1024 * 1024)
+                dst_f.truncate()
+                dst_f.flush()
+                with contextlib.suppress(OSError):
+                    os.fsync(dst_f.fileno())
+        else:
+            drive_tmp = drive_checkpoint.with_name(f".{drive_checkpoint.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+            with src_file.open("rb") as src_f, drive_tmp.open("wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f, length=4 * 1024 * 1024)
+                dst_f.flush()
+                with contextlib.suppress(OSError):
+                    os.fsync(dst_f.fileno())
+            os.replace(drive_tmp, drive_checkpoint)
+            drive_tmp = None
+    finally:
+        if drive_tmp is not None:
+            with contextlib.suppress(OSError):
+                drive_tmp.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
             local_backup_tmp.unlink(missing_ok=True)
 
 
@@ -661,6 +986,7 @@ class _TarArchivePipeline:
             [list[_ArchivedEntry], int, dict[str, tuple[int, int]], int, int, int, int], None
         ],
         on_failed: Callable[[list[_ArchivedEntry], str], None],
+        on_quota_pause: Callable[[str], None] | None = None,
         log: Callable[[str], None],
     ) -> None:
         self.job = job
@@ -670,6 +996,7 @@ class _TarArchivePipeline:
         self.max_members_per_shard = 50_000
         self._on_committed = on_committed
         self._on_failed = on_failed
+        self._on_quota_pause = on_quota_pause
         self._log = log
 
         self.archives_dir.mkdir(parents=True, exist_ok=True)
@@ -678,6 +1005,7 @@ class _TarArchivePipeline:
             max_workers=24, thread_name_prefix=f"r2-unlink-{job.job_id}"
         )
         self.reconcile_drive_manifests()
+        self.reconcile_missing_drive_shards()
         self.heal_uncleaned_loose_files()
 
         self._seq_lock = threading.Lock()
@@ -864,6 +1192,14 @@ class _TarArchivePipeline:
             with contextlib.suppress(OSError):
                 shard.stage_tar_path.unlink(missing_ok=True)
             self._dec_inflight(len(shard.entries))
+            if (isinstance(exc, OSError) and exc.errno == errno.ENOSPC) or "No space left on device" in str(exc):
+                if self._on_quota_pause is not None:
+                    self._on_quota_pause(
+                        "Google Drive 挂载或本地缓存空间不足（可能已触发单账号 750 GB / 24h 上传限流 userRateLimitExceeded）；"
+                        "任务已安全暂停，待云端后台上传释放缓存后执行 resume 继续"
+                    )
+                    self._on_failed(shard.entries, "")
+                    return
             self._on_failed(shard.entries, f"TAR shard seal failed: {exc}")
 
     def _resolve_batch_paths(self, tasks: list[_ArchiveTask]) -> list[str]:
@@ -1135,6 +1471,14 @@ class _TarArchivePipeline:
 
         if last_err is not None:
             self._dec_inflight(len(entries))
+            if (isinstance(last_err, OSError) and last_err.errno == errno.ENOSPC) or "No space left on device" in str(last_err):
+                if self._on_quota_pause is not None:
+                    self._on_quota_pause(
+                        "Google Drive 挂载或本地缓存空间不足（可能已触发单账号 750 GB / 24h 上传限流 userRateLimitExceeded）；"
+                        "任务已安全暂停，待云端后台上传释放缓存后执行 resume 继续"
+                    )
+                    self._on_failed(entries, "")
+                    return
             self._on_failed(entries, f"Drive TAR flush failed: {last_err}")
             return
 
@@ -1332,6 +1676,47 @@ class _TarArchivePipeline:
             self._log(f"job {self.job.job_id}: reconciled {replayed} TAR shards from Drive manifests")
         return replayed
 
+    def reconcile_missing_drive_shards(self) -> int:
+        """Reset objects from shards recorded in SQLite whose Drive .tar file is missing or size-mismatched."""
+        with self.job.db_lock:
+            rows = self.conn.execute("SELECT shard_name, rel_tar_path, tar_bytes FROM tar_shards").fetchall()
+        missing: list[tuple[str, Path]] = []
+        for sname, rel_tar, expected_sz in rows:
+            tar_path = self.job.dest_root / str(rel_tar)
+            exists_ok = False
+            with contextlib.suppress(OSError):
+                exists_ok = tar_path.is_file() and tar_path.stat().st_size == int(expected_sz)
+            if not exists_ok:
+                missing.append((str(sname), tar_path))
+        if not missing:
+            return 0
+        reset_objs = 0
+        for sname, tar_path in missing:
+            with contextlib.suppress(OSError):
+                tar_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                tar_path.with_name(f"{tar_path.name}.manifest.jsonl").unlink(missing_ok=True)
+            with self.job.db_lock:
+                cur = self.conn.execute(
+                    """
+                    UPDATE objects SET status='pending', error=''
+                    WHERE status='copied'
+                      AND (bucket, key) IN (
+                          SELECT bucket, key FROM archived_files
+                          WHERE shard_name=? AND bucket != '' AND key != ''
+                      )
+                    """,
+                    (sname,),
+                )
+                reset_objs += max(0, int(cur.rowcount or 0))
+                self.conn.execute("DELETE FROM archived_files WHERE shard_name=?", (sname,))
+                self.conn.execute("DELETE FROM tar_shards WHERE shard_name=?", (sname,))
+                self.conn.commit()
+        self._log(
+            f"job {self.job.job_id}: reset {len(missing)} missing/incomplete TAR shards ({reset_objs} objects back to pending)"
+        )
+        return len(missing)
+
     def heal_uncleaned_loose_files(self) -> None:
         """Finish or roll back shards whose loose Drive source cleanup was interrupted by crash."""
         with self.job.db_lock:
@@ -1500,33 +1885,33 @@ class MigrationManager:
             job.last_db_refresh_mono = now_m
 
     def _refresh_buckets_locked(self, job: _RuntimeJob, conn: sqlite3.Connection) -> None:
-        rows = conn.execute(
-            """
-            SELECT b.bucket, b.last_key, b.listing_done, b.objects_listed, b.bytes_listed,
-                   COALESCE(SUM(CASE WHEN o.status IN ('copied', 'deleted') THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN o.status = 'deleted' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN o.status = 'failed' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN o.status = 'ia_deferred' THEN 1 ELSE 0 END), 0)
-            FROM buckets b
-            LEFT JOIN objects o ON o.bucket = b.bucket
-            GROUP BY b.bucket
-            ORDER BY b.bucket
-            """
+        b_rows = conn.execute(
+            "SELECT bucket, last_key, listing_done, objects_listed, bytes_listed FROM buckets ORDER BY bucket"
         ).fetchall()
-        snap = [
-            {
-                "bucket": r[0],
-                "last_key": r[1],
-                "listing_done": bool(r[2]),
-                "objects_listed": int(r[3]),
-                "bytes_listed": int(r[4]),
-                "objects_migrated": int(r[5]),
-                "objects_deleted": int(r[6]),
-                "objects_failed": int(r[7]),
-                "objects_ia_deferred": int(r[8]),
-            }
-            for r in rows
-        ]
+        by_bucket: dict[str, dict[str, int]] = {}
+        for status_val, b_name, cnt in conn.execute(
+            "SELECT status, bucket, COUNT(*) FROM objects GROUP BY status, bucket"
+        ).fetchall():
+            by_bucket.setdefault(str(b_name), {})[str(status_val)] = int(cnt)
+        snap = []
+        for r in b_rows:
+            b_name = str(r[0])
+            st_map = by_bucket.get(b_name, {})
+            copied_c = st_map.get("copied", 0)
+            deleted_c = st_map.get("deleted", 0)
+            snap.append(
+                {
+                    "bucket": b_name,
+                    "last_key": r[1],
+                    "listing_done": bool(r[2]),
+                    "objects_listed": int(r[3]),
+                    "bytes_listed": int(r[4]),
+                    "objects_migrated": copied_c + deleted_c,
+                    "objects_deleted": deleted_c,
+                    "objects_failed": st_map.get("failed", 0),
+                    "objects_ia_deferred": st_map.get("ia_deferred", 0),
+                }
+            )
         with job.lock:
             job.buckets_snapshot = snap
 
@@ -1603,10 +1988,16 @@ class MigrationManager:
             self._refresh_counts_locked(job, conn)
             self._refresh_buckets_locked(job, conn)
             local_tmp = self.state_dir / f".{job.job_id}.backup.tmp"
-            _backup_sqlite_to_drive(conn, local_tmp, self._job_checkpoint_path(job))
+            try:
+                _backup_sqlite_to_drive(conn, local_tmp, self._job_checkpoint_path(job), db_path=job.db_path)
+            except OSError as exc:
+                self._log(f"job {job.job_id}: checkpoint backup to Drive deferred: {exc}")
         with job.lock:
             job.updated_at = time.time()
-        self._persist_job_summary(job)
+        try:
+            self._persist_job_summary(job)
+        except OSError as exc:
+            self._log(f"job {job.job_id}: job.json summary persist deferred: {exc}")
 
     def _load_existing_jobs(self) -> None:
         if not self.jobs_drive_dir.is_dir():
@@ -1656,6 +2047,9 @@ class MigrationManager:
                 for err_item in data.get("recent_errors") or []:
                     job.recent_errors.append(dict(err_item))
                 self._jobs[job_id] = job
+                if job.db_path.is_file():
+                    with contextlib.suppress(sqlite3.Error, OSError):
+                        self._ensure_job_db_open(job)
             except (OSError, ValueError, TypeError):
                 continue
 
@@ -1716,7 +2110,7 @@ class MigrationManager:
             return client.list_buckets()
         finally:
             client.close()
-            self.ledger.flush()
+            self.ledger.flush(ignore_errors=True)
 
     def create_or_resume_job(
         self,
@@ -1935,50 +2329,242 @@ class MigrationManager:
             self._persist_job_summary(job)
         return self.get_job(job_id)
 
+    def _reconcile_missing_tar_shards(self, job: _RuntimeJob, conn: sqlite3.Connection) -> int:
+        """Reset objects belonging to tar_shards missing/incomplete on Drive back to pending before cleanup."""
+        with job.db_lock:
+            rows = conn.execute("SELECT shard_name, rel_tar_path, tar_bytes FROM tar_shards").fetchall()
+        if not rows:
+            return 0
+        missing: list[tuple[str, Path]] = []
+        for sname, rel_tar, expected_sz in rows:
+            tar_path = job.dest_root / str(rel_tar)
+            exists_ok = False
+            with contextlib.suppress(OSError):
+                exists_ok = tar_path.is_file() and tar_path.stat().st_size == int(expected_sz)
+            if not exists_ok:
+                missing.append((str(sname), tar_path))
+        if not missing:
+            return 0
+
+        reset_objs = 0
+        for sname, tar_path in missing:
+            with contextlib.suppress(OSError):
+                tar_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                tar_path.with_name(f"{tar_path.name}.manifest.jsonl").unlink(missing_ok=True)
+            with job.db_lock:
+                cur = conn.execute(
+                    """
+                    UPDATE objects SET status='pending', error=''
+                    WHERE status IN ('copied', 'failed')
+                      AND (bucket, key) IN (
+                          SELECT bucket, key FROM archived_files
+                          WHERE shard_name=? AND bucket != '' AND key != ''
+                      )
+                    """,
+                    (sname,),
+                )
+                reset_objs += max(0, int(cur.rowcount or 0))
+                conn.execute("DELETE FROM archived_files WHERE shard_name=?", (sname,))
+                conn.execute("DELETE FROM tar_shards WHERE shard_name=?", (sname,))
+                conn.commit()
+        with job.db_lock:
+            shard_row = conn.execute("SELECT COUNT(*), COALESCE(SUM(tar_bytes), 0) FROM tar_shards").fetchone()
+            self._refresh_counts_locked(job, conn)
+            self._refresh_buckets_locked(job, conn)
+        with job.lock:
+            job.tar_shards_count = int(shard_row[0] or 0) if shard_row else 0
+            job.tar_bytes_total = int(shard_row[1] or 0) if shard_row else 0
+        self._log(
+            f"job {job.job_id}: reconciled {len(missing)} missing/incomplete TAR shards ({reset_objs} objects back to pending)"
+        )
+        return len(missing)
+
     def cleanup_job(
         self,
         job_id: str,
         *,
         credentials: dict[str, Any] | R2Credentials | None = None,
+        background: bool = False,
     ) -> dict[str, Any]:
-        """Verify Drive copies and batch-delete R2 originals for a previously migrated job (Free DeleteObjects)."""
+        """Verify Drive copies (including Cloud sync on fuse.drive) and batch-delete R2 originals (Free DeleteObjects)."""
         job = self._require_job(job_id)
         with job.lock:
             if job.worker_thread is not None and job.worker_thread.is_alive():
                 raise ValueError("任务仍在运行，请先暂停或等待完成后再执行 cleanup")
+            prev_status = job.status
+            job.stop_event.clear()
+            job.pause_requested = False
+            job.cancel_requested = False
+            job.status = "running"
+            job.finished_at = None
+            job.files_done_session = 0
+            job.bytes_done_session = 0
+            job.session_started_at = time.time()
+            job.session_finished_at = None
+            job.message = "正在核验 Drive（含云端同步状态）并批量清理 R2 原文件..."
+            job.updated_at = time.time()
         creds, _ = self.cred_store.resolve(credentials)
         if creds is None:
+            with job.lock:
+                job.status = prev_status
             raise ValueError("缺少 R2 凭据；请提供或先保存凭据")
 
         conn = self._ensure_job_db_open(job)
+        with contextlib.suppress(OSError):
+            self._persist_job_summary(job)
+
+        if background:
+            th = threading.Thread(
+                target=self._run_cleanup_wrapper,
+                args=(job, conn, creds, prev_status),
+                name=f"r2-cleanup-{job.job_id}",
+                daemon=True,
+            )
+            with job.lock:
+                job.worker_thread = th
+            th.start()
+            return self._snapshot_job(job)
+
+        return self._run_cleanup_wrapper(job, conn, creds, prev_status)
+
+    def _run_cleanup_wrapper(
+        self,
+        job: _RuntimeJob,
+        conn: sqlite3.Connection,
+        creds: R2Credentials,
+        prev_status: str,
+    ) -> dict[str, Any]:
         client = R2Client(creds, ledger=self.ledger, timeout=self.client_timeout)
         deleted_total = 0
         failed_total = 0
+        deferred_total = 0
+        verifier = _DriveCloudSyncVerifier(job.dest_root, log=self._log)
+        after_keys: dict[str, str] = {}
+        skip_buckets: set[str] = set()
+        transient_bucket_errors: dict[str, str] = {}
+        last_log_mono = time.monotonic()
         try:
-            with job.lock:
-                job.status = "running"
-                job.message = "正在核验 Drive 文件并批量清理 R2 原文件..."
-                job.updated_at = time.time()
-            self._persist_job_summary(job)
-            while True:
-                d_cnt, f_cnt = self._delete_copied_chunk(job, conn, client, batch_limit=1000)
+            if job.config.get("storage_mode") == "tar":
+                self._reconcile_missing_tar_shards(job, conn)
+            while not job.stop_event.is_set() and not self._shutdown:
+                d_cnt, f_cnt, s_cnt = self._delete_copied_chunk(
+                    job,
+                    conn,
+                    client,
+                    batch_limit=10000,
+                    after_keys=after_keys,
+                    single_pass=True,
+                    cloud_verifier=verifier,
+                    delete_concurrency=32,
+                    skip_buckets=skip_buckets,
+                    transient_bucket_errors=transient_bucket_errors,
+                )
                 deleted_total += d_cnt
                 failed_total += f_cnt
-                if d_cnt == 0 and f_cnt == 0:
+                deferred_total += s_cnt
+                now_m = time.monotonic()
+                if (now_m - last_log_mono) >= 30.0:
+                    with job.db_lock:
+                        self._refresh_buckets_locked(job, conn)
+                    with job.lock:
+                        job.message = (
+                            f"正在核验 Drive 并清理 R2 原文件：已删 {deleted_total} 个"
+                            + (f"，等待同步 {deferred_total} 个" if deferred_total else "")
+                            + (f"，失败 {failed_total} 个" if failed_total else "")
+                        )
+                        job.updated_at = time.time()
+                    self._log(
+                        f"job {job.job_id} cleanup progress: deleted={deleted_total} deferred_sync={deferred_total} failed={failed_total}"
+                    )
+                    last_log_mono = now_m
+                if d_cnt == 0 and f_cnt == 0 and s_cnt == 0:
                     break
+
+            with job.db_lock:
+                self._refresh_counts_locked(job, conn)
+                self._refresh_buckets_locked(job, conn)
+            counts = job.status_counts
+            rem_pending = counts.get("pending", {}).get("count", 0)
+            rem_ia = counts.get("ia_deferred", {}).get("count", 0)
+            rem_copied = counts.get("copied", {}).get("count", 0)
+            rem_failed = counts.get("failed", {}).get("count", 0)
+
+            now_done = time.time()
             with job.lock:
-                if failed_total > 0:
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                    job.message = f"已取消清理任务（本次已清理 {deleted_total} 个 R2 原文件）"
+                elif job.pause_requested or self._shutdown:
+                    job.status = "paused_quota" if prev_status == "paused_quota" else "paused"
+                    job.message = f"已暂停清理任务（本次已清理 {deleted_total} 个 R2 原文件）"
+                elif failed_total > 0 or (transient_bucket_errors and deleted_total == 0):
                     job.status = "failed"
-                    job.message = f"已清理 {deleted_total} 个 R2 原文件，{failed_total} 个核验或删除失败"
+                    err_note = ""
+                    if transient_bucket_errors:
+                        err_note = "；R2 暂态超时桶: " + ", ".join(
+                            f"{b} ({e})" for b, e in sorted(transient_bucket_errors.items())
+                        )
+                    job.message = (
+                        f"已核验并清理 {deleted_total} 个 R2 原文件；"
+                        f"{failed_total or rem_failed} 个核验或删除失败"
+                        + (f"，{deferred_total} 个正等待 Drive 云端同步" if deferred_total else "")
+                        + (f"，另有 {rem_pending} 个待迁移" if rem_pending else "")
+                        + err_note
+                    )
+                elif deferred_total > 0 or rem_copied > 0:
+                    job.status = "paused_quota"
+                    extra_parts: list[str] = []
+                    if rem_pending or rem_ia:
+                        extra_parts.append(f"另有 {rem_pending + rem_ia} 个待迁移")
+                    if rem_failed:
+                        extra_parts.append(f"{rem_failed} 个失败待重试")
+                    if transient_bucket_errors:
+                        extra_parts.append(
+                            "部分桶 R2 删源暂时超时待重试: " + ", ".join(sorted(transient_bucket_errors.keys()))
+                        )
+                    extra_suffix = ("（" + "；".join(extra_parts) + "）") if extra_parts else ""
+                    job.message = (
+                        f"已核验并清理 {deleted_total} 个 R2 原文件；"
+                        f"剩余 {rem_copied} 个已拷贝对象正等待 Google Drive 云端同步 (750 GB/24h 限流)"
+                        f"{extra_suffix}，同步完成后请再次执行 cleanup / resume {job.job_id}"
+                    )
+                elif rem_pending > 0 or rem_ia > 0:
+                    job.status = (
+                        prev_status
+                        if prev_status in ("paused", "paused_budget", "paused_quota", "interrupted")
+                        else "paused"
+                    )
+                    job.message = (
+                        f"已核验并清理 {deleted_total} 个 R2 原文件；"
+                        f"仍有 {rem_pending + rem_ia} 个对象待迁移"
+                        + (f"（另有 {rem_failed} 个失败待重试）" if rem_failed else "")
+                    )
+                elif rem_failed > 0:
+                    job.status = "failed"
+                    job.message = f"已核验并清理 {deleted_total} 个 R2 原文件；仍有 {rem_failed} 个失败对象待重试"
                 else:
                     job.status = "completed"
                     job.message = f"已核验 Drive 并清理 {deleted_total} 个 R2 原文件"
-                job.finished_at = time.time()
+                job.finished_at = now_done
+                job.session_finished_at = now_done
             self._flush_checkpoint(job, conn)
-            return self.get_job(job_id)
+            return self.get_job(job.job_id)
+        except Exception as err:
+            self._log(f"job {job.job_id} cleanup error: {err}")
+            now_done = time.time()
+            with job.lock:
+                job.recent_errors.append({"key": "", "error": str(err)})
+                job.status = "failed"
+                job.message = f"R2 清理失败（已删 {deleted_total} 个）: {err}"
+                job.finished_at = now_done
+                job.session_finished_at = now_done
+            with contextlib.suppress(Exception):
+                self._flush_checkpoint(job, conn)
+            return self.get_job(job.job_id)
         finally:
             client.close()
-            self.ledger.flush()
+            self.ledger.flush(ignore_errors=True)
 
     def shutdown(self) -> None:
         self._shutdown = True
@@ -2000,7 +2586,7 @@ class MigrationManager:
                     with contextlib.suppress(Exception):
                         job.conn.close()
                     job.conn = None
-        self.ledger.flush()
+        self.ledger.flush(ignore_errors=True)
 
     def _launch_job_thread(self, job: _RuntimeJob, creds: R2Credentials) -> None:
         th = threading.Thread(
@@ -2031,7 +2617,22 @@ class MigrationManager:
                 with contextlib.suppress(Exception):
                     self._flush_checkpoint(job, conn)
             else:
-                self._persist_job_summary(job)
+                with contextlib.suppress(OSError):
+                    self._persist_job_summary(job)
+        except _QuotaPaused as quota_err:
+            self._log(f"job {job.job_id} paused on Drive quota/cache guard: {quota_err.message}")
+            now_wall = time.time()
+            with job.lock:
+                job.status = "paused_quota"
+                job.message = quota_err.message
+                job.finished_at = now_wall
+                job.session_finished_at = now_wall
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    self._flush_checkpoint(job, conn)
+            else:
+                with contextlib.suppress(OSError):
+                    self._persist_job_summary(job)
         except Exception as err:
             self._log(f"job {job.job_id} error: {err}")
             now_wall = time.time()
@@ -2045,10 +2646,11 @@ class MigrationManager:
                 with contextlib.suppress(Exception):
                     self._flush_checkpoint(job, conn)
             else:
-                self._persist_job_summary(job)
+                with contextlib.suppress(OSError):
+                    self._persist_job_summary(job)
         finally:
             client.close()
-            self.ledger.flush()
+            self.ledger.flush(ignore_errors=True)
             with contextlib.suppress(OSError):
                 if job.spool_dir.is_dir() and not any(job.spool_dir.iterdir()):
                     job.spool_dir.rmdir()
@@ -2517,8 +3119,10 @@ class MigrationManager:
 
         dir_cache = DriveDirCache(job.dest_root)
         spool_budget = ByteBudgetSemaphore(self.spool_bytes_cap)
+        is_fuse_drive = _detect_fuse_drive_mydrive(job.dest_root) is not None
         work_cond = threading.Condition()
         budget_pause_msg: list[str] = []
+        quota_pause_msg: list[str] = []
         lister_error: list[str] = []
         internal_stop = threading.Event()
         listing_finished = threading.Event()
@@ -2537,6 +3141,14 @@ class MigrationManager:
         def trigger_budget_pause(msg: str) -> None:
             if not budget_pause_msg:
                 budget_pause_msg.append(msg)
+            internal_stop.set()
+            job.stop_event.set()
+            with work_cond:
+                work_cond.notify_all()
+
+        def trigger_quota_pause(msg: str) -> None:
+            if not quota_pause_msg:
+                quota_pause_msg.append(msg)
             internal_stop.set()
             job.stop_event.set()
             with work_cond:
@@ -2682,19 +3294,56 @@ class MigrationManager:
 
         # --- Background R2 DeleteObjects thread ---
         def deleter_loop() -> None:
+            del_after_keys: dict[str, str] = {}
+            del_verifier = _DriveCloudSyncVerifier(job.dest_root, log=self._log)
             while not stop_deleter.is_set() and not is_stopping():
-                with job.lock:
-                    copied_total = job.status_counts.get("copied", {}).get("count", 0)
-                if copied_total >= 1000:
-                    with job.db_lock:
-                        ready_buckets = conn.execute(
-                            "SELECT bucket, COUNT(*) FROM objects WHERE status='copied' GROUP BY bucket HAVING COUNT(*) >= 1000"
-                        ).fetchall()
-                    for r_b, _ in ready_buckets:
-                        if stop_deleter.is_set() or is_stopping():
-                            break
-                        self._delete_copied_chunk(job, conn, client, bucket_filter=str(r_b), batch_limit=1000)
-                delete_wake.wait(timeout=1.5)
+                deferred_cycle = 0
+                deleted_cycle = 0
+                try:
+                    with job.lock:
+                        copied_total = job.status_counts.get("copied", {}).get("count", 0)
+                    if copied_total >= 1000:
+                        with job.db_lock:
+                            b_names = [
+                                str(r[0])
+                                for r in conn.execute("SELECT bucket FROM buckets ORDER BY bucket").fetchall()
+                            ]
+                            ready_buckets: list[str] = []
+                            for b_name in b_names:
+                                ak = del_after_keys.get(b_name, "")
+                                if (
+                                    conn.execute(
+                                        "SELECT 1 FROM objects WHERE bucket=? AND status='copied' AND key > ? "
+                                        "ORDER BY key LIMIT 1 OFFSET 999",
+                                        (b_name, ak),
+                                    ).fetchone()
+                                    is not None
+                                ):
+                                    ready_buckets.append(b_name)
+                                elif ak:
+                                    del_after_keys[b_name] = ""
+                        for r_b in ready_buckets:
+                            if stop_deleter.is_set() or is_stopping():
+                                break
+                            d_cnt, _, s_cnt = self._delete_copied_chunk(
+                                job,
+                                conn,
+                                client,
+                                bucket_filter=r_b,
+                                batch_limit=1000,
+                                after_keys=del_after_keys,
+                                single_pass=False,
+                                cloud_verifier=del_verifier,
+                            )
+                            deleted_cycle += d_cnt
+                            deferred_cycle += s_cnt
+                except Exception as exc:
+                    self._log(f"job {job.job_id}: background deleter transient error (retrying): {exc}")
+                    delete_wake.wait(timeout=3.0)
+                    delete_wake.clear()
+                    continue
+                wait_sec = 5.0 if (deferred_cycle > 0 and deleted_cycle == 0) else 1.5
+                delete_wake.wait(timeout=wait_sec)
                 delete_wake.clear()
 
         # --- DriveFS direct writer workers (files mode) ---
@@ -2710,6 +3359,15 @@ class MigrationManager:
                         rel_path, spool_tmp, size, on_relocate=record_relocate
                     )
                     outcomes_q.put((bucket, key, actual_rel, "copied", "", size, "pending"))
+                except OSError as exc:
+                    if exc.errno == errno.ENOSPC or "No space left on device" in str(exc):
+                        trigger_quota_pause(
+                            "Google Drive 挂载或本地缓存空间不足（可能已触发单账号 750 GB / 24h 上传限流 userRateLimitExceeded）；"
+                            "任务已安全暂停，待云端后台上传释放缓存后执行 resume 继续"
+                        )
+                        outcomes_q.put((bucket, key, rel_path, "pending", "", size, "pending"))
+                    else:
+                        outcomes_q.put((bucket, key, rel_path, "failed", f"Drive write failed: {exc}", size, "pending"))
                 except Exception as exc:
                     outcomes_q.put((bucket, key, rel_path, "failed", f"Drive write failed: {exc}", size, "pending"))
                 finally:
@@ -2752,6 +3410,14 @@ class MigrationManager:
                 work_cond.notify_all()
 
         def on_tar_failed(entries: list[_ArchivedEntry], err_msg: str) -> None:
+            if not err_msg:
+                with in_flight_lock:
+                    for e in entries:
+                        if e.bucket and e.key:
+                            dispatched_keys.discard((e.bucket, e.key))
+                with work_cond:
+                    work_cond.notify_all()
+                return
             now_ts = time.time()
             upd: list[tuple[str, float, str, str]] = []
             deltas: dict[str, tuple[int, int]] = {}
@@ -2799,6 +3465,7 @@ class MigrationManager:
                 tar_shard_mb=tar_shard_mb,
                 on_committed=on_tar_committed,
                 on_failed=on_tar_failed,
+                on_quota_pause=trigger_quota_pause,
                 log=self._log,
             )
             with job.db_lock:
@@ -2987,8 +3654,14 @@ class MigrationManager:
             except _JobStopped:
                 pass
             except Exception as exc:
-                outcomes_q.put((bucket, key, rel_path, "failed", str(exc), size, "pending"))
-                handed_off = True
+                if (isinstance(exc, OSError) and exc.errno == errno.ENOSPC) or "No space left on device" in str(exc):
+                    trigger_quota_pause(
+                        "Google Drive 挂载或本地缓存空间不足（可能已触发单账号 750 GB / 24h 上传限流 userRateLimitExceeded）；"
+                        "任务已安全暂停，待云端后台上传释放缓存后执行 resume 继续"
+                    )
+                else:
+                    outcomes_q.put((bucket, key, rel_path, "failed", str(exc), size, "pending"))
+                    handed_off = True
             finally:
                 if not handed_off:
                     if spool_tmp is not None:
@@ -3099,8 +3772,15 @@ class MigrationManager:
                         job.message = "正在高速迁移 R2 对象为 TAR 分卷"
 
             # Phase 2: concurrent R2 downloads -> DriveFS / TAR pipeline
+            ckpt_interval = (
+                TAR_DEFAULT_CHECKPOINT_INTERVAL
+                if (storage_mode == "tar" and self.checkpoint_interval == DEFAULT_CHECKPOINT_INTERVAL)
+                else self.checkpoint_interval
+            )
             last_ckpt_time = time.monotonic()
+            last_ckpt_changes = conn.total_changes
             last_ui_time = time.monotonic()
+            last_disk_check = 0.0
             pending_futs: set[concurrent.futures.Future[None]] = set()
             dispatch_cursor: tuple[str, str] = ("", "")
 
@@ -3110,10 +3790,12 @@ class MigrationManager:
                         drain_outcomes()
 
                         now_m = time.monotonic()
-                        if (now_m - last_ckpt_time) >= self.checkpoint_interval:
-                            self._flush_checkpoint(job, conn)
+                        if (now_m - last_ckpt_time) >= ckpt_interval:
+                            if conn.total_changes != last_ckpt_changes:
+                                self._flush_checkpoint(job, conn)
+                                last_ckpt_changes = conn.total_changes
+                                last_ui_time = time.monotonic()
                             last_ckpt_time = time.monotonic()
-                            last_ui_time = last_ckpt_time
                         elif (now_m - last_ui_time) >= 30.0:
                             with job.db_lock:
                                 self._refresh_counts_locked(job, conn)
@@ -3121,6 +3803,17 @@ class MigrationManager:
                             last_ui_time = now_m
 
                         pending_futs = {f for f in pending_futs if not f.done()}
+
+                        if is_fuse_drive and (now_m - last_disk_check) >= 5.0 and not is_stopping():
+                            last_disk_check = now_m
+                            with contextlib.suppress(OSError):
+                                min_free = max(_MIN_DRIVEFS_WORK_FREE_BYTES, int(self.spool_bytes_cap) + 2 * 1024 * 1024 * 1024)
+                                if shutil.disk_usage(self.work_dir).free < min_free:
+                                    trigger_quota_pause(
+                                        "Google Drive 本地上传缓存空间不足（可能已触发单账号 750 GB / 24h 上传限流 userRateLimitExceeded）；"
+                                        "任务已安全暂停，待云端后台上传释放缓存后执行 resume 继续"
+                                    )
+                                    break
 
                         if is_stopping():
                             break
@@ -3258,18 +3951,27 @@ class MigrationManager:
                 and not job.cancel_requested
                 and not job.pause_requested
                 and not self._shutdown
-                and not budget_pause_msg
-                and not lister_error
             ):
-                while True:
-                    d_cnt, f_cnt = self._delete_copied_chunk(job, conn, client, batch_limit=1000)
-                    if d_cnt == 0 and f_cnt == 0:
+                end_after_keys: dict[str, str] = {}
+                end_verifier = _DriveCloudSyncVerifier(job.dest_root, log=self._log)
+                while not self._shutdown:
+                    d_cnt, f_cnt, s_cnt = self._delete_copied_chunk(
+                        job,
+                        conn,
+                        client,
+                        batch_limit=1000,
+                        after_keys=end_after_keys,
+                        single_pass=True,
+                        cloud_verifier=end_verifier,
+                    )
+                    if d_cnt == 0 and f_cnt == 0 and s_cnt == 0:
                         break
 
             with job.db_lock:
                 self._refresh_counts_locked(job, conn)
                 self._refresh_buckets_locked(job, conn)
             counts = job.status_counts
+            pending_cnt = counts.get("pending", {}).get("count", 0)
             failed_cnt = counts.get("failed", {}).get("count", 0)
             ia_cnt = counts.get("ia_deferred", {}).get("count", 0)
             copied_cnt = counts.get("copied", {}).get("count", 0)
@@ -3283,6 +3985,9 @@ class MigrationManager:
                 elif budget_pause_msg:
                     job.status = "paused_budget"
                     job.message = budget_pause_msg[0]
+                elif quota_pause_msg:
+                    job.status = "paused_quota"
+                    job.message = quota_pause_msg[0]
                 elif job.pause_requested or self._shutdown:
                     job.status = "paused"
                     job.message = "任务已暂停并保存断点检查点，可通过 resume 继续"
@@ -3298,6 +4003,13 @@ class MigrationManager:
                 elif failed_cnt > 0:
                     job.status = "failed"
                     job.message = f"部分对象失败 ({failed_cnt} 个)，可执行 `resume {job.job_id}` 重试失败项"
+                elif delete_source and copied_cnt > 0 and pending_cnt == 0 and ia_cnt == 0:
+                    job.status = "paused_quota"
+                    job.message = (
+                        f"全部对象已打包写入本地 Drive 挂载，并已清理云端核验通过的 {deleted_cnt} 个 R2 原文件；"
+                        f"剩余 {copied_cnt} 个对象正等待 Google Drive 云端同步 (750 GB/24h 限流)，"
+                        f"同步完成后执行 cleanup {job.job_id} 即可删空"
+                    )
                 else:
                     job.status = "completed"
                     if delete_source:
@@ -3325,30 +4037,53 @@ class MigrationManager:
         *,
         bucket_filter: str | None = None,
         batch_limit: int = 1000,
-    ) -> tuple[int, int]:
-        """Re-verify Drive copies (TAR shard or loose file) and batch-delete up to `batch_limit` keys via Free DeleteObjects."""
+        after_keys: dict[str, str] | None = None,
+        single_pass: bool = False,
+        cloud_verifier: _DriveCloudSyncVerifier | None = None,
+        delete_concurrency: int = 4,
+        skip_buckets: set[str] | None = None,
+        transient_bucket_errors: dict[str, str] | None = None,
+    ) -> tuple[int, int, int]:
+        """Re-verify Drive copies (TAR shard or loose file, plus Cloud sync on fuse.drive) and batch-delete up to `batch_limit` keys via Free DeleteObjects.
+
+        Returns `(deleted_total, failed_total, deferred_sync_total)`.
+        """
         with job.db_lock:
             if bucket_filter:
                 buckets = [bucket_filter]
             else:
                 buckets = [
                     str(r[0])
-                    for r in conn.execute("SELECT DISTINCT bucket FROM objects WHERE status='copied' ORDER BY bucket").fetchall()
+                    for r in conn.execute("SELECT bucket FROM buckets ORDER BY bucket").fetchall()
                 ]
+                if not buckets:
+                    buckets = [
+                        str(r[0])
+                        for r in conn.execute("SELECT DISTINCT bucket FROM objects WHERE status='copied' ORDER BY bucket").fetchall()
+                    ]
         if not buckets:
-            return 0, 0
+            return 0, 0, 0
 
+        verifier = cloud_verifier or _DriveCloudSyncVerifier(job.dest_root, log=self._log)
         deleted_total = 0
         failed_total = 0
-        shard_ok_cache: dict[str, bool] = {}
+        deferred_sync_total = 0
+        shard_state_cache: dict[str, str] = {}
         now_ts = time.time()
         for bucket in buckets:
+            if job.stop_event.is_set() or self._shutdown:
+                break
+            if skip_buckets is not None and bucket in skip_buckets:
+                continue
+            after_key = (after_keys or {}).get(bucket, "")
             with job.db_lock:
                 rows = conn.execute(
-                    "SELECT key, size, rel_path, is_dir FROM objects WHERE bucket=? AND status='copied' ORDER BY key LIMIT ?",
-                    (bucket, batch_limit),
+                    "SELECT key, size, rel_path, is_dir FROM objects WHERE bucket=? AND status='copied' AND key > ? ORDER BY key LIMIT ?",
+                    (bucket, after_key, batch_limit),
                 ).fetchall()
                 if not rows:
+                    if after_keys is not None and not single_pass:
+                        after_keys[bucket] = ""
                     continue
                 arch_map: dict[str, tuple[int, str, str, int]] = {}
                 rel_cands: list[str] = []
@@ -3374,36 +4109,44 @@ class MigrationManager:
             key_sizes: dict[str, int] = {str(k): int(sz) for k, sz, _, _ in rows}
             verified_keys: list[str] = []
             verify_failed: list[tuple[str, str]] = []
+            deferred_here = 0
             for key, size, rel_path, is_dir in rows:
                 s_rel = str(rel_path)
                 arch_entry = arch_map.get(s_rel) or arch_map.get(f"{s_rel}/__r2_object__")
-                ok = False
+                state = "missing"
                 if arch_entry is not None:
                     asz, sname, rel_tar_path, tar_bytes = arch_entry
                     if is_dir or int(asz) == int(size):
-                        s_ok = shard_ok_cache.get(sname)
-                        if s_ok is None:
+                        s_state = shard_state_cache.get(sname)
+                        if s_state is None:
                             tar_p = job.dest_root / rel_tar_path
-                            with contextlib.suppress(OSError):
-                                s_ok = tar_p.is_file() and tar_p.stat().st_size == int(tar_bytes)
-                            s_ok = bool(s_ok)
-                            shard_ok_cache[sname] = s_ok
-                        ok = s_ok
-                if not ok:
+                            s_state = verifier.verify_file(tar_p, int(tar_bytes))
+                            shard_state_cache[sname] = s_state
+                        state = s_state
+                if state == "missing":
                     target = job.dest_root / s_rel
                     if is_dir:
-                        ok = target.is_dir()
+                        if target.is_dir():
+                            state = "synced"
                     else:
-                        with contextlib.suppress(OSError):
-                            if target.is_file() and target.stat().st_size == int(size):
-                                ok = True
-                            elif target.is_dir():
-                                reloc_target = target / "__r2_object__"
-                                ok = reloc_target.is_file() and reloc_target.stat().st_size == int(size)
-                if ok:
+                        st1 = verifier.verify_file(target, int(size))
+                        if st1 != "missing":
+                            state = st1
+                        elif target.is_dir():
+                            state = verifier.verify_file(target / "__r2_object__", int(size))
+                if state == "synced":
                     verified_keys.append(str(key))
+                elif state == "pending_sync":
+                    deferred_sync_total += 1
+                    deferred_here += 1
                 else:
                     verify_failed.append((str(key), f"Drive pre-delete verification failed: {job.dest_root / s_rel}"))
+
+            if after_keys is not None:
+                if single_pass or deferred_here > 0:
+                    after_keys[bucket] = str(rows[-1][0])
+                elif len(rows) < batch_limit:
+                    after_keys[bucket] = ""
 
             deltas: dict[str, tuple[int, int]] = {}
             if verify_failed:
@@ -3425,7 +4168,30 @@ class MigrationManager:
                         job.recent_errors.append({"key": f"{bucket}/{k}", "error": err})
 
             if verified_keys:
-                res: DeleteBatchResult = client.delete_objects(bucket, verified_keys)
+                try:
+                    res: DeleteBatchResult = client.delete_objects(
+                        bucket,
+                        verified_keys,
+                        batch_size=250,
+                        quiet=True,
+                        concurrency=delete_concurrency,
+                        log=self._log,
+                    )
+                except R2Error as err:
+                    if isinstance(err, R2HttpError) and err.status in (401, 403):
+                        raise
+                    self._log(
+                        f"job {job.job_id}: transient R2 delete failure on bucket {bucket} (deferring bucket): {err}"
+                    )
+                    with job.lock:
+                        job.recent_errors.append({"key": f"{bucket}/*", "error": str(err)})
+                    if skip_buckets is not None:
+                        skip_buckets.add(bucket)
+                    if transient_bucket_errors is not None:
+                        transient_bucket_errors[bucket] = str(err)
+                    if deltas:
+                        self._adjust_status_counts(job, deltas)
+                    continue
                 with job.db_lock:
                     if res.deleted:
                         conn.executemany(
@@ -3438,12 +4204,19 @@ class MigrationManager:
                             [(err, now_ts, bucket, k) for k, err in res.errors.items()],
                         )
                     conn.commit()
+                del_bytes_chunk = 0
                 for k in res.deleted:
                     sz = key_sizes.get(k, 0)
+                    del_bytes_chunk += sz
                     cc, cb = deltas.get("copied", (0, 0))
                     deltas["copied"] = (cc - 1, cb - sz)
                     dc, db = deltas.get("deleted", (0, 0))
                     deltas["deleted"] = (dc + 1, db + sz)
+                if single_pass and res.deleted:
+                    with job.lock:
+                        job.files_done_session += len(res.deleted)
+                        job.bytes_done_session += del_bytes_chunk
+                        job.updated_at = time.time()
                 for k in res.errors:
                     sz = key_sizes.get(k, 0)
                     cc, cb = deltas.get("copied", (0, 0))
@@ -3458,7 +4231,7 @@ class MigrationManager:
                             job.recent_errors.append({"key": f"{bucket}/{k}", "error": err})
             if deltas:
                 self._adjust_status_counts(job, deltas)
-        return deleted_total, failed_total
+        return deleted_total, failed_total, deferred_sync_total
 
     def list_drive(self, inputs: list[str] | None = None, *, recursive: bool = True, limit: int = 500) -> dict[str, Any]:
         """List migrated folders/files safely within Drive mount (or local fallback)."""

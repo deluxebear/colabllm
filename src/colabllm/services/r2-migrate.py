@@ -242,7 +242,9 @@ def _wait_job(job: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
                     f"migrated={prog.get('objects_migrated', 0)}/{prog.get('objects_listed', 0)} "
                     f"({_format_bytes(prog.get('bytes_migrated', 0))})"
                     f"{shard_info} "
-                    f"deleted={prog.get('objects_deleted', 0)} failed={prog.get('objects_failed', 0)} | "
+                    f"deleted={prog.get('objects_deleted', 0)} "
+                    f"pending_del={prog.get('objects_copied_pending_delete', 0)} "
+                    f"failed={prog.get('objects_failed', 0)} | "
                     f"{prog.get('files_per_sec', 0)} files/s ({prog.get('mb_per_sec', 0)} MB/s) | "
                     f"R2 ops A={usage.get('class_a_ops', 0)} B={usage.get('class_b_ops', 0)} "
                     f"est=${usage.get('estimated_cost_usd', 0.0):.4f}",
@@ -364,7 +366,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if not args.no_wait:
         job = _wait_job(job, args)
     print(json.dumps(job, ensure_ascii=False, indent=2))
-    if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_credentials", "interrupted"):
+    if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_quota", "paused_credentials", "interrupted"):
         return 1
     return 0
 
@@ -380,7 +382,7 @@ def cmd_job(args: argparse.Namespace) -> int:
     if args.wait and job.get("status") in ("queued", "running"):
         job = _wait_job(job, args)
     print(json.dumps(job, ensure_ascii=False, indent=2))
-    return 1 if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_credentials") else 0
+    return 1 if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_quota", "paused_credentials") else 0
 
 
 def cmd_pause(args: argparse.Namespace) -> int:
@@ -422,12 +424,14 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if args.wait:
         job = _wait_job(job, args)
     print(json.dumps(job, ensure_ascii=False, indent=2))
-    return 1 if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_credentials") else 0
+    return 1 if job.get("status") in ("failed", "cancelled", "paused_budget", "paused_quota", "paused_credentials") else 0
 
 
 def cmd_cleanup(args: argparse.Namespace) -> int:
     creds = _resolve_local_credentials(args)
-    payload = {"credentials": creds} if creds else {}
+    payload: dict[str, Any] = {"background": True}
+    if creds:
+        payload["credentials"] = creds
     job = _request(f"/api/jobs/{args.id}/cleanup", args, payload)
     if args.wait and job.get("status") in ("queued", "running"):
         job = _wait_job(job, args)

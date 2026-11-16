@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import contextlib
 import dataclasses
 import datetime as dt
@@ -56,6 +57,10 @@ class R2HttpError(R2Error):
 
 class R2IntegrityError(R2Error):
     """Downloaded object failed size or MD5 ETag integrity verification."""
+
+
+class R2TruncatedReadError(R2IntegrityError):
+    """Downloaded object stream ended early before expected Size."""
 
 
 def s3_quote(value: str, safe: str = "-_.~") -> str:
@@ -327,7 +332,7 @@ class DeleteBatchResult:
 class R2UsageLedger:
     """Thread-safe UTC-monthly R2 call-count and estimated USD cost tracker."""
 
-    def __init__(self, data_dir: Path, *, flush_interval: float = 5.0) -> None:
+    def __init__(self, data_dir: Path, *, flush_interval: float = 30.0) -> None:
         self.data_dir = Path(data_dir)
         self.flush_interval = max(0.2, float(flush_interval))
         self._lock = threading.Lock()
@@ -382,16 +387,33 @@ class R2UsageLedger:
     def _write_locked(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         payload = self._snapshot_locked()
+        raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         target = self._path_for_month(self._month)
-        tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, target)
+        if target.is_file():
+            with target.open("r+b") as fh:
+                fh.seek(0)
+                fh.write(raw)
+                fh.truncate()
+                fh.flush()
+        else:
+            tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                tmp.write_bytes(raw)
+                os.replace(tmp, target)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    tmp.unlink(missing_ok=True)
+                raise
         self._dirty = False
         self._last_flush = time.monotonic()
 
     def _maybe_flush_locked(self) -> None:
         if self._dirty and (time.monotonic() - self._last_flush) >= self.flush_interval:
-            self._write_locked()
+            try:
+                self._write_locked()
+            except OSError:
+                self._dirty = True
+                self._last_flush = time.monotonic()
 
     def _snapshot_locked(self) -> dict[str, Any]:
         c = dict(self._counters)
@@ -421,10 +443,16 @@ class R2UsageLedger:
             self._roll_month_if_needed_locked()
             return self._snapshot_locked()
 
-    def flush(self) -> dict[str, Any]:
+    def flush(self, *, ignore_errors: bool = False) -> dict[str, Any]:
         with self._lock:
             self._roll_month_if_needed_locked()
-            self._write_locked()
+            try:
+                self._write_locked()
+            except OSError:
+                if not ignore_errors:
+                    raise
+                self._dirty = True
+                self._last_flush = time.monotonic()
             return self._snapshot_locked()
 
     def can_spend_class_a(self, cost_mode: str, max_free_class_a: int = DEFAULT_SAFE_FREE_CLASS_A) -> tuple[bool, bool]:
@@ -546,6 +574,7 @@ class R2Client:
         self._local = threading.local()
         self._pool_lock = threading.Lock()
         self._all_conns: dict[int, dict[tuple[str, str, int], http.client.HTTPConnection]] = {}
+        self._bucket_delete_mode: dict[str, tuple[str, int]] = {}
 
     def _thread_pool(self) -> dict[tuple[str, str, int], http.client.HTTPConnection]:
         pool = getattr(self._local, "pool", None)
@@ -556,16 +585,29 @@ class R2Client:
                 self._all_conns[threading.get_ident()] = pool
         return pool
 
-    def _get_conn(self, scheme: str, host: str, port: int) -> http.client.HTTPConnection:
+    def _get_conn(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        *,
+        timeout: float | None = None,
+    ) -> http.client.HTTPConnection:
         pool = self._thread_pool()
         key = (scheme, host, port)
+        eff_timeout = self.timeout if timeout is None else float(timeout)
         conn = pool.get(key)
         if conn is None:
             if scheme == "https":
-                conn = http.client.HTTPSConnection(host, port, timeout=self.timeout, context=self._ssl_ctx)
+                conn = http.client.HTTPSConnection(host, port, timeout=eff_timeout, context=self._ssl_ctx)
             else:
-                conn = http.client.HTTPConnection(host, port, timeout=self.timeout)
+                conn = http.client.HTTPConnection(host, port, timeout=eff_timeout)
             pool[key] = conn
+        else:
+            conn.timeout = eff_timeout
+            if conn.sock is not None:
+                with contextlib.suppress(OSError):
+                    conn.sock.settimeout(eff_timeout)
         return conn
 
     def _drop_conn(self, scheme: str, host: str, port: int) -> None:
@@ -604,10 +646,13 @@ class R2Client:
         query_params: Sequence[tuple[str, str]] = (),
         headers: dict[str, str] | None = None,
         payload: bytes = b"",
+        timeout: float | None = None,
+        max_retries: int | None = None,
     ) -> tuple[int, http.client.HTTPMessage, bytes]:
         canon_uri = self.base_path + (rel_path if rel_path.startswith("/") else "/" + rel_path)
+        retries = self.max_retries if max_retries is None else max(1, int(max_retries))
         last_err: Exception | None = None
-        for attempt in range(self.max_retries):
+        for attempt in range(retries):
             req_target, signed_hdrs = sign_s3_request(
                 self.creds,
                 method,
@@ -618,11 +663,11 @@ class R2Client:
                 payload=payload,
             )
             try:
-                conn = self._get_conn(self.scheme, self.host, self.port)
+                conn = self._get_conn(self.scheme, self.host, self.port, timeout=timeout)
                 conn.request(method, req_target, body=payload if payload else None, headers=signed_hdrs)
                 resp = conn.getresponse()
                 body = resp.read()
-                if resp.status in _RETRY_STATUSES and attempt + 1 < self.max_retries:
+                if resp.status in _RETRY_STATUSES and attempt + 1 < retries:
                     ra = resp.getheader("Retry-After")
                     self._drop_conn(self.scheme, self.host, self.port)
                     self._retry_sleep(attempt, ra)
@@ -641,8 +686,8 @@ class R2Client:
             except (http.client.HTTPException, OSError, TimeoutError, ssl.SSLError) as err:
                 last_err = err
                 self._drop_conn(self.scheme, self.host, self.port)
-                if attempt + 1 >= self.max_retries:
-                    raise R2Error(f"R2 S3 request failed after {self.max_retries} attempts: {err}") from err
+                if attempt + 1 >= retries:
+                    raise R2Error(f"R2 S3 request failed after {retries} attempts: {err}") from err
                 self._retry_sleep(attempt)
         raise R2Error(f"R2 S3 request failed: {last_err}")
 
@@ -754,6 +799,8 @@ class R2Client:
                 md5.update(chunk)
                 total += len(chunk)
         md5_hex = md5.hexdigest()
+        if expected_size is not None and total < expected_size:
+            raise R2TruncatedReadError(f"Size mismatch: expected {expected_size}, got {total}")
         if expected_size is not None and total != expected_size:
             raise R2IntegrityError(f"Size mismatch: expected {expected_size}, got {total}")
         etag = (expected_etag or "").strip('"').strip()
@@ -870,6 +917,14 @@ class R2Client:
                 if attempt + 1 >= self.max_retries:
                     raise last_err from None
                 self._retry_sleep(attempt, retry_exc.retry_after)
+            except R2TruncatedReadError as err:
+                last_err = err
+                self._drop_conn(self.scheme, self.host, self.port)
+                with contextlib.suppress(OSError):
+                    dest_temp.unlink(missing_ok=True)
+                if attempt + 1 >= self.max_retries:
+                    raise
+                self._retry_sleep(attempt)
             except R2IntegrityError:
                 self._drop_conn(self.scheme, self.host, self.port)
                 with contextlib.suppress(OSError):
@@ -890,13 +945,20 @@ class R2Client:
                 self._retry_sleep(attempt)
         raise R2Error(f"Download failed for {bucket}/{key}: {last_err}")
 
-    def delete_object(self, bucket: str, key: str) -> None:
+    def delete_object(
+        self,
+        bucket: str,
+        key: str,
+        *,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+    ) -> None:
         """Delete a single object (Free $0.00 operation on R2)."""
         if self.ledger is not None:
             self.ledger.record_free(delete_ops=1)
         rel_path = f"/{s3_quote(bucket)}/{s3_quote_path(key)}"
         try:
-            self._signed_request("DELETE", rel_path)
+            self._signed_request("DELETE", rel_path, timeout=timeout, max_retries=max_retries)
         except R2HttpError as err:
             if err.status == 404 or err.code == "NoSuchKey":
                 pass
@@ -905,65 +967,61 @@ class R2Client:
         if self.ledger is not None:
             self.ledger.record_free(deleted_objects=1)
 
-    def delete_objects(self, bucket: str, keys: Sequence[str]) -> DeleteBatchResult:
-        """Delete up to thousands of keys via Free $0.00 R2 DeleteObjects batches (<=1000/req)."""
-        deleted: list[str] = []
-        errors: dict[str, str] = {}
-        xml_safe: list[str] = []
-        for k in keys:
-            if _XML_ILLEGAL_CTRL_RE.search(k):
-                try:
-                    self.delete_object(bucket, k)
-                    deleted.append(k)
-                except Exception as err:
-                    errors[k] = str(err)
-            else:
-                xml_safe.append(k)
+    def _delete_xml_batch(
+        self,
+        bucket: str,
+        batch: Sequence[str],
+        *,
+        quiet: bool = True,
+        timeout: float | None = None,
+        max_retries: int | None = None,
+    ) -> tuple[list[str], dict[str, str]]:
+        """Execute one Free $0.00 S3 DeleteObjects XML POST request."""
+        if not batch:
+            return [], {}
+        quiet_tag = "true" if quiet else "false"
+        body_parts = [f"<Delete><Quiet>{quiet_tag}</Quiet>"]
+        for k in batch:
+            body_parts.append(f"<Object><Key>{xml_escape(k)}</Key></Object>")
+        body_parts.append("</Delete>")
+        xml_bytes = "".join(body_parts).encode("utf-8")
+        md5_b64 = base64.b64encode(hashlib.md5(xml_bytes).digest()).decode("ascii")
+        if self.ledger is not None:
+            self.ledger.record_free(delete_ops=1)
+        _, _, resp_body = self._signed_request(
+            "POST",
+            f"/{s3_quote(bucket)}",
+            query_params=[("delete", "")],
+            headers={
+                "content-md5": md5_b64,
+                "content-type": "application/xml",
+            },
+            payload=xml_bytes,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        batch_deleted: list[str] = []
+        batch_errors: dict[str, str] = {}
+        try:
+            root = ET.fromstring(resp_body)
+            for child in root:
+                name = _strip_ns(child.tag)
+                if name == "Deleted":
+                    k = _xml_text(child, "Key")
+                    if k:
+                        batch_deleted.append(k)
+                elif name == "Error":
+                    k = _xml_text(child, "Key")
+                    code = _xml_text(child, "Code")
+                    msg = _xml_text(child, "Message")
+                    if k:
+                        batch_errors[k] = f"{code}: {msg}".strip(": ") or "Delete error"
+        except ET.ParseError as parse_err:
+            return [], {k: f"Invalid DeleteObjects response XML: {parse_err}" for k in batch}
 
-        for idx in range(0, len(xml_safe), 1000):
-            batch = xml_safe[idx : idx + 1000]
-            if not batch:
-                continue
-            body_parts = ["<Delete><Quiet>false</Quiet>"]
-            for k in batch:
-                body_parts.append(f"<Object><Key>{xml_escape(k)}</Key></Object>")
-            body_parts.append("</Delete>")
-            xml_bytes = "".join(body_parts).encode("utf-8")
-            md5_b64 = base64.b64encode(hashlib.md5(xml_bytes).digest()).decode("ascii")
-            if self.ledger is not None:
-                self.ledger.record_free(delete_ops=1)
-            _, _, resp_body = self._signed_request(
-                "POST",
-                f"/{s3_quote(bucket)}",
-                query_params=[("delete", "")],
-                headers={
-                    "content-md5": md5_b64,
-                    "content-type": "application/xml",
-                },
-                payload=xml_bytes,
-            )
-            batch_deleted: list[str] = []
-            batch_errors: dict[str, str] = {}
-            try:
-                root = ET.fromstring(resp_body)
-                for child in root:
-                    name = _strip_ns(child.tag)
-                    if name == "Deleted":
-                        k = _xml_text(child, "Key")
-                        if k:
-                            batch_deleted.append(k)
-                    elif name == "Error":
-                        k = _xml_text(child, "Key")
-                        code = _xml_text(child, "Code")
-                        msg = _xml_text(child, "Message")
-                        if k:
-                            batch_errors[k] = f"{code}: {msg}".strip(": ") or "Delete error"
-            except ET.ParseError as parse_err:
-                for k in batch:
-                    errors[k] = f"Invalid DeleteObjects response XML: {parse_err}"
-                continue
-
-            # If server omitted Deleted nodes under implicit Quiet behavior, infer untouched keys not in errors.
+        if quiet and not batch_deleted:
+            batch_deleted = [k for k in batch if k not in batch_errors]
+        else:
             accounted = set(batch_deleted) | set(batch_errors.keys())
             if not batch_deleted and not batch_errors:
                 batch_deleted = list(batch)
@@ -971,10 +1029,184 @@ class R2Client:
                 for k in batch:
                     if k not in accounted:
                         batch_errors[k] = "Missing from DeleteObjects result"
-            deleted.extend(batch_deleted)
-            errors.update(batch_errors)
-            if self.ledger is not None and batch_deleted:
-                self.ledger.record_free(deleted_objects=len(batch_deleted))
+        if self.ledger is not None and batch_deleted:
+            self.ledger.record_free(deleted_objects=len(batch_deleted))
+        return batch_deleted, batch_errors
+
+    def delete_objects(
+        self,
+        bucket: str,
+        keys: Sequence[str],
+        *,
+        batch_size: int = 250,
+        quiet: bool = True,
+        concurrency: int = 1,
+        log: Callable[[str], None] | None = None,
+    ) -> DeleteBatchResult:
+        """Delete keys via Free $0.00 R2 DeleteObjects with adaptive fallback to smaller batches / single DELETE."""
+        deleted: list[str] = []
+        errors: dict[str, str] = {}
+        xml_safe: list[str] = []
+        for k in keys:
+            if _XML_ILLEGAL_CTRL_RE.search(k):
+                try:
+                    self.delete_object(bucket, k, timeout=min(self.timeout, 25.0), max_retries=2)
+                    deleted.append(k)
+                except Exception as err:
+                    errors[k] = str(err)
+            else:
+                xml_safe.append(k)
+
+        if not xml_safe:
+            return DeleteBatchResult(deleted=deleted, errors=errors)
+
+        req_batch = max(1, min(1000, int(batch_size)))
+        conc = max(1, int(concurrency))
+
+        def _is_non_retryable_http(err: Exception) -> bool:
+            return isinstance(err, R2HttpError) and err.status < 500 and err.status not in (408, 429)
+
+        def _delete_via_single(sub_keys: Sequence[str]) -> tuple[list[str], dict[str, str]]:
+            if not sub_keys:
+                return [], {}
+            probe_timeout = min(self.timeout, 20.0)
+            self.delete_object(bucket, sub_keys[0], timeout=probe_timeout, max_retries=2)
+            ok_keys: list[str] = [sub_keys[0]]
+            err_map: dict[str, str] = {}
+            if len(sub_keys) == 1:
+                return ok_keys, err_map
+
+            rest = sub_keys[1:]
+            max_w = min(len(rest), max(8, conc * 2))
+            last_r2_err: R2Error | None = None
+
+            def _del_one(one_key: str) -> tuple[str, bool, str, R2Error | None]:
+                try:
+                    self.delete_object(bucket, one_key, timeout=probe_timeout, max_retries=2)
+                    return one_key, True, "", None
+                except R2HttpError as http_err:
+                    if _is_non_retryable_http(http_err):
+                        return one_key, False, str(http_err), None
+                    return one_key, False, str(http_err), http_err
+                except R2Error as r2_err:
+                    return one_key, False, str(r2_err), r2_err
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as pool:
+                for one_key, ok, msg, r2_err in pool.map(_del_one, rest):
+                    if ok:
+                        ok_keys.append(one_key)
+                    else:
+                        err_map[one_key] = msg
+                        if r2_err is not None:
+                            last_r2_err = r2_err
+            if len(ok_keys) == 1 and len(err_map) == len(rest) and last_r2_err is not None:
+                raise last_r2_err
+            return ok_keys, err_map
+
+        def _process_chunk(chunk: list[str]) -> tuple[list[str], dict[str, str]]:
+            if not chunk:
+                return [], {}
+            with self._pool_lock:
+                cur_mode = self._bucket_delete_mode.get(bucket, ("batch", req_batch))[0]
+            if cur_mode == "single":
+                return _delete_via_single(chunk)
+
+            try:
+                res_ok = self._delete_xml_batch(
+                    bucket,
+                    chunk,
+                    quiet=quiet,
+                    timeout=min(self.timeout, 35.0),
+                    max_retries=2,
+                )
+                with self._pool_lock:
+                    if bucket not in self._bucket_delete_mode:
+                        self._bucket_delete_mode[bucket] = ("batch", req_batch)
+                return res_ok
+            except R2Error as err:
+                if _is_non_retryable_http(err):
+                    raise
+                d_list: list[str] = []
+                e_dict: dict[str, str] = {}
+                remaining_keys: Sequence[str] = chunk
+                if len(chunk) > 15:
+                    with self._pool_lock:
+                        self._bucket_delete_mode[bucket] = ("batch", 15)
+                    if log is not None:
+                        log(f"R2 DeleteObjects on {bucket} timed out at batch={len(chunk)}; adapting to 15-key batches ({err})")
+                    fallback_from: int | None = None
+                    for idx in range(0, len(chunk), 15):
+                        sub = chunk[idx : idx + 15]
+                        try:
+                            sd, se = self._delete_xml_batch(
+                                bucket,
+                                sub,
+                                quiet=quiet,
+                                timeout=min(self.timeout, 25.0),
+                                max_retries=2,
+                            )
+                            d_list.extend(sd)
+                            e_dict.update(se)
+                        except R2Error as err2:
+                            if _is_non_retryable_http(err2):
+                                raise
+                            fallback_from = idx
+                            break
+                    if fallback_from is None:
+                        return d_list, e_dict
+                    remaining_keys = chunk[fallback_from:]
+
+                if log is not None:
+                    log(f"R2 POST ?delete on {bucket} failed at <=15 keys; probing single DELETE fallback")
+                d_rest, e_rest = _delete_via_single(remaining_keys)
+                with self._pool_lock:
+                    self._bucket_delete_mode[bucket] = ("single", 1)
+                return d_list + d_rest, {**e_dict, **e_rest}
+
+        with self._pool_lock:
+            calibrated = bucket in self._bucket_delete_mode
+            mode, eff_batch = self._bucket_delete_mode.get(bucket, ("batch", req_batch))
+
+        if mode == "single":
+            d0, e0 = _delete_via_single(xml_safe)
+            deleted.extend(d0)
+            errors.update(e0)
+            return DeleteBatchResult(deleted=deleted, errors=errors)
+
+        eff_batch = max(1, min(1000, int(eff_batch)))
+        if not calibrated:
+            first_chunk = xml_safe[:eff_batch]
+            d_first, e_first = _process_chunk(first_chunk)
+            deleted.extend(d_first)
+            errors.update(e_first)
+
+            rest_keys = xml_safe[len(first_chunk) :]
+            if not rest_keys:
+                return DeleteBatchResult(deleted=deleted, errors=errors)
+
+            with self._pool_lock:
+                mode, new_batch = self._bucket_delete_mode.get(bucket, ("batch", req_batch))
+            if mode == "single":
+                d_rest, e_rest = _delete_via_single(rest_keys)
+                deleted.extend(d_rest)
+                errors.update(e_rest)
+                return DeleteBatchResult(deleted=deleted, errors=errors)
+            eff_batch = max(1, min(1000, int(new_batch)))
+        else:
+            rest_keys = xml_safe
+
+        rem_chunks = [rest_keys[i : i + eff_batch] for i in range(0, len(rest_keys), eff_batch)]
+        if conc <= 1 or len(rem_chunks) <= 1:
+            for ch in rem_chunks:
+                dc, ec = _process_chunk(ch)
+                deleted.extend(dc)
+                errors.update(ec)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(conc, len(rem_chunks))) as pool:
+                for dc, ec in pool.map(_process_chunk, rem_chunks):
+                    deleted.extend(dc)
+                    errors.update(ec)
+
         return DeleteBatchResult(deleted=deleted, errors=errors)
 
 

@@ -1004,6 +1004,8 @@ HTML_TEMPLATE = """<!doctype html>
           + (p.tar_shards ? ` · 分卷:${p.tar_shards} (${fmtBytes(p.tar_bytes || 0)})` : '')
           + (p.consolidated_existing_files ? ` · 已归并散列:${p.consolidated_existing_files}` : '')
           + (p.objects_deleted ? ` · 已删:${p.objects_deleted}` : '')
+          + (p.objects_copied_pending_delete > 0 ? ` · 待删R2:${p.objects_copied_pending_delete}` : '')
+          + (p.objects_pending > 0 ? ` · 待迁:${p.objects_pending}` : '')
           + (p.objects_failed ? ` · 失败:${p.objects_failed}` : '');
 
         const tdMsg = document.createElement('td');
@@ -1056,8 +1058,8 @@ HTML_TEMPLATE = """<!doctype html>
               `将核验 Drive 中已拷贝的 ${p.objects_copied_pending_delete} 个文件是否存在且大小一致，然后通过 Free DeleteObjects 从 Cloudflare R2 删除对应原对象。确认执行？`
             );
             if (!ok) return;
-            await apiJson(`/api/jobs/${encodeURIComponent(j.id)}/cleanup`, { method: 'POST', body: '{}' });
-            setStatus(`已完成任务 ${j.id} 的 R2 原文件清理`);
+            const cleanRes = await apiJson(`/api/jobs/${encodeURIComponent(j.id)}/cleanup`, { method: 'POST', body: '{}' });
+            setStatus(cleanRes.status === 'running' ? `已启动任务 ${j.id} 的 R2 核验清理（后台执行中）` : `已完成任务 ${j.id} 的 R2 原文件清理`);
             await refreshAll();
           }));
         }
@@ -1256,7 +1258,8 @@ class R2MigrateRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(raw)
 
     def _send_html(self, status: int, html: str, nonce: str) -> None:
         raw = html.encode("utf-8")
@@ -1267,7 +1270,8 @@ class R2MigrateRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(raw)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            self.wfile.write(raw)
 
     def _read_json(self) -> dict[str, Any]:
         raw_len = self.headers.get("Content-Length")
@@ -1303,8 +1307,8 @@ class R2MigrateRequestHandler(http.server.BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "r2-migrate",
-                    "version": "2.0",
-                    "capabilities": ["files", "tar", "consolidate_existing"],
+                    "version": "2.1",
+                    "capabilities": ["files", "tar", "consolidate_existing", "cloud_sync_verify", "adaptive_delete", "fast_cleanup"],
                     "drive_mounted": mgr.drive_mount.is_dir(),
                     "data_dir": str(mgr.data_dir),
                     "work_dir": str(mgr.work_dir),
@@ -1455,7 +1459,14 @@ class R2MigrateRequestHandler(http.server.BaseHTTPRequestHandler):
                     )
                     return
                 if action == "cleanup":
-                    self._send_json(200, mgr.cleanup_job(job_id, credentials=body.get("credentials")))
+                    self._send_json(
+                        200,
+                        mgr.cleanup_job(
+                            job_id,
+                            credentials=body.get("credentials"),
+                            background=bool(body.get("background", True)),
+                        ),
+                    )
                     return
                 if action == "cancel":
                     self._send_json(200, mgr.cancel_job(job_id))
