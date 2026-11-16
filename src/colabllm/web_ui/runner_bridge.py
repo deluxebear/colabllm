@@ -11,7 +11,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from cli_support import CliError, UsageError
 from colab_accounts import validate_account
@@ -66,11 +66,24 @@ class ManagedTask:
 
 
 class TaskManager:
-    def __init__(self) -> None:
+    def __init__(self, *, on_change: Callable[[], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._tasks: dict[str, ManagedTask] = {}
         self._order: list[str] = []
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
+        self._on_change = on_change
+        self._last_notify_mono = 0.0
+
+    def _notify_change(self, *, force: bool = False) -> None:
+        cb = self._on_change
+        if cb is None:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_notify_mono) < 0.2:
+            return
+        self._last_notify_mono = now
+        with contextlib.suppress(Exception):
+            cb()
 
     def start_task(
         self,
@@ -149,6 +162,7 @@ class TaskManager:
                             task.total_bytes -= len(dropped.encode("utf-8", errors="replace"))
                             task.truncated = True
                         task.cond.notify_all()
+                    self._notify_change()
         finally:
             if proc.stdout is not None:
                 with contextlib.suppress(OSError):
@@ -162,6 +176,7 @@ class TaskManager:
                 task.cond.notify_all()
             with self._lock:
                 self._procs.pop(task.task_id, None)
+            self._notify_change(force=True)
 
     def list_tasks(self) -> list[dict[str, Any]]:
         with self._lock:
@@ -180,6 +195,8 @@ class TaskManager:
                     "status": task.status,
                     "returncode": task.returncode,
                     "chunk_count": len(task.chunks),
+                    "truncated": task.truncated,
+                    "output_tail": "".join(task.chunks)[-4096:],
                 })
         return result
 

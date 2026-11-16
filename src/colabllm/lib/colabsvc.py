@@ -28,6 +28,7 @@ Lessons baked in (verified on real runs):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import dataclasses
 import contextlib
 import fcntl
@@ -43,6 +44,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Any, Callable
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -56,6 +58,8 @@ from colab_accounts import (
     resolve_effective_drive_account,
     validate_account,
 )
+from colab_ws import has_native_colab_session, run_single_ws_session
+import mux
 from protocol import NotebookProtocol
 from processes import process_identity, runner_alive, stop_owned_process
 
@@ -340,12 +344,15 @@ def list_service_instances(base_name: str) -> list[dict]:
     return items
 
 
-def colab_env_for(svc: Service) -> dict[str, str] | None:
-    return colab_subprocess_env(svc.account, svc.drive_account)
+def colab_env_for(svc: Service, *, env_overrides: dict[str, str] | None = None) -> dict[str, str] | None:
+    if not env_overrides:
+        return colab_subprocess_env(svc.account, svc.drive_account)
+    merged = {**os.environ, **env_overrides}
+    return colab_subprocess_env(svc.account, svc.drive_account, base_env=merged) or merged
 
 
-def colab_runtime_env_for(svc: Service) -> dict[str, str]:
-    env = dict(colab_env_for(svc) or os.environ)
+def colab_runtime_env_for(svc: Service, *, env_overrides: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(colab_env_for(svc, env_overrides=env_overrides) or os.environ)
     env.setdefault("REQUEST_TIMEOUT", str(DEFAULT_COLAB_REQUEST_TIMEOUT))
     return env
 
@@ -666,9 +673,20 @@ def parse_colab_session_status(session_name: str, returncode: int, stdout: str =
     return "unknown"
 
 
-def check_remote_session(svc: Service, timeout: float = 30.0) -> str:
+def check_remote_session(
+    svc: Service,
+    timeout: float = 30.0,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> str:
     try:
-        res = run(["colab", "status", "-s", svc.name], capture=True, check=False, timeout=timeout, env=colab_env_for(svc))
+        res = run(
+            ["colab", "status", "-s", svc.name],
+            capture=True,
+            check=False,
+            timeout=timeout,
+            env=colab_env_for(svc, env_overrides=env_overrides),
+        )
     except (OSError, subprocess.SubprocessError, CliError):
         return "unknown"
     return parse_colab_session_status(svc.name, res.returncode, res.stdout or "", res.stderr or "")
@@ -677,8 +695,16 @@ def check_remote_session(svc: Service, timeout: float = 30.0) -> str:
 def finish_runner(state, pid, identity, exit_code=None):
     def finish(st):
         if st.get("runner_pid") == pid and st.get("runner_identity") == identity:
-            st.update(runner_pid=None, runner_identity=None, exec_pid=None, exec_identity=None, ready=False,
-                      runner_exit=exit_code)
+            st.update(
+                runner_pid=None,
+                runner_identity=None,
+                runner_mode=None,
+                runner_lock=None,
+                exec_pid=None,
+                exec_identity=None,
+                ready=False,
+                runner_exit=exit_code,
+            )
         return st
     state.update(finish)
 
@@ -849,6 +875,7 @@ def _provision_session_for_restart(
     identity: str | None,
     *,
     previous_url: str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> str:
     """Verify remote session state under `.operation.lock` and reconnect or recreate the Colab VM.
 
@@ -866,11 +893,11 @@ def _provision_session_for_restart(
             account=st.get("account") or svc.account,
             drive_account=st.get("drive_account") or svc.drive_account,
         )
-        target_env = colab_env_for(target_svc)
-        runtime_env = colab_runtime_env_for(target_svc)
+        target_env = colab_env_for(target_svc, env_overrides=env_overrides)
+        runtime_env = colab_runtime_env_for(target_svc, env_overrides=env_overrides)
         mount_drive = bool(st.get("mount_drive", True))
         try:
-            remote = check_remote_session(target_svc)
+            remote = check_remote_session(target_svc, env_overrides=env_overrides)
             if remote == "alive":
                 log(f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活（本地连接闪断），正在恢复挂载与保活连接")
                 remount_ok = True
@@ -892,7 +919,15 @@ def _provision_session_for_restart(
                     return "ready"
             log(f"[auto-restart] 远端会话 '{target_svc.name}' 已停机，正在清理残留记录并重新申请实例")
             run(["colab", "stop", "-s", target_svc.name], capture=True, check=False, env=target_env)
-            ensure_session(target_svc, force_new=True)
+            args = ["colab", "new", "-s", target_svc.name]
+            if target_svc.tpu:
+                args += ["--tpu", target_svc.tpu]
+            elif target_svc.gpu:
+                args += ["--gpu", target_svc.gpu]
+            if target_svc.high_mem:
+                args += ["--high-mem"]
+            log(" ".join(args))
+            run(args, env=target_env)
             if mount_drive:
                 log("colab dfs mount")
                 run(["colab", "dfs", "mount", "-s", target_svc.name], env=runtime_env)
@@ -909,6 +944,243 @@ def _compute_backoff_delay(base_delay: float, consecutive_failures: int) -> floa
     return min(MAX_RESTART_BACKOFF, base_delay * (2 ** exponent))
 
 
+def _runtime_tuning(st: dict[str, Any], env_overrides: dict[str, str] | None) -> tuple[float, float, int, int, float]:
+    def _get(key: str) -> str | None:
+        if env_overrides and key in env_overrides:
+            return env_overrides[key]
+        return os.environ.get(key)
+
+    saved_idle_check = float(st.get("idle_check_seconds") or DEFAULT_IDLE_CHECK_SECONDS)
+    try:
+        idle_check_seconds = float(_get("COLABLLM_IDLE_CHECK_SECONDS") or saved_idle_check)
+    except ValueError:
+        idle_check_seconds = saved_idle_check
+    try:
+        fast_probe_seconds = float(_get("COLABLLM_FAST_PROBE_SECONDS") or DEFAULT_FAST_PROBE_SECONDS)
+    except ValueError:
+        fast_probe_seconds = DEFAULT_FAST_PROBE_SECONDS
+    try:
+        max_startup_retries = max(1, int(_get("COLABLLM_MAX_STARTUP_RETRIES") or DEFAULT_MAX_STARTUP_RETRIES))
+    except ValueError:
+        max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
+    try:
+        preflight_retries = max(0, int(_get("COLABLLM_PREFLIGHT_RETRIES") or DEFAULT_PREFLIGHT_RETRIES))
+    except ValueError:
+        preflight_retries = DEFAULT_PREFLIGHT_RETRIES
+    try:
+        raw_delay = _get("COLABLLM_PREFLIGHT_RETRY_DELAY")
+        preflight_retry_delay = max(
+            0.0, float(raw_delay if raw_delay is not None else DEFAULT_PREFLIGHT_RETRY_DELAY)
+        )
+    except ValueError:
+        preflight_retry_delay = DEFAULT_PREFLIGHT_RETRY_DELAY
+    return idle_check_seconds, fast_probe_seconds, max_startup_retries, preflight_retries, preflight_retry_delay
+
+
+async def supervise_instance_async(
+    svc: Service,
+    nb_path: Path,
+    *,
+    owner_pid: int | None = None,
+    owner_identity: str | None = None,
+    output_sink: Callable[[bytes], None] | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> int:
+    """Native asyncio WebSocket supervisor matching `exec_runner`'s retry & auto-restart semantics."""
+    state = State(svc)
+    st = state.load()
+    svc.account = svc.account or st.get("account")
+    svc.drive_account = svc.drive_account or st.get("drive_account")
+    pid = owner_pid if owner_pid is not None else os.getpid()
+    identity = owner_identity if owner_identity is not None else process_identity(pid)
+    if nb_path.is_file() and st.get("env"):
+        with contextlib.suppress(OSError, ValueError):
+            current_nb = json.loads(nb_path.read_text(encoding="utf-8"))
+            _write_private_notebook(nb_path, current_nb, st["env"])
+
+    merged_env = {**os.environ, **(env_overrides or {})}
+    auto_restart = bool(st.get("auto_restart"))
+    base_delay = float(st.get("restart_delay") or DEFAULT_RESTART_DELAY)
+    max_restarts = int(st.get("max_restarts") or 0)
+    (
+        idle_check_seconds,
+        fast_probe_seconds,
+        max_startup_retries,
+        preflight_retries,
+        preflight_retry_delay,
+    ) = _runtime_tuning(st, env_overrides)
+
+    def _emit(chunk: bytes) -> None:
+        if not chunk:
+            return
+        if output_sink is not None:
+            output_sink(chunk)
+        else:
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.flush()
+
+    async def _probe_async(target_s: Service, curr_st: dict[str, Any], timeout: float) -> str:
+        return await asyncio.to_thread(_probe_service_endpoint, target_s, curr_st, timeout=timeout)
+
+    async def _check_remote_async() -> str:
+        return await asyncio.to_thread(check_remote_session, svc, env_overrides=env_overrides)
+
+    async def _refresh_token_async() -> None:
+        await asyncio.to_thread(check_remote_session, svc, env_overrides=env_overrides)
+
+    ready_timeout = st.get("ready_timeout", svc.ready_timeout)
+    is_foreground = st.get("runner_mode") == "foreground"
+    already_ready = bool(st.get("ready") and st.get("url"))
+    conn_seq = 0
+
+    if not auto_restart:
+        deadline = time.monotonic() + ready_timeout if (is_foreground and not already_ready) else None
+        for preflight_attempt in range(preflight_retries + 1):
+            conn_seq += 1
+            rc, reached_ready, _, preflight_error = await run_single_ws_session(
+                svc,
+                state,
+                nb_path,
+                _emit,
+                env=merged_env,
+                deadline=deadline,
+                auto_restart=False,
+                idle_check_seconds=0.0,
+                fast_probe_seconds=0.0,
+                initially_ready=already_ready,
+                probe_fn=_probe_async,
+                check_remote_fn=_check_remote_async,
+                refresh_token_fn=_refresh_token_async,
+                conn_seq=conn_seq,
+            )
+            if rc == 0 or reached_ready or not preflight_error or preflight_attempt >= preflight_retries:
+                return rc
+            owned, _ = _runner_still_owned(state, pid, identity)
+            if not owned:
+                return 0
+            if await _check_remote_async() == "missing":
+                warn(f"远端 Colab 会话 '{svc.name}' 已不存在，停止预连接重试")
+                return rc
+            state.save(exec_pid=None, exec_identity=None)
+            warn(
+                f"原生 WebSocket 预连接中断 ({preflight_error})；远端会话仍存活，"
+                f"将在 {preflight_retry_delay:g}s 后自动重连 ({preflight_attempt + 1}/{preflight_retries})"
+            )
+            if preflight_retry_delay > 0:
+                await asyncio.sleep(preflight_retry_delay)
+        return rc
+
+    ever_ready = already_ready
+    consecutive_failures = 0
+    restart_count = int(st.get("restart_count") or 0)
+    attempt = 0
+    reattached_ready = already_ready
+    while True:
+        deadline = (
+            time.monotonic() + ready_timeout
+            if (not reattached_ready and (is_foreground or attempt > 0))
+            else None
+        )
+        last_timeout_err: TimeoutError | None = None
+        reached_ready = False
+        half_open_reclaimed = False
+        conn_seq += 1
+        try:
+            rc, reached_ready, half_open_reclaimed, _ = await run_single_ws_session(
+                svc,
+                state,
+                nb_path,
+                _emit,
+                env=merged_env,
+                deadline=deadline,
+                auto_restart=True,
+                idle_check_seconds=idle_check_seconds,
+                fast_probe_seconds=fast_probe_seconds,
+                initially_ready=reattached_ready,
+                probe_fn=_probe_async,
+                check_remote_fn=_check_remote_async,
+                refresh_token_fn=_refresh_token_async,
+                conn_seq=conn_seq,
+            )
+        except TimeoutError as err:
+            last_timeout_err = err
+            rc = 124
+            warn(f"[auto-restart] 等待 CT_READY 超时 ({ready_timeout}s)")
+
+        owned, st = _runner_still_owned(state, pid, identity)
+        if not owned:
+            return 0
+
+        if reached_ready:
+            ever_ready = True
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+
+        if not ever_ready and consecutive_failures >= max_startup_retries:
+            warn(f"[auto-restart] 首次启动连续 {consecutive_failures} 次未就绪，停止自动重试")
+            if last_timeout_err is not None:
+                raise last_timeout_err
+            return rc or 1
+
+        if max_restarts > 0 and restart_count >= max_restarts:
+            warn(f"[auto-restart] 已达到最大重启次数 ({max_restarts})，停止自动守护")
+            if last_timeout_err is not None and not reached_ready:
+                raise last_timeout_err
+            return rc or 1
+
+        restart_count += 1
+        previous_url = st.get("url")
+        keep_url = previous_url if st.get("hostname") else None
+        st = state.save(
+            ready=False,
+            url=keep_url,
+            exec_pid=None,
+            exec_identity=None,
+            last_cell_started=False,
+            restart_count=restart_count,
+        )
+
+        delay = 0.0 if half_open_reclaimed else _compute_backoff_delay(
+            base_delay, 0 if reached_ready else consecutive_failures
+        )
+        if delay > 0:
+            log(f"[auto-restart #{restart_count}] 检测到运行时已停止 (exit={rc})，将在 {delay:g}s 后检查并恢复会话")
+            await asyncio.sleep(delay)
+        else:
+            log(f"[auto-restart #{restart_count}] 已确认远端会话停机，立即恢复会话")
+
+        reattached_ready = False
+        while True:
+            status_result = await asyncio.to_thread(
+                _provision_session_for_restart,
+                svc,
+                state,
+                pid,
+                identity,
+                previous_url=previous_url,
+                env_overrides=env_overrides,
+            )
+            if status_result == "stopped":
+                return 0
+            if status_result in ("ready", "reattached_ready"):
+                reattached_ready = status_result == "reattached_ready"
+                break
+            consecutive_failures += 1
+            if not ever_ready and consecutive_failures >= max_startup_retries:
+                warn(f"[auto-restart] 首次启动连续 {consecutive_failures} 次失败，停止自动重试")
+                return 1
+            retry_delay = _compute_backoff_delay(base_delay, consecutive_failures)
+            warn(f"[auto-restart #{restart_count}] 将在 {retry_delay:g}s 后重试会话重建")
+            await asyncio.sleep(retry_delay)
+
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        state.save(started=now_str, last_restart=now_str)
+        header = f"\n=== [colabsvc] auto-restart #{restart_count} at {now_str} ({svc.name}) ===\n"
+        _emit(header.encode("utf-8"))
+        attempt += 1
+
+
 def exec_runner(svc: Service, nb_path: Path) -> int:
     """Own the Colab connection, reap its process group, and optionally supervise auto-restarts."""
     state = State(svc)
@@ -923,36 +1195,6 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
             _write_private_notebook(nb_path, current_nb, st["env"])
         except (OSError, ValueError):
             pass
-    # Keep credentials out of argv (`ps aux`); secrets live in the 0600 runtime notebook prelude.
-    cmd = [
-        "colab", "exec", "-s", svc.name, "-f", str(nb_path),
-        "--timeout", str(7 * 24 * 3600),
-        "--env", f"CT_SERVICE={svc.name}",
-    ]
-    auto_restart = bool(st.get("auto_restart"))
-    base_delay = float(st.get("restart_delay") or DEFAULT_RESTART_DELAY)
-    max_restarts = int(st.get("max_restarts") or 0)
-    saved_idle_check = float(st.get("idle_check_seconds") or DEFAULT_IDLE_CHECK_SECONDS)
-    try:
-        idle_check_seconds = float(os.environ.get("COLABLLM_IDLE_CHECK_SECONDS", saved_idle_check))
-    except ValueError:
-        idle_check_seconds = saved_idle_check
-    try:
-        fast_probe_seconds = float(os.environ.get("COLABLLM_FAST_PROBE_SECONDS", DEFAULT_FAST_PROBE_SECONDS))
-    except ValueError:
-        fast_probe_seconds = DEFAULT_FAST_PROBE_SECONDS
-    try:
-        max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
-    except ValueError:
-        max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
-    try:
-        preflight_retries = max(0, int(os.environ.get("COLABLLM_PREFLIGHT_RETRIES", DEFAULT_PREFLIGHT_RETRIES)))
-    except ValueError:
-        preflight_retries = DEFAULT_PREFLIGHT_RETRIES
-    try:
-        preflight_retry_delay = max(0.0, float(os.environ.get("COLABLLM_PREFLIGHT_RETRY_DELAY", DEFAULT_PREFLIGHT_RETRY_DELAY)))
-    except ValueError:
-        preflight_retry_delay = DEFAULT_PREFLIGHT_RETRY_DELAY
 
     old_handler = signal.getsignal(signal.SIGTERM)
     def terminated(signum, frame):
@@ -960,6 +1202,47 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
     signal.signal(signal.SIGTERM, terminated)
     rc = None
     try:
+        if st.get("exec_backend") == "native":
+            rc = asyncio.run(
+                supervise_instance_async(
+                    svc,
+                    nb_path,
+                    owner_pid=pid,
+                    owner_identity=identity,
+                )
+            )
+            return rc
+
+        # Legacy subprocess `colab exec` fallback (used when no native session token is available or --exec-backend cli).
+        cmd = [
+            "colab", "exec", "-s", svc.name, "-f", str(nb_path),
+            "--timeout", str(7 * 24 * 3600),
+            "--env", f"CT_SERVICE={svc.name}",
+        ]
+        auto_restart = bool(st.get("auto_restart"))
+        base_delay = float(st.get("restart_delay") or DEFAULT_RESTART_DELAY)
+        max_restarts = int(st.get("max_restarts") or 0)
+        saved_idle_check = float(st.get("idle_check_seconds") or DEFAULT_IDLE_CHECK_SECONDS)
+        try:
+            idle_check_seconds = float(os.environ.get("COLABLLM_IDLE_CHECK_SECONDS", saved_idle_check))
+        except ValueError:
+            idle_check_seconds = saved_idle_check
+        try:
+            fast_probe_seconds = float(os.environ.get("COLABLLM_FAST_PROBE_SECONDS", DEFAULT_FAST_PROBE_SECONDS))
+        except ValueError:
+            fast_probe_seconds = DEFAULT_FAST_PROBE_SECONDS
+        try:
+            max_startup_retries = max(1, int(os.environ.get("COLABLLM_MAX_STARTUP_RETRIES", DEFAULT_MAX_STARTUP_RETRIES)))
+        except ValueError:
+            max_startup_retries = DEFAULT_MAX_STARTUP_RETRIES
+        try:
+            preflight_retries = max(0, int(os.environ.get("COLABLLM_PREFLIGHT_RETRIES", DEFAULT_PREFLIGHT_RETRIES)))
+        except ValueError:
+            preflight_retries = DEFAULT_PREFLIGHT_RETRIES
+        try:
+            preflight_retry_delay = max(0.0, float(os.environ.get("COLABLLM_PREFLIGHT_RETRY_DELAY", DEFAULT_PREFLIGHT_RETRY_DELAY)))
+        except ValueError:
+            preflight_retry_delay = DEFAULT_PREFLIGHT_RETRY_DELAY
         ready_timeout = st.get("ready_timeout", svc.ready_timeout)
         is_foreground = st.get("runner_mode") == "foreground"
         already_ready = bool(st.get("ready") and st.get("url"))
@@ -1285,6 +1568,16 @@ def _start_up(svc: Service, script: Path, a):
                 log(f"远端服务已在运行 (HTTP {code})，直接复用现有实例并接管保活")
                 initial_url = candidate_url
                 initial_ready = True
+    req_backend = getattr(a, "exec_backend", None) or os.environ.get("COLABLLM_EXEC_BACKEND") or "auto"
+    use_native = (req_backend == "native") or (
+        req_backend == "auto" and has_native_colab_session(svc.name, svc.account)
+    )
+    use_mux = (
+        use_native
+        and not bool(getattr(a, "no_mux", False))
+        and not bool(os.environ.get("COLABLLM_NO_MUX"))
+    )
+
     st = state.save(
         base_service=svc.base_name or svc.name,
         account=svc.account,
@@ -1300,14 +1593,29 @@ def _start_up(svc: Service, script: Path, a):
         max_restarts=max_restarts,
         restart_count=0,
         last_restart=None,
+        exec_backend=("native" if use_native else "cli"),
     )
 
-    # 4. notebook through an attached `colab exec` (keep-alive)
+    # 4. notebook through native WebSocket mux or attached `colab exec` (keep-alive)
     if a.foreground:
         state.save(runner_pid=os.getpid(), runner_identity=process_identity(os.getpid()), runner_mode="foreground")
         return nb_path
     state.log_path.write_bytes(b"")
     state.log_path.chmod(0o600)
+    if use_mux:
+        env_overrides = {
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith(("COLABLLM_", "COLAB_"))
+            or k in ("PATH", "HOME", "XDG_CONFIG_HOME", "REQUEST_TIMEOUT", "FAKE_COLAB_ROOT", "FAKE_COLAB_URL")
+        }
+        return mux.start_in_mux(
+            svc,
+            nb_path,
+            state_root=STATE_ROOT,
+            exec_backend="native",
+            env_overrides=env_overrides,
+        )
     exec_cmd = [sys.executable, str(script), *(["-i", svc.instance] if svc.instance else []), "_exec", str(nb_path)]
     with state.log_path.open("ab") as logfile:
         proc = subprocess.Popen(exec_cmd, stdin=subprocess.DEVNULL, stdout=logfile,
@@ -1321,7 +1629,11 @@ def _start_up(svc: Service, script: Path, a):
 
 def _wait_ready(svc, proc, timeout=None):
     state = State(svc)
-    log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path}")
+    mode = state.load().get("runner_mode")
+    if mode == "mux":
+        log(f"runner started in shared mux (pid {proc.pid}) -- native WebSocket keep-alive; log: {state.log_path}")
+    else:
+        log(f"runner started (pid {proc.pid}) -- it keeps `colab exec` attached; log: {state.log_path}")
     log("streaming progress until the service reports CT_READY (Ctrl-C only stops watching)")
     offset, deadline = 0, time.monotonic() + (svc.ready_timeout if timeout is None else timeout)
 
@@ -1506,7 +1818,10 @@ def cmd_down(svc: Service, a) -> None:
         if result.returncode != 0:
             raise CliError(f"停止 {svc.name} 失败；已保留运行状态，可重试 down", result.returncode if result.returncode > 0 else 1)
         stop_owned_process(st.get("exec_pid"), st.get("exec_identity"), group=True)
-        stop_owned_process(st.get("runner_pid"), st.get("runner_identity"), group=st.get("runner_mode") == "background")
+        if st.get("runner_mode") == "mux":
+            mux.stop_in_mux(svc.name, state, state_root=STATE_ROOT)
+        else:
+            stop_owned_process(st.get("runner_pid"), st.get("runner_identity"), group=st.get("runner_mode") == "background")
         if a.delete_tunnel and st.get('frp_route'):
             from frp_backend import remove_route
             remove_route(st['frp_route'],svc.name)
@@ -1564,6 +1879,10 @@ def build_parser(svc: Service, configure=None):
     u.add_argument("--max-restarts", type=nonnegative_int, default=0, metavar="N",
                    help="最大自动重启次数，0 表示就绪后不限次数（默认: 0）")
     u.add_argument("--ready-timeout", type=positive_seconds, help="seconds to wait for readiness (default: service-specific)")
+    u.add_argument("--exec-backend", choices=("auto", "native", "cli"), default="auto",
+                   help="保活执行后端：auto 优先使用原生轻量 WebSocket 多路复用，无会话令牌时回退 colab exec（默认: auto）")
+    u.add_argument("--no-mux", action="store_true",
+                   help="禁用单进程多路复用守护，为当前实例单独启动后台进程")
     u.add_argument("--dry-run", action="store_true", help="only show the cell plan")
     d = sub.add_parser("down", help="stop runner + Colab session")
     d.add_argument("--delete-tunnel", action="store_true", help="also delete the named tunnel and its DNS record")

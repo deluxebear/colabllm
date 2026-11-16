@@ -75,7 +75,6 @@ const state = {
   tunnel: null,
   tasks: [],
   bootstrapSeeded: false,
-  lifecycleStreams: new Map(),
   knownTaskStatuses: new Map(),
   notifiedTaskIds: new Set(),
   recentTaskFailures: new Map(),
@@ -431,21 +430,35 @@ function flushDeferredToasts() {
 
 /* API client */
 async function apiFetch(url, options = {}) {
-  const method = (options.method || "GET").toUpperCase();
-  const headers = new Headers(options.headers || {});
+  const { json, timeoutMs = 20000, ...fetchOpts } = options;
+  const method = (fetchOpts.method || "GET").toUpperCase();
+  const headers = new Headers(fetchOpts.headers || {});
   if (method !== "GET" && method !== "HEAD" && CSRF_TOKEN) {
     headers.set("X-ColabLLM-CSRF", CSRF_TOKEN);
   }
-  if (options.json !== undefined) {
+  if (json !== undefined) {
     headers.set("Content-Type", "application/json");
   }
-  const resp = await fetch(url, {
-    ...options,
-    method,
-    headers,
-    credentials: "same-origin",
-    body: options.json !== undefined ? JSON.stringify(options.json) : options.body,
-  });
+  let signal = fetchOpts.signal;
+  if (!signal && timeoutMs > 0 && typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    signal = AbortSignal.timeout(timeoutMs);
+  }
+  let resp;
+  try {
+    resp = await fetch(url, {
+      ...fetchOpts,
+      method,
+      headers,
+      signal,
+      credentials: "same-origin",
+      body: json !== undefined ? JSON.stringify(json) : fetchOpts.body,
+    });
+  } catch (err) {
+    if (err && (err.name === "TimeoutError" || err.name === "AbortError")) {
+      throw new Error("请求本机控制台超时：若打开了过多控制台标签页，请关闭多余标签页或刷新后重试");
+    }
+    throw err;
+  }
   const ct = resp.headers.get("Content-Type") || "";
   if (ct.includes("application/json")) {
     const data = await resp.json();
@@ -890,11 +903,11 @@ function rebuildEffectiveInstances() {
     if (t.status !== "running") continue;
     const parsed = parseLifecycleTask(t);
     if (!parsed) continue;
-    const streamInfo = state.lifecycleStreams.get(t.task_id);
+    const rawTail = t.output_tail || t.output || "";
 
     if (parsed.subcommand === "up") {
       state.recentTaskFailures.delete(parsed.sessionName);
-      const hint = streamInfo?.stageHint || "正在准备启动环境...";
+      const hint = inferLifecycleTaskHint("up", rawTail) || "正在准备启动环境...";
       const ts = Math.max(t.created_at || 0, 0) || Date.now() / 1000;
       if (bySession.has(parsed.sessionName)) {
         const item = bySession.get(parsed.sessionName);
@@ -950,7 +963,7 @@ function rebuildEffectiveInstances() {
         });
       }
     } else if (parsed.subcommand === "down") {
-      const hint = streamInfo?.stageHint || "正在停止实例与清理 Colab 会话...";
+      const hint = inferLifecycleTaskHint("down", rawTail) || "正在停止实例与清理 Colab 会话...";
       const ts = Math.max(t.created_at || 0, 0) || Date.now() / 1000;
       const targets = parsed.downAll
         ? Array.from(bySession.values()).filter((item) => item.service === parsed.service && item.running)
@@ -1052,114 +1065,47 @@ function recordLifecycleFailure(task, parsed, rawOutput) {
   showToast(`${parsed.displayLabel} ${actionLabel}失败: ${reason}`, "danger", 8000);
 }
 
-function ensureLifecycleTaskStream(task, parsed) {
-  if (!task || state.lifecycleStreams.has(task.task_id)) return;
-  const src = new EventSource(`/api/tasks/${encodeURIComponent(task.task_id)}/stream`);
-  const entry = {
-    source: src,
-    output: "",
-    stageHint: inferLifecycleTaskHint(parsed.subcommand, ""),
-    parsed,
-  };
-  state.lifecycleStreams.set(task.task_id, entry);
-
-  src.addEventListener("open", () => {
-    entry.output = "";
-  });
-  src.addEventListener("chunk", (evt) => {
-    try {
-      const data = JSON.parse(evt.data);
-      entry.output += data.text || "";
-      const nextHint = inferLifecycleTaskHint(parsed.subcommand, entry.output);
-      if (nextHint !== entry.stageHint) {
-        entry.stageHint = nextHint;
-        refreshEffectiveFleet();
-      }
-    } catch {
-      // Ignore parse error.
-    }
-  });
-  src.addEventListener("done", (evt) => {
-    src.close();
-    state.lifecycleStreams.delete(task.task_id);
-    try {
-      const summary = JSON.parse(evt.data);
-      const idx = state.tasks.findIndex((item) => item.task_id === task.task_id);
-      if (idx >= 0) {
-        state.tasks[idx] = { ...state.tasks[idx], ...summary };
-      }
-      state.knownTaskStatuses.set(task.task_id, summary.status);
-      if (summary.status === "failed") {
-        recordLifecycleFailure(summary, parsed, summary.output || entry.output);
-      } else {
-        refreshEffectiveFleet();
-      }
-    } catch {
-      // Ignore parse error.
-    }
-    loadBootstrap().catch(() => {});
-  });
-  src.addEventListener("error", () => {
-    const latest = state.tasks.find((item) => item.task_id === task.task_id);
-    if (!latest || latest.status !== "running") {
-      src.close();
-      state.lifecycleStreams.delete(task.task_id);
-    }
-  });
-}
-
 function reconcileTasksAndInstances(rawInstances, tasks, { seedOnly = false } = {}) {
   state.rawInstances = rawInstances || [];
   state.tasks = tasks || [];
 
-  const runningIds = new Set();
+  const newlyFailed = [];
   for (const t of state.tasks) {
-    if (t.status === "running") runningIds.add(t.task_id);
     const parsed = parseLifecycleTask(t);
     if (seedOnly) {
       state.knownTaskStatuses.set(t.task_id, t.status);
       if (t.status !== "running") {
         state.notifiedTaskIds.add(t.task_id);
-      } else if (parsed) {
-        ensureLifecycleTaskStream(t, parsed);
       }
       continue;
     }
 
     if (!parsed) continue;
     state.knownTaskStatuses.set(t.task_id, t.status);
-    if (t.status === "running") {
-      ensureLifecycleTaskStream(t, parsed);
-    } else {
-      const openStream = state.lifecycleStreams.get(t.task_id);
-      if (openStream) {
-        openStream.source.close();
-        state.lifecycleStreams.delete(t.task_id);
-      }
-      if (t.status === "failed" && !state.notifiedTaskIds.has(t.task_id) && !fetchingFailedTaskIds.has(t.task_id)) {
-        fetchingFailedTaskIds.add(t.task_id);
-        apiFetch(`/api/tasks/${encodeURIComponent(t.task_id)}`)
-          .then((detail) => {
-            recordLifecycleFailure(detail, parsed, detail.output || "");
-          })
-          .catch(() => {
-            recordLifecycleFailure(t, parsed, "");
-          })
-          .finally(() => {
-            fetchingFailedTaskIds.delete(t.task_id);
-          });
-      }
-    }
-  }
-
-  for (const [taskId, streamEntry] of state.lifecycleStreams.entries()) {
-    if (!runningIds.has(taskId)) {
-      streamEntry.source.close();
-      state.lifecycleStreams.delete(taskId);
+    if (t.status === "failed" && !state.notifiedTaskIds.has(t.task_id) && !fetchingFailedTaskIds.has(t.task_id)) {
+      newlyFailed.push({ task: t, parsed });
     }
   }
 
   rebuildEffectiveInstances();
+
+  for (const { task: t, parsed } of newlyFailed) {
+    if (typeof t.output === "string" || (typeof t.output_tail === "string" && !t.truncated)) {
+      recordLifecycleFailure(t, parsed, t.output ?? t.output_tail ?? "");
+      continue;
+    }
+    fetchingFailedTaskIds.add(t.task_id);
+    apiFetch(`/api/tasks/${encodeURIComponent(t.task_id)}`)
+      .then((detail) => {
+        recordLifecycleFailure(detail, parsed, detail.output || detail.output_tail || "");
+      })
+      .catch(() => {
+        recordLifecycleFailure(t, parsed, t.output_tail || "");
+      })
+      .finally(() => {
+        fetchingFailedTaskIds.delete(t.task_id);
+      });
+  }
 }
 
 function renderKPIs() {
@@ -2596,10 +2542,58 @@ async function loadBootstrap() {
   }
 }
 
-/* SSE live updates */
-function connectEventsSse() {
+/* SSE live updates + cross-tab multiplexing */
+const eventsChannel = typeof BroadcastChannel === "function" ? new BroadcastChannel("colabllm-web-events") : null;
+
+function applyEventsPayload(payload, { broadcast = false } = {}) {
+  if (!payload || typeof payload !== "object") return;
+  reconcileTasksAndInstances(payload.instances || [], payload.tasks || []);
+  populateGroupedServiceSelect(document.getElementById("up-service"));
+  populateGroupedServiceSelect(document.getElementById("wb-service"));
+  renderKPIs();
+  renderInstances();
+  renderServices();
+  copilotController?.syncCopilotState();
+  renderTasksList();
+  if (broadcast && eventsChannel) {
+    try {
+      eventsChannel.postMessage({ type: "state", payload });
+    } catch {
+      // Ignore closed channel errors.
+    }
+  }
+}
+
+function disconnectEventsSse({ paused = false } = {}) {
   if (state.eventsSource) {
     state.eventsSource.close();
+    state.eventsSource = null;
+  }
+  const dot = document.getElementById("sse-dot");
+  const label = document.getElementById("sse-label");
+  if (dot && label && paused) {
+    dot.dataset.state = "open";
+    label.textContent = "后台标签页同步中";
+  }
+}
+
+if (eventsChannel) {
+  eventsChannel.addEventListener("message", (evt) => {
+    const msg = evt.data;
+    if (msg && msg.type === "state" && msg.payload) {
+      applyEventsPayload(msg.payload, { broadcast: false });
+    }
+  });
+}
+
+function connectEventsSse() {
+  if (document.visibilityState === "hidden") {
+    disconnectEventsSse({ paused: true });
+    return;
+  }
+  if (state.eventsSource) {
+    state.eventsSource.close();
+    state.eventsSource = null;
   }
   const dot = document.getElementById("sse-dot");
   const label = document.getElementById("sse-label");
@@ -2615,19 +2609,16 @@ function connectEventsSse() {
   src.addEventListener("state", (evt) => {
     try {
       const payload = JSON.parse(evt.data);
-      reconcileTasksAndInstances(payload.instances || [], payload.tasks || []);
-      populateGroupedServiceSelect(document.getElementById("up-service"));
-      populateGroupedServiceSelect(document.getElementById("wb-service"));
-      renderKPIs();
-      renderInstances();
-      renderServices();
-      copilotController?.syncCopilotState();
-      renderTasksList();
+      applyEventsPayload(payload, { broadcast: true });
     } catch {
       // Ignore malformed frame.
     }
   });
   src.addEventListener("error", () => {
+    if (document.visibilityState === "hidden") {
+      disconnectEventsSse({ paused: true });
+      return;
+    }
     dot.dataset.state = "error";
     label.textContent = "事件流重连中...";
   });
@@ -3034,7 +3025,7 @@ async function runProbeInstance(inst) {
   try {
     const q = new URLSearchParams({ instance: inst.instance_arg || "" });
     if (inst.account) q.set("account", inst.account);
-    const res = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/probe?${q.toString()}`);
+    const res = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/probe?${q.toString()}`, { timeoutMs: 40000 });
     const tone = res.healthy || res.ready ? "ok" : "warn";
     showToast(`${inst.session_name} 探活: running=${res.running} ready=${res.ready}${res.http_status ? ` HTTP ${res.http_status}` : ""}`, tone);
   } catch (err) {
@@ -3424,6 +3415,7 @@ function initInteractions() {
       const res = await apiFetch(`/api/instances/${encodeURIComponent(svc)}/up`, {
         method: "POST",
         json: getUpPayload(true),
+        timeoutMs: 30000,
       });
       document.getElementById("up-cmd-preview").textContent = res.command;
       out.textContent = res.output || "(无输出)";
@@ -3460,7 +3452,7 @@ function initInteractions() {
       refreshEffectiveFleet();
       const parsed = parseLifecycleTask(task);
       showToast(`已开始启动 ${parsed?.displayLabel || svc}，正在准备环境...`, "ok");
-      await loadBootstrap();
+      loadBootstrap().catch(() => {});
     } catch (err) {
       const out = document.getElementById("up-dryrun-output");
       out.hidden = false;
@@ -3604,7 +3596,7 @@ function initInteractions() {
     out.hidden = false;
     out.textContent = "正在探测 FRP 状态...";
     try {
-      const res = await apiFetch("/api/frp-status");
+      const res = await apiFetch("/api/frp-status", { timeoutMs: 40000 });
       out.textContent = JSON.stringify(res, null, 2);
     } catch (err) {
       out.textContent = `FRP 检查失败: ${err.message}`;
@@ -3624,7 +3616,7 @@ function initInteractions() {
         drive_account: document.getElementById("doctor-drive-account").value.trim(),
         transport: document.getElementById("doctor-transport").value.trim(),
       });
-      const res = await apiFetch(`/api/doctor?${q.toString()}`);
+      const res = await apiFetch(`/api/doctor?${q.toString()}`, { timeoutMs: 70000 });
       banner.textContent = `体检完成：overall=${res.ok ? "PASS" : "FAIL"} | transport=${res.transport || "-"} | account=${res.account || "-"}`;
       const trs = (res.checks || []).map((c) => {
         const tone = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "danger";
@@ -3643,15 +3635,33 @@ function initInteractions() {
     }
   });
 
-  window.addEventListener("beforeunload", () => {
-    state.eventsSource?.close();
+  const releaseBackgroundStreams = () => {
+    disconnectEventsSse({ paused: document.visibilityState === "hidden" });
     state.logsSource?.close();
+    state.logsSource = null;
     state.activeTaskSource?.close();
-    for (const streamEntry of state.lifecycleStreams.values()) {
-      streamEntry.source.close();
+    state.activeTaskSource = null;
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      disconnectEventsSse({ paused: true });
+    } else if (document.visibilityState === "visible") {
+      if (!state.eventsSource) {
+        connectEventsSse();
+        loadBootstrap().catch(() => {});
+      }
     }
-    state.lifecycleStreams.clear();
   });
+
+  window.addEventListener("pageshow", () => {
+    if (document.visibilityState !== "hidden" && !state.eventsSource) {
+      connectEventsSse();
+      loadBootstrap().catch(() => {});
+    }
+  });
+  window.addEventListener("pagehide", releaseBackgroundStreams);
+  window.addEventListener("beforeunload", releaseBackgroundStreams);
 }
 
 async function main() {

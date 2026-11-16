@@ -1,10 +1,14 @@
 """Shared CLI errors, diagnostic output and authenticated HTTP transport."""
+import contextlib
+import contextvars
 import http.client
 import math
 import time
 import os
+import ssl
 import subprocess
 import sys
+import threading
 import traceback
 import urllib.error
 import urllib.parse
@@ -12,6 +16,10 @@ import urllib.request
 
 QUIET = False
 NO_COLOR = False
+_DIAGNOSTIC_STREAM = contextvars.ContextVar('_DIAGNOSTIC_STREAM', default=None)
+_SSL_LOCK = threading.Lock()
+_SHARED_SSL_CTX = None
+_SHARED_OPENER = None
 
 
 class CliError(RuntimeError):
@@ -24,8 +32,23 @@ class UsageError(ValueError):
     code = 2
 
 
+@contextlib.contextmanager
+def redirect_diagnostics(binary_file):
+    """Route async task diagnostics to a binary log file instead of stderr."""
+    token = _DIAGNOSTIC_STREAM.set(binary_file)
+    try:
+        yield
+    finally:
+        _DIAGNOSTIC_STREAM.reset(token)
+
+
 def diagnostic(message, color=None):
     if QUIET:
+        return
+    sink = _DIAGNOSTIC_STREAM.get()
+    if sink is not None:
+        sink.write((str(message) + '\n').encode('utf-8', errors='replace'))
+        sink.flush()
         return
     if color and not NO_COLOR and not os.environ.get('NO_COLOR') and sys.stderr.isatty():
         message = f'\033[{color}m{message}\033[0m'
@@ -111,8 +134,27 @@ class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def shared_ssl_context():
+    """Return a lazy process-wide SSLContext so repeated probes share one CA store."""
+    global _SHARED_SSL_CTX
+    if _SHARED_SSL_CTX is None:
+        with _SSL_LOCK:
+            if _SHARED_SSL_CTX is None:
+                _SHARED_SSL_CTX = ssl.create_default_context()
+    return _SHARED_SSL_CTX
+
+
 def safe_urlopen(request, *args, **kwargs):
-    return urllib.request.build_opener(SameOriginRedirect()).open(request, *args, **kwargs)
+    global _SHARED_OPENER
+    if _SHARED_OPENER is None:
+        ssl_ctx = shared_ssl_context()
+        with _SSL_LOCK:
+            if _SHARED_OPENER is None:
+                _SHARED_OPENER = urllib.request.build_opener(
+                    SameOriginRedirect(),
+                    urllib.request.HTTPSHandler(context=ssl_ctx),
+                )
+    return _SHARED_OPENER.open(request, *args, **kwargs)
 
 
 def configure_output():

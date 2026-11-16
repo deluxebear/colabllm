@@ -104,6 +104,9 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     EVENTS_SNAPSHOT_TTL = 0.75
+    MAX_EVENTS_SSE_STREAMS = 3
+    MAX_AUX_SSE_STREAMS = 2
+    MAX_TOTAL_SSE_STREAMS = 4
 
     def __init__(
         self,
@@ -119,12 +122,15 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
         self.allow_remote = bool(allow_remote)
         self.bootstrap_token = secrets.token_urlsafe(24)
         self.hmac_key = os.urandom(32)
-        self.task_manager = runner_bridge.TaskManager()
         self.version = _package_version()
         self._events_lock = threading.Lock()
         self._events_compute_lock = threading.Lock()
         self._events_gen = 0
         self._events_cache: tuple[float, str, str] | None = None
+        self._sse_lock = threading.Lock()
+        self._events_sse: list[threading.Event] = []
+        self._aux_sse: list[threading.Event] = []
+        self.task_manager = runner_bridge.TaskManager(on_change=self.invalidate_events_snapshot)
 
         bound_host = server_address[0].strip().lower()
         self.wildcard_remote = bool(allow_remote and bound_host in ("0.0.0.0", "::"))
@@ -184,8 +190,44 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
                     self._events_cache = (time.monotonic(), encoded, digest)
                     return encoded, digest
 
+    def register_sse_stream(self, kind: str) -> threading.Event:
+        """Register an active SSE stream and evict oldest surplus streams so HTTP/1.1 sockets stay free."""
+        ev = threading.Event()
+        to_close: list[threading.Event] = []
+        with self._sse_lock:
+            if kind == "events":
+                self._events_sse.append(ev)
+                while len(self._events_sse) > self.MAX_EVENTS_SSE_STREAMS:
+                    to_close.append(self._events_sse.pop(0))
+            else:
+                self._aux_sse.append(ev)
+                while len(self._aux_sse) > self.MAX_AUX_SSE_STREAMS:
+                    to_close.append(self._aux_sse.pop(0))
+            while (len(self._events_sse) + len(self._aux_sse)) > self.MAX_TOTAL_SSE_STREAMS:
+                if self._events_sse and (kind != "events" or len(self._events_sse) > 1):
+                    to_close.append(self._events_sse.pop(0))
+                elif self._aux_sse:
+                    to_close.append(self._aux_sse.pop(0))
+                else:
+                    break
+        for old in to_close:
+            old.set()
+        return ev
+
+    def unregister_sse_stream(self, kind: str, ev: threading.Event) -> None:
+        with self._sse_lock:
+            bucket = self._events_sse if kind == "events" else self._aux_sse
+            if ev in bucket:
+                bucket.remove(ev)
+
     def shutdown(self) -> None:
         self.stop_event.set()
+        with self._sse_lock:
+            active_streams = [*self._events_sse, *self._aux_sse]
+            self._events_sse.clear()
+            self._aux_sse.clear()
+        for ev in active_streams:
+            ev.set()
         super().shutdown()
         self.task_manager.shutdown_all()
 
@@ -594,6 +636,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         }
 
     def _handle_events_sse(self) -> None:
+        stream_stop = self.server.register_sse_stream("events")
         self.send_response(200)
         self._add_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -605,7 +648,9 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         last_digest = ""
         ticks = 0
         try:
-            while not self.server.stop_event.is_set():
+            self.wfile.write(b"retry: 5000\n\n")
+            self.wfile.flush()
+            while not self.server.stop_event.is_set() and not stream_stop.is_set():
                 encoded, digest = self.server.get_events_snapshot()
                 if digest != last_digest:
                     last_digest = digest
@@ -615,10 +660,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                 ticks += 1
-                if self.server.stop_event.wait(1.0):
+                if stream_stop.wait(1.0) or self.server.stop_event.is_set():
                     break
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        finally:
+            self.server.unregister_sse_stream("events", stream_stop)
 
     def _handle_instances_route(self, method: str, tail: str, query: dict[str, list[str]]) -> None:
         parts = [urllib.parse.unquote(p) for p in tail.strip("/").split("/") if p]
@@ -752,6 +799,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
     def _handle_logs_sse(self, svc_name: str, inst: str, lines: int, known: set[str]) -> None:
         tail = state_store.read_log_tail(svc_name, inst, lines, known)
         log_path = Path(tail["log_path"])
+        stream_stop = self.server.register_sse_stream("aux")
 
         self.send_response(200)
         self._add_common_headers()
@@ -762,12 +810,13 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
         try:
+            self.wfile.write(b"retry: 4000\n\n")
             self.wfile.write(f"event: init\ndata: {json.dumps(tail, ensure_ascii=False)}\n\n".encode("utf-8"))
             self.wfile.flush()
 
             offset = int(tail["size"])
             ticks = 0
-            while not self.server.stop_event.is_set():
+            while not self.server.stop_event.is_set() and not stream_stop.is_set():
                 if log_path.is_file():
                     size = log_path.stat().st_size
                     if size < offset:
@@ -786,10 +835,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                 ticks += 1
-                if self.server.stop_event.wait(0.4):
+                if stream_stop.wait(0.4) or self.server.stop_event.is_set():
                     break
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        finally:
+            self.server.unregister_sse_stream("aux", stream_stop)
 
     def _handle_tasks_route(self, method: str, tail: str) -> None:
         parts = [urllib.parse.unquote(p) for p in tail.strip("/").split("/") if p]
@@ -825,6 +876,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         self._send_json(404, {"error": "无效的任务接口"})
 
     def _handle_task_sse(self, task: runner_bridge.ManagedTask) -> None:
+        stream_stop = self.server.register_sse_stream("aux")
         self.send_response(200)
         self._add_common_headers()
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -835,7 +887,9 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
         sent_chunks = 0
         try:
-            while not self.server.stop_event.is_set():
+            self.wfile.write(b"retry: 4000\n\n")
+            self.wfile.flush()
+            while not self.server.stop_event.is_set() and not stream_stop.is_set():
                 with task.cond:
                     if sent_chunks < len(task.chunks):
                         new_text = "".join(task.chunks[sent_chunks:])
@@ -845,7 +899,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     status = task.status
                     summary = task.summary() if status != "running" else None
                     if not new_text and status == "running":
-                        task.cond.wait(timeout=0.5)
+                        task.cond.wait(timeout=0.4)
                         continue
                 if new_text:
                     evt = json.dumps({"text": new_text}, ensure_ascii=False)
@@ -857,6 +911,8 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     break
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
+        finally:
+            self.server.unregister_sse_stream("aux", stream_stop)
 
     def _handle_proxy(self, method: str, tail: str, raw_query: str) -> None:
         parts = tail.lstrip("/").split("/", 2)

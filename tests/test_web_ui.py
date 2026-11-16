@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import urllib.parse
@@ -1185,6 +1186,91 @@ class WebServerIntegrationTest(unittest.TestCase):
             ctrl.close()
             sse1.close()
             sse2.close()
+
+    def test_sse_connection_pool_cap_prevents_http11_starvation(self):
+        srv, port = self._start_console(read_only=False)
+        cookie_hdr, csrf = self._authenticate(srv, port)
+        hdrs = {'Cookie': cookie_hdr, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'}
+
+        conns: list[http.client.HTTPConnection] = []
+        resps: list[http.client.HTTPResponse] = []
+        ctrl = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+        try:
+            for _ in range(5):
+                c = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+                conns.append(c)
+                c.request('GET', '/api/events', headers={'Cookie': cookie_hdr})
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                evs = _read_sse_until(r, lambda items: any(e[0] == 'state' for e in items), timeout=5.0)
+                self.assertTrue(evs)
+                resps.append(r)
+
+            deadline = time.monotonic() + 2.0
+            while len(srv._events_sse) > 3 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertLessEqual(len(srv._events_sse), 3)
+
+            # Oldest 2 streams must have been evicted and closed cleanly so HTTP/1.1 sockets stay free.
+            for evicted_resp in resps[:2]:
+                evicted_resp.fp.raw._sock.settimeout(2.0)  # type: ignore[attr-defined]
+                self.assertEqual(evicted_resp.readline(), b'')
+
+            # While newest SSE streams remain open, dry-run up still responds 200 immediately.
+            ctrl.request(
+                'POST',
+                '/api/instances/ollama/up',
+                body=json.dumps({'dry_run': True, 'tunnel_mode': 'quick'}),
+                headers=hdrs,
+            )
+            dry_resp = ctrl.getresponse()
+            dry_data = json.loads(dry_resp.read().decode('utf-8'))
+            self.assertEqual(dry_resp.status, 200)
+            self.assertTrue(dry_data['dry_run'])
+
+            # Running a task populates output_tail and pushes updated task state on /api/events.
+            ctrl.request(
+                'POST',
+                '/api/tasks/run',
+                body=json.dumps({'service': 'qwen-flash', 'subcommand': 'plan', 'values': {'opt:--json': True}}),
+                headers=hdrs,
+            )
+            task_resp = ctrl.getresponse()
+            task = json.loads(task_resp.read().decode('utf-8'))
+            self.assertEqual(task_resp.status, 202)
+            task_id = task['task_id']
+
+            deadline = time.monotonic() + 10.0
+            listed = None
+            while time.monotonic() < deadline:
+                items = srv.task_manager.list_tasks()
+                match = next((it for it in items if it['task_id'] == task_id), None)
+                if match and match['status'] != 'running':
+                    listed = match
+                    break
+                time.sleep(0.05)
+            self.assertIsNotNone(listed)
+            self.assertIn('output_tail', listed)
+            self.assertIn('truncated', listed)
+            self.assertTrue(listed['output_tail'].strip())
+
+            latest_events = _read_sse_until(
+                resps[-1],
+                lambda items: any(
+                    e[0] == 'state'
+                    and any(
+                        t['task_id'] == task_id and t['status'] != 'running' and t.get('output_tail')
+                        for t in json.loads(e[1]).get('tasks', [])
+                    )
+                    for e in items
+                ),
+                timeout=5.0,
+            )
+            self.assertTrue(latest_events)
+        finally:
+            ctrl.close()
+            for c in conns:
+                c.close()
 
     def test_remove_and_prune_stopped_instance_endpoints(self):
         catalog = introspect.get_service_catalog()

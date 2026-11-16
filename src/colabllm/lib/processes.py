@@ -1,4 +1,5 @@
 """Process ownership identities and bounded shutdown using only the standard library."""
+import fcntl
 import os
 from pathlib import Path
 import signal
@@ -35,8 +36,30 @@ def owned_process(pid, identity):
     return bool(identity and process_identity(pid) == identity)
 
 
+def file_flock_held(lock_path):
+    if not lock_path:
+        return False
+    path = Path(lock_path)
+    if not path.is_file():
+        return False
+    try:
+        with path.open('rb') as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
 def runner_alive(state):
-    return owned_process(state.get('runner_pid'), state.get('runner_identity'))
+    if not owned_process(state.get('runner_pid'), state.get('runner_identity')):
+        return False
+    if state.get('runner_mode') == 'mux' and state.get('runner_lock'):
+        return file_flock_held(state.get('runner_lock'))
+    return True
 
 
 def stop_owned_process(pid, identity, *, group=False, timeout=5):
