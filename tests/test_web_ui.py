@@ -1577,6 +1577,226 @@ sys.exit(2)
             r'\[hidden\]:not\(\[hidden="until-found"\]\)\s*\{\s*display:\s*none\s*!important;',
         )
 
+    def test_copilot_target_dropdown_filters_running_instances_only(self):
+        if not shutil.which('node'):
+            self.skipTest('node not available')
+
+        copilot_js = SRC / 'colabllm' / 'web_ui' / 'static' / 'copilot.js'
+        js_script = r"""
+import assert from 'node:assert/strict';
+import { pathToFileURL } from 'node:url';
+
+class NodeEl {
+  constructor(tag) {
+    this.tagName = String(tag || '').toUpperCase();
+    this.children = [];
+    this.attributes = new Map();
+    this.dataset = {};
+    this.style = { setProperty() {} };
+    this.classList = { toggle: () => false };
+    this.className = '';
+    this.textContent = '';
+    this._value = '';
+    this.hidden = false;
+    this.disabled = false;
+    this.selected = false;
+    this.parentNode = null;
+  }
+  get options() { return this.children.filter((c) => c.tagName === 'OPTION'); }
+  get selectedOptions() { return this.options.filter((o) => o.value === this.value); }
+  get value() {
+    if (this.tagName === 'SELECT') {
+      if (this.options.some((o) => o.value === this._value)) return this._value;
+      const selOpt = this.options.find((o) => o.selected) || this.options[0];
+      return selOpt ? selOpt.value : '';
+    }
+    return this._value;
+  }
+  set value(v) { this._value = String(v ?? ''); }
+  setAttribute(k, v) {
+    this.attributes.set(k, String(v));
+    if (k === 'value') this._value = String(v);
+    if (k === 'hidden') this.hidden = true;
+    if (k === 'disabled') this.disabled = true;
+    if (k === 'selected') this.selected = true;
+    if (k === 'class') this.className = String(v);
+  }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+    if (k === 'hidden') this.hidden = false;
+    if (k === 'disabled') this.disabled = false;
+    if (k === 'selected') this.selected = false;
+  }
+  getAttribute(k) { return this.attributes.get(k) ?? null; }
+  appendChild(c) {
+    if (c && typeof c === 'object') {
+      c.parentNode = this;
+      this.children.push(c);
+    }
+    return c;
+  }
+  replaceChildren(...nodes) {
+    for (const c of this.children) c.parentNode = null;
+    this.children = [];
+    for (const n of nodes) this.appendChild(n);
+    if (this.tagName === 'SELECT' && !this.options.some((o) => o.value === this._value)) {
+      const selOpt = this.options.find((o) => o.selected) || this.options[0];
+      this._value = selOpt ? selOpt.value : '';
+    }
+  }
+  remove() {
+    if (this.parentNode) {
+      this.parentNode.children = this.parentNode.children.filter((c) => c !== this);
+      this.parentNode = null;
+    }
+  }
+  addEventListener() {}
+  querySelector(sel) {
+    if (sel === 'option[value=""]') return this.options.find((o) => o.value === '') || null;
+    return null;
+  }
+  querySelectorAll() { return []; }
+  closest() { return null; }
+}
+
+const ids = new Map();
+for (const id of [
+  'ck-target',
+  'ck-drawer-target',
+  'ck-model',
+  'ck-status-pill',
+  'ck-proxy-url-hint',
+  'ck-capabilities-summary',
+  'ck-welcome-title',
+  'ck-drawer-model-badge',
+]) {
+  const tag = id.includes('target') ? 'select' : id === 'ck-model' ? 'input' : 'span';
+  ids.set(id, new NodeEl(tag));
+}
+
+globalThis.window = { location: { origin: 'http://127.0.0.1:8765' } };
+globalThis.localStorage = { getItem: () => null, setItem: () => {} };
+globalThis.document = {
+  getElementById: (id) => ids.get(id) || null,
+  querySelector: () => null,
+  createElement: (t) => new NodeEl(t),
+  createTextNode: (s) => ({ textContent: String(s) }),
+  createDocumentFragment: () => new NodeEl('frag'),
+  body: new NodeEl('body'),
+};
+
+function el(tag, attrs = null, ...children) {
+  const node = new NodeEl(tag);
+  if (attrs) {
+    for (const [k, v] of Object.entries(attrs)) {
+      if (v === undefined || v === null || v === false) continue;
+      if (k === 'className') node.className = String(v);
+      else if (k === 'textContent') node.textContent = String(v);
+      else if (v === true) node.setAttribute(k, '');
+      else node.setAttribute(k, String(v));
+    }
+  }
+  for (const ch of children) {
+    if (ch === null || ch === undefined || ch === false) continue;
+    if (typeof ch === 'string' || typeof ch === 'number') node.textContent += String(ch);
+    else node.appendChild(ch);
+  }
+  return node;
+}
+
+const { initCopilotStudio } = await import(pathToFileURL(process.env.COPILOT_JS_PATH).href);
+
+const appState = {
+  services: [
+    { name: 'r2-migrate', api_profile: { default_model: 'r2-migrate', primary_surface: 'specialized' } },
+    { name: 'qwen-flash', api_profile: { default_model: 'qwen3.8-flash', primary_surface: 'chat' } },
+    { name: 'ollama', api_profile: { default_model: 'qwen3:8b', primary_surface: 'chat' } },
+    { name: 'indextts', api_profile: { default_model: 'indextts-2.5', primary_surface: 'audio' } },
+    { name: 'flux-klein', api_profile: { default_model: 'flux-3-image-klein', primary_surface: 'image' } },
+  ],
+  instances: [
+    { session_name: 'r2-migrate', service: 'r2-migrate', running: true, ready: true, stopping: false, state_label: 'READY', url: 'https://r2-migrate.example.com' },
+    { session_name: 'qwen-flash', service: 'qwen-flash', running: true, ready: false, stopping: false, state_label: 'STARTING', url: null },
+    { session_name: 'ollama', service: 'ollama', running: true, ready: false, stopping: true, state_label: 'STOPPING', url: 'https://ollama.example.com' },
+    { session_name: 'indextts', service: 'indextts', running: false, ready: false, stopping: false, state_label: 'STOPPED', url: 'https://indextts.example.com' },
+    { session_name: 'flux-klein', service: 'flux-klein', running: false, ready: false, stopping: false, state_label: 'ERROR', url: null },
+  ],
+};
+
+const ctrl = initCopilotStudio({
+  appState,
+  el,
+  toast() {},
+  copyText() {},
+  switchView() {},
+});
+
+const ckTarget = ids.get('ck-target');
+const ckDrawerTarget = ids.get('ck-drawer-target');
+const ckModel = ids.get('ck-model');
+const ckStatusPill = ids.get('ck-status-pill');
+
+// 1. Only READY and STARTING (non-stopping) running instances appear
+assert.deepEqual(ckTarget.options.map((o) => o.value), ['r2-migrate', 'qwen-flash']);
+assert.deepEqual(ckDrawerTarget.options.map((o) => o.value), ['r2-migrate', 'qwen-flash']);
+assert.equal(ckTarget.value, 'r2-migrate');
+assert.equal(ckDrawerTarget.value, 'r2-migrate');
+assert.equal(ckModel.value, 'r2-migrate');
+
+// 2. When r2-migrate stops, syncCopilotState updates dropdowns and falls back to qwen-flash
+appState.instances[0].running = false;
+appState.instances[0].ready = false;
+appState.instances[0].state_label = 'STOPPED';
+ctrl.syncCopilotState();
+assert.deepEqual(ckTarget.options.map((o) => o.value), ['qwen-flash']);
+assert.deepEqual(ckDrawerTarget.options.map((o) => o.value), ['qwen-flash']);
+assert.equal(ckTarget.value, 'qwen-flash');
+assert.equal(ckDrawerTarget.value, 'qwen-flash');
+assert.equal(ckModel.value, 'qwen3.8-flash');
+
+// 3. When all running instances stop, dropdown shows empty placeholder and resets model + pill
+appState.instances[1].running = false;
+appState.instances[1].state_label = 'STOPPED';
+ctrl.syncCopilotState();
+assert.deepEqual(ckTarget.options.map((o) => ({ value: o.value, text: o.textContent })), [{ value: '', text: '暂无运行中实例' }]);
+assert.deepEqual(ckDrawerTarget.options.map((o) => ({ value: o.value, text: o.textContent })), [{ value: '', text: '暂无运行中实例' }]);
+assert.equal(ckModel.value, '');
+assert.equal(ckStatusPill.textContent, '暂无运行中实例');
+
+// 4. openServiceInCopilot for a stopped service while another service is running
+appState.instances[0].running = true;
+appState.instances[0].ready = true;
+appState.instances[0].state_label = 'READY';
+ctrl.syncCopilotState();
+ctrl.openServiceInCopilot('indextts');
+assert.deepEqual(ckTarget.options.filter((o) => !o.hidden).map((o) => o.value), ['r2-migrate']);
+assert.deepEqual(ckDrawerTarget.options.filter((o) => !o.hidden).map((o) => o.value), ['r2-migrate']);
+assert.equal(ckTarget.value, '');
+assert.equal(ckStatusPill.textContent, 'indextts (未启动实例)');
+assert.equal(ckModel.value, 'indextts-2.5');
+
+// Once indextts starts running, syncCopilotState promotes it automatically
+appState.instances[3].running = true;
+appState.instances[3].ready = true;
+appState.instances[3].state_label = 'READY';
+ctrl.syncCopilotState();
+assert.deepEqual(ckTarget.options.filter((o) => !o.hidden).map((o) => o.value), ['r2-migrate', 'indextts']);
+assert.equal(ckTarget.value, 'indextts');
+assert.equal(ckDrawerTarget.value, 'indextts');
+"""
+        proc = subprocess.run(
+            ['node', '--input-type=module', '-e', js_script],
+            env={**os.environ, 'COPILOT_JS_PATH': str(copilot_js)},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f'Node copilot test failed (rc={proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}',
+        )
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -198,10 +198,25 @@ export function initCopilotStudio(deps) {
     });
   }
 
+  function isRunningInstance(inst) {
+    return Boolean(inst && inst.running && !inst.stopping);
+  }
+
+  function getRunningInstances() {
+    return (appState.instances || [])
+      .filter(isRunningInstance)
+      .sort(
+        (a, b) =>
+          Number(Boolean(b.ready)) - Number(Boolean(a.ready)) ||
+          Number(Boolean(b.url)) - Number(Boolean(a.url))
+      );
+  }
+
   function getSelectedTarget() {
-    const instances = appState.instances || [];
     if (ckState.selectedSession) {
-      const found = instances.find((i) => i.session_name === ckState.selectedSession);
+      const found = (appState.instances || []).find(
+        (i) => i.session_name === ckState.selectedSession && isRunningInstance(i)
+      );
       if (found) return found;
     }
     return null;
@@ -612,9 +627,10 @@ export function initCopilotStudio(deps) {
       return { status: "rendered", widget: args };
     }
     if (name === "generate_image_on_runtime") {
+      const running = getRunningInstances();
       const target =
-        (appState.instances || []).find((i) => i.session_name === args.session_name && i.url) ||
-        (appState.instances || []).find((i) => i.primary_surface === "image" && i.ready && i.url) ||
+        running.find((i) => i.session_name === args.session_name && i.url) ||
+        running.find((i) => i.primary_surface === "image" && i.ready && i.url) ||
         getSelectedTarget();
       if (!target?.url) return { error: "未找到可用的图像生成运行时实例" };
       const resp = await proxyFetch(target.session_name, "v1/images/generations", {
@@ -633,9 +649,10 @@ export function initCopilotStudio(deps) {
       };
     }
     if (name === "synthesize_speech_on_runtime") {
+      const running = getRunningInstances();
       const target =
-        (appState.instances || []).find((i) => i.session_name === args.session_name && i.url) ||
-        (appState.instances || []).find((i) => i.primary_surface === "audio" && i.ready && i.url) ||
+        running.find((i) => i.session_name === args.session_name && i.url) ||
+        running.find((i) => i.primary_surface === "audio" && i.ready && i.url) ||
         getSelectedTarget();
       if (!target?.url) return { error: "未找到可用的语音合成运行时实例" };
       const resp = await proxyFetch(target.session_name, "v1/audio/speech", {
@@ -1056,6 +1073,14 @@ export function initCopilotStudio(deps) {
         statusPill.className = "badge neutral";
       }
       if (proxyHint) proxyHint.textContent = "在「舰队与实例」启动后可通过本机同源代理直接调用";
+    } else {
+      if (statusPill) {
+        statusPill.textContent = "暂无运行中实例";
+        statusPill.className = "badge neutral";
+      }
+      if (proxyHint) {
+        proxyHint.textContent = "请先在「舰队与实例」启动运行时实例";
+      }
     }
 
     const feats = profile?.features || {};
@@ -1198,7 +1223,9 @@ export function initCopilotStudio(deps) {
 
   /* ---------- Slide-out CopilotSidebar Drawer (Swipe-to-Dismiss) ---------- */
   function openDrawer(sessionName = "") {
-    if (sessionName) selectSession(sessionName);
+    if (sessionName && getRunningInstances().some((i) => i.session_name === sessionName)) {
+      selectSession(sessionName);
+    }
     const drawer = document.getElementById("copilot-drawer");
     if (!drawer || drawer.open) return;
     ckState.drawerHasEntered = false;
@@ -1220,54 +1247,85 @@ export function initCopilotStudio(deps) {
   }
 
   function selectSession(sessionName) {
-    const prevInst = getSelectedTarget();
+    if (!sessionName) return;
+    const nextCandidate = (appState.instances || []).find(
+      (i) => i.session_name === sessionName && isRunningInstance(i)
+    );
+    if (!nextCandidate) return;
+    const prevSvcName = getSelectedServiceMeta()?.name || "";
     ckState.selectedSession = sessionName;
     ckState.selectedServiceFallback = "";
     for (const selId of ["ck-target", "ck-drawer-target"]) {
       const sel = document.getElementById(selId);
-      if (sel && sel.value !== sessionName) sel.value = sessionName;
+      if (!sel) continue;
+      sel.querySelector('option[value=""]')?.remove();
+      if (sel.value !== sessionName) sel.value = sessionName;
     }
-    const nextInst = getSelectedTarget();
     const modelIn = document.getElementById("ck-model");
-    if (modelIn && (!modelIn.value.trim() || prevInst?.service !== nextInst?.service)) {
-      const nextSvc = (appState.services || []).find((s) => s.name === nextInst?.service);
-      modelIn.value = nextSvc?.api_profile?.default_model || nextInst?.service || "";
+    if (modelIn && (!modelIn.value.trim() || prevSvcName !== nextCandidate.service)) {
+      const nextSvc = (appState.services || []).find((s) => s.name === nextCandidate.service);
+      modelIn.value = nextSvc?.api_profile?.default_model || nextCandidate.service || "";
     }
     updateCapabilityUI();
   }
 
   function syncCopilotState() {
-    const instances = appState.instances || [];
-    const usable = instances.slice().sort((a, b) => Number(Boolean(b.url)) - Number(Boolean(a.url)));
-    if (!ckState.selectedSession || !instances.some((i) => i.session_name === ckState.selectedSession)) {
-      if (!ckState.selectedServiceFallback && usable.length) {
-        ckState.selectedSession = usable[0].session_name;
+    const prevSession = ckState.selectedSession;
+    const prevSvcName =
+      (appState.instances || []).find((i) => i.session_name === prevSession)?.service ||
+      ckState.selectedServiceFallback ||
+      "";
+    const usable = getRunningInstances();
+
+    if (ckState.selectedSession && !usable.some((i) => i.session_name === ckState.selectedSession)) {
+      ckState.selectedSession = "";
+    }
+    if (!ckState.selectedSession && ckState.selectedServiceFallback) {
+      const fallbackRunning = usable.find((i) => i.service === ckState.selectedServiceFallback);
+      if (fallbackRunning) {
+        ckState.selectedSession = fallbackRunning.session_name;
+        ckState.selectedServiceFallback = "";
       }
+    }
+    if (!ckState.selectedSession && !ckState.selectedServiceFallback && usable.length) {
+      ckState.selectedSession = usable[0].session_name;
     }
 
     for (const selId of ["ck-target", "ck-drawer-target"]) {
       const sel = document.getElementById(selId);
       if (!sel) continue;
       if (!usable.length) {
-        sel.replaceChildren(el("option", { value: "" }, "暂无已发现实例"));
+        sel.replaceChildren(el("option", { value: "" }, "暂无运行中实例"));
       } else {
-        sel.replaceChildren(
-          ...usable.map((i) =>
+        const opts = [];
+        if (!ckState.selectedSession) {
+          opts.push(el("option", { value: "", disabled: true, hidden: true, selected: true }, "请选择运行中实例"));
+        }
+        for (const i of usable) {
+          opts.push(
             el(
               "option",
               { value: i.session_name },
               `${i.session_name} (${i.state_label}${i.url ? ` · ${i.url}` : " · 无URL"})`
             )
-          )
-        );
-        if (ckState.selectedSession) sel.value = ckState.selectedSession;
+          );
+        }
+        sel.replaceChildren(...opts);
+        sel.value = ckState.selectedSession || "";
       }
     }
 
     const modelIn = document.getElementById("ck-model");
-    if (modelIn && !modelIn.value.trim()) {
-      const prof = getSelectedProfile();
-      modelIn.value = prof?.default_model || getSelectedTarget()?.service || "";
+    if (modelIn) {
+      const nextSvcName = getSelectedServiceMeta()?.name || "";
+      if (!nextSvcName) {
+        if (prevSession && !ckState.selectedSession) {
+          modelIn.value = "";
+        }
+      } else if (!modelIn.value.trim() || (prevSession !== ckState.selectedSession && prevSvcName !== nextSvcName)) {
+        const prof = getSelectedProfile();
+        modelIn.value = prof?.default_model || nextSvcName;
+      }
     }
 
     updateCapabilityUI();
@@ -1275,6 +1333,10 @@ export function initCopilotStudio(deps) {
 
   function openInstanceInCopilot(inst, surface = "") {
     if (!inst) return;
+    if (!isRunningInstance(inst)) {
+      openServiceInCopilot(inst.service);
+      return;
+    }
     selectSession(inst.session_name);
     const prof = getSelectedProfile();
     activateCopilotSurface(surface || prof?.primary_surface || "chat");
@@ -1282,8 +1344,11 @@ export function initCopilotStudio(deps) {
   }
 
   function openServiceInCopilot(serviceName) {
-    const match = (appState.instances || []).find((i) => i.service === serviceName && i.url)
-      || (appState.instances || []).find((i) => i.service === serviceName);
+    const usable = getRunningInstances();
+    const match =
+      usable.find((i) => i.service === serviceName && i.ready && i.url) ||
+      usable.find((i) => i.service === serviceName && i.url) ||
+      usable.find((i) => i.service === serviceName);
     if (match) {
       openInstanceInCopilot(match);
       return;
@@ -1295,7 +1360,7 @@ export function initCopilotStudio(deps) {
     if (modelIn && svc) {
       modelIn.value = svc.api_profile?.default_model || svc.name;
     }
-    updateCapabilityUI();
+    syncCopilotState();
     activateCopilotSurface(svc?.api_profile?.primary_surface || "chat");
     switchView("copilot");
   }

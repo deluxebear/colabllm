@@ -1575,7 +1575,7 @@ function createActionCluster(surface, idSeq, getInst) {
           }),
         );
       }
-      if (inst.url) {
+      if (inst.running && !inst.stopping && inst.url) {
         popItems.push(
           el("button", {
             type: "button",
