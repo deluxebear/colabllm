@@ -4,6 +4,32 @@
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-16
+
+### 新增
+
+- **零依赖本机 Web 控制台（`colabllm web`）**：
+  - 采用回环优先监听与一次性启动令牌认证，自动签发 `HttpOnly; SameSite=Strict` 会话 Cookie，并强制启用 `X-ColabLLM-CSRF`、来源校验及严格 `CSP + Trusted Types` 防护；支持 `--read-only`、`--port`、`-d`/`--detach`、`--status`、`--stop` 后台守护以及基于 `fcntl.flock` 的单实例互斥锁。
+  - 提供卡片/紧凑表格/按服务聚合三视图舰队看板，支持多账户/分类/状态筛选、折叠已停止实例抽屉、声明式一键复制、右上角排队通知以及与后台任务状态联动的即时启动/停止进度与日志流追踪；同时内置基于 `argparse` 契约动态解析的工作台命令表单、隧道与多账户总览及一键环境体检 (`doctor`)。
+- **AI 演练场（Copilot Studio）与全局快捷 `<CopilotSidebar />` 抽屉**：
+  - 升级本机同源安全代理 `/api/proxy/<service>/<instance>/<subpath>`，支持 `GET`/`HEAD`/`POST`/`PUT`/`DELETE`、128 MiB 请求体、SSE (`text/event-stream`) 与 Ollama 原生 NDJSON (`application/x-ndjson`) 流式转发以及音频采样率 / Drive 保存路径响应头透传，浏览器全程零密钥暴露。
+  - 覆盖全部 19 个现有运行时的 API 能力档案，并支持对后续新增 OpenAI 兼容或自定义服务按文档与子命令启发式自动发现；集成多会话历史、流式 Reasoning 思考折叠卡片、前端 Generative UI 工具调用循环（在聊天流内直接渲染 KPI 指标卡与对比表格）、图像/语音克隆/8 维情绪调节/Nemotron SALM CTC 时间戳转写/向量余弦矩阵/原生专有 API 控制台与通用 HTTP 探针，实时生成同源代理 cURL 与 Python OpenAI SDK 代码。
+- **Cloudflare R2 → Google Drive 迁移运行时（`r2-migrate`）**：
+  - 新增纯标准库 SigV4 S3/R2 客户端、CPU 高内存服务脚本与内置 Web UI，通过 Google Drive 挂载直通执行高并发 Direct 同步与 `512 MiB` PAX `.tar` 分片归档；内置 SQLite 检查点断点续传、R2 免费额度护栏、宽松 Drive 文件收敛、云端校验后安全清理与自适应删除控制。
+
+### 变更
+
+- **文本与代码推理运行时升级**：`qwen-flash`、`deepseek-coder`、`deepseek-qwen-9b` 统一升级至 `llama-server` `v1.0.0` 并更新 `deepseek-qwen-9b` GGUF 版本固定，同时在 `colabllm web` 舰队卡片中为 `llama-server` 系列暴露“打开 Web UI”快捷按钮。
+
+### 修复
+
+- **热内核模块化重载与 `colab exec` 预检容错**：Setup Cell 在导入嵌入式辅助模块前自动淘汰旧 `sys.modules` 缓存并失效导入缓存，避免温内核重复执行残留旧代码；为 `colab exec` 与 `colab dfs mount` 注入 `REQUEST_TIMEOUT=60` 防止过早握手超时，并可在远端 VM 存活时自动回收卡死进程后安全重试 Cell 1 前的瞬态断连。
+- **`unsloth-studio` 首次启动凭据对账与密钥收敛**：在发出 `CT_READY` 前自动通过 `/api/auth/login` 与 `/api/auth/change-password` 将初始密码统一对账为 `CT_AUTH_PASS`，在 `info`/`ps --show-secrets` 中严格按服务认证模式收敛公开字段，并在同源代理登录 `/api/auth/login` 时自动注入本机 `state.json` 凭据。
+
+### 文档
+
+- 在 README 顶部加入使用实机 `indextts`（IndexTTS-2.5）合成中文旁白的 `1080p` 全景实操演示视频与封面预览，并新增可复现录制与配音合成脚本 `tools/record_walkthrough_video.py`。
+
 ## [0.1.10] - 2026-11-14
 
 ### 新增
