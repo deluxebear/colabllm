@@ -6,7 +6,9 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -14,7 +16,7 @@ import time
 from typing import Any, Callable
 
 from cli_support import CliError, UsageError
-from colab_accounts import validate_account
+from colab_accounts import list_account_names, validate_account
 from colabsvc import validate_instance
 from processes import process_identity, stop_owned_process
 from .state_store import strip_ansi
@@ -22,6 +24,11 @@ from .state_store import strip_ansi
 PKG_ROOT = Path(__file__).resolve().parents[1]
 _MAX_TASK_OUTPUT_BYTES = 512 * 1024
 _MAX_RETAINED_TASKS = 80
+_USAGE_CACHE_TTL = 45.0
+_USAGE_LOCK = threading.Lock()
+_USAGE_COND = threading.Condition(_USAGE_LOCK)
+_USAGE_INFLIGHT = False
+_USAGE_CACHE: dict[str, Any] | None = None
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -361,3 +368,236 @@ def run_frp_status(*, timeout: float = 20.0) -> dict[str, Any]:
         return json.loads(stdout_clean) if stdout_clean else {}
     except ValueError:
         return {"raw": stdout_clean}
+
+
+_PLAIN_BALANCE_RE = re.compile(r"Current balance:\s*([0-9]+(?:\.[0-9]+)?)\s*compute units", re.IGNORECASE)
+_PLAIN_RATE_RE = re.compile(r"Usage rate:\s*([0-9]+(?:\.[0-9]+)?)/hr", re.IGNORECASE)
+_PLAIN_ACTIVE_RE = re.compile(r"Active assignments:\s*([0-9]+)", re.IGNORECASE)
+
+
+def get_cached_accounts_usage(*, max_age: float | None = None) -> dict[str, Any] | None:
+    """Return cached Colab compute-unit usage snapshot without spawning subprocesses."""
+    ttl = _USAGE_CACHE_TTL if max_age is None else float(max_age)
+    with _USAGE_COND:
+        if _USAGE_CACHE is None:
+            return None
+        if ttl >= 0 and (time.time() - float(_USAGE_CACHE.get("fetched_at") or 0.0)) > ttl:
+            return None
+        return dict(_USAGE_CACHE)
+
+
+def clear_accounts_usage_cache() -> None:
+    """Reset the in-memory Colab quota cache (mainly for tests)."""
+    global _USAGE_CACHE
+    with _USAGE_COND:
+        _USAGE_CACHE = None
+
+
+def _normalize_account_quota(
+    raw_usage: dict[str, Any] | None,
+    raw_assignments: list[Any] | None,
+    error: str | None,
+) -> dict[str, Any]:
+    usage_obj: dict[str, Any] | None = None
+    if isinstance(raw_usage, dict):
+        balance = round(float(raw_usage.get("balance", 0.0) or 0.0), 2)
+        rate_hourly = round(float(raw_usage.get("rate_hourly", 0.0) or 0.0), 2)
+        assignments_count = int(raw_usage.get("assignments_count", 0) or 0)
+        estimated_hours = round(balance / rate_hourly, 1) if (balance > 0 and rate_hourly > 0) else None
+        usage_obj = {
+            "balance": balance,
+            "rate_hourly": rate_hourly,
+            "assignments_count": assignments_count,
+            "estimated_hours": estimated_hours,
+            "tier": "paid" if balance > 0 else "free",
+        }
+
+    assignments: list[dict[str, str]] = []
+    if isinstance(raw_assignments, list):
+        for a in raw_assignments:
+            if not isinstance(a, dict):
+                continue
+            assignments.append({
+                "name": str(a.get("name") or "?"),
+                "endpoint": str(a.get("endpoint") or ""),
+                "hardware": str(a.get("hardware") or a.get("accelerator") or "CPU"),
+                "shape": str(a.get("shape") or "Standard"),
+            })
+
+    return {
+        "usage": usage_obj,
+        "assignments": assignments,
+        "error": str(error) if error else None,
+    }
+
+
+def _parse_plain_colab_usage(text: str) -> dict[str, Any] | None:
+    cleaned = strip_ansi(text or "")
+    bal_m = _PLAIN_BALANCE_RE.search(cleaned)
+    rate_m = _PLAIN_RATE_RE.search(cleaned)
+    act_m = _PLAIN_ACTIVE_RE.search(cleaned)
+    if not bal_m:
+        return None
+    return {
+        "balance": float(bal_m.group(1)),
+        "rate_hourly": float(rate_m.group(1)) if rate_m else 0.0,
+        "assignments_count": int(act_m.group(1)) if act_m else 0,
+    }
+
+
+def _query_single_plain_usage(colab_bin: str, account: str | None, *, timeout: float) -> dict[str, Any]:
+    cmd = [colab_bin]
+    if account:
+        cmd.extend(["-a", account])
+    cmd.append("usage")
+    try:
+        res = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_subprocess_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return _normalize_account_quota(None, [], "查询 colab usage 超时")
+    except OSError as err:
+        return _normalize_account_quota(None, [], str(err))
+
+    stdout_clean = strip_ansi((res.stdout or "").strip())
+    stderr_clean = strip_ansi((res.stderr or "").strip())
+    if res.returncode != 0:
+        err_msg = stderr_clean or stdout_clean or f"colab usage 退出码 {res.returncode}"
+        return _normalize_account_quota(None, [], err_msg)
+
+    parsed: dict[str, Any] | None = None
+    if stdout_clean.startswith("{"):
+        with contextlib.suppress(ValueError):
+            obj = json.loads(stdout_clean)
+            if isinstance(obj, dict):
+                raw_u = obj.get("usage") if isinstance(obj.get("usage"), dict) else obj
+                if "balance" in raw_u:
+                    parsed = raw_u
+    if parsed is None:
+        parsed = _parse_plain_colab_usage(stdout_clean)
+    if parsed is None:
+        return _normalize_account_quota(None, [], stderr_clean or stdout_clean or "无法解析 colab usage 输出")
+    return _normalize_account_quota(parsed, [], None)
+
+
+def fetch_accounts_usage(*, refresh: bool = False, timeout: float = 20.0) -> dict[str, Any]:
+    """Query Colab compute-unit balance and active VMs with single-flight caching."""
+    global _USAGE_INFLIGHT, _USAGE_CACHE
+
+    with _USAGE_COND:
+        if (
+            not refresh
+            and _USAGE_CACHE is not None
+            and (time.time() - float(_USAGE_CACHE.get("fetched_at") or 0.0)) < _USAGE_CACHE_TTL
+        ):
+            return dict(_USAGE_CACHE)
+        if _USAGE_INFLIGHT:
+            _USAGE_COND.wait(timeout=timeout + 5.0)
+            if _USAGE_CACHE is not None:
+                return dict(_USAGE_CACHE)
+        _USAGE_INFLIGHT = True
+
+    try:
+        env = _subprocess_env()
+        colab_bin = shutil.which("colab", path=env.get("PATH"))
+        now = time.time()
+        fetched_time = time.strftime("%H:%M:%S", time.localtime(now))
+        by_account: dict[str, dict[str, Any]] = {}
+        legacy: dict[str, Any] | None = None
+        source = "missing"
+        supported = bool(colab_bin)
+        top_error: str | None = None
+
+        if not colab_bin:
+            top_error = "未找到 colab CLI"
+        else:
+            ext_items: list[Any] | None = None
+            try:
+                res = subprocess.run(
+                    [colab_bin, "account", "status", "--json"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+                if res.returncode == 0:
+                    stdout_clean = strip_ansi((res.stdout or "").strip())
+                    if stdout_clean:
+                        with contextlib.suppress(ValueError):
+                            parsed = json.loads(stdout_clean)
+                            if isinstance(parsed, list):
+                                ext_items = parsed
+            except (subprocess.TimeoutExpired, OSError):
+                ext_items = None
+
+            if ext_items is not None:
+                source = "colab-ext"
+                for item in ext_items:
+                    if not isinstance(item, dict) or not item.get("account"):
+                        continue
+                    acct_name = str(item["account"])
+                    by_account[acct_name] = _normalize_account_quota(
+                        item.get("usage"),
+                        item.get("assignments"),
+                        item.get("error"),
+                    )
+            else:
+                source = "colab-usage"
+                names = list_account_names()
+                if names:
+                    per_timeout = min(10.0, timeout)
+                    for name in names:
+                        by_account[name] = _query_single_plain_usage(colab_bin, name, timeout=per_timeout)
+                else:
+                    legacy = _query_single_plain_usage(colab_bin, None, timeout=min(10.0, timeout))
+                    if legacy.get("error") and legacy.get("usage") is None:
+                        top_error = legacy["error"]
+
+        entries = list(by_account.values()) if by_account else ([legacy] if legacy else [])
+        queried_accounts = sum(1 for item in entries if isinstance(item, dict) and item.get("usage") is not None)
+        total_balance = round(
+            sum(float((item.get("usage") or {}).get("balance") or 0.0) for item in entries if isinstance(item, dict)),
+            2,
+        )
+        total_rate = round(
+            sum(
+                float((item.get("usage") or {}).get("rate_hourly") or 0.0)
+                for item in entries
+                if isinstance(item, dict)
+            ),
+            2,
+        )
+        total_assignments = sum(
+            int((item.get("usage") or {}).get("assignments_count") or 0)
+            for item in entries
+            if isinstance(item, dict)
+        )
+
+        snapshot: dict[str, Any] = {
+            "supported": supported,
+            "source": source,
+            "fetched_at": now,
+            "fetched_time": fetched_time,
+            "accounts": by_account,
+            "legacy": legacy,
+            "totals": {
+                "total_balance": total_balance,
+                "total_rate_hourly": total_rate,
+                "total_assignments": total_assignments,
+                "queried_accounts": queried_accounts,
+            },
+            "error": top_error,
+        }
+        with _USAGE_COND:
+            _USAGE_CACHE = snapshot
+            return dict(snapshot)
+    finally:
+        with _USAGE_COND:
+            _USAGE_INFLIGHT = False
+            _USAGE_COND.notify_all()

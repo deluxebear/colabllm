@@ -507,17 +507,22 @@
             </section>
 
             <section class="card">
-              <h2>Colab 多账户与共享 Drive 状态</h2>
-              <p class="muted">仅只读读取 ~/.config/colab-cli 账户索引与授权文件存在性，不读取 OAuth 凭据原文。</p>
+              <div class="block-header">
+                <h2 id="accounts-card-heading">Colab 多账户与共享 Drive 状态</h2>
+                <button type="button" id="accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              </div>
+              <p class="muted">仅只读读取 ~/.config/colab-cli 账户索引与授权文件，并通过 colab CLI 查询各账户剩余计算单元（CCU）与活跃会话，不读取 OAuth 凭据原文。</p>
               <div id="accounts-summary" class="kv-list"></div>
-              <div class="table-wrap">
-                <table>
+              <div id="accounts-table-wrap" tabindex="0" role="region" aria-labelledby="accounts-card-heading" class="table-wrap accounts-table-wrap">
+                <table id="accounts-table">
                   <thead>
                     <tr>
-                      <th>账户名</th>
-                      <th>邮箱</th>
-                      <th>绑定 Drive</th>
-                      <th>Drive 授权</th>
+                      <th scope="col">账户名</th>
+                      <th scope="col">邮箱</th>
+                      <th scope="col">Colab 可用量</th>
+                      <th scope="col">消耗速率 / 活跃会话</th>
+                      <th scope="col">绑定 Drive</th>
+                      <th scope="col">Drive 授权</th>
                     </tr>
                   </thead>
                   <tbody id="accounts-tbody"></tbody>

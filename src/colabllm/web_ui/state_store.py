@@ -515,7 +515,11 @@ def read_log_tail(
     }
 
 
-def accounts_overview(default_account: str | None = None) -> dict[str, Any]:
+def accounts_overview(
+    default_account: str | None = None,
+    *,
+    usage_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     registry = None
     error_msg = None
     try:
@@ -542,6 +546,7 @@ def accounts_overview(default_account: str | None = None) -> dict[str, Any]:
     accounts_meta = (registry.get("accounts") or {}) if isinstance(registry, dict) else {}
     active_name = str(registry.get("active") or "").strip() if isinstance(registry, dict) else ""
     default_drv = str(registry.get("default_drive_account") or "").strip() if isinstance(registry, dict) else ""
+    quota_by_account = (usage_snapshot or {}).get("accounts") or {}
 
     items: list[dict[str, Any]] = []
     for name in names:
@@ -555,12 +560,24 @@ def accounts_overview(default_account: str | None = None) -> dict[str, Any]:
             "effective": name == effective_account,
             "drive_account": bound_drive,
             "has_drive_consent": creds_path.is_file(),
+            "quota": quota_by_account.get(name),
         })
 
     legacy_consent = False
     if not items:
         with contextlib.suppress(Exception):
             legacy_consent = account_dfs_credentials_path(None, None, registry=None).is_file()
+
+    usage_summary: dict[str, Any] | None = None
+    if usage_snapshot is not None:
+        usage_summary = {
+            "supported": bool(usage_snapshot.get("supported", True)),
+            "source": usage_snapshot.get("source"),
+            "fetched_at": usage_snapshot.get("fetched_at"),
+            "fetched_time": usage_snapshot.get("fetched_time"),
+            "totals": usage_snapshot.get("totals"),
+            "error": usage_snapshot.get("error"),
+        }
 
     return {
         "multi_account_initialized": registry is not None,
@@ -571,6 +588,8 @@ def accounts_overview(default_account: str | None = None) -> dict[str, Any]:
         "effective_drive_account": effective_drive,
         "drive_source": drive_source,
         "legacy_drive_consent": legacy_consent,
+        "legacy_quota": (usage_snapshot or {}).get("legacy"),
+        "usage_summary": usage_summary,
         "accounts": items,
         "error": error_msg,
     }

@@ -29,7 +29,7 @@ for _p in (str(SRC), str(LIB)):
 
 from cli_support import CliError, UsageError  # noqa: E402
 from colabllm import web as colabllm_web  # noqa: E402
-from colabllm.web_ui import api_catalog, introspect, server as web_server, state_store  # noqa: E402
+from colabllm.web_ui import api_catalog, introspect, runner_bridge, server as web_server, state_store  # noqa: E402
 
 
 def _read_sse_until(resp: http.client.HTTPResponse, predicate, *, timeout: float = 10.0) -> list[tuple[str, str]]:
@@ -398,6 +398,7 @@ class WebServerIntegrationTest(unittest.TestCase):
             clear=False,
         )
         self._env_patch.start()
+        runner_bridge.clear_accounts_usage_cache()
         self._servers: list[tuple[web_server.WebConsoleServer, threading.Thread]] = []
 
     def tearDown(self):
@@ -405,6 +406,7 @@ class WebServerIntegrationTest(unittest.TestCase):
             srv.shutdown()
             th.join(timeout=2.0)
             srv.server_close()
+        runner_bridge.clear_accounts_usage_cache()
         self._env_patch.stop()
         self._tmp.cleanup()
 
@@ -1400,6 +1402,131 @@ class WebServerIntegrationTest(unittest.TestCase):
                 conn.close()
                 ro_conn.close()
 
+    def test_accounts_usage_endpoint_and_caching(self):
+        cfg_dir = self.user_dir / '.config' / 'colab-cli'
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        accounts_json = cfg_dir / 'accounts.json'
+        accounts_json.write_text(
+            json.dumps({
+                'active': 'free',
+                'accounts': {
+                    'main': {'email': 'main@example.com', 'drive_account': 'main'},
+                    'free': {'email': 'free@example.com', 'drive_account': 'main'},
+                },
+            }),
+            encoding='utf-8',
+        )
+        mode_flag = self.tmp / 'plain-mode'
+        calls_log = self.tmp / 'usage-calls.jsonl'
+        colab_stub = self.bin_dir / 'colab'
+        colab_stub.write_text(
+            f'''#!{sys.executable}
+import json
+from pathlib import Path
+import sys
+
+calls_path = Path({str(calls_log)!r})
+with calls_path.open('a', encoding='utf-8') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+
+args = sys.argv[1:]
+plain = Path({str(mode_flag)!r}).exists()
+if not plain and args[:3] == ['account', 'status', '--json']:
+    print(json.dumps([
+        {{
+            'account': 'main',
+            'active': False,
+            'email': 'main@example.com',
+            'usage': {{'balance': 617.7, 'rate_hourly': 2.5, 'assignments_count': 1}},
+            'assignments': [{{'name': 'qwen-flash', 'endpoint': 'ep-1', 'hardware': 'T4', 'shape': 'Standard'}}],
+            'error': None,
+        }},
+        {{
+            'account': 'free',
+            'active': True,
+            'email': 'free@example.com',
+            'usage': {{'balance': 0.0, 'rate_hourly': 0.08, 'assignments_count': 1}},
+            'assignments': [{{'name': 'r2-migrate', 'endpoint': 'ep-2', 'hardware': 'CPU', 'shape': 'Standard'}}],
+            'error': None,
+        }},
+    ]))
+    sys.exit(0)
+if args == ['usage']:
+    print('Current balance: 120.50 compute units')
+    print('Usage rate: 1.25/hr')
+    print('Active assignments: 1')
+    sys.exit(0)
+sys.exit(2)
+''',
+            encoding='utf-8',
+        )
+        colab_stub.chmod(0o755)
+
+        srv, port = self._start_console(read_only=False)
+        cookie, _csrf = self._authenticate(srv, port)
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
+        try:
+            # 1. Initial bootstrap returns immediately without invoking `colab` CLI.
+            conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            boot0 = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            self.assertIsNone(boot0['accounts']['usage_summary'])
+            self.assertFalse(calls_log.exists())
+
+            # 2. First GET /api/accounts/usage runs `colab account status --json` and computes metrics + totals.
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            ov1 = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            by_name = {a['name']: a for a in ov1['accounts']}
+            self.assertEqual(by_name['main']['quota']['usage']['balance'], 617.7)
+            self.assertEqual(by_name['main']['quota']['usage']['estimated_hours'], 247.1)
+            self.assertEqual(by_name['main']['quota']['assignments'][0]['hardware'], 'T4')
+            self.assertEqual(by_name['free']['quota']['usage']['tier'], 'free')
+            self.assertEqual(ov1['usage_summary']['source'], 'colab-ext')
+            self.assertEqual(ov1['usage_summary']['totals']['total_balance'], 617.7)
+            self.assertEqual(ov1['usage_summary']['totals']['total_rate_hourly'], 2.58)
+            self.assertEqual(ov1['usage_summary']['totals']['total_assignments'], 2)
+            self.assertEqual(len(calls_log.read_text(encoding='utf-8').splitlines()), 1)
+
+            # 3. Cached read on /api/accounts/usage & /api/bootstrap does not respawn CLI.
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            ov2 = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            self.assertEqual(ov2['usage_summary']['totals']['total_assignments'], 2)
+            self.assertEqual(len(calls_log.read_text(encoding='utf-8').splitlines()), 1)
+
+            conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            boot1 = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            self.assertIsNotNone(boot1['accounts']['usage_summary'])
+            self.assertEqual(len(calls_log.read_text(encoding='utf-8').splitlines()), 1)
+
+            # 4. ?refresh=1 forces fresh CLI query.
+            conn.request('GET', '/api/accounts/usage?refresh=1', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(len(calls_log.read_text(encoding='utf-8').splitlines()), 2)
+
+            # 5. Plain single-account fallback (`colab usage`) works without `accounts.json` / `colab-ext`.
+            accounts_json.unlink()
+            mode_flag.touch()
+            conn.request('GET', '/api/accounts/usage?refresh=1', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            plain_ov = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            self.assertEqual(plain_ov['accounts'], [])
+            self.assertEqual(plain_ov['usage_summary']['source'], 'colab-usage')
+            self.assertEqual(plain_ov['legacy_quota']['usage']['balance'], 120.5)
+            self.assertEqual(plain_ov['legacy_quota']['usage']['estimated_hours'], 96.4)
+            self.assertEqual(plain_ov['legacy_quota']['usage']['assignments_count'], 1)
+        finally:
+            conn.close()
+
     def test_static_frontend_offline_and_trusted_types_hygiene(self):
         static_dir = SRC / 'colabllm' / 'web_ui' / 'static'
         index_html = (static_dir / 'index.html').read_text(encoding='utf-8')
@@ -1414,6 +1541,8 @@ class WebServerIntegrationTest(unittest.TestCase):
                 self.assertNotIn(forbidden_sink, js_src, f'{js_name} must not contain {forbidden_sink}')
 
         self.assertIn('id="logs-copy-btn"', index_html)
+        self.assertIn('id="accounts-usage-refresh-btn"', index_html)
+        self.assertIn('role="region"', index_html)
         self.assertIn('command="--copy"', index_html)
         self.assertIn('commandfor="logs-viewer"', index_html)
         self.assertIn('command="--copy-token"', index_html)
@@ -1426,6 +1555,7 @@ class WebServerIntegrationTest(unittest.TestCase):
         self.assertIn('id="ck-surface-tablist"', index_html)
         self.assertIn('inset: calc(4.5rem + var(--toast-offset, 0px)) 1.25rem auto auto;', styles_css)
         self.assertIn('.badge.is-busy::before', styles_css)
+        self.assertIn('@container (width < 580px)', styles_css)
         self.assertIn('field-sizing: content', copilot_css)
         self.assertIn('@supports (position-area: block-end)', copilot_css)
         self.assertIn('@supports (animation-timeline: scroll())', copilot_css)

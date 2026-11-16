@@ -72,6 +72,7 @@ const state = {
   rawInstances: [],
   instances: [],
   accounts: null,
+  accountsUsageLoading: false,
   tunnel: null,
   tasks: [],
   bootstrapSeeded: false,
@@ -543,6 +544,9 @@ function switchView(viewName) {
   const [title, subtitle] = VIEW_META[viewName] || ["ColabLLM", ""];
   document.getElementById("view-title").textContent = title;
   document.getElementById("view-subtitle").textContent = subtitle;
+  if (viewName === "tunnel" && !state.accounts?.usage_summary && !state.accountsUsageLoading) {
+    void refreshAccountsUsage({ force: false, silent: true });
+  }
 }
 
 function activateTab(panelId) {
@@ -2452,6 +2456,50 @@ function renderTasksList() {
   box.replaceChildren(...rows);
 }
 
+function formatAccountQuotaCell(quota, isLoading) {
+  if (quota && quota.usage) {
+    const bal = Number(quota.usage.balance || 0);
+    const estHours = quota.usage.estimated_hours;
+    const badgeCls = bal > 0 ? (bal >= 10 ? "badge ok" : "badge warn") : "badge";
+    const badgeText = bal > 0 ? `${bal.toFixed(2)} CCU` : "0.00 CCU · 免费额度";
+    const children = [el("span", { className: badgeCls, textContent: badgeText })];
+    if (estHours) {
+      children.push(el("span", { className: "quota-sub", textContent: `约可跑 ${estHours}h` }));
+    }
+    return el("div", { className: "quota-stack" }, ...children);
+  }
+  if (quota && quota.error) {
+    const shortErr = String(quota.error).slice(0, 72);
+    return el(
+      "div",
+      { className: "quota-stack" },
+      el("span", { className: "badge danger", title: quota.error, textContent: "查询失败" }),
+      el("span", { className: "quota-sub", title: quota.error, textContent: shortErr }),
+    );
+  }
+  return el("span", { className: "muted", textContent: isLoading ? "查询中..." : "待刷新" });
+}
+
+function formatAccountSessionsCell(quota, isLoading) {
+  if (quota && quota.usage) {
+    const rate = Number(quota.usage.rate_hourly || 0);
+    const cnt = Number(quota.usage.assignments_count || 0);
+    const primary = `${rate.toFixed(2)}/h · ${cnt > 0 ? `${cnt} 台活跃` : "空闲"}`;
+    const children = [el("span", { textContent: primary })];
+    if (Array.isArray(quota.assignments) && quota.assignments.length) {
+      const desc = quota.assignments
+        .map((a) => (a.name && a.name !== "?" ? `${a.name} (${a.hardware || "CPU"})` : (a.hardware || "CPU")))
+        .join("、");
+      children.push(el("span", { className: "quota-sub", textContent: desc }));
+    }
+    return el("div", { className: "quota-stack" }, ...children);
+  }
+  if (quota && quota.error) {
+    return el("span", { className: "muted", textContent: "-" });
+  }
+  return el("span", { className: "muted", textContent: isLoading ? "查询中..." : "-" });
+}
+
 function renderTunnelAndAccounts() {
   const tunnelSummary = document.getElementById("tunnel-summary");
   const t = state.tunnel || {};
@@ -2471,25 +2519,65 @@ function renderTunnelAndAccounts() {
 
   const acctSummary = document.getElementById("accounts-summary");
   const ac = state.accounts || {};
+  const us = ac.usage_summary || null;
+  let usageTotalText = "待查询（点击刷新可用量）";
+  if (state.accountsUsageLoading && !us) {
+    usageTotalText = "正在查询实时额度...";
+  } else if (us) {
+    if (!us.supported) {
+      usageTotalText = us.error || "colab CLI 不可用";
+    } else if (us.error && !(us.totals && us.totals.queried_accounts > 0)) {
+      usageTotalText = `查询失败: ${us.error}`;
+    } else {
+      const tot = us.totals || {};
+      const bal = Number(tot.total_balance || 0).toFixed(2);
+      const rate = Number(tot.total_rate_hourly || 0).toFixed(2);
+      const activeCnt = Number(tot.total_assignments || 0);
+      usageTotalText = `${bal} CCU · ${rate}/h · ${activeCnt} 台活跃 (${us.fetched_time || "-"})`;
+    }
+  }
   acctSummary.replaceChildren(
     el("span", { className: "kv-key", textContent: "生效计算账户" }),
     el("span", { className: "kv-val", textContent: `${ac.effective_account || "未解析"} (${ac.effective_source || "-"})` }),
     el("span", { className: "kv-key", textContent: "生效共享 Drive" }),
     el("span", { className: "kv-val", textContent: `${ac.effective_drive_account || "无"} (${ac.drive_source || "-"})` }),
+    el("span", { className: "kv-key", textContent: "Colab 可用量合计" }),
+    el("span", { className: "kv-val", textContent: usageTotalText }),
   );
 
   const tbody = document.getElementById("accounts-tbody");
   const list = ac.accounts || [];
+  const isLoading = Boolean(state.accountsUsageLoading);
   if (!list.length) {
-    tbody.replaceChildren(el("tr", null, el("td", { colSpan: "4", className: "muted", textContent: "未检测到 colab-ext 多账户配置" })));
+    if (ac.legacy_quota) {
+      const hasConsent = Boolean(ac.legacy_drive_consent);
+      tbody.replaceChildren(
+        el(
+          "tr",
+          null,
+          el("th", { scope: "row", textContent: "默认账户 (单账户)" }),
+          el("td", { textContent: "-" }),
+          el("td", null, formatAccountQuotaCell(ac.legacy_quota, isLoading)),
+          el("td", null, formatAccountSessionsCell(ac.legacy_quota, isLoading)),
+          el("td", { textContent: "-" }),
+          el("td", null, el("span", { className: `badge ${hasConsent ? "ok" : "warn"}`, textContent: hasConsent ? "已授权文件" : "无本地授权" })),
+        ),
+      );
+      return;
+    }
+    tbody.replaceChildren(
+      el("tr", null, el("td", { colSpan: "6", className: "muted", textContent: "未检测到 colab-ext 多账户配置" })),
+    );
     return;
   }
   const trs = list.map((a) =>
     el(
       "tr",
       null,
-      el("td", { textContent: `${a.name}${a.active ? " (默认)" : ""}` }),
+      el("th", { scope: "row", textContent: `${a.name}${a.active ? " (默认)" : ""}` }),
       el("td", { textContent: a.email || "-" }),
+      el("td", null, formatAccountQuotaCell(a.quota, isLoading)),
+      el("td", null, formatAccountSessionsCell(a.quota, isLoading)),
       el("td", { textContent: a.drive_account || "-" }),
       el("td", null, el("span", { className: `badge ${a.has_drive_consent ? "ok" : "warn"}`, textContent: a.has_drive_consent ? "已授权文件" : "无本地授权" })),
     ),
@@ -2498,12 +2586,55 @@ function renderTunnelAndAccounts() {
 }
 
 function populateAccountSelectors() {
-  const names = (state.accounts?.accounts || []).map((a) => a.name);
-  fillSelectOptions(document.getElementById("up-account"), names, { emptyLabel: "自动解析" });
+  const accts = state.accounts?.accounts || [];
+  const names = accts.map((a) => a.name);
+  fillSelectOptions(document.getElementById("up-account"), accts, {
+    emptyLabel: "自动解析",
+    valueFn: (a) => a.name,
+    labelFn: (a) => {
+      const u = a.quota?.usage;
+      if (!u) return a.name;
+      const bal = Number(u.balance || 0).toFixed(1);
+      const cnt = Number(u.assignments_count || 0);
+      return `${a.name} (${bal} CCU · ${cnt > 0 ? `${cnt}活跃` : "空闲"})`;
+    },
+  });
   fillSelectOptions(document.getElementById("up-drive-account"), names, { emptyLabel: "自动解析" });
   fillSelectOptions(document.getElementById("wb-account"), names, { emptyLabel: "默认规则解析" });
   fillSelectOptions(document.getElementById("doctor-account"), names, { emptyLabel: "自动解析" });
   fillSelectOptions(document.getElementById("doctor-drive-account"), names, { emptyLabel: "跟随账户绑定" });
+}
+
+async function refreshAccountsUsage({ force = false, silent = true } = {}) {
+  if (state.accountsUsageLoading) return;
+  const btn = document.getElementById("accounts-usage-refresh-btn");
+  state.accountsUsageLoading = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("is-busy");
+    btn.textContent = "查询中...";
+  }
+  renderTunnelAndAccounts();
+  try {
+    const q = force ? "?refresh=1" : "";
+    state.accounts = await apiFetch(`/api/accounts/usage${q}`, { timeoutMs: 25000 });
+    populateAccountSelectors();
+    if (!silent) {
+      showToast("已更新各账户 Colab 可用量", "ok", 2200);
+    }
+  } catch (err) {
+    if (!silent) {
+      showToast(`查询 Colab 可用量失败: ${err.message}`, "danger");
+    }
+  } finally {
+    state.accountsUsageLoading = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("is-busy");
+      btn.textContent = "刷新可用量";
+    }
+    renderTunnelAndAccounts();
+  }
 }
 
 async function loadBootstrap() {
@@ -2535,6 +2666,9 @@ async function loadBootstrap() {
   copilotController?.syncCopilotState();
   renderTasksList();
   renderTunnelAndAccounts();
+  if (!state.accounts?.usage_summary) {
+    void refreshAccountsUsage({ force: false, silent: true });
+  }
 
   if (state.services.length && !document.getElementById("wb-subcommand").options.length) {
     const initialWbSvc = document.getElementById("wb-service").value || state.services[0].name;
@@ -3169,6 +3303,7 @@ function initInteractions() {
   document.getElementById("refresh-btn").addEventListener("click", async () => {
     try {
       await loadBootstrap();
+      void refreshAccountsUsage({ force: true, silent: true });
       showToast("状态已刷新", "ok", 2200);
     } catch (err) {
       showToast(`刷新失败: ${err.message}`, "danger");
@@ -3601,6 +3736,10 @@ function initInteractions() {
     } catch (err) {
       out.textContent = `FRP 检查失败: ${err.message}`;
     }
+  });
+
+  document.getElementById("accounts-usage-refresh-btn")?.addEventListener("click", async () => {
+    await refreshAccountsUsage({ force: true, silent: false });
   });
 
   // Doctor

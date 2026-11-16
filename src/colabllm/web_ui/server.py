@@ -524,6 +524,18 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, report)
                 return
 
+            if path == "/api/accounts/usage" and method == "GET":
+                if self._require_api_auth() is None:
+                    return
+                refresh = _truthy(query.get("refresh", ["0"])[0])
+                snap = runner_bridge.fetch_accounts_usage(refresh=refresh)
+                overview = state_store.accounts_overview(
+                    default_account=self.server.default_account,
+                    usage_snapshot=snap,
+                )
+                self._send_json(200, overview)
+                return
+
             if path == "/api/tunnel":
                 if method == "GET":
                     if self._require_api_auth() is None:
@@ -619,7 +631,10 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
     def _build_bootstrap(self) -> dict[str, Any]:
         catalog = introspect.get_service_catalog()
         instances = state_store.list_all_instances(catalog)
-        accounts = state_store.accounts_overview(default_account=self.server.default_account)
+        accounts = state_store.accounts_overview(
+            default_account=self.server.default_account,
+            usage_snapshot=runner_bridge.get_cached_accounts_usage(),
+        )
         tunnel = state_store.tunnel_overview()
         tasks = self.server.task_manager.list_tasks()
         services_list = sorted(catalog.values(), key=lambda item: item["name"])
