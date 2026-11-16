@@ -914,6 +914,7 @@ button.kpi-card.kpi-action[aria-pressed="true"] {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
   gap: 0.35rem;
   padding: 0.45rem 0.8rem;
   border-radius: var(--radius-sm);
@@ -923,6 +924,7 @@ button.kpi-card.kpi-action[aria-pressed="true"] {
   font: inherit;
   font-size: 13px;
   font-weight: 500;
+  white-space: nowrap;
   cursor: pointer;
   text-decoration: none;
 }
@@ -1449,17 +1451,28 @@ th[aria-sort="descending"] .sort-indicator::after {
 .table-url-cell {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
-  max-inline-size: 260px;
+  gap: 0.45rem;
+  max-inline-size: 300px;
+  min-inline-size: 0;
 }
 
 .table-url-link {
+  flex: 0 1 auto;
+  min-inline-size: 0;
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--accent);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.card-url-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  min-inline-size: 0;
 }
 
 .table-actions-cell {
@@ -1703,6 +1716,7 @@ dialog::backdrop {
   position: relative;
   display: inline-flex;
   align-items: center;
+  flex: none;
 }
 
 .copy-wrap:has(> [hidden]) {
@@ -1754,7 +1768,7 @@ dialog::backdrop {
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.16s ease;
-  z-index: 5;
+  z-index: 12;
 }
 
 .copy-btn:is([data-copied], [data-failed]) + .copy-tip {

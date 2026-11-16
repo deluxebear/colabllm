@@ -459,7 +459,13 @@
                     <code id="wb-cmd-preview">colabllm ...</code>
                   </div>
                   <div class="form-actions">
-                    <button type="button" id="wb-copy-cmd" class="btn secondary">复制命令</button>
+                    <span class="copy-wrap">
+                      <button type="button" id="wb-copy-cmd" class="btn secondary copy-btn" command="--copy" commandfor="wb-cmd-preview">
+                        <span class="copy-icon" aria-hidden="true"></span>
+                        <span>复制命令</span>
+                      </button>
+                      <span class="copy-tip" role="status"></span>
+                    </span>
                     <button type="submit" id="wb-run-btn" class="btn primary">运行子命令</button>
                     <button type="button" id="wb-cancel-btn" class="btn danger" hidden>停止当前任务</button>
                   </div>

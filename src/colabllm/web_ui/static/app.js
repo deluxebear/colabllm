@@ -1184,15 +1184,20 @@ function formatRelativeTime(ts) {
   return { short, full };
 }
 
-function copyTextToClipboard(text, successMsg) {
-  if (!navigator.clipboard?.writeText) {
-    showToast("浏览器不支持自动复制剪贴板，请手动复制", "warn");
-    return;
+async function copyTextToClipboard(text, successMsg) {
+  try {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(text);
+    showToast(successMsg, "ok", 2000);
+  } catch {
+    if (legacyCopyText(text)) {
+      showToast(successMsg, "ok", 2000);
+    } else {
+      showToast("浏览器拒绝剪贴板访问，请手动复制", "warn");
+    }
   }
-  navigator.clipboard.writeText(text).then(
-    () => showToast(successMsg, "ok", 2000),
-    () => showToast("浏览器拒绝剪贴板访问，请手动复制", "warn"),
-  );
 }
 
 const copyTimers = new WeakMap();
@@ -1288,7 +1293,7 @@ async function handleCopyCommand(button, target, command = "--copy") {
   } else if (target.id === "logs-viewer") {
     text = target.dataset.copyEmpty === "1" ? "" : state.logsDisplayedText || "";
   } else {
-    text = target.matches("input, textarea") ? target.value : target.innerText.trim();
+    text = target.matches("input, textarea") ? target.value : (target.innerText || target.textContent || "").trim();
   }
   if (!text) {
     reportCopyButton(
@@ -1642,6 +1647,38 @@ function createActionCluster(surface, idSeq, getInst) {
   return { el: actionsEl, sync };
 }
 
+function createUrlCopyRow(linkId, urlHref, linkClass, wrapClass) {
+  return el(
+    "div",
+    { className: wrapClass },
+    el("a", {
+      id: linkId,
+      className: linkClass,
+      href: urlHref,
+      target: "_blank",
+      rel: "noopener noreferrer",
+      title: urlHref,
+      textContent: urlHref,
+    }),
+    el(
+      "span",
+      { className: "copy-wrap" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "btn sm secondary copy-btn",
+          command: "--copy",
+          commandfor: linkId,
+        },
+        el("span", { className: "copy-icon", "aria-hidden": "true" }),
+        el("span", { textContent: "复制" }),
+      ),
+      el("span", { className: "copy-tip", role: "status" }),
+    ),
+  );
+}
+
 function getOrUpdateInstanceNodes(inst) {
   let entry = instanceNodeCache.get(inst.session_name);
   if (!entry) {
@@ -1849,34 +1886,19 @@ function getOrUpdateInstanceNodes(inst) {
   if (entry.urlSig !== nextUrlSig) {
     entry.urlSig = nextUrlSig;
     if (urlHref) {
-      entry.cardUrlBox.className = "card-url";
-      entry.cardUrlBox.textContent = urlHref;
-
-      entry.tdUrl.replaceChildren(
-        el(
-          "div",
-          { className: "table-url-cell" },
-          el("a", {
-            className: "table-url-link",
-            href: urlHref,
-            target: "_blank",
-            rel: "noopener noreferrer",
-            title: urlHref,
-            textContent: urlHref,
-          }),
-          el("button", {
-            type: "button",
-            className: "btn sm secondary icon-btn",
-            "aria-label": `复制公网地址 (${titleText})`,
-            title: "复制公网地址",
-            textContent: "复制",
-            onClick: () => copyTextToClipboard(urlHref, "已复制公网地址"),
-          }),
-        ),
+      entry.cardUrlBox.className = "";
+      entry.cardUrlBox.replaceChildren(
+        createUrlCopyRow(`inst-card-url-${entry.idSeq}`, urlHref, "card-url", "card-url-row"),
       );
 
-      entry.grpUrlBox.className = "card-url";
-      entry.grpUrlBox.textContent = urlHref;
+      entry.tdUrl.replaceChildren(
+        createUrlCopyRow(`inst-table-url-${entry.idSeq}`, urlHref, "table-url-link", "table-url-cell"),
+      );
+
+      entry.grpUrlBox.className = "";
+      entry.grpUrlBox.replaceChildren(
+        createUrlCopyRow(`inst-grp-url-${entry.idSeq}`, urlHref, "card-url", "card-url-row"),
+      );
     } else {
       const noUrlMsg = inst.hostname ? `预设域名: ${inst.hostname}` : "暂无公网 URL";
       entry.cardUrlBox.className = "muted";
@@ -3649,13 +3671,6 @@ function initInteractions() {
   document.getElementById("wb-account").addEventListener("change", scheduleWorkbenchPreview);
   document.getElementById("wb-form").addEventListener("input", scheduleWorkbenchPreview);
   document.getElementById("wb-form").addEventListener("change", scheduleWorkbenchPreview);
-  document.getElementById("wb-copy-cmd").addEventListener("click", () => {
-    const cmd = document.getElementById("wb-cmd-preview").textContent;
-    navigator.clipboard?.writeText(cmd).then(
-      () => showToast("已复制 CLI 命令", "ok", 2000),
-      () => showToast("复制失败，请手动选中复制", "warn"),
-    );
-  });
 
   document.getElementById("wb-form").addEventListener("submit", async (evt) => {
     evt.preventDefault();
