@@ -380,14 +380,19 @@ class WebServerIntegrationTest(unittest.TestCase):
         self.home_dir = self.tmp / 'colabllm_home'
         self.xdg_dir = self.tmp / 'xdg_config'
         self.user_dir = self.tmp / 'user_home'
-        for d in (self.home_dir, self.xdg_dir, self.user_dir):
+        self.bin_dir = self.tmp / 'bin'
+        for d in (self.home_dir, self.xdg_dir, self.user_dir, self.bin_dir):
             d.mkdir(parents=True, exist_ok=True)
+        colab_stub = self.bin_dir / 'colab'
+        colab_stub.write_text('#!/bin/sh\nexit 99\n', encoding='utf-8')
+        colab_stub.chmod(0o755)
         self._env_patch = patch.dict(
             os.environ,
             {
                 'COLABLLM_HOME': str(self.home_dir),
                 'XDG_CONFIG_HOME': str(self.xdg_dir),
                 'HOME': str(self.user_dir),
+                'PATH': str(self.bin_dir) + os.pathsep + os.environ.get('PATH', ''),
             },
             clear=False,
         )

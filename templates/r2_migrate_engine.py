@@ -2252,6 +2252,13 @@ class MigrationManager:
         public_map = parse_public_urls(public_urls) if public_urls is not None else None
 
         with job.lock:
+            prev_th = job.worker_thread
+            prev_running = job.status in ("queued", "running")
+            if prev_th is not None and prev_th.is_alive() and prev_running:
+                return self._snapshot_job(job)
+        if prev_th is not None and prev_th.is_alive() and prev_th is not threading.current_thread():
+            prev_th.join(timeout=10.0)
+        with job.lock:
             if job.worker_thread is not None and job.worker_thread.is_alive() and job.status in ("queued", "running"):
                 return self._snapshot_job(job)
             job.stop_event.clear()
@@ -2390,7 +2397,15 @@ class MigrationManager:
         """Verify Drive copies (including Cloud sync on fuse.drive) and batch-delete R2 originals (Free DeleteObjects)."""
         job = self._require_job(job_id)
         with job.lock:
-            if job.worker_thread is not None and job.worker_thread.is_alive():
+            prev_th = job.worker_thread
+            prev_running = job.status in ("queued", "running")
+        if prev_th is not None and prev_th.is_alive():
+            if prev_running:
+                raise ValueError("任务仍在运行，请先暂停或等待完成后再执行 cleanup")
+            if prev_th is not threading.current_thread():
+                prev_th.join(timeout=10.0)
+        with job.lock:
+            if (job.worker_thread is not None and job.worker_thread.is_alive()) or job.status in ("queued", "running"):
                 raise ValueError("任务仍在运行，请先暂停或等待完成后再执行 cleanup")
             prev_status = job.status
             job.stop_event.clear()
