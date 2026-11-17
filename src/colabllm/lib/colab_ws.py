@@ -43,6 +43,10 @@ class ColabSessionLostError(ColabWsError):
     """Colab runtime or kernel returned HTTP 404 / no longer exists."""
 
 
+class _ReadyDeadlineExceeded(TimeoutError):
+    """Raised only when the notebook fails to emit CT_READY before `deadline`."""
+
+
 def _colab_config_dir(env: dict[str, str] | None = None) -> Path:
     src = env if env is not None else os.environ
     raw = (src.get("COLAB_CLI_CONFIG_DIR") or "").strip()
@@ -611,7 +615,7 @@ async def _run_execute_cell(
             now = time.monotonic()
             if deadline is not None and not st.get("ready"):
                 if now >= deadline:
-                    raise TimeoutError("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
+                    raise _ReadyDeadlineExceeded("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
 
             if (now - ws.last_rx_mono) > pong_timeout:
                 raise ColabWsError("Connection was lost.")
@@ -734,6 +738,13 @@ async def run_single_ws_session(
     half_open_reclaimed = False
     protocol = NotebookProtocol()
     st = await asyncio.to_thread(state.save, ready=bool(initially_ready), exec_pid=None, exec_identity=None)
+    state_box: dict[str, Any] = {
+        "st": st,
+        "reached_ready": reached_ready,
+        "next_idle_probe_at": 0.0,
+        "next_fast_probe_at": 0.0,
+        "next_status_allowed_at": 0.0,
+    }
 
     ws: AsyncWebSocket | None = None
     try:
@@ -792,19 +803,22 @@ async def run_single_ws_session(
 
         assert ws is not None
         st = await asyncio.to_thread(state.save, exec_pid=None, exec_identity=f"native-ws:{conn_seq}")
+        state_box["st"] = st
 
         cells = _extract_notebook_cells(nb_path, {"CT_SERVICE": svc.name})
         if not cells:
             return 0, reached_ready, False, None
 
         now0 = time.monotonic()
-        state_box: dict[str, Any] = {
-            "st": st,
-            "reached_ready": reached_ready,
-            "next_idle_probe_at": now0 + idle_check_seconds,
-            "next_fast_probe_at": now0 + fast_probe_seconds,
-            "next_status_allowed_at": 0.0,
-        }
+        state_box.update(
+            {
+                "st": st,
+                "reached_ready": reached_ready,
+                "next_idle_probe_at": now0 + idle_check_seconds,
+                "next_fast_probe_at": now0 + fast_probe_seconds,
+                "next_status_allowed_at": 0.0,
+            }
+        )
 
         await _run_execute_cell(
             ws,
@@ -827,7 +841,7 @@ async def run_single_ws_session(
             state_box=state_box,
         )
         st = state_box["st"]
-        reached_ready = bool(state_box["reached_ready"])
+        reached_ready = reached_ready or bool(state_box["reached_ready"]) or bool(st.get("ready"))
 
         cell_failed = False
         total = len(cells)
@@ -861,7 +875,7 @@ async def run_single_ws_session(
                 state_box=state_box,
             )
             st = state_box["st"]
-            reached_ready = bool(state_box["reached_ready"])
+            reached_ready = reached_ready or bool(state_box["reached_ready"]) or bool(st.get("ready"))
             if reclaimed:
                 half_open_reclaimed = True
                 break
@@ -872,6 +886,7 @@ async def run_single_ws_session(
         final_updates = protocol.feed(b"", final=True)
         if final_updates:
             st = await asyncio.to_thread(state.save, **final_updates)
+            state_box["st"] = st
             if st.get("ready"):
                 reached_ready = True
         preflight_error = (
@@ -884,15 +899,18 @@ async def run_single_ws_session(
         if cell_failed or not st.get("ready"):
             return 1, reached_ready, False, preflight_error
         return 0, reached_ready, False, preflight_error
-    except TimeoutError:
+    except _ReadyDeadlineExceeded:
         raise
     except (EOFError, ColabWsError, OSError, ValueError) as err:
+        st = state_box["st"]
+        reached_ready = reached_ready or bool(state_box["reached_ready"]) or bool(st.get("ready"))
         err_line = f"{err}\n".encode("utf-8", errors="replace")
         output_sink(err_line)
         protocol.feed(err_line)
         final_updates = protocol.feed(b"", final=True)
         if final_updates:
             st = await asyncio.to_thread(state.save, **final_updates)
+            state_box["st"] = st
             if st.get("ready"):
                 reached_ready = True
         preflight_error = (

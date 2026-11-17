@@ -156,6 +156,57 @@ class LifecycleSafetyTest(unittest.TestCase):
         cmds = [call.args[0] for call in mock_run.call_args_list]
         self.assertEqual(cmds, [['colab', 'stop', '-s', 'test'], ['colab', 'new', '-s', 'test', '--gpu', 'T4']])
 
+    def test_extract_failure_reason_handles_rich_tracebacks_tagged_messages_and_plain_stderr(self):
+        rich_stderr = (
+            "╭───── Traceback (most recent call last) ─────╮\n"
+            "│ /fake/colab_cli/client.py:229               │\n"
+            "╰─────────────────────────────────────────────╯\n"
+            "ConnectionError: HTTPSConnectionPool(host='colab.research.google.com', port=443):\n"
+            "NameResolutionError(\"Failed to resolve 'colab.research.google.com'\")\n"
+        )
+        extracted_rich = svc._extract_failure_reason("", rich_stderr)
+        self.assertIsNotNone(extracted_rich)
+        self.assertIn("ConnectionError:", extracted_rich)
+        self.assertIn("NameResolutionError", extracted_rich)
+
+        quota_stderr = (
+            "[colab] Creating session 'indextts'...\n"
+            "[colab] Allocation refused (precondition failed).\n"
+        )
+        self.assertEqual(
+            svc._extract_failure_reason("", quota_stderr),
+            "[colab] Allocation refused (precondition failed).",
+        )
+
+        self.assertEqual(
+            svc._extract_failure_reason("", "plain error line 1\nplain error line 2\n"),
+            "plain error line 2",
+        )
+
+    def test_inspect_remote_session_distinguishes_error_from_missing_and_alive(self):
+        dns_err = subprocess.CompletedProcess(
+            ["colab", "status", "-s", "test"],
+            1,
+            "",
+            "╰────╯\nNameResolutionError: Failed to resolve 'colab.research.google.com'\n",
+        )
+        with patch.object(svc, "run", return_value=dns_err):
+            state_name, detail = svc.inspect_remote_session(self.service)
+        self.assertEqual(state_name, "error")
+        self.assertIn("NameResolutionError", detail or "")
+
+        alive_res = subprocess.CompletedProcess(
+            ["colab", "status", "-s", "test"], 0, "[test] ep-1 | Hardware: L4 | Status: BUSY\n", ""
+        )
+        with patch.object(svc, "run", return_value=alive_res):
+            self.assertEqual(svc.inspect_remote_session(self.service), ("alive", None))
+
+        missing_res = subprocess.CompletedProcess(
+            ["colab", "status", "-s", "test"], 0, "[colab] Session 'test' not found.\n", ""
+        )
+        with patch.object(svc, "run", return_value=missing_res):
+            self.assertEqual(svc.inspect_remote_session(self.service), ("missing", None))
+
 
 if __name__ == '__main__':
     unittest.main()

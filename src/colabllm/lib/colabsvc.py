@@ -370,6 +370,49 @@ def banner(lines: list[str]) -> None:
     print("\n" + "=" * w + "\n" + "\n".join(f"    {line}" for line in lines) + "\n" + "=" * w + "\n", flush=True)
 
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _extract_failure_reason(
+    stdout: str | None, stderr: str | None, *, max_len: int = 420
+) -> str | None:
+    """Extract a concise single-line root cause from captured CLI stderr/stdout (including Rich tracebacks)."""
+    for raw in (stderr, stdout):
+        if not raw:
+            continue
+        cleaned = _ANSI_ESCAPE_RE.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")
+        lines = [ln.strip() for ln in cleaned.splitlines()]
+        last_box_end = -1
+        for idx, ln in enumerate(lines):
+            if ln.startswith("╰"):
+                last_box_end = idx
+        if last_box_end >= 0:
+            after = [ln for ln in lines[last_box_end + 1 :] if ln]
+            if after:
+                joined = " ".join(after)
+                return joined if len(joined) <= max_len else joined[: max_len - 3] + "..."
+        tagged_idx = next(
+            (
+                i
+                for i, ln in enumerate(lines)
+                if ln.startswith(("[colab]", "[drive]"))
+                and not ln.startswith(("[colab] Creating session", "[colab] Stopping session"))
+            ),
+            None,
+        )
+        if tagged_idx is not None:
+            joined = " ".join(
+                ln for ln in lines[tagged_idx:] if ln and not ln.startswith(("╭", "│", "╰"))
+            )
+            if joined:
+                return joined if len(joined) <= max_len else joined[: max_len - 3] + "..."
+        non_box = [ln for ln in lines if ln and not ln.startswith(("╭", "│", "╰"))]
+        if non_box:
+            tail = non_box[-1]
+            return tail if len(tail) <= max_len else tail[: max_len - 3] + "..."
+    return None
+
+
 def run(
     cmd: list[str],
     *,
@@ -378,6 +421,7 @@ def run(
     input: str | None = None,
     timeout=None,
     env: dict[str, str] | None = None,
+    quiet_capture_on_error: bool = False,
 ):
     res = subprocess.run(cmd, text=True, input=input,
                          stdout=subprocess.PIPE if capture else None,
@@ -385,9 +429,13 @@ def run(
                          timeout=command_timeout() if timeout is None else timeout,
                          env=env)
     if check and res.returncode != 0:
-        if capture:
+        if capture and not quiet_capture_on_error:
             sys.stderr.write((res.stdout or "") + (res.stderr or ""))
-        raise CliError(f"命令执行失败 ({res.returncode}): {' '.join(cmd[:4])}", res.returncode if res.returncode > 0 else 1)
+        reason = _extract_failure_reason(res.stdout, res.stderr) if capture else None
+        msg = f"命令执行失败 ({res.returncode}): {' '.join(cmd[:4])}"
+        if reason:
+            msg = f"{msg} — {reason}"
+        raise CliError(msg, res.returncode if res.returncode > 0 else 1)
     return res
 
 
@@ -655,12 +703,17 @@ def parse_colab_session_status(session_name: str, returncode: int, stdout: str =
     return "unknown"
 
 
-def check_remote_session(
+def inspect_remote_session(
     svc: Service,
     timeout: float = 30.0,
     *,
     env_overrides: dict[str, str] | None = None,
-) -> str:
+) -> tuple[str, str | None]:
+    """Query `colab status -s <name>` and return `(state, error_detail)`.
+
+    `state` is `'alive'`, `'missing'`, `'unknown'` (command exited 0 with unrecognized text),
+    or `'error'` (command failed / timed out, e.g. local DNS or network outage).
+    """
     try:
         res = run(
             ["colab", "status", "-s", svc.name],
@@ -669,9 +722,23 @@ def check_remote_session(
             timeout=timeout,
             env=colab_env_for(svc, env_overrides=env_overrides),
         )
-    except (OSError, subprocess.SubprocessError, CliError):
-        return "unknown"
-    return parse_colab_session_status(svc.name, res.returncode, res.stdout or "", res.stderr or "")
+    except (OSError, subprocess.SubprocessError, CliError) as err:
+        return "error", str(err)
+    parsed = parse_colab_session_status(svc.name, res.returncode, res.stdout or "", res.stderr or "")
+    if res.returncode != 0 and parsed != "missing":
+        detail = _extract_failure_reason(res.stdout, res.stderr) or f"exit={res.returncode}"
+        return "error", detail
+    return parsed, None
+
+
+def check_remote_session(
+    svc: Service,
+    timeout: float = 30.0,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> str:
+    status_name, _ = inspect_remote_session(svc, timeout=timeout, env_overrides=env_overrides)
+    return "unknown" if status_name == "error" else status_name
 
 
 def finish_runner(state, pid, identity, exit_code=None):
@@ -879,15 +946,33 @@ def _provision_session_for_restart(
         runtime_env = colab_runtime_env_for(target_svc, env_overrides=env_overrides)
         mount_drive = bool(st.get("mount_drive", True))
         try:
-            remote = check_remote_session(target_svc, env_overrides=env_overrides)
+            remote, status_err = inspect_remote_session(target_svc, env_overrides=env_overrides)
+            if remote == "error":
+                warn(
+                    f"[auto-restart] 无法查询远端会话 '{target_svc.name}' 状态"
+                    f"（{status_err or '网络或 Colab 接口异常'}），暂不销毁实例，稍后重试"
+                )
+                return "failed"
             if remote == "alive":
                 log(f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活（本地连接闪断），正在恢复挂载与保活连接")
                 remount_ok = True
                 if mount_drive:
                     try:
                         log("colab dfs mount")
-                        run(["colab", "dfs", "mount", "-s", target_svc.name], env=runtime_env)
+                        run(
+                            ["colab", "dfs", "mount", "-s", target_svc.name],
+                            capture=True,
+                            quiet_capture_on_error=True,
+                            env=runtime_env,
+                        )
                     except (CliError, OSError, subprocess.SubprocessError) as err:
+                        recheck, recheck_err = inspect_remote_session(target_svc, env_overrides=env_overrides)
+                        if recheck == "error":
+                            warn(
+                                f"[auto-restart] 原会话挂载恢复失败且无法复查远端状态"
+                                f"（{recheck_err or err}），暂不销毁实例，稍后重试"
+                            )
+                            return "failed"
                         warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
                         remount_ok = False
                 if remount_ok:
@@ -909,10 +994,15 @@ def _provision_session_for_restart(
             if target_svc.high_mem:
                 args += ["--high-mem"]
             log(" ".join(args))
-            run(args, env=target_env)
+            run(args, capture=True, quiet_capture_on_error=True, env=target_env)
             if mount_drive:
                 log("colab dfs mount")
-                run(["colab", "dfs", "mount", "-s", target_svc.name], env=runtime_env)
+                run(
+                    ["colab", "dfs", "mount", "-s", target_svc.name],
+                    capture=True,
+                    quiet_capture_on_error=True,
+                    env=runtime_env,
+                )
             return "ready"
         except (CliError, OSError, subprocess.SubprocessError) as err:
             warn(f"[auto-restart] 会话恢复失败：{err}")

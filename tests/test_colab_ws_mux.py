@@ -407,6 +407,10 @@ if "-s" in sys.argv:
         sess = sys.argv[idx + 1]
 
 if cmd == "new" and sess:
+    if (root / "fail-new-quota").exists():
+        (root / "fail-new-quota").unlink()
+        print("[colab] Allocation refused (precondition failed).", file=sys.stderr, flush=True)
+        sys.exit(1)
     data = load_sessions()
     tok = "tok-initial"
     if (root / "use-expired-initial-token").exists():
@@ -431,6 +435,10 @@ if cmd == "new" and sess:
     sys.exit(0)
 
 if cmd == "status":
+    if (root / "status-dns-error").exists():
+        print("╰────╯", file=sys.stderr, flush=True)
+        print("NameResolutionError: Failed to resolve 'colab.research.google.com'", file=sys.stderr, flush=True)
+        sys.exit(1)
     missing = set()
     if (root / "session-missing").exists():
         missing.add(sess)
@@ -642,6 +650,91 @@ sys.exit(0)
         self.assertTrue(recreated["ready"])
         self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 2)
         self.assertEqual(self.cli("ollama", "-i", "ar", "down").returncode, 0)
+
+    def test_post_ready_dns_outage_preserves_live_vm_beyond_startup_retry_cap_and_surfaces_errors(self):
+        self.env["COLABLLM_FAST_PROBE_SECONDS"] = "0.08"
+        self.env["COLABLLM_IDLE_CHECK_SECONDS"] = "300"
+        up = self.cli(
+            "ollama", "-i", "dns", "up", "--quick-tunnel", "--no-drive", "--auto-restart", "--restart-delay", "0.03"
+        )
+        self.assertEqual(up.returncode, 0, up.stderr)
+
+        status_before = len([c for c in self.colab_calls() if c[:1] == ["status"]])
+        (self.root / "status-dns-error").touch()
+        (self.root / "reattach-busy-kernel").touch()
+        self.mock_ws.drop_all_ws()
+
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            status_calls = [c for c in self.colab_calls() if c[:1] == ["status"]]
+            if len(status_calls) >= status_before + 4:
+                break
+            time.sleep(0.02)
+        self.assertGreaterEqual(
+            len([c for c in self.colab_calls() if c[:1] == ["status"]]),
+            status_before + 4,
+            self.colab_calls(),
+        )
+
+        sp = self.profile_dir / "services" / "ollama-dns" / "state.json"
+        st_during = json.loads(sp.read_text(encoding="utf-8"))
+        self.assertIsNotNone(st_during.get("runner_pid"), st_during)
+        run_log_path = self.profile_dir / "services" / "ollama-dns" / "run.log"
+        log_during = run_log_path.read_text(encoding="utf-8")
+        self.assertNotIn("首次启动连续", log_during)
+        self.assertIn("无法查询远端会话", log_during)
+        self.assertIn("NameResolutionError", log_during)
+        self.assertEqual([c for c in self.colab_calls() if c[:1] == ["stop"]], [])
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 1)
+        mux_log_path = self.profile_dir / "mux" / "mux.log"
+        mux_text_during = mux_log_path.read_text(encoding="utf-8") if mux_log_path.is_file() else ""
+        self.assertNotIn("NameResolutionError", mux_text_during)
+
+        # Recover network/DNS -> live VM reattaches without `colab new`.
+        (self.root / "status-dns-error").unlink(missing_ok=True)
+        deadline = time.monotonic() + 8.0
+        reattached = {}
+        while time.monotonic() < deadline:
+            reattached = json.loads(sp.read_text(encoding="utf-8"))
+            if int(reattached.get("restart_count") or 0) >= 1 and reattached.get("ready"):
+                break
+            time.sleep(0.03)
+        self.assertTrue(reattached.get("ready"), reattached)
+        self.assertGreaterEqual(int(reattached.get("restart_count") or 0), 1)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 1)
+
+        # Trigger real VM reclamation (`session-missing` + `http-502`) and one `colab new` quota failure.
+        (self.root / "reattach-busy-kernel").unlink(missing_ok=True)
+        (self.root / "fail-new-quota").touch()
+        (self.root / "http-502").touch()
+        (self.root / "session-missing").touch()
+
+        def _clear_502_after_recreate():
+            dl = time.monotonic() + 8.0
+            while time.monotonic() < dl:
+                if len([c for c in self.colab_calls() if c[:1] == ["new"]]) >= 3:
+                    (self.root / "http-502").unlink(missing_ok=True)
+                    return
+                time.sleep(0.03)
+
+        t = threading.Thread(target=_clear_502_after_recreate, daemon=True)
+        t.start()
+        deadline = time.monotonic() + 10.0
+        recreated = {}
+        while time.monotonic() < deadline:
+            recreated = json.loads(sp.read_text(encoding="utf-8"))
+            if int(recreated.get("restart_count") or 0) >= 2 and recreated.get("ready"):
+                break
+            time.sleep(0.03)
+        t.join(timeout=2.0)
+        self.assertTrue(recreated.get("ready"), recreated)
+        self.assertGreaterEqual(int(recreated.get("restart_count") or 0), 2)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 3)
+        log_after = run_log_path.read_text(encoding="utf-8")
+        self.assertIn("[colab] Allocation refused", log_after)
+        mux_text_after = mux_log_path.read_text(encoding="utf-8") if mux_log_path.is_file() else ""
+        self.assertNotIn("Allocation refused", mux_text_after)
+        self.assertEqual(self.cli("ollama", "-i", "dns", "down").returncode, 0)
 
     def test_ws_ping_and_binary_frame_decoding_and_foreground_mode(self):
         # Exercise native WS in foreground mode + verify Jupyter binary frames & RFC 6455 encoding/decoding.
