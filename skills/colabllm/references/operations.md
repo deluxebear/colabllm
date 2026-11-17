@@ -43,6 +43,9 @@ resource ownership before a targeted repair; back up private configuration befor
 | 401 with saved token | Confirm the runtime/instance, URL origin and actual server key |
 | Wrong account or missing Drive credentials in multi-account setup | Inspect `colabllm <service> info --json`, `colab account status`, and `colabllm doctor -a <account>` |
 | New `colab exec` never executes | Last notebook cell intentionally blocks; use logs/HTTP instead |
+| Gateway returns `503` (`runtime_starting` / `runtime_compat_disabled`) | Run `colabllm <service> status --json` or verify `CT_OLLAMA_COMPAT` enables `openai`/`anthropic` |
+| Gateway returns `504` (`cf_edge_524` / `prefill_timeout`) | Enable `stream: true` for long-context prefill or launch runtime with `--transport frp` |
+| Gateway returns `403` on media or Drive field | Gateway blocks Google Drive fields/schemes and external media URLs; pass inline `data:` URIs or binary multipart |
 | Failed `down` | Tracking is preserved; resolve the error and retry, instead of deleting state |
 | Job wait interrupted | Save the job ID and query it later; do not assume it was cancelled |
 

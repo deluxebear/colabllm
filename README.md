@@ -40,10 +40,13 @@ colabllm comfyui up
 colabllm ollama up --dry-run
 colabllm unlimited-ocr --help
 
-# 项目级配置与本地 Web 控制台也使用同一入口
+# 项目级配置与本地控制台/网关也使用同一入口
 colabllm web
 colabllm web -d                         # 后台运行，并支持 --status / --stop
 colabllm web --port 8765 --read-only
+colabllm gateway -d                     # 常驻 OpenAI/Anthropic 兼容聚合网关（默认 127.0.0.1:8787）
+colabllm gateway token create pi-agent  # 签发命名客户端 Token（clgw_...，磁盘仅存 SHA-256）
+colabllm gateway --status               # 查询网关与各副本槽位快照（支持 --json / --stop）
 colabllm tunnel-config
 colabllm frp-config --help
 colabllm frp-status
@@ -58,6 +61,8 @@ colabllm frp-status
 ├── tunnel-config.json           # 全局主域名与 FRP 设置
 ├── services/<name>/state.json   # 实例凭据、会话、隧道与 runner PID
 ├── services/<name>/run.log      # 日志；执行用 notebook 也在实例目录
+├── web/                         # 本地 Web 控制台状态与 web.log
+├── gateway/                     # 本地聚合网关 tokens.json、state.json 与 gateway.log (0600)
 └── frp/<server-id>.json         # FRP 私密凭据
 ```
 
@@ -333,7 +338,11 @@ pyproject.toml                 # 包元数据、版本、colabllm 命令入口
 src/colabllm/
 ├── cli.py                     # 统一命令分发
 ├── control.py                 # 全局域名与 FRP 管理
+├── gateway.py                 # 常驻多模型聚合网关命令行入口
+├── gateway_runtime/           # 网关能力目录、鉴权、亲和路由与 HTTP/1.1 转发
 ├── utility.py                 # 通用工具子命令
+├── web.py                     # 本地可视化 Web 控制台入口
+├── web_ui/                    # 本地浏览器控制台服务与静态资源
 ├── lib/                       # 本地共享 runner、状态、HTTP/音频工具与 FRP 实现
 └── services/                  # <name>.py + <name>.ipynb；随包安装
 templates/                     # notebook 生成器 build_notebooks.py 与嵌入 notebook 的独立模块
@@ -343,6 +352,29 @@ tools/                         # 文档同步、分发包校验、基准测试�
 tests/                         # 本地测试（Python 标准库）
 tests_colab/                   # 仅在 Colab 模型环境运行的回归测试
 ```
+
+## 本地常驻聚合网关 (`colabllm gateway`)
+
+`colabllm gateway` 与本地 Web 控制台隔离运行，在固定端口（默认 `127.0.0.1:8787`，端口占用时直接退出）将本机就绪的 12 个 OpenAI 兼容文本与多模态运行时聚合成单一入口，向跨机 `pi` 编程代理及 OpenAI / Anthropic SDK 提供标准化调用与可独立吊销凭据（`clgw_...`，支持 `Authorization: Bearer` 与 `x-api-key`）：
+
+```bash
+# 1. 启动后台常驻网关（仅推荐在 Tailscale/WireGuard 组网或带 --allow-host 的 HTTPS 反代后使用 --allow-remote）
+colabllm gateway --detach --host 0.0.0.0 --allow-remote --allow-host host-a.ts.net --json
+
+# 2. 为不同终端设备签发、轮换或即时吊销命名 Token（服务运行中热生效，不中断现有连接）
+colabllm gateway token create laptop-sdk --json
+colabllm gateway token list
+colabllm gateway token rotate laptop-sdk --json
+colabllm gateway token revoke laptop-sdk
+
+# 3. 查询脱敏运行快照与停止网关
+colabllm gateway --status --json
+colabllm gateway --stop
+```
+
+*   **统一模型寻址与前缀音色接口**：客户端通过 `GET /v1/models` 发现并采用 `<upstream_model>@<runtime>[:<instance_id|default>]` 发起请求（保留 `ollama` `@sha256:` 摘要，无 `@<runtime>` 后缀的裸模型返回 `HTTP 400`）；TTS 音色只读查询走前缀路由 `GET /r/{qwen3-tts,indextts,drama3}[:<inst>]/v1/audio/voices`。
+*   **`-np 1` 前缀亲和与预响应切换**：网关从激活实例的 `state.json` 读取并发槽位并维护对话/Messages/Responses/Completions 根前缀 LRU 亲和（短宽限等待与全满 `HTTP 429` + `Retry-After` 背压），仅在尚未向客户端发出响应字节前于保有目标模型的健康副本间切换。
+*   **默认 Fail-Closed 安全边界与 `524` 超时建议**：跨机请求禁止任何 Google Drive 头/字段、`/api/ct/*` 与音色变更接口、外部 `http(s)://` 媒体 URL 与视频托管/yt-dlp 域名（返 `HTTP 403`，仅放行 `data:` 内联媒体与二进制 multipart 上传）；生图不支持 `response_format="url"`（返 `HTTP 400`）；工具定义 Schema 与结构化工具调用载荷按三协议精确豁免以防误伤代理。遇到 Cloudflare Quick Tunnel 约 100 秒超时断连或本地 prefill 超时时，网关统一返 `HTTP 504`（区分 `cf_edge_524` 与 `prefill_timeout`），长上下文任务建议开启 `stream: true` 或改用 `--transport frp`。详见 [运行时通用操作](https://github.com/deluxebear/colabllm/blob/master/docs/runtime-common.md)。
 
 ## 本地环境与前置准备
 

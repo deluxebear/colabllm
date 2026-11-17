@@ -24,6 +24,11 @@ def _inspect_wheel(wheel: Path) -> list[str]:
         assert 'colabllm/web.py' in names, 'Missing web CLI module'
         assert 'colabllm/web_ui/server.py' in names, 'Missing web_ui server module'
         assert 'colabllm/web_ui/api_catalog.py' in names, 'Missing web_ui api_catalog module'
+        assert 'colabllm/gateway.py' in names, 'Missing gateway CLI module'
+        for gw_mod in ('__init__.py', 'catalog.py', 'auth.py', 'routing.py', 'server.py'):
+            assert f'colabllm/gateway_runtime/{gw_mod}' in names, f'Missing gateway_runtime/{gw_mod}'
+        for lib_mod in ('local_daemon.py', 'instance_discovery.py'):
+            assert f'colabllm/lib/{lib_mod}' in names, f'Missing lib/{lib_mod}'
         for asset in ('index.html', 'styles.css', 'copilot.css', 'app.js', 'copilot.js', 'copilot_studios.js', 'favicon.svg'):
             assert f'colabllm/web_ui/static/{asset}' in names, f'Missing web_ui static asset: {asset}'
         assert any(n.endswith('/licenses/LICENSE') or n.endswith('/LICENSE') for n in names), 'Missing LICENSE in wheel'
@@ -35,7 +40,7 @@ def _inspect_wheel(wheel: Path) -> list[str]:
             notebook = json.loads(archive.read(f'colabllm/services/{service}.ipynb'))
             assert notebook['cells'], f'Empty notebook: {service}'
             assert all(not cell.get('outputs') for cell in notebook['cells']), f'Notebook outputs: {service}'
-        assert not any('/.state/' in n or n.endswith('state.json') for n in names)
+        assert not any('/.state/' in n or n.endswith(('state.json', 'tokens.json', 'gateway.log')) for n in names)
         return services
 
 
@@ -51,6 +56,11 @@ def _inspect_sdist(sdist: Path) -> list[str]:
         assert any(n.endswith('/src/colabllm/web.py') for n in names), 'Missing web CLI module in sdist'
         assert any(n.endswith('/src/colabllm/web_ui/server.py') for n in names), 'Missing web_ui server module in sdist'
         assert any(n.endswith('/src/colabllm/web_ui/api_catalog.py') for n in names), 'Missing web_ui api_catalog module in sdist'
+        assert any(n.endswith('/src/colabllm/gateway.py') for n in names), 'Missing gateway CLI module in sdist'
+        for gw_mod in ('__init__.py', 'catalog.py', 'auth.py', 'routing.py', 'server.py'):
+            assert any(n.endswith(f'/src/colabllm/gateway_runtime/{gw_mod}') for n in names), f'Missing gateway_runtime/{gw_mod} in sdist'
+        for lib_mod in ('local_daemon.py', 'instance_discovery.py'):
+            assert any(n.endswith(f'/src/colabllm/lib/{lib_mod}') for n in names), f'Missing lib/{lib_mod} in sdist'
         for asset in ('index.html', 'styles.css', 'copilot.css', 'app.js', 'copilot.js', 'copilot_studios.js', 'favicon.svg'):
             assert any(n.endswith(f'/src/colabllm/web_ui/static/{asset}') for n in names), f'Missing web_ui static asset in sdist: {asset}'
         assert any(n.endswith('/LICENSE') for n in names), 'Missing LICENSE in sdist'
@@ -63,7 +73,7 @@ def _inspect_sdist(sdist: Path) -> list[str]:
                 notebook = json.loads(archive.extractfile(members[name]).read())
                 assert notebook['cells'], f'Empty notebook in sdist: {name}'
                 assert all(not cell.get('outputs') for cell in notebook['cells']), f'Notebook outputs in sdist: {name}'
-        assert not any('/.state/' in n or n.endswith('state.json') for n in names)
+        assert not any('/.state/' in n or n.endswith(('state.json', 'tokens.json', 'gateway.log')) for n in names)
         return services
 
 
@@ -135,7 +145,11 @@ def check(artifact):
             assert 'colabllm _complete' in script
         assert 'tts' in run([command, '_complete', '--', 'qwen3-tts', 't']).splitlines()
         assert 'web' in run([command, '_complete', '--', 'w']).splitlines()
+        assert 'gateway' in run([command, '_complete', '--', 'g']).splitlines()
+        assert 'create' in run([command, '_complete', '--', 'gateway', 'token', '']).splitlines()
         run([command, 'web', '--help'])
+        run([command, 'gateway', '--help'])
+        run([command, 'gateway', 'token', '--help'])
         run([command, 'frp-config', '--help'])
         skill_text = run([command, 'skill'])
         assert 'name: colabllm' in skill_text
@@ -163,6 +177,11 @@ def check(artifact):
         for service in services:
             run([command, service, 'up', '--dry-run', '--quick-tunnel', '-i', 'check'])
         assert not override.exists(), 'Dry-run unexpectedly wrote state'
+        gw_empty = root / 'empty-gw-home'
+        env['COLABLLM_HOME'] = str(gw_empty)
+        assert json.loads(run([command, 'gateway', '--status', '--json'])) == {'running': False}
+        assert json.loads(run([command, 'gateway', 'token', 'list', '--json'])) == {'tokens': []}
+        assert not gw_empty.exists(), 'Gateway status/token list unexpectedly created COLABLLM_HOME'
     kind = 'Wheel' if artifact.name.endswith('.whl') else 'Source distribution'
     print(f'{kind} verified: {len(services)} services; isolated uv installation, LICENSE, notebook resources, user config and dry-runs passed.')
 

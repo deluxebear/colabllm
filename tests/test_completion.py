@@ -17,9 +17,16 @@ class CompletionTest(unittest.TestCase):
     def test_real_commands_options_and_choices(self):
         self.assertIn('doctor', candidates(['d']))
         self.assertIn('web', candidates(['w']))
+        self.assertIn('gateway', candidates(['g']))
         web_flags = candidates(['web', '--'])
         for flag in ('--read-only', '--detach', '--status', '--stop', '--json'):
             self.assertIn(flag, web_flags)
+        gw_cands = candidates(['gateway', ''])
+        for item in ('token', '--host', '--port', '--allow-remote', '--allow-host', '--detach', '--status', '--stop'):
+            self.assertIn(item, gw_cands)
+        self.assertEqual(candidates(['gateway', 'token', 'c']), ['create'])
+        self.assertIn('--json', candidates(['gateway', 'token', 'create', 'pi', '--']))
+        self.assertEqual(candidates(['gateway', '--host', '']), [])
         self.assertIn('tts', candidates(['qwen3-tts', 't']))
         self.assertNotIn('_exec', candidates(['ollama', '']))
         self.assertEqual(candidates(['qwen3-tts', 'tts', '--format', 'm']), ['mp3'])

@@ -4,16 +4,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import errno
 import fcntl
-import ipaddress
 import json
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import webbrowser
@@ -27,8 +24,19 @@ for _path in (str(_LIB_DIR), str(_SRC_DIR)):
 
 from cli_support import CliError, UsageError, positive_seconds, run_cli  # noqa: E402
 from colab_accounts import validate_account  # noqa: E402
-from paths import private_dir, user_home  # noqa: E402
-from processes import owned_process, process_identity, stop_owned_process  # noqa: E402
+from local_daemon import (  # noqa: E402
+    _display_host,
+    _normalize_host,
+    _validate_bind_args,
+    acquire_instance_lock as _acquire_lock_shared,
+    bind_http_server,
+    cleanup_own_daemon_state as _cleanup_own_daemon_state_shared,
+    is_loopback_host,
+    load_live_daemon_state as _load_live_daemon_state_shared,
+    stop_daemon as _stop_daemon_shared,
+)
+from paths import private_dir, user_home, write_private  # noqa: E402
+from processes import process_identity, stop_owned_process  # noqa: E402
 
 _DAEMON_ENV = '_COLABLLM_WEB_DAEMON'
 
@@ -66,34 +74,6 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _normalize_host(raw_host: str) -> str:
-    host = (raw_host or '').strip()
-    if host.startswith('[') and host.endswith(']'):
-        host = host[1:-1]
-    if not host:
-        raise UsageError('监听地址不能为空')
-    return host
-
-
-def is_loopback_host(host: str) -> bool:
-    normalized = _normalize_host(host)
-    if normalized.lower() == 'localhost':
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
-
-
-def _display_host(host: str) -> str:
-    normalized = _normalize_host(host)
-    if normalized in ('0.0.0.0', '::'):
-        return '127.0.0.1' if normalized == '0.0.0.0' else '[::1]'
-    if ':' in normalized:
-        return f'[{normalized}]'
-    return normalized
-
-
 def _should_auto_open(no_open: bool) -> bool:
     if no_open:
         return False
@@ -106,59 +86,23 @@ def _should_auto_open(no_open: bool) -> bool:
     return True
 
 
-def _validate_bind_args(host: str, port: int, allow_remote: bool) -> str:
-    if not (0 <= port <= 65535):
-        raise UsageError('端口号必须在 0–65535 之间')
-    normalized_host = _normalize_host(host)
-    if not is_loopback_host(normalized_host) and not allow_remote:
-        raise UsageError('默认仅允许绑定本机回环地址；若确需监听其他地址，请显式指定 --allow-remote')
-    return normalized_host
-
-
 def _daemon_paths() -> tuple[Path, Path, Path, Path]:
     web_dir = user_home() / 'web'
     return web_dir, web_dir / 'state.json', web_dir / 'web.log', web_dir / 'instance.lock'
 
 
 def _write_private_json(path: Path, payload: dict) -> None:
-    private_dir(path.parent)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix='.state.', suffix='.json')
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        os.replace(tmp_name, path)
-    except BaseException:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
+    write_private(path, payload)
 
 
 def _load_live_daemon_state(*, unlink_stale: bool = True) -> dict | None:
     _, state_path, _, _ = _daemon_paths()
-    if not state_path.is_file():
-        return None
-    try:
-        loaded = json.loads(state_path.read_text(encoding='utf-8'))
-    except (OSError, ValueError, UnicodeDecodeError):
-        if unlink_stale:
-            state_path.unlink(missing_ok=True)
-        return None
-    if not isinstance(loaded, dict) or not owned_process(loaded.get('pid'), loaded.get('identity')):
-        if unlink_stale:
-            state_path.unlink(missing_ok=True)
-        return None
-    return loaded
+    return _load_live_daemon_state_shared(state_path, unlink_stale=unlink_stale)
 
 
 def _cleanup_own_daemon_state(pid: int, identity: str) -> None:
     _, state_path, _, _ = _daemon_paths()
-    try:
-        loaded = json.loads(state_path.read_text(encoding='utf-8'))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return
-    if isinstance(loaded, dict) and loaded.get('pid') == pid and loaded.get('identity') == identity:
-        state_path.unlink(missing_ok=True)
+    _cleanup_own_daemon_state_shared(state_path, pid, identity)
 
 
 def _already_running_error(st: dict | None) -> CliError:
@@ -176,31 +120,14 @@ def _already_running_error(st: dict | None) -> CliError:
 
 
 def _acquire_instance_lock(*, probe_only: bool = False):
-    web_dir, _, _, lock_path = _daemon_paths()
-    private_dir(web_dir)
-    lock_file = lock_path.open('a+', encoding='utf-8')
-    try:
-        os.chmod(lock_path, 0o600)
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        lock_file.close()
-        st = None
-        deadline = time.monotonic() + 0.3
-        while time.monotonic() < deadline:
-            st = _load_live_daemon_state(unlink_stale=False)
-            if st is not None:
-                break
-            time.sleep(0.03)
-        raise _already_running_error(st) from None
-    except BaseException:
-        lock_file.close()
-        raise
-    if probe_only:
-        with contextlib.suppress(OSError):
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-        lock_file.close()
-        return None
-    return lock_file
+    web_dir, state_path, _, lock_path = _daemon_paths()
+    return _acquire_lock_shared(
+        web_dir,
+        lock_path,
+        state_path,
+        already_running_error=_already_running_error,
+        probe_only=probe_only,
+    )
 
 
 def _public_daemon_payload(st: dict) -> dict:
@@ -228,23 +155,20 @@ def create_bound_server(
 ):
     from colabllm.web_ui.server import WebConsoleServer
 
-    normalized_host = _validate_bind_args(host, port, allow_remote)
-
-    attempts = [port] if (strict_port or port == 0) else [port + offset for offset in range(25) if port + offset <= 65535]
-    last_error: OSError | None = None
-    for candidate_port in attempts:
-        try:
-            return WebConsoleServer(
-                (normalized_host, candidate_port),
-                read_only=read_only,
-                default_account=default_account,
-                allow_remote=allow_remote,
-            )
-        except OSError as err:
-            last_error = err
-            if err.errno != errno.EADDRINUSE or strict_port or port == 0:
-                raise CliError(f'无法监听 {normalized_host}:{candidate_port}: {err.strerror or err}') from None
-    raise CliError(f'从 {port} 起连续端口均已被占用：{last_error}')
+    return bind_http_server(
+        host,
+        port,
+        server_factory=lambda addr: WebConsoleServer(
+            addr,
+            read_only=read_only,
+            default_account=default_account,
+            allow_remote=allow_remote,
+        ),
+        allow_remote=allow_remote,
+        strict_port=strict_port,
+        port_span=25,
+        min_port=0,
+    )
 
 
 def _cmd_status(output_json: bool) -> int:
@@ -271,17 +195,14 @@ def _cmd_status(output_json: bool) -> int:
 
 
 def _cmd_stop(output_json: bool) -> int:
-    st = _load_live_daemon_state()
-    if st is None:
+    _, state_path, _, _ = _daemon_paths()
+    pid = _stop_daemon_shared(state_path, timeout=5)
+    if pid is None:
         if output_json:
             print(json.dumps({'stopped': False, 'running': False}, ensure_ascii=False))
         else:
             print('Web 控制台未运行。')
         return 0
-    pid = int(st['pid'])
-    stop_owned_process(pid, st['identity'], group=(st.get('mode') != 'foreground'), timeout=5)
-    _, state_path, _, _ = _daemon_paths()
-    state_path.unlink(missing_ok=True)
     if output_json:
         print(json.dumps({'stopped': True, 'running': False, 'pid': pid}, ensure_ascii=False))
     else:

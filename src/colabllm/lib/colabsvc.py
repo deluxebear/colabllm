@@ -285,49 +285,31 @@ def cmd_tunnel_config(args) -> None:
 
 
 def _known_service_names() -> set[str]:
-    services_dir = Path(__file__).resolve().parents[1] / "services"
-    if not services_dir.is_dir():
-        return set()
-    return {p.stem for p in services_dir.glob("*.py") if p.with_suffix(".ipynb").is_file()}
+    from instance_discovery import discover_service_pairs
+    return set(discover_service_pairs(Path(__file__).resolve().parents[1] / "services"))
 
 
 def list_service_instances(base_name: str) -> list[dict]:
     """Return status dicts for the default instance and all `<base_name>-<id>` instances found in `~/.colabllm/services/`."""
-    directory = STATE_ROOT / "services"
-    if not directory.is_dir():
-        return []
-    longer_services = {name for name in _known_service_names() if len(name) > len(base_name) and name.startswith(base_name + "-")}
+    from instance_discovery import list_raw_instances
+    raw_items = list_raw_instances(
+        STATE_ROOT / "services",
+        _known_service_names(),
+        target_service=base_name,
+        alive_fn=runner_alive,
+        on_corrupt="skip",
+    )
     items: list[dict] = []
-    for d in sorted(directory.iterdir()):
-        if not d.is_dir():
-            continue
-        if d.name == base_name:
-            inst_id = ""
-        elif d.name.startswith(base_name + "-"):
-            inst_id = d.name[len(base_name) + 1:]
-        else:
-            continue
-        sp = d / "state.json"
-        if not sp.is_file():
-            continue
-        try:
-            st = json.loads(sp.read_text())
-        except Exception:
-            continue
-        recorded_base = st.get("base_service")
-        if recorded_base is not None:
-            if recorded_base != base_name:
-                continue
-        elif any(d.name == other or d.name.startswith(other + "-") for other in longer_services):
-            continue
-        alive = runner_alive(st)
+    for raw in raw_items:
+        st = raw["state"]
+        alive = raw["alive"]
         items.append({
-            "instance": inst_id or "default",
-            "instance_arg": inst_id,
-            "name": d.name,
+            "instance": raw["instance"],
+            "instance_arg": raw["instance_arg"],
+            "name": raw["name"],
             "alive": alive,
             "running": alive,
-            "ready": bool(st.get("ready") and alive),
+            "ready": raw["ready"],
             "auto_restart": bool(st.get("auto_restart")),
             "restart_count": int(st.get("restart_count", 0)),
             "runner_pid": st.get("runner_pid"),

@@ -13,6 +13,10 @@ colabllm web -d
 colabllm web --status
 colabllm web --stop
 colabllm web --port 8765 --read-only
+colabllm gateway --detach
+colabllm gateway --status --json
+colabllm gateway --stop
+colabllm gateway token list --json
 colabllm doctor
 colabllm doctor -a ACCOUNT --online --timeout 10
 colabllm tunnel-config
@@ -70,3 +74,9 @@ TTS 和转写的 `--timeout` 是请求限时；OCR/Avatar/Openjutsu/MiniMax-H3-I
 查 `logs`、`status --json`、`colab sessions --all`、`colab account status`；最后一个 notebook cell 阻塞是保活设计，新的 `colab exec` 可能排队。
 DNS 归属冲突先核对 `tunnel-config` 与 `frp-status` 的项目 ID/服务路由；不能覆盖不明归属的记录。
 停止或重置前先确认没有正在生成、训练或转写的任务，并保留任务 ID、输出和恢复信息。
+
+## 本地聚合网关 (`colabllm gateway`)
+
+- **常驻固定入口与 Token 管理**：`colabllm gateway` 默认监听 `127.0.0.1:8787`（端口冲突报错），支持 `-d/--detach`、`--status`、`--stop` 与 `token {create,list,rotate,revoke}`；跨机访问须在 Tailscale/WireGuard 或带 TLS 的前置反代后显式配置 `--allow-remote` 与 `--allow-host`。`tokens.json`（`0600`）仅保存 SHA-256 摘要，客户端凭据形如 `clgw_...`（兼容 `Authorization: Bearer` 与 `x-api-key`）。
+- **模型路由与可用端点**：`GET /v1/models` 动态聚合全部已开启 OpenAI 兼容模式且处于 `READY` 的文本/多模态运行时；请求模型须写为 `<upstream_model>@<runtime>[:<instance_id|default>]`（无状态 `/v1/responses` 不支持 `previous_response_id`，`llama-server` 与多副本未指明 `:inst` 的 `ollama` 携带该字段返回 `HTTP 400`）。TTS 音色只读查询使用 `GET /r/{qwen3-tts,indextts,drama3}[:<inst>]/v1/audio/voices`。
+- **安全与超时诊断**：网关默认阻断 Drive 读写请求头/字段、`/api/ct/*`、音色写接口、视频托管下载域名与全部外部 `http(s)://` 媒体引用（返 `HTTP 403`，跨机媒体请使用 `data:` 内联 URI 或二进制 multipart 上传；生图 `response_format="url"` 返 `HTTP 400`）。`STARTING` 实例返回 `HTTP 503`；prefill 超时与 Quick Tunnel `524` 均统一返回 `HTTP 504`（提示启用流式输出 `stream: true` 或改用 `--transport frp`）。

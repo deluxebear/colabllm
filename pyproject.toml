@@ -27,7 +27,7 @@ Issues = "https://github.com/deluxebear/colabllm/issues"
 Changelog = "https://github.com/deluxebear/colabllm/blob/master/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["colabllm", "colabllm.web_ui"]
+packages = ["colabllm", "colabllm.web_ui", "colabllm.gateway_runtime"]
 package-dir = {"" = "src"}
 include-package-data = false
 

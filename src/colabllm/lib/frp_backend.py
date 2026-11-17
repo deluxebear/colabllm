@@ -9,6 +9,7 @@ import shutil
 import subprocess
 from cli_support import command_timeout
 from pathlib import Path
+from paths import private_dir, write_private
 
 
 def validate_config(config):
@@ -53,21 +54,6 @@ def remote(config, payload):
 def credentials_path(state_root, config):
     identity=config['ssh']+'|'+config['server_ip']+'|'+str(config['server_port'])
     return Path(state_root)/'frp'/ (hashlib.sha256(identity.encode()).hexdigest()[:24]+'.json')
-
-
-def write_private(path, data):
-    path=Path(path)
-    from paths import private_dir
-    private_dir(path.parent)
-    temp=path.with_name(path.name+'.'+secrets.token_hex(6)+'.tmp')
-    try:
-        with temp.open('x') as output:
-            os.chmod(temp,0o600)
-            json.dump(data,output,indent=2)
-            output.write('\n')
-        temp.replace(path)
-    finally:
-        temp.unlink(missing_ok=True)
 
 
 def configure(args, state_root):

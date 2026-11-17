@@ -117,6 +117,7 @@ There is no public command for setting an arbitrary persistent key. `up --new-cr
 a random replacement on a stopped instance. Do not pretend a local state edit rotates a live server.
 
 Configuration/state lives in `~/.colabllm/` or `COLABLLM_HOME`. Respect that selected profile.
+For fixed-port multi-runtime OpenAI/Anthropic SDK or `pi` agent access across machines without exposing control-plane operations, run `colabllm gateway` (`-d`/`--detach`, `--status --json`, `--stop`, `--allow-remote --allow-host HOST`) with named SHA-256 hashed tokens (`colabllm gateway token create|list|rotate|revoke NAME`). Address models via `<upstream_model>@<runtime>[:<inst|default>]` and read-only TTS voices via `GET /r/{qwen3-tts,indextts,drama3}[:<inst>]/v1/audio/voices`. The gateway rejects Google Drive fields/schemes, external `http(s)://` media URLs (send inline `data:` URIs or binary multipart uploads), and `response_format="url"` (`400`).
 Local relative file paths resolve against the caller's directory. `drive://...` means a path under
 MyDrive on the remote VM, not a local path, browser sharing URL or Drive file ID.
 Task/client interruption need not stop server-side work: retain returned job IDs and resume querying

@@ -7,10 +7,11 @@ import runpy
 from cli_support import UsageError
 from colab_accounts import list_account_names
 from colabsvc import build_parser
+from instance_discovery import list_instance_dir_names
 from paths import user_home
 
 ROOT = Path(__file__).resolve().parents[1]
-GLOBAL = ('services', 'help', 'doctor', 'completion', 'skill', 'web', 'tunnel-config', 'frp-config', 'frp-status')
+GLOBAL = ('services', 'help', 'doctor', 'completion', 'skill', 'web', 'gateway', 'tunnel-config', 'frp-config', 'frp-status')
 FLAGS = ('--help', '--version', '--account', '--debug', '--quiet', '--no-color', '--command-timeout')
 
 
@@ -19,22 +20,7 @@ def service_scripts():
 
 
 def instance_ids(service):
-    directory = user_home() / 'services'
-    if not directory.is_dir():
-        return []
-    scripts = service_scripts()
-    longer = {name for name in scripts if len(name) > len(service) and name.startswith(service + '-')}
-    prefix = service + '-'
-    results = []
-    for p in directory.iterdir():
-        if not p.is_dir() or not p.name.startswith(prefix):
-            continue
-        if any(p.name == other or p.name.startswith(other + '-') for other in longer):
-            continue
-        inst = p.name[len(prefix):]
-        if re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]{0,63}', inst):
-            results.append(inst)
-    return sorted(results)
+    return list_instance_dir_names(user_home() / 'services', service, service_scripts())
 
 
 def _normalize_wordbreaks(words):
@@ -83,10 +69,18 @@ def candidates(words):
         return [shell for shell in ('bash', 'zsh', 'fish') if shell.startswith(prefix)]
     if service not in scripts:
         parser = None
+        append_gateway_token = False
         if service in ('doctor', 'skill'):
             parser = runpy.run_path(str(ROOT/'utility.py'))['build_parser']()
         elif service == 'web':
             parser = runpy.run_path(str(ROOT/'web.py'))['build_parser']()
+        elif service == 'gateway':
+            gw_mod = runpy.run_path(str(ROOT/'gateway.py'))
+            if 'token' in done:
+                parser = gw_mod['build_token_parser']()
+            else:
+                parser = gw_mod['build_parser']()
+                append_gateway_token = True
         elif service in ('tunnel-config', 'frp-config', 'frp-status'):
             # Global controller parsers are also shared with completion.
             parser = runpy.run_path(str(ROOT/'control.py'))['build_parser']()
@@ -94,6 +88,7 @@ def candidates(words):
             return []
         done.insert(0, service)
     else:
+        append_gateway_token = False
         module = runpy.run_path(str(scripts[service]))
         parser = build_parser(module['SERVICE'], module.get('configure_cli'))
     root_options = {flag: action for action in parser._actions for flag in action.option_strings}
@@ -132,6 +127,8 @@ def candidates(words):
             values = list(expected.choices or ())
         return [flag_prefix + str(value) for value in values if str(value).startswith(prefix)]
     values = list(options)
+    if append_gateway_token:
+        values.append('token')
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
             values.extend(name for name in action.choices if not name.startswith('_'))

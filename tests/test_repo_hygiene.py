@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "src/colabllm/lib"))
 
 SKIP_DIRS = {".git", ".state", "dist", "build", "__pycache__", ".venv", "venv", "node_modules"}
@@ -120,6 +121,17 @@ class RepoHygieneTest(unittest.TestCase):
         ):
             alias = load_service(name).SERVICE.default_hostname
             self.assertTrue(alias and "." not in alias, (name, alias))
+
+    def test_every_service_is_registered_in_gateway_catalog(self):
+        from colabllm.gateway_runtime.catalog import GATEWAY_RUNTIME_SPECS
+        from instance_discovery import discover_service_pairs
+
+        paired = set(discover_service_pairs(ROOT / "src/colabllm/services"))
+        self.assertEqual(paired, set(GATEWAY_RUNTIME_SPECS.keys()))
+        for name, spec in GATEWAY_RUNTIME_SPECS.items():
+            if spec.gateway_enabled:
+                self.assertTrue(spec.allowed_v1_routes, f"{name} missing allowed_v1_routes")
+                self.assertIn(("GET", "/v1/models"), spec.allowed_v1_routes)
 
 
 if __name__ == "__main__":

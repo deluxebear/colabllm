@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent
 GLOBAL_COMMANDS = ('tunnel-config', 'frp-config', 'frp-status')
 UTILITY_COMMANDS = ('doctor', 'completion', 'skill')
 WEB_COMMANDS = ('web',)
+GATEWAY_COMMANDS = ('gateway',)
 _ACCOUNT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
 
 
@@ -84,13 +85,14 @@ def main(argv=None):
               '      colabllm <全局配置命令> [参数...]\n'
               '\n'
               '运行时: ' + ', '.join(available) + '\n'
-              '全局命令: ' + ', '.join((*GLOBAL_COMMANDS, *UTILITY_COMMANDS, *WEB_COMMANDS)) + '\n\n'
+              '全局命令: ' + ', '.join((*GLOBAL_COMMANDS, *UTILITY_COMMANDS, *WEB_COMMANDS, *GATEWAY_COMMANDS)) + '\n\n'
               '示例:\n'
               '  colabllm unlimited-ocr up\n'
               '  colabllm unlimited-ocr up -a work --drive-account main\n'
               '  colabllm unlimited-ocr ocr ./documents -O ./results\n'
               '  colabllm qwen3-tts up -i 2\n'
               '  colabllm web\n'
+              '  colabllm gateway --detach\n'
               '  colabllm tunnel-config\n\n'
               '全局选项: --account ACCOUNT、--debug、--quiet、--no-color、--command-timeout SECONDS\n'
               'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
@@ -113,6 +115,9 @@ def main(argv=None):
         remaining = [command, *remaining]
     elif command in WEB_COMMANDS:
         script = ROOT / 'web.py'
+        remaining = [command, *remaining]
+    elif command in GATEWAY_COMMANDS:
+        script = ROOT / 'gateway.py'
         remaining = [command, *remaining]
     elif command in GLOBAL_COMMANDS:
         script = ROOT / 'control.py'
