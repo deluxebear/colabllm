@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-18
+
+### 新增
+
+- **Kaggle 运行时子命令命名空间（`colabllm kaggle <short_name> <subcmd>`）与纯 CPU 诊断运行时（`web-probe`）**：
+  - 新增隔离状态树 `~/.colabllm/kaggle/services/<session>/state.json`、多账户注册表只读解析与优先级锁定（`kaggle_accounts.py`）、非 CPU 加速器每周剩余配额门禁（`remaining_hours > 0.15` fail-closed）、双向 Cloudflare Tunnel / FRP DNS 归属隔离（`kagglesvc` / `kagglesvc-frp`，自动前缀 `kaggle-<alias>` 子域名）、四分支 `--auto-restart` 看门狗、非 CPU `--max-uptime`（默认 `6h`）以及 `CT_READY` 前全模式反孤儿远端停机保护。
+  - 随包分发纯 CPU 诊断探针服务 `web-probe`（`gateway_enabled=False`），采用 `/kaggle/working/.ct-cache/bin` 固定版本 SHA-256 校验缓存与 `/tmp/ct-runtime`（`0700`）运行时私密凭据分区，通过本地 `0600` `runtime.env` 在内核内存中静默注入隧道与鉴权密钥，避免云端占位 Notebook 留存明文凭据。
+- **`colabllm web`、`colabllm gateway`、`doctor` 与 Shell 补全多平台纳管**：
+  - `colabllm web` 同时自省 Colab 与 Kaggle 服务目录（双射前缀键名 `kaggle-<short_name>`），支持 Kaggle 专属启动参数表单、60 秒单飞缓存的多账户每周 GPU/TPU 配额看板、同源代理 JSONL 脱敏审计日志（`web.log`）与按平台隔离的环境体检（`colabllm doctor --provider {colab,kaggle,all}`）；更新离线 `bash` / `zsh` / `fish` 补全以支持 `colabllm kaggle` 实例与账户名补全。
+  - `colabllm gateway` 扩展双状态根实例扫描与安全守卫（新增 `"/kaggle/"` 媒体路径前缀阻断、对未启用网关的数据面探针统一返回 `HTTP 501`），并在 `/gateway/status` 与 `gateway.log` 中标注副本 `provider` 与 `account`。
+
+### 性能优化
+
+- **原生 Kaggle Jupyter WebSocket 执行器（`kaggle_ws.py`）与跨平台单进程 `MuxDaemon` 复用（`mux.py`）**：
+  - 新增纯标准库 RFC 6455 Kaggle Jupyter 代理客户端（支持静默隐藏帧注入 `runtime.env`、`Origin` 握手重试、只读 IOPub 心跳重连监听以及 `KGRT_` / `/k/<id>/<token>` 代理凭据日志脱敏），并将 `MuxDaemon` 升级为跨平台（`colab` + `kaggle`）多路复用守护进程，消除每实例 `kaggle session exec` 独立子进程常驻内存开销；支持能力握手与繁忙旧版守护进程零停机溢出槽位（`~/.colabllm/kaggle/mux`）滚动升级。
+
+### 修复
+
+- **Colab `--auto-restart` 就绪态保持与错误根因提取**：区分首次等待 `CT_READY` 超时与运行期瞬态网络/DNS 断连，在公网故障期间持续保留已就绪状态与远端存活 VM（不受初始重试上限误伤），并从外部 CLI 的 Rich 边框报错输出中提取单行根因信息。
+
+### 文档
+
+- 新增 Kaggle 运行时架构设计规范（`docs/designs/kaggle-runtime.md`）与 `web-probe` 运行指南（`docs/kaggle-web-probe.md`），同步更新 `README.md`、通用操作指南、随包分发用户技能（`skills/colabllm/`）及维护者开发技能（`.agents/skills/colab-llm-service/`）。
+
 ## [1.1.0] - 2026-11-17
 
 ### 新增
