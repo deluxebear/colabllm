@@ -3,9 +3,9 @@ name: colab-llm-service
 description: >-
   Deploy and operate large-model and utility services on Google Colab through this repository's
   one-notebook/one-script convention and unified colabllm CLI. Use for service setup, lifecycle,
-  per-runtime Web UIs and the local colabllm web console, project-global domains, Cloudflare Tunnel
-  or SSH-managed FRP/Caddy, API key lookup and rotation, uv package installation checks, and
-  session or tunnel troubleshooting.
+  per-runtime Web UIs, the local colabllm web console, the local colabllm gateway OpenAI/Anthropic
+  data-plane proxy, project-global domains, Cloudflare Tunnel or SSH-managed FRP/Caddy, API key
+  lookup and rotation, uv package installation checks, and session or tunnel troubleshooting.
 ---
 
 # Colab LLM service
@@ -15,9 +15,13 @@ Every model service in this repo is a pair of files in `src/colabllm/services/`,
 ```
 src/colabllm/cli.py     packaged CLI: service dispatch and project configuration
 src/colabllm/web_ui/                  local browser console (`colabllm web`): introspect.py, server.py, state_store.py, static/
+src/colabllm/gateway.py               local gateway CLI/daemon (`colabllm gateway`, `token create|list|rotate|revoke`)
+src/colabllm/gateway_runtime/         gateway HTTP/1.1 data-plane: catalog.py, auth.py, routing.py, server.py
 src/colabllm/services/<name>.py       execution script (local): session, Drive, selected tunnel, credentials, keep-alive
 src/colabllm/services/<name>.ipynb    notebook (Colab VM): setup, service, Caddy auth, cloudflared/frpc, keep-alive loop
 src/colabllm/lib/colabsvc.py          shared runner used by every script (Service dataclass + CLI)
+src/colabllm/lib/local_daemon.py      shared local daemon host/lock/bind/stop helpers (`web`, `gateway`)
+src/colabllm/lib/instance_discovery.py shared service pair discovery and stateless instance listing
 src/colabllm/lib/colab_accounts.py    read-only colab-ext multi-account & shared-Drive resolver (no secrets read)
 src/colabllm/control.py             project-global domain and FRP configuration
 src/colabllm/lib/frp_backend.py      local SSH/DNS orchestration; frp_server.py provisions/adopts the server
@@ -27,6 +31,7 @@ templates/*.py, *.js     modules embedded into notebooks: tunnel_client, colab_c
 templates/               also service.py + service.ipynb to copy for a new service
 ~/.colabllm/services/<name>/           private runtime state and resource identities (outside the checkout)
 ~/.colabllm/web/                      local Web UI daemon state and web.log
+~/.colabllm/gateway/                  local gateway daemon state, 0600 tokens.json (SHA-256), and JSONL gateway.log
 ~/.colabllm/tunnel-config.json  shared base domain and optional FRP metadata
 ~/.colabllm/frp/             private per-server client credentials (0600)
 ```
@@ -62,6 +67,7 @@ For each runtime's current concrete usage, read `docs/<name>.md`; portable copie
 
 Use `colabllm <name> <command> [args...]` for runtime operations and user-facing examples.
 Use `colabllm web` (`-d`/`--detach`, `--status`, `--stop`, `--read-only`) to launch the local browser console (instance lifecycle fleet, **"打开 Web UI"** launcher, introspected CLI Workbench, and OpenAI Chat Playground).
+Use `colabllm gateway` (`-d`/`--detach`, `--status`, `--stop`, `--allow-remote --allow-host HOST`, `token create|list|rotate|revoke NAME`) to run the local OpenAI/Anthropic multi-runtime data-plane proxy on `127.0.0.1:8787` (`<model>@<runtime>[:<instance>]` routing and `GET /r/<tts>/v1/audio/voices`).
 Use `colabllm tunnel-config`, `colabllm frp-config`, and `colabllm frp-status` for project configuration.
 Run `colabllm services` to discover runtimes and `colabllm <name> --help` for their commands.
 
@@ -236,7 +242,11 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
      job/file/control dashboard (`templates/<name>_app.py` at `GET /` behind `auth="caddy"`), build the embedded UI
      with `modern-web-guidance` (zero external CDNs, per-request CSP `nonce`, safe DOM APIs, masked secrets, Drive path containment).
    - Register `<name>` in `src/colabllm/web_ui/introspect.py` (`WEB_UI_SERVICES` / `LLAMA_SERVER_SERVICES` so running instances show **"打开 Web UI"**, `CHAT_SERVICES` if OpenAI-chat compatible, `_CATEGORIES`, and `_SENSITIVE_FLAGS` / secret `dest`s so password options redact in previews), verify `_allowed_secret_keys` in `state_store.py`, add assertions in `tests/test_web_ui.py` & `tests/test_repo_hygiene.py`, and restart any running `colabllm web` daemon so its cached catalog refreshes.
-6. Update the distributed user skill in `skills/colabllm/` in the same change. Add the runtime to
+6. Decide Gateway passthrough & register in `colabllm gateway` -- see [references/gateway.md](references/gateway.md):
+   - Every `src/colabllm/services/<name>.py` + `.ipynb` pair MUST be registered in `GATEWAY_RUNTIME_SPECS` inside `src/colabllm/gateway_runtime/catalog.py` (enforced by `tests/test_repo_hygiene.py::RepoHygieneTest.test_every_service_is_registered_in_gateway_catalog`). Use bare `RuntimeGatewaySpec()` (`gateway_enabled=False`) for non-OpenAI Web UI/workflow/utility services (`comfyui`, `openjutsu`, `r2-migrate`, `unsloth-studio`, etc.).
+   - For OpenAI/Anthropic-compatible runtimes (`llama-server`, `vllm`, `vllm-omni`, `sglang`, Diffusion, TTS, ASR), expose authenticated `GET /v1/models` (returning canonical model ID + short alias before `CT_READY`) and standard `/v1/*` routes accepting inline `data:(image|audio)/...;base64,...` URIs and/or binary `multipart/form-data` without requiring `drive://`, `save_to_drive`, `X-Save-Drive`, `response_format="url"`, or `/api/ct/*`.
+   - Configure `allowed_v1_routes`, `allowed_v1_prefixes`, `prefixed_only_routes` (e.g. read-only TTS `GET /v1/audio/voices`), exhaustive `media_fields` & `drive_forbidden_fields`, `slot_capacity_env`, `reject_url_response_format`, `forbid_ytdlp_urls`, `rewrite_batch_items_model`, and `stateless_responses_only` in `GATEWAY_RUNTIME_SPECS`, cover new policy behavior in `tests/test_gateway.py`, and restart any running `colabllm gateway` daemon after updating `catalog.py` (preserving existing `tokens.json`).
+7. Update the distributed user skill in `skills/colabllm/` in the same change. Add the runtime to
    `SKILL.md`'s task/runtime/reference table and document its actual user workflow in an appropriate
    per-runtime reference. Canonical usage guides live in `docs/<name>.md`; run
    `python tools/sync_runtime_docs.py` to update the matching portable skill references. Cover prerequisites/GPU,
@@ -245,10 +255,10 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
    personal domains or credentials. Update the skill description if the new capability changes
    when an agent should invoke it. Runtime removals and command/behavior changes require the same
    reconciliation; the distributed skill is part of runtime delivery, not optional follow-up work.
-7. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
+8. Verify discovery with `colabllm services` and argument forwarding with `colabllm <name> --help`.
    Run `colabllm <name> up --dry-run`, then a real `up` (CPU `--gpu none` for wiring tests), check
    `status` (unauthenticated probe must be 401 for Caddy services), then `down`.
-8. Run `python tools/sync_runtime_docs.py --check`, check user-skill links and parse its new examples against the actual CLI without submitting jobs.
+9. Run `python tools/sync_runtime_docs.py --check`, check user-skill links and parse its new examples against the actual CLI without submitting jobs.
    Build with `uv build --no-sources` and run `python tools/check_distribution.py <wheel>`; verify the
    new runtime and complete skill references are included and `colabllm skill --output <temporary-dir>`
    works outside the checkout. Adjust packaging rules and skill-export checks when adding resource
@@ -260,6 +270,7 @@ Put `# @ct:skip` in a cell (or `up --skip N`) to skip it.
 - [references/notebooks.md](references/notebooks.md) -- notebook generator, embedded modules, CONFIG helpers, middleware security, cache archives
 - [references/auth.md](references/auth.md) -- choosing builtin vs Caddy, client usage, hardening
 - [references/web-ui.md](references/web-ui.md) -- runtime Web UI patterns (Caddy, builtin, llama-server, custom embedded UI) and `colabllm web` console registration
+- [references/gateway.md](references/gateway.md) -- upstream `/v1/*` passthrough contract, `RuntimeGatewaySpec` registration, security fields, and concurrency mapping
 - [references/cf-tunnel.md](references/cf-tunnel.md) -- Cloudflare quick/named tunnels and project-domain selection
 - [references/frp.md](references/frp.md) -- FRP provisioning/adoption, credentials, DNS, diagnostics and cleanup
 - [references/troubleshooting.md](references/troubleshooting.md) -- symptoms → causes → fixes

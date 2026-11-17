@@ -26,6 +26,11 @@
 | SSH diagnostic returns HTTP 429 | Another SSH channel is active | Finish the owned diagnostic connection; preserve unrelated user sessions |
 | `colab new` fails for a GPU | Quota / tier / availability | Try another `--gpu`, check `colab usage` (or `colab usage --all` across accounts), or launch on another account with `up -a <acct>` |
 | Multi-account VM or Drive credential mismatch | Wrong active account or unconfigured shared Drive binding | Inspect `colabllm <name> info --json`, `colab account status`, `colab ext doctor`, and `colabllm doctor -a <acct>` |
+| `test_every_service_is_registered_in_gateway_catalog` fails | New `src/colabllm/services/<name>.py` missing from `GATEWAY_RUNTIME_SPECS` | Register `<name>` in `src/colabllm/gateway_runtime/catalog.py`; see [gateway contract](gateway.md) |
+| Gateway returns `503` (`runtime_starting` / `runtime_compat_disabled`) | Instance has not printed `CT_READY` yet or `CT_OLLAMA_COMPAT` excludes `openai`/`anthropic` | Check `colabllm <name> status --json` / `logs` or enable OpenAI/Anthropic compatible APIs |
+| Gateway returns `504` (`cf_edge_524` / `prefill_timeout`) | Long-context prefill or slow generation exceeded Quick Tunnel ~100s edge limit or `--prefill-timeout` | Use `stream: true` or launch runtime with `--transport frp` |
+| Gateway returns `403` (`external_media_blocked` / `drive_field_blocked` / `policy_blocked`) | Request used external `http(s)://` media URL, `drive://`/local path, `save_to_drive`, or non-whitelisted route | Pass inline `data:` URIs or binary `multipart/form-data`; use `/r/<tts>/v1/audio/voices` for read-only TTS voices |
+| Running `colabllm gateway` ignores a newly added runtime in `catalog.py` | Daemon loaded old `GATEWAY_RUNTIME_SPECS` or old non-editable `uv tool` install | Reinstall CLI if non-editable, then `colabllm gateway --stop && colabllm gateway --detach` (`tokens.json` persists across restarts) |
 
 Start with offline `colabllm doctor` (or `colabllm doctor -a <acct>`); use `doctor --online` only when read-only authorization probes are needed.
 Useful commands: `colab sessions --all`, `colab account status`, `colab ext doctor`, `colab status -s <name>`, `colab usage --all`, `colab log -s <name>`,
