@@ -4,6 +4,31 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-17
+
+### 新增
+
+- **多运行时 OpenAI / Anthropic 兼容数据面网关（`colabllm gateway`）**：
+  - 新增纯标准库本地 HTTP/1.1 聚合网关守护进程（默认监听 `127.0.0.1:8787`，支持 `-d`/`--detach`、`--status`、`--stop`、`--allow-remote` 与多级通配 `--allow-host`），通过 `<upstream_model>@<runtime>[:<instance_id|default>]` 显式目标语法与 `GET /r/{qwen3-tts,indextts,drama3}[:<inst>]/v1/audio/voices` 前缀音色路由，零重启自动发现本机 `READY` 的文本/视觉推理、生图、语音合成、音效及语音转写运行时，并在 JSON、SSE 流与 `multipart/form-data` 请求/响应间对称改写 `model` 标识。
+  - 提供命名客户端凭据生命周期管理（`colabllm gateway token {create,list,rotate,revoke}`），`~/.colabllm/gateway/tokens.json`（`0600`）仅存储 `SHA-256` 摘要并支持运行时热加载（兼容 `Authorization: Bearer` 与 Anthropic `x-api-key`）；默认阻断 `/api/ct/*` 控制面、Google Drive 读写字段/请求头、外部 `http(s)://` 媒体引用、受限视频域名及生图 `response_format="url"`，并输出 `0600` 轮转 JSONL 审计日志（`gateway.log`）。
+  - 内置按副本槽位信号量并发控制、30 秒单飞 `/v1/models` 探测缓存、协议感知根前缀 KV-Cache 亲和 LRU 与短宽限排队、分阶段 `connect` / `prefill` / `stream_idle` 超时控制（自动将 Cloudflare Quick Tunnel `524` 映射为诊断性 `504`）以及首包前跨副本故障切换。
+- **Web 控制台多账户 Colab CCU 配额与活跃 VM 遥测**：
+  - 新增 45 秒单飞缓存的账户配额采集器与 `GET /api/accounts/usage[?refresh=1]` 接口（兼容 `colab-ext` JSON 输出与原生 `colab usage` 回退），在隧道与账户看板及启动表单账户选择器中实时展示各账户 CCU 余额、消耗速率、远端活跃 VM 与汇总指标。
+
+### 性能优化
+
+- **原生 Colab WebSocket 保活多路复用器（`mux.py`）与 Web SSE 连接上限**：
+  - 新增纯标准库 RFC 6455 `AsyncWebSocket` Jupyter Kernel 客户端（`colab_ws.py`）与单进程异步保活守护进程（`mux.py`），通过 `--exec-backend {auto,native,cli}` 与 `--no-mux` 将多个 Colab 会话保活收敛至单一本地进程（支持 `colab status` 自动刷新令牌、`.runner.lock` 文件锁存活校验、空闲自动退出及异常无缝回退 `colab exec`）。
+  - 为 `colabllm web` 增加服务端 SSE 并发流上限淘汰、`BroadcastChannel` 多标签页状态共享与页面可见性感知流释放，消除浏览器同源 HTTP/1.1 六连接池耗尽阻塞。
+
+### 修复
+
+- **`colabllm web` 交互细节修复**：修复复制按钮中文文本换行挤压并统一三视图舰队卡片与工作台命令预览的声明式复制气泡反馈；将 Copilot 演练场目标下拉框收敛为仅展示当前运行中的实例。
+
+### 文档
+
+- 新增网关架构设计规范（`docs/designs/colabllm-gateway.md`），同步更新 `README.md`、通用操作指南、随包分发用户技能（`skills/colabllm/`）及仓库维护者开发技能（`.agents/skills/colab-llm-service/`）。
+
 ## [1.0.0] - 2026-11-16
 
 ### 新增
