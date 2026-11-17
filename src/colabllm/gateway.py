@@ -22,7 +22,7 @@ for _path in (str(_LIB_DIR), str(_SRC_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from cli_support import CliError, UsageError, nonnegative_seconds, positive_seconds, run_cli  # noqa: E402
+from cli_support import CliError, UsageError, nonnegative_seconds, positive_seconds, run_cli, validate_account_syntax  # noqa: E402
 from colab_accounts import validate_account  # noqa: E402
 from colabllm.gateway_runtime.auth import TokenStore, TokenStoreFormatError, validate_allow_host_pattern  # noqa: E402
 from colabllm.gateway_runtime.server import GatewayConfig, GatewayHTTPServer  # noqa: E402
@@ -67,7 +67,7 @@ def _positive_int(value: str) -> int:
 
 def _add_global_root_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--command-timeout", type=positive_seconds, help="外部命令超时秒数")
-    parser.add_argument("--account", metavar="ACCOUNT", type=validate_account, help="Colab 账户名或邮箱")
+    parser.add_argument("--account", metavar="ACCOUNT", type=validate_account_syntax, help="账户标识（网关数据面不使用）")
     parser.add_argument("--debug", action="store_true", help="输出异常堆栈")
     parser.add_argument("--quiet", action="store_true", help="静默诊断输出")
     parser.add_argument("--no-color", action="store_true", help="关闭彩色诊断输出")
@@ -333,9 +333,11 @@ def _cmd_status(output_json: bool) -> int:
         insts = snapshot.get("instances") or []
         print(f"全局并发：{snapshot.get('inflight_global', 0)}/{snapshot.get('max_concurrent', 0)} | 活跃实例：{len(insts)}")
         for item in insts:
+            acct_part = f" account={item['account']}" if item.get("account") else ""
+            prov = item.get("provider", "colab")
             print(
-                f"  - {item['service']}:{item['instance']} [{item['state']}] "
-                f"slots={item['inflight']}/{item['slot_capacity']} url={item['url']}"
+                f"  - {item['service']}:{item['instance']} [{prov}|{item['state']}]"
+                f"{acct_part} slots={item['inflight']}/{item['slot_capacity']} url={item['url']}"
             )
     return 0
 

@@ -10,14 +10,22 @@ import shlex
 import threading
 from typing import Any
 
-from cli_support import UsageError, nonnegative_seconds, positive_seconds
+from cli_support import UsageError, duration_seconds, nonnegative_seconds, positive_seconds
 from colab_accounts import validate_account
 from colabsvc import build_parser, nonnegative_int, validate_domain, validate_instance
+from instance_discovery import discover_all_provider_services, parse_catalog_name
+from kaggle_accounts import validate_kaggle_account
+from kagglesvc import (
+    build_parser as build_kaggle_parser,
+    validate_kaggle_instance,
+    validate_kaggle_session_name,
+)
 
 from .api_catalog import CAPABILITY_SURFACES, build_api_profile
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 SERVICES_DIR = PKG_ROOT / "services"
+KAGGLE_SERVICES_DIR = PKG_ROOT / "kaggle_services"
 
 _CATEGORIES: dict[str, set[str]] = {
     "llm": {"qwen-flash", "deepseek-coder", "deepseek-qwen-9b", "ollama"},
@@ -44,6 +52,7 @@ WEB_UI_SERVICES = {
     "unsloth-studio",
     "unlimited-ocr",
     "r2-migrate",
+    "kaggle-web-probe",
     *LLAMA_SERVER_SERVICES,
 }
 CHAT_SERVICES = {*LLAMA_SERVER_SERVICES, "ollama"}
@@ -71,8 +80,31 @@ STANDARD_UP_DESTS = {
     "dry_run",
 }
 
+KAGGLE_UP_DESTS = {
+    "help",
+    "account",
+    "domain",
+    "base_domain",
+    "quick_tunnel",
+    "transport",
+    "accelerator",
+    "internet",
+    "new_credentials",
+    "foreground",
+    "detach",
+    "auto_restart",
+    "restart_delay",
+    "idle_check",
+    "max_restarts",
+    "max_uptime",
+    "ready_timeout",
+    "startup_timeout",
+    "dry_run",
+}
+
 LIFECYCLE_SUBCOMMANDS = {
     "up",
+    "restart",
     "down",
     "info",
     "ps",
@@ -93,13 +125,11 @@ _SCHEMA_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def discover_service_paths() -> dict[str, Path]:
-    if not SERVICES_DIR.is_dir():
-        return {}
-    return {
-        p.stem: p
-        for p in sorted(SERVICES_DIR.glob("*.py"))
-        if p.with_suffix(".ipynb").is_file()
-    }
+    specs = discover_all_provider_services(
+        services_dir=SERVICES_DIR,
+        kaggle_services_dir=KAGGLE_SERVICES_DIR,
+    )
+    return {name: spec.script_path for name, spec in specs.items()}
 
 
 def _category_for(name: str) -> str:
@@ -224,10 +254,13 @@ def _extract_subparser_fields(subparser: argparse.ArgumentParser, *, exclude_des
 
 
 def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    provider, short_name = parse_catalog_name(name)
+    is_kaggle = provider == "kaggle"
     module = runpy.run_path(str(path))
     svc_orig = module["SERVICE"]
     svc = copy.deepcopy(svc_orig)
-    parser = build_parser(svc, module.get("configure_cli"))
+    parser_builder = build_kaggle_parser if is_kaggle else build_parser
+    parser = parser_builder(svc, module.get("configure_cli"))
 
     sub_choices: dict[str, argparse.ArgumentParser] = {}
     for action in parser._actions:
@@ -236,7 +269,8 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
             break
 
     up_parser = sub_choices.get("up")
-    up_options = _extract_subparser_fields(up_parser, exclude_dests=STANDARD_UP_DESTS) if up_parser else []
+    up_dests = KAGGLE_UP_DESTS if is_kaggle else STANDARD_UP_DESTS
+    up_options = _extract_subparser_fields(up_parser, exclude_dests=up_dests) if up_parser else []
 
     subcommands: list[dict[str, Any]] = []
     for sub_name, sub_parser in sub_choices.items():
@@ -251,7 +285,7 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
     doc = (module.get("__doc__") or "").strip()
     cat = _category_for(name)
     subcommand_names = [s["name"] for s in subcommands]
-    has_web_ui = name in WEB_UI_SERVICES
+    has_web_ui = (name in WEB_UI_SERVICES) or bool(getattr(svc_orig, "has_web_ui", False))
     api_profile = build_api_profile(
         name,
         doc=doc,
@@ -259,16 +293,25 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
         auth=svc_orig.auth,
         has_web_ui=has_web_ui,
     )
+    gpu_val = getattr(svc_orig, "gpu", None)
+    tpu_val = getattr(svc_orig, "tpu", None)
+    high_mem_val = bool(getattr(svc_orig, "high_mem", False))
+    accelerator_val = getattr(svc_orig, "accelerator", gpu_val or tpu_val or "cpu")
     meta = {
         "name": name,
+        "provider": provider,
+        "short_name": short_name,
         "script_path": str(path),
         "category": cat,
         "category_label": CATEGORY_LABELS.get(cat, cat),
         "summary": _doc_summary(doc),
         "doc": doc,
-        "gpu": svc_orig.gpu,
-        "tpu": svc_orig.tpu,
-        "high_mem": bool(svc_orig.high_mem),
+        "gpu": gpu_val,
+        "tpu": tpu_val,
+        "high_mem": high_mem_val,
+        "accelerator": accelerator_val,
+        "enable_internet": bool(getattr(svc_orig, "enable_internet", True)),
+        "max_uptime": getattr(svc_orig, "max_uptime", None),
         "auth": svc_orig.auth,
         "service_port": svc_orig.service_port,
         "public_port": svc_orig.public_port,
@@ -280,6 +323,7 @@ def _load_service_record(name: str, path: Path) -> tuple[dict[str, Any], dict[st
         "api_profile": api_profile,
         "subcommand_names": subcommand_names,
         "has_plan": any(s["name"] == "plan" for s in subcommands),
+        "supports_restart": is_kaggle,
     }
     schema = {
         "service": meta,
@@ -322,7 +366,9 @@ def format_command_preview(service_name: str, argv: list[str], secret_indices: s
     for idx in secret_indices or ():
         if 0 <= idx < len(redacted):
             redacted[idx] = "***"
-    return " ".join(["colabllm", service_name, *(shlex.quote(arg) for arg in redacted)])
+    provider, short_name = parse_catalog_name(service_name)
+    prefix = ["colabllm", "kaggle", short_name] if provider == "kaggle" else ["colabllm", service_name]
+    return " ".join([*prefix, *(shlex.quote(arg) for arg in redacted)])
 
 
 def _append_field_argv(
@@ -430,22 +476,40 @@ def _append_field_argv(
             secret_indices.add(len(opt_argv) - 1)
 
 
+def _validate_provider_instance(provider: str, short_name: str, raw_instance: str) -> str:
+    if provider == "kaggle":
+        validated = validate_kaggle_instance(raw_instance)
+        validate_kaggle_session_name(f"{short_name}-{validated}")
+        return validated
+    return validate_instance(raw_instance)
+
+
+def _validate_provider_account(provider: str, raw_account: str) -> str:
+    if provider == "kaggle":
+        return validate_kaggle_account(raw_account)
+    return validate_account(raw_account)
+
+
 def build_up_argv(service_name: str, payload: dict[str, Any]) -> tuple[list[str], str]:
     schema = get_service_schema(service_name)
+    provider, short_name = parse_catalog_name(service_name)
+    is_kaggle = provider == "kaggle"
     argv: list[str] = []
     secret_indices: set[int] = set()
 
     inst = str(payload.get("instance") or "").strip()
     if inst:
-        argv.extend(["-i", validate_instance(inst)])
+        argv.extend(["-i", _validate_provider_instance(provider, short_name, inst)])
     account = str(payload.get("account") or "").strip()
     if account:
-        argv.extend(["--account", validate_account(account)])
+        argv.extend(["--account", _validate_provider_account(provider, account)])
 
     argv.append("up")
 
     drive_account = str(payload.get("drive_account") or "").strip()
     if drive_account:
+        if is_kaggle:
+            raise UsageError("Kaggle 服务不支持 --drive-account")
         argv.extend(["--drive-account", validate_account(drive_account)])
 
     tunnel_mode = str(payload.get("tunnel_mode") or "default").strip()
@@ -473,21 +537,48 @@ def build_up_argv(service_name: str, payload: dict[str, Any]) -> tuple[list[str]
 
     gpu = str(payload.get("gpu") or "").strip()
     if gpu:
+        if is_kaggle:
+            raise UsageError("Kaggle 服务请使用 --accelerator 而非 --gpu")
         if not _GPU_RE.fullmatch(gpu):
             raise UsageError("GPU 参数格式无效")
         argv.extend(["--gpu", gpu])
 
+    accelerator = str(payload.get("accelerator") or "").strip()
+    if accelerator:
+        if not is_kaggle:
+            raise UsageError("Colab 服务不支持 --accelerator")
+        if not _GPU_RE.fullmatch(accelerator):
+            raise UsageError("accelerator 参数格式无效")
+        argv.extend(["--accelerator", accelerator])
+
+    internet = payload.get("internet")
+    if internet is not None and internet != "":
+        if not is_kaggle:
+            raise UsageError("Colab 服务不支持 --internet/--no-internet")
+        if internet is True or str(internet).strip().lower() == "true":
+            argv.append("--internet")
+        elif internet is False or str(internet).strip().lower() == "false":
+            argv.append("--no-internet")
+        else:
+            raise UsageError(f"internet 参数取值无效: {internet}")
+
     skip = str(payload.get("skip") or "").strip()
     if skip:
+        if is_kaggle:
+            raise UsageError("Kaggle 服务不支持 --skip")
         if not _SKIP_RE.fullmatch(skip):
             raise UsageError("--skip 须为逗号分隔的 cell 序号，例如 1,2")
         argv.extend(["--skip", skip])
 
     if payload.get("no_drive"):
+        if is_kaggle:
+            raise UsageError("Kaggle 服务不支持 --no-drive")
         argv.append("--no-drive")
 
     hf_token = str(payload.get("hf_token") or "").strip()
     if hf_token:
+        if is_kaggle:
+            raise UsageError("Kaggle 服务不支持 --hf-token")
         argv.append("--hf-token")
         argv.append(hf_token)
         secret_indices.add(len(argv) - 1)
@@ -504,10 +595,28 @@ def build_up_argv(service_name: str, payload: dict[str, Any]) -> tuple[list[str]
             val = positive_seconds(str(raw).strip())
             argv.extend([flag, f"{val:g}"])
 
+    raw_startup_timeout = payload.get("startup_timeout")
+    if raw_startup_timeout is not None and str(raw_startup_timeout).strip() != "":
+        if not is_kaggle:
+            raise UsageError("Colab 服务不支持 --startup-timeout")
+        val = positive_seconds(str(raw_startup_timeout).strip())
+        argv.extend(["--startup-timeout", f"{val:g}"])
+
+    raw_max_uptime = payload.get("max_uptime")
+    if raw_max_uptime is not None and str(raw_max_uptime).strip() != "":
+        if not is_kaggle:
+            raise UsageError("Colab 服务不支持 --max-uptime")
+        uptime_text = str(raw_max_uptime).strip()
+        try:
+            duration_seconds(uptime_text)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from None
+        argv.extend(["--max-uptime", uptime_text])
+
     max_restarts = payload.get("max_restarts")
     if max_restarts is not None and str(max_restarts).strip() != "":
         val = nonnegative_int(str(max_restarts).strip())
-        if val > 0:
+        if is_kaggle or val > 0:
             argv.extend(["--max-restarts", str(val)])
 
     extra = payload.get("extra") or {}
@@ -543,15 +652,16 @@ def build_cli_argv(
     values: dict[str, Any] | None = None,
 ) -> tuple[list[str], str]:
     schema = get_service_schema(service_name)
+    provider, short_name = parse_catalog_name(service_name)
     sub_map = {item["name"]: item for item in schema["subcommands"]}
     if subcommand not in sub_map:
         raise UsageError(f"{service_name} 不支持子命令: {subcommand}")
 
     argv: list[str] = []
     if instance and str(instance).strip():
-        argv.extend(["-i", validate_instance(str(instance).strip())])
+        argv.extend(["-i", _validate_provider_instance(provider, short_name, str(instance).strip())])
     if account and str(account).strip():
-        argv.extend(["--account", validate_account(str(account).strip())])
+        argv.extend(["--account", _validate_provider_account(provider, str(account).strip())])
     argv.append(subcommand)
 
     val_map = values or {}

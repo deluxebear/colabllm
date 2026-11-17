@@ -26,15 +26,20 @@ if _LIB_DIR not in sys.path:
 from cli_support import CliError, redirect_diagnostics
 from paths import private_dir, user_home
 from processes import owned_process, process_identity, runner_alive
+from runtime_core import redact_runtime_secrets
 
 _RPC_TIMEOUT = 10.0
 _DAEMON_BOOT_TIMEOUT = 8.0
 _IDLE_GRACE_SECONDS = 0.25
 
 
-def mux_paths(state_root: Path | None = None) -> tuple[Path, Path, Path, Path, Path]:
+def _mux_session_key(provider: str, session_name: str) -> str:
+    return f"kaggle/{session_name}" if provider == "kaggle" else session_name
+
+
+def mux_paths(state_root: Path | None = None, *, mux_subdir: str = "mux") -> tuple[Path, Path, Path, Path, Path]:
     root = Path(state_root) if state_root is not None else user_home()
-    mux_dir = root / "mux"
+    mux_dir = root / mux_subdir
     return (
         mux_dir,
         mux_dir / "state.json",
@@ -42,6 +47,14 @@ def mux_paths(state_root: Path | None = None) -> tuple[Path, Path, Path, Path, P
         mux_dir / "mux.lock",
         mux_dir / "spawn.lock",
     )
+
+
+def _ensure_private_tree(root: Path, target: Path) -> None:
+    private_dir(root)
+    cur = root
+    for part in target.relative_to(root).parts:
+        cur = cur / part
+        private_dir(cur)
 
 
 def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
@@ -59,8 +72,8 @@ def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
         tmp_path.unlink(missing_ok=True)
 
 
-def _load_live_mux_state(state_root: Path) -> dict[str, Any] | None:
-    _, state_path, _, _, _ = mux_paths(state_root)
+def _load_live_mux_state(state_root: Path, *, mux_subdir: str = "mux") -> dict[str, Any] | None:
+    _, state_path, _, _, _ = mux_paths(state_root, mux_subdir=mux_subdir)
     if not state_path.is_file():
         return None
     try:
@@ -113,18 +126,23 @@ class ActiveMuxSession:
     session_name: str
     lock_fd: int
     log_file: BinaryIO
+    provider: str = "colab"
+    session_key: str = ""
     task: asyncio.Task[Any] | None = None
 
 
 class MuxDaemon:
-    """Single-process asyncio supervisor multiplexing Colab WS sessions."""
+    """Single-process asyncio supervisor multiplexing Colab and Kaggle WS sessions."""
 
-    def __init__(self, state_root: Path) -> None:
+    def __init__(self, state_root: Path, *, mux_subdir: str = "mux") -> None:
         import colabsvc
+        import kagglesvc
 
         self.state_root = state_root.resolve()
+        self.mux_subdir = mux_subdir
         colabsvc.STATE_ROOT = self.state_root
-        self.mux_dir, self.state_path, _, self.lock_path, _ = mux_paths(self.state_root)
+        kagglesvc.STATE_ROOT = self.state_root
+        self.mux_dir, self.state_path, _, self.lock_path, _ = mux_paths(self.state_root, mux_subdir=mux_subdir)
         self.pid = os.getpid()
         self.identity = process_identity(self.pid) or ""
         self.token = secrets.token_hex(32)
@@ -136,8 +154,7 @@ class MuxDaemon:
         self._idle_task: asyncio.Task[Any] | None = None
 
     def acquire_daemon_lock(self) -> None:
-        private_dir(self.state_root)
-        private_dir(self.mux_dir)
+        _ensure_private_tree(self.state_root, self.mux_dir)
         fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             os.chmod(self.lock_path, 0o600)
@@ -189,9 +206,16 @@ class MuxDaemon:
         nb_path: Path,
         env_overrides: dict[str, str],
     ) -> None:
-        import colabsvc
+        if entry.provider == "kaggle":
+            import kagglesvc as runner_mod
 
-        state = colabsvc.State(svc)
+            state = runner_mod._state_for(svc)
+            err_prefix = "[kagglesvc]"
+        else:
+            import colabsvc as runner_mod
+
+            state = runner_mod.State(svc)
+            err_prefix = "[colabsvc]"
         exit_code = 1
         try:
             def sink(data: bytes) -> None:
@@ -201,7 +225,7 @@ class MuxDaemon:
                 entry.log_file.flush()
 
             with redirect_diagnostics(entry.log_file):
-                exit_code = await colabsvc.supervise_instance_async(
+                exit_code = await runner_mod.supervise_instance_async(
                     svc,
                     nb_path,
                     owner_pid=self.pid,
@@ -214,25 +238,28 @@ class MuxDaemon:
             raise
         except BaseException as err:
             with contextlib.suppress(OSError, ValueError):
-                entry.log_file.write(f"[colabsvc] {err}\n".encode("utf-8", errors="replace"))
+                safe_err = redact_runtime_secrets(str(err))
+                entry.log_file.write(f"{err_prefix} {safe_err}\n".encode("utf-8", errors="replace"))
                 entry.log_file.flush()
             code = getattr(err, "code", None)
             exit_code = code if isinstance(code, int) and code > 0 else 1
         finally:
             with contextlib.suppress(Exception):
-                colabsvc.finish_runner(state, self.pid, self.identity, exit_code)
+                runner_mod.finish_runner(state, self.pid, self.identity, exit_code)
             with contextlib.suppress(OSError):
                 fcntl.flock(entry.lock_fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(entry.lock_fd)
             with contextlib.suppress(OSError):
                 entry.log_file.close()
-            if self.sessions.get(svc.name) is entry:
-                self.sessions.pop(svc.name, None)
+            if self.sessions.get(entry.session_key) is entry:
+                self.sessions.pop(entry.session_key, None)
             self._schedule_idle_check()
 
     async def _handle_start(self, req: dict[str, Any]) -> dict[str, Any]:
-        import colabsvc
+        provider = str(req.get("provider") or "colab").strip().lower()
+        if provider not in ("colab", "kaggle"):
+            return {"ok": False, "error": f"不支持的 mux provider: {provider!r}"}
 
         svc_data = req.get("service")
         nb_path_raw = req.get("nb_path")
@@ -240,15 +267,27 @@ class MuxDaemon:
         env_overrides = req.get("env_overrides") or {}
         if not isinstance(svc_data, dict) or not isinstance(nb_path_raw, str):
             return {"ok": False, "error": "无效的 start 请求"}
-        svc = colabsvc.Service(**svc_data)
-        existing = self.sessions.get(svc.name)
-        if existing is not None and existing.task is not None and not existing.task.done():
-            return {"ok": False, "error": f"'{svc.name}' is already running (mux pid {self.pid})"}
+        if provider == "kaggle":
+            import kagglesvc
 
-        state = colabsvc.State(svc)
+            svc = kagglesvc.KaggleService(**svc_data)
+            state = kagglesvc._state_for(svc)
+        else:
+            import colabsvc
+
+            svc = colabsvc.Service(**svc_data)
+            state = colabsvc.State(svc)
+
+        skey = _mux_session_key(provider, svc.name)
+        existing = self.sessions.get(skey)
+        if existing is not None and existing.task is not None and not existing.task.done():
+            return {"ok": False, "error": f"'{skey}' is already running (mux pid {self.pid})"}
+
         private_dir(self.state_root)
-        private_dir(state.dir.parent)
-        private_dir(state.dir)
+        cur = self.state_root
+        for part in state.dir.relative_to(self.state_root).parts:
+            cur = cur / part
+            private_dir(cur)
         lock_path = state.dir / ".runner.lock"
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
@@ -256,7 +295,7 @@ class MuxDaemon:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BaseException:
             os.close(lock_fd)
-            return {"ok": False, "error": f"'{svc.name}' 锁被占用，无法重复启动"}
+            return {"ok": False, "error": f"'{skey}' 锁被占用，无法重复启动"}
 
         try:
             log_file = state.log_path.open("ab")
@@ -275,8 +314,14 @@ class MuxDaemon:
             runner_lock=str(lock_path),
             exec_backend=exec_backend,
         )
-        entry = ActiveMuxSession(session_name=svc.name, lock_fd=lock_fd, log_file=log_file)
-        self.sessions[svc.name] = entry
+        entry = ActiveMuxSession(
+            session_name=svc.name,
+            lock_fd=lock_fd,
+            log_file=log_file,
+            provider=provider,
+            session_key=skey,
+        )
+        self.sessions[skey] = entry
         entry.task = asyncio.create_task(
             self._run_session_task(
                 entry,
@@ -288,8 +333,12 @@ class MuxDaemon:
         return {"ok": True, "pid": self.pid, "identity": self.identity}
 
     async def _handle_stop(self, req: dict[str, Any]) -> dict[str, Any]:
+        provider = str(req.get("provider") or "colab").strip().lower()
         session_name = str(req.get("session") or "").strip()
-        entry = self.sessions.get(session_name)
+        skey = _mux_session_key(provider, session_name)
+        entry = self.sessions.get(skey)
+        if entry is None and session_name.startswith("kaggle/"):
+            entry = self.sessions.get(session_name)
         if entry is None or entry.task is None or entry.task.done():
             return {"ok": True, "stopped": False}
         entry.task.cancel()
@@ -314,7 +363,12 @@ class MuxDaemon:
                 else:
                     action = req.get("action")
                     if action == "ping":
-                        resp = {"ok": True, "pid": self.pid, "sessions": sorted(self.sessions)}
+                        resp = {
+                            "ok": True,
+                            "pid": self.pid,
+                            "providers": ["colab", "kaggle"],
+                            "sessions": sorted(self.sessions),
+                        }
                     elif action == "start":
                         resp = await self._handle_start(req)
                     elif action == "stop":
@@ -359,6 +413,7 @@ class MuxDaemon:
                     "identity": self.identity,
                     "port": port,
                     "token": self.token,
+                    "providers": ["colab", "kaggle"],
                     "state_root": str(self.state_root),
                 },
             )
@@ -396,27 +451,54 @@ class MuxRunnerHandle:
         return self.returncode
 
 
-def _ensure_mux_daemon(state_root: Path) -> dict[str, Any]:
-    mux_dir, state_path, log_path, _, spawn_lock_path = mux_paths(state_root)
-    private_dir(state_root)
-    private_dir(mux_dir)
+def _ensure_mux_daemon_at(
+    state_root: Path,
+    *,
+    mux_subdir: str = "mux",
+    required_provider: str = "colab",
+    allow_overflow: bool = False,
+) -> dict[str, Any]:
+    mux_dir, state_path, log_path, _, spawn_lock_path = mux_paths(state_root, mux_subdir=mux_subdir)
+    _ensure_private_tree(state_root, mux_dir)
     spawn_fd = os.open(str(spawn_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
         os.chmod(spawn_lock_path, 0o600)
         fcntl.flock(spawn_fd, fcntl.LOCK_EX)
-        st = _load_live_mux_state(state_root)
+        st = _load_live_mux_state(state_root, mux_subdir=mux_subdir)
         if st is not None:
             try:
                 pong = _rpc_sync(st["port"], st["token"], "ping", timeout=2.0)
                 if pong.get("ok"):
-                    return st
+                    supported = set(pong.get("providers") or ("colab",))
+                    if required_provider in supported:
+                        return st
+                    if not pong.get("sessions"):
+                        with contextlib.suppress(OSError, EOFError, ValueError):
+                            _rpc_sync(st["port"], st["token"], "shutdown", timeout=2.0)
+                        exit_dl = time.monotonic() + 1.5
+                        while owned_process(st.get("pid"), st.get("identity")) and time.monotonic() < exit_dl:
+                            time.sleep(0.05)
+                    elif allow_overflow:
+                        return _ensure_mux_daemon_at(
+                            state_root,
+                            mux_subdir="kaggle/mux",
+                            required_provider=required_provider,
+                            allow_overflow=False,
+                        )
             except (OSError, EOFError, ValueError):
                 pass
 
         with log_path.open("ab") as logf:
             os.chmod(log_path, 0o600)
             proc = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "--state-root", str(state_root)],
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--state-root",
+                    str(state_root),
+                    "--mux-subdir",
+                    mux_subdir,
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
@@ -426,7 +508,7 @@ def _ensure_mux_daemon(state_root: Path) -> dict[str, Any]:
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 break
-            st = _load_live_mux_state(state_root)
+            st = _load_live_mux_state(state_root, mux_subdir=mux_subdir)
             if st is not None and st.get("pid") == proc.pid:
                 with contextlib.suppress(OSError, EOFError, ValueError):
                     pong = _rpc_sync(st["port"], st["token"], "ping", timeout=1.5)
@@ -441,6 +523,15 @@ def _ensure_mux_daemon(state_root: Path) -> dict[str, Any]:
             os.close(spawn_fd)
 
 
+def _ensure_mux_daemon(state_root: Path, *, required_provider: str = "colab") -> dict[str, Any]:
+    return _ensure_mux_daemon_at(
+        state_root,
+        mux_subdir="mux",
+        required_provider=required_provider,
+        allow_overflow=(required_provider == "kaggle"),
+    )
+
+
 def start_in_mux(
     svc: Any,
     nb_path: Path,
@@ -448,10 +539,21 @@ def start_in_mux(
     state_root: Path,
     exec_backend: str,
     env_overrides: dict[str, str],
+    provider: str = "colab",
+    state: Any = None,
 ) -> MuxRunnerHandle:
-    import colabsvc
+    if state is None:
+        if provider == "kaggle":
+            import kagglesvc
+
+            state = kagglesvc._state_for(svc)
+        else:
+            import colabsvc
+
+            state = colabsvc.State(svc)
 
     payload = {
+        "provider": provider,
         "service": dataclasses.asdict(svc),
         "nb_path": str(nb_path),
         "exec_backend": exec_backend,
@@ -459,7 +561,7 @@ def start_in_mux(
     }
     last_err: Exception | None = None
     for _ in range(2):
-        st = _ensure_mux_daemon(state_root)
+        st = _ensure_mux_daemon(state_root, required_provider=provider)
         try:
             resp = _rpc_sync(st["port"], st["token"], "start", payload, timeout=_RPC_TIMEOUT)
         except (OSError, EOFError, ValueError) as err:
@@ -467,7 +569,7 @@ def start_in_mux(
             continue
         if not resp.get("ok"):
             raise CliError(str(resp.get("error") or "mux 启动实例失败"))
-        return MuxRunnerHandle(int(resp["pid"]), colabsvc.State(svc))
+        return MuxRunnerHandle(int(resp["pid"]), state)
     raise CliError(f"连接 mux 守护进程失败: {last_err}")
 
 
@@ -476,12 +578,21 @@ def stop_in_mux(
     state: Any,
     *,
     state_root: Path,
+    provider: str = "colab",
     timeout: float = 5.0,
 ) -> None:
-    st = _load_live_mux_state(state_root)
-    if st is not None:
-        with contextlib.suppress(OSError, EOFError, ValueError):
-            _rpc_sync(st["port"], st["token"], "stop", {"session": session_name}, timeout=timeout)
+    subdirs = ("mux", "kaggle/mux") if provider == "kaggle" else ("mux",)
+    for sub in subdirs:
+        st = _load_live_mux_state(state_root, mux_subdir=sub)
+        if st is not None:
+            with contextlib.suppress(OSError, EOFError, ValueError):
+                _rpc_sync(
+                    st["port"],
+                    st["token"],
+                    "stop",
+                    {"provider": provider, "session": session_name},
+                    timeout=timeout,
+                )
     deadline = time.monotonic() + timeout
     while runner_alive(state.load()) and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -490,8 +601,9 @@ def stop_in_mux(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ColabLLM shared asyncio multiplexer daemon")
     parser.add_argument("--state-root", required=True)
+    parser.add_argument("--mux-subdir", default="mux")
     args = parser.parse_args(argv)
-    daemon = MuxDaemon(Path(args.state_root))
+    daemon = MuxDaemon(Path(args.state_root), mux_subdir=args.mux_subdir)
     return asyncio.run(daemon.run())
 
 

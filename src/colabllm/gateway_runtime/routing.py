@@ -12,7 +12,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 import urllib.parse
 
 _LIB_DIR = str(Path(__file__).resolve().parents[1] / "lib")
@@ -21,7 +21,14 @@ if _LIB_DIR not in sys.path:
 
 from cli_support import shared_ssl_context  # noqa: E402
 from http_client import BROWSER_UA  # noqa: E402
-from instance_discovery import INSTANCE_ID_RE, discover_service_pairs, list_raw_instances  # noqa: E402
+from instance_discovery import (  # noqa: E402
+    INSTANCE_ID_RE,
+    discover_kaggle_service_pairs,
+    discover_service_pairs,
+    kaggle_catalog_name,
+    list_raw_instances,
+    parse_catalog_name,
+)
 from processes import runner_alive  # noqa: E402
 
 from .auth import GatewayError  # noqa: E402
@@ -35,6 +42,14 @@ from .catalog import (  # noqa: E402
 )
 
 PREFIXED_ROUTE_RE = re.compile(r"^/r/([^/]+)(/.*)?$")
+
+
+def format_runtime_cli(runtime: str, subcmd: str) -> str:
+    """Format provider-aware CLI invocation hint for error messages."""
+    provider, short_name = parse_catalog_name(runtime)
+    if provider == "kaggle":
+        return f"colabllm kaggle {short_name} {subcmd}"
+    return f"colabllm {runtime} {subcmd}"
 
 
 def compute_upstream_auth_header(state: dict[str, Any]) -> str | None:
@@ -106,6 +121,8 @@ class ReplicaRuntime:
     slot_capacity: int
     alive: bool
     ready: bool
+    provider: str = "colab"
+    account: str | None = None
 
     @property
     def key(self) -> str:
@@ -175,6 +192,7 @@ class GatewayRouter:
         *,
         state_root: Path,
         services_dir: Path | None,
+        kaggle_services_dir: Path | None = None,
         max_concurrent: int = 32,
         slot_wait_timeout: float = 5.0,
         affinity_grace_timeout: float = 1.0,
@@ -182,10 +200,15 @@ class GatewayRouter:
         probe_timeout: float = 3.0,
         probe_ttl_seconds: float = 30.0,
         max_affinity_entries: int = 1024,
-        specs: dict[str, RuntimeGatewaySpec] | None = None,
+        specs: Mapping[str, RuntimeGatewaySpec] | None = None,
     ) -> None:
         self.state_root = Path(state_root)
         self.services_dir = Path(services_dir) if services_dir is not None else self.state_root / "services"
+        self.kaggle_services_dir = (
+            Path(kaggle_services_dir)
+            if kaggle_services_dir is not None
+            else self.services_dir.parent / "kaggle" / "services"
+        )
         self.max_concurrent = max(1, int(max_concurrent))
         self.slot_wait_timeout = max(0.0, float(slot_wait_timeout))
         self.affinity_grace_timeout = max(0.0, float(affinity_grace_timeout))
@@ -204,47 +227,77 @@ class GatewayRouter:
         self._inflight_probes: dict[str, threading.Event] = {}
         self._affinity_lru: OrderedDict[tuple[str, str, str], str] = OrderedDict()
 
-    def _service_names(self) -> tuple[str, ...]:
+    def _colab_service_names(self) -> tuple[str, ...]:
         pairs = set(discover_service_pairs())
-        pairs.update(self.specs.keys())
+        pairs.update(k for k in self.specs if parse_catalog_name(k)[0] == "colab")
         return tuple(sorted(pairs))
 
+    def _kaggle_short_names(self) -> tuple[str, ...]:
+        pairs = set(discover_kaggle_service_pairs())
+        pairs.update(parse_catalog_name(k)[1] for k in self.specs if parse_catalog_name(k)[0] == "kaggle")
+        return tuple(sorted(pairs))
+
+    def _service_names(self) -> tuple[str, ...]:
+        names = set(self._colab_service_names())
+        names.update(kaggle_catalog_name(s) for s in self._kaggle_short_names())
+        return tuple(sorted(names))
+
     def scan_replicas(self, target_service: str | None = None) -> list[ReplicaRuntime]:
-        """Perform lockless read-only discovery of local instance state files."""
-        raw_items = list_raw_instances(
-            self.services_dir,
-            self._service_names(),
-            target_service=target_service,
-            alive_fn=runner_alive,
-            on_corrupt="skip",
-        )
-        replicas: list[ReplicaRuntime] = []
-        for item in raw_items:
-            svc = item["service"]
-            spec = get_runtime_spec(svc, self.specs)
-            if spec is None or not spec.gateway_enabled:
-                continue
-            st = item["state"]
-            env = st.get("env") if isinstance(st.get("env"), dict) else {}
-            url = str(st.get("url") or "").strip()
-            replicas.append(
-                ReplicaRuntime(
-                    service=svc,
-                    instance=item["instance"],
-                    instance_arg=item["instance_arg"],
-                    session_name=item["session_name"],
-                    state_path=item["state_path"],
-                    state_mtime_ns=item["state_mtime_ns"],
-                    state_size=item["state_size"],
-                    url=url,
-                    auth_header=compute_upstream_auth_header(st),
-                    transport=str(st.get("transport") or "cloudflare"),
-                    env=dict(env),
-                    slot_capacity=parse_slot_capacity(spec, env),
-                    alive=bool(item["alive"]),
-                    ready=bool(item["ready"]),
-                )
+        """Perform lockless read-only discovery of local instance state files across providers."""
+        if target_service is not None:
+            t_prov, t_short = parse_catalog_name(target_service)
+            if t_prov == "kaggle":
+                scan_specs = (("kaggle", self.kaggle_services_dir, self._kaggle_short_names(), t_short),)
+            else:
+                scan_specs = (("colab", self.services_dir, self._colab_service_names(), target_service),)
+        else:
+            scan_specs = (
+                ("colab", self.services_dir, self._colab_service_names(), None),
+                ("kaggle", self.kaggle_services_dir, self._kaggle_short_names(), None),
             )
+
+        replicas: list[ReplicaRuntime] = []
+        for prov, root_dir, names, target_name in scan_specs:
+            raw_items = list_raw_instances(
+                root_dir,
+                names,
+                target_service=target_name,
+                alive_fn=runner_alive,
+                on_corrupt="skip",
+            )
+            for item in raw_items:
+                svc = kaggle_catalog_name(item["service"]) if prov == "kaggle" else item["service"]
+                spec = get_runtime_spec(svc, self.specs)
+                if spec is None or not spec.gateway_enabled:
+                    continue
+                st = item["state"]
+                env = st.get("env") if isinstance(st.get("env"), dict) else {}
+                url = str(st.get("url") or "").strip()
+                session_name = (
+                    kaggle_catalog_name(item["session_name"]) if prov == "kaggle" else item["session_name"]
+                )
+                acct_raw = st.get("account")
+                acct = str(acct_raw).strip() or None if isinstance(acct_raw, str) else None
+                replicas.append(
+                    ReplicaRuntime(
+                        service=svc,
+                        instance=item["instance"],
+                        instance_arg=item["instance_arg"],
+                        session_name=session_name,
+                        state_path=item["state_path"],
+                        state_mtime_ns=item["state_mtime_ns"],
+                        state_size=item["state_size"],
+                        url=url,
+                        auth_header=compute_upstream_auth_header(st),
+                        transport=str(st.get("transport") or "cloudflare"),
+                        env=dict(env),
+                        slot_capacity=parse_slot_capacity(spec, env),
+                        alive=bool(item["alive"]),
+                        ready=bool(item["ready"]),
+                        provider=prov,
+                        account=acct,
+                    )
+                )
         return replicas
 
     def _probe_single_upstream(self, rep: ReplicaRuntime) -> _ProbeEntry:
@@ -517,14 +570,14 @@ class GatewayRouter:
             if not rep.alive:
                 raise GatewayError(
                     503,
-                    f"实例 {service}:{pinned_instance} 当前未运行（请先执行 colabllm {service} status）",
+                    f"实例 {service}:{pinned_instance} 当前未运行（请先执行 {format_runtime_cli(service, 'status')}）",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_unavailable",
                 )
             if not rep.ready:
                 raise GatewayError(
                     503,
-                    f"实例 {service}:{pinned_instance} 正在启动中（STARTING），请稍后重试或执行 colabllm {service} status",
+                    f"实例 {service}:{pinned_instance} 正在启动中（STARTING），请稍后重试或执行 {format_runtime_cli(service, 'status')}",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_starting",
                 )
@@ -536,7 +589,7 @@ class GatewayRouter:
             if starting_reps:
                 raise GatewayError(
                     503,
-                    f"运行时 {service} 正在启动中（STARTING），请执行 colabllm {service} status 排查",
+                    f"运行时 {service} 正在启动中（STARTING），请执行 {format_runtime_cli(service, 'status')} 排查",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_starting",
                 )
@@ -581,14 +634,14 @@ class GatewayRouter:
             if not rep.alive:
                 raise GatewayError(
                     503,
-                    f"副本 {target.runtime}:{target.pinned_instance} 已停止（可检查 colabllm {target.runtime} status）",
+                    f"副本 {target.runtime}:{target.pinned_instance} 已停止（可检查 {format_runtime_cli(target.runtime, 'status')}）",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_unavailable",
                 )
             if not rep.ready or not rep.url:
                 raise GatewayError(
                     503,
-                    f"副本 {target.runtime}:{target.pinned_instance} 正在启动中（STARTING），请执行 colabllm {target.runtime} status 查看进度",
+                    f"副本 {target.runtime}:{target.pinned_instance} 正在启动中（STARTING），请执行 {format_runtime_cli(target.runtime, 'status')} 查看进度",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_starting",
                 )
@@ -666,7 +719,7 @@ class GatewayRouter:
             if starting_reps:
                 raise GatewayError(
                     503,
-                    f"运行时 {target.runtime} 实例正在启动中（STARTING），请执行 colabllm {target.runtime} status 查看进度",
+                    f"运行时 {target.runtime} 实例正在启动中（STARTING），请执行 {format_runtime_cli(target.runtime, 'status')} 查看进度",
                     oai_type="service_unavailable_error",
                     oai_code="runtime_starting",
                 )
@@ -868,6 +921,8 @@ class GatewayRouter:
             compat_ok = True if rep.service != "ollama" else ollama_is_gateway_compatible(rep.env)
             items.append({
                 "service": rep.service,
+                "provider": rep.provider,
+                "account": rep.account,
                 "instance": rep.instance,
                 "state": "READY" if rep.ready else ("STARTING" if rep.alive else "STOPPED"),
                 "url": redact_upstream_url(rep.url),

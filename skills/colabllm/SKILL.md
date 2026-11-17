@@ -20,8 +20,11 @@ Treat installed `--help` as authoritative for available services, commands and o
 ```bash
 colabllm --version
 colabllm services
+colabllm kaggle services
 colabllm doctor
+colabllm doctor --provider kaggle
 colabllm <service> --help
+colabllm kaggle <short_name> --help
 colabllm <service> <command> --help
 ```
 
@@ -52,6 +55,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
 | Resumable multi-bucket Cloudflare R2 -> Google Drive migration (CPU + Web UI) | `r2-migrate` | [R2 -> Drive Migration](references/r2-migrate.md) |
+| Kaggle pure-CPU HTTP connectivity & `/kaggle/working/.ct-cache` probe (`colabllm kaggle web-probe`) | `kaggle-web-probe` | [Kaggle Web Probe](references/kaggle-web-probe.md) |
 
 Read the selected runtime reference before constructing its task commands. The [common operations
 guide](references/runtime-common.md) defines shared lifecycle, path and timeout semantics. These guides

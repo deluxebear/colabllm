@@ -2,11 +2,11 @@
 
 ## First-use dependencies
 
-Run `colabllm doctor` (or `colabllm doctor -a ACCOUNT [--drive-account STORAGE]`); inspect structured results with `--json`. Local dependencies include Python
-3.12+, installed Colab CLI and its separate `colab-ext` extension. A successful `colab version` alone does
+Run `colabllm doctor` (or `colabllm doctor -a ACCOUNT [--drive-account STORAGE]`); for Kaggle runtimes run `colabllm doctor --provider kaggle` (or `--provider all`); inspect structured results with `--json`. Local dependencies include Python
+3.12+, installed Colab CLI and its separate `colab-ext` extension (or `kaggle` CLI with `kaggle-ext` providing `kaggle account` / `kaggle session` / `kaggle ext doctor` for Kaggle runtimes). A successful `colab version` alone does
 not prove Drive/multi-account extension (`colab drive` / `colab dfs`) is installed; follow the installed distribution's prerequisite documentation for
 the extension (`colab ext doctor`). When `accounts.json` exists under `~/.config/colab-cli/`, `doctor` checks the active or specified account's Drive binding and per-account `dfs_credentials.json`; `doctor --online --timeout 10` additionally checks
-selected backend authorization without creating a GPU session or opening a browser.
+selected backend authorization without creating a GPU session or opening a browser. Keep Kaggle accounts in `~/.config/kaggle-ext/accounts.json`, and use `colabllm kaggle <short_name> restart` to restart a live Kaggle Jupyter kernel while preserving `/kaggle/working/.ct-cache`.
 
 Google/Drive and Cloudflare login may need human interaction. Report the exact missing prerequisite;
 never claim an offline doctor warning proves credentials expired. A user with an existing remote API

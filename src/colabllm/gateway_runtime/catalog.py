@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import sys
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 _LIB_DIR = str(Path(__file__).resolve().parents[1] / "lib")
 if _LIB_DIR not in sys.path:
@@ -237,16 +237,17 @@ GATEWAY_RUNTIME_SPECS: dict[str, RuntimeGatewaySpec] = {
     "unlimited-ocr": RuntimeGatewaySpec(),
     "r2-migrate": RuntimeGatewaySpec(),
     "unsloth-studio": RuntimeGatewaySpec(),
+    "kaggle-web-probe": RuntimeGatewaySpec(),
 }
 
 
-def get_runtime_spec(runtime: str, specs: dict[str, RuntimeGatewaySpec] | None = None) -> RuntimeGatewaySpec | None:
+def get_runtime_spec(runtime: str, specs: Mapping[str, RuntimeGatewaySpec] | None = None) -> RuntimeGatewaySpec | None:
     """Return RuntimeGatewaySpec for a runtime name, or None if unregistered."""
     table = GATEWAY_RUNTIME_SPECS if specs is None else specs
     return table.get(runtime)
 
 
-def all_root_post_routes(specs: dict[str, RuntimeGatewaySpec] | None = None) -> tuple[set[str], tuple[str, ...]]:
+def all_root_post_routes(specs: Mapping[str, RuntimeGatewaySpec] | None = None) -> tuple[set[str], tuple[str, ...]]:
     """Return exact POST paths and POST prefix paths enabled on any runtime."""
     table = GATEWAY_RUNTIME_SPECS if specs is None else specs
     exact: set[str] = set()

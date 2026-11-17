@@ -99,6 +99,64 @@ class DoctorTest(unittest.TestCase):
             self.assertEqual(bad_by_name['colab-account']['status'], 'fail')
             self.assertNotIn('colab-auth', bad_by_name)
 
+    def test_kaggle_provider_checks_and_fail_open_warning_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            kcfg = root / 'kaggle-ext'
+            kcfg.mkdir()
+            (kcfg / 'accounts.json').write_text(json.dumps({
+                'version': 1,
+                'active': 'k_main',
+                'accounts': {'k_main': {'username': 'alice'}},
+            }), encoding='utf-8')
+            env = {**os.environ, 'COLABLLM_HOME': str(root / 'profile'), 'KAGGLE_EXT_CONFIG_DIR': str(kcfg)}
+
+            def fake_which(name):
+                return '/fake/kaggle' if name == 'kaggle' else None
+
+            def fake_run_ok(cmd, **kw):
+                if cmd[:3] == ['kaggle', 'ext', 'doctor']:
+                    return subprocess.CompletedProcess(cmd, 0, '{"ok": true}', '')
+                if cmd[:3] == ['kaggle', 'account', 'status']:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([{'account': 'k_main', 'authenticated': True}]), '')
+                if cmd[:3] == ['kaggle', 'session', 'list']:
+                    return subprocess.CompletedProcess(cmd, 0, '[]', '')
+                return subprocess.CompletedProcess(cmd, 0, 'usage: kaggle', '')
+
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(doctor, 'STATE_ROOT', doctor._INITIAL_STATE_ROOT), \
+                 patch.object(doctor, 'load_tunnel_config', return_value={}), \
+                 patch.object(doctor.shutil, 'which', side_effect=fake_which), \
+                 patch.object(doctor.subprocess, 'run', side_effect=fake_run_ok):
+                report = doctor.diagnose(provider='kaggle', online=True)
+            self.assertTrue(report['ok'])
+            self.assertEqual(report['provider'], 'kaggle')
+            by_name = {c['name']: c for c in report['checks']}
+            self.assertNotIn('colab', by_name)
+            self.assertNotIn('drive-consent', by_name)
+            self.assertEqual(by_name['kaggle-ext-cli']['status'], 'pass')
+            self.assertEqual(by_name['kaggle-ext-doctor']['status'], 'pass')
+            self.assertEqual(by_name['kaggle-auth']['status'], 'pass')
+
+            # Stock kaggle CLI emitting [kaggle-ext] fail-open stderr triggers failure
+            def fake_run_fail_open(cmd, **kw):
+                if cmd[:2] == ['kaggle', 'session']:
+                    return subprocess.CompletedProcess(cmd, 0, '', '[kaggle-ext] warning: sitecustomize skipped')
+                if cmd[:3] == ['kaggle', 'ext', 'doctor']:
+                    return subprocess.CompletedProcess(cmd, 2, '', 'no such command ext')
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(doctor, 'STATE_ROOT', doctor._INITIAL_STATE_ROOT), \
+                 patch.object(doctor, 'load_tunnel_config', return_value={}), \
+                 patch.object(doctor.shutil, 'which', side_effect=fake_which), \
+                 patch.object(doctor.subprocess, 'run', side_effect=fake_run_fail_open):
+                bad = doctor.diagnose(provider='kaggle', online=False)
+            self.assertFalse(bad['ok'])
+            bad_names = {c['name']: c for c in bad['checks']}
+            self.assertEqual(bad_names['kaggle-ext-cli']['status'], 'fail')
+            self.assertEqual(bad_names['kaggle-ext-doctor']['status'], 'fail')
+
 
 if __name__ == '__main__':
     unittest.main()

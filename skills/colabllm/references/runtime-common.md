@@ -21,11 +21,13 @@ colabllm gateway --stop
 colabllm gateway token list --json
 colabllm doctor
 colabllm doctor -a ACCOUNT --online --timeout 10
+colabllm doctor --provider kaggle --online --timeout 10
+colabllm kaggle services
 colabllm tunnel-config
 ```
 
-`colab` CLI、独立的 `colab-ext` 扩展（提供 `colab drive`/`dfs`、多账户 `colab account` 与 `colab ext doctor`）以及 Google/Drive 授权需要另行准备。
-`doctor` 默认离线检查当前活动或指定账户与 Drive 授权文件；`doctor --online --timeout 10` 增加限时只读授权检查。
+`colab` CLI、独立的 `colab-ext` 扩展（提供 `colab drive`/`dfs`、多账户 `colab account` 与 `colab ext doctor`）以及 Google/Drive 授权需要另行准备；使用 Kaggle 运行时（`colabllm kaggle <short_name> ...`）则需要独立配置 `kaggle` CLI（含 `kaggle-ext` 扩展，提供 `kaggle account` / `kaggle session` / `kaggle ext doctor`）。
+`doctor` 默认以 `--provider colab` 离线检查当前活动或指定账户与 Drive 授权文件；`doctor --provider kaggle` 跳过 Drive 检查并核验 `kaggle-ext` 与 `~/.colabllm/kaggle/` 状态；`--online --timeout 10` 增加限时只读授权检查。
 固定域名需要 Cloudflare 授权；FRP 还需要用户配置的服务器及 SSH 认证。
 安装包和前置依赖的完整说明以发行版 README 为准。包内 Agent 技能可用 `colabllm skill --output <技能父目录>` 导出。
 
@@ -39,7 +41,7 @@ colabllm tunnel-config
 每个运行时指南给出了具体服务名。共享命令为 `up/down/info/ps/list/status/logs/tunnel-config`，服务专用命令见各自指南。
 
 - `up` 等到完整的 `CT_READY` 协议行；`up --detach` 仅提交后台启动，需要继续检查 `status --json`。
-- `up --auto-restart` 开启守护模式（可配合 `--restart-delay SECONDS`、`--idle-check SECONDS` 与 `--max-restarts N`）：当 `colab exec` 断开（默认 `3s` 后立即核实恢复）、或静默期间每 `10s` 轻量公网边缘探针检出网关异常（如 `502`/`530`/不可达）及 `--idle-check`（默认 `300s`）兜底巡检确认远端会话已不存在时，若远端 VM 仍存活则直接重连挂载，若已被回收则立即清理残留记录并重新 `colab new` 申卡挂载恢复，固定域名与 `api_token` 保持不变；手动 `down` 时正常退出不重拉。
+- `up --auto-restart` 开启守护模式（可配合 `--restart-delay SECONDS`、`--idle-check SECONDS` 与 `--max-restarts N`）：Colab 与 Kaggle 后台实例均默认由单进程共享 `MuxDaemon` 托管（`--exec-backend auto` 优先使用原生纯标准库 Jupyter WebSocket，稳态零常驻外部 CLI 子进程；`--no-mux` 独立运行，`--exec-backend cli` 回退外部 CLI 子进程）。当保活连接断开、轻量公网边缘探针检出网关异常或 `--idle-check`（默认 `300s`）巡检超时时，若远端容器/VM 仍存活且 HTTP 健康则以只读 WebSocket `iopub`（或 `kaggle session logs -f`）重附不计重启次数；若已被回收则清理残留记录并重建恢复，固定域名与 `api_token` 保持不变；手动 `down` 时正常退出不重拉（单实例 `down`/`restart` 通过 `mux` RPC 停止对应协程而不影响同进程内其他平台实例）。
 - `up --ready-timeout SECONDS` 限制就绪等待。默认后台模式超时保留 runner；前台 `--foreground` 超时断开连接。
 - `--command-timeout SECONDS` 或 `COLABLLM_COMMAND_TIMEOUT` 限制外部控制命令；长驻保活连接不受该通用上限影响。
 - `status --json` 返回运行、就绪、URL 和探测信息；`running: true` 只代表本地 runner 活着，不能替代模型就绪检查。
@@ -62,8 +64,8 @@ colabllm tunnel-config
 切换到不同来源的 `--url` / URL 环境变量时，须显式提供匹配 Token；协议、主机、有效端口共同决定来源。
 当前没有公共命令设置任意持久 API Key；`up --new-credentials` 对停止的实例生成随机新凭据，不能接受指定值。
 
-本机状态在 `~/.colabllm/services/<服务[-实例]>/`，可用 `COLABLLM_HOME` 选择隔离配置。
-全局配置在用户目录的 `tunnel-config.json`；CLI 的外部授权仍由 Colab/Cloudflare/SSH 管理。
+本机状态在 `~/.colabllm/services/<服务[-实例]>/` 与 `~/.colabllm/kaggle/services/<短服务名[-实例]>/`，可用 `COLABLLM_HOME` 选择隔离配置（Kaggle 运行时状态加前缀 `kaggle-web-probe` 等标识展示，目录仍保留短名且要求 `<short_name[-inst]>` 总长 `<= 48` 字符）。
+全局配置在用户目录的 `tunnel-config.json`（Cloudflare/FRP 主域名双平台共享）；Kaggle 容器内部统一使用 `CT_WORK_DIR=/tmp/ct-runtime` 易失运行区与 `CT_CACHE_DIR=/kaggle/working/.ct-cache` 持久二进制缓存区，`restart` 会在不清除 `.ct-cache` 的前提下安全重启远端 Jupyter 内核；非 CPU 的 Kaggle 会话在宿主机强制执行 `--max-uptime`（默认 `6h`）与周配额安全余量门禁（`<= 0.15h` 拦截启动）。
 本机相对输入输出路径基于当前目录；`drive://...` 表示远端 MyDrive 路径，不接受 Drive 分享网页或文件 ID 代替路径。
 Drive 数据通常在 `MyDrive/colab-llm/<服务>/`；各服务具体存储以指南和返回结果为准。
 

@@ -59,6 +59,31 @@ class CompletionTest(unittest.TestCase):
             # Ensure minimax-h3-image's `-a` still completes aspect ratios, NOT accounts
             self.assertEqual(candidates(['minimax-h3-image', 'generate', '-a', '16:']), ['16:9'])
 
+    def test_kaggle_completion_commands_instances_and_accounts(self):
+        self.assertIn('kaggle', candidates(['k']))
+        self.assertIn('web-probe', candidates(['kaggle', 'w']))
+        self.assertIn('services', candidates(['kaggle', 's']))
+        self.assertEqual(candidates(['kaggle', 'help', 'w']), ['web-probe'])
+        k_subs = candidates(['kaggle', 'web-probe', ''])
+        self.assertIn('up', k_subs)
+        self.assertIn('restart', k_subs)
+        self.assertNotIn('_exec', k_subs)
+        self.assertIn('--accelerator', candidates(['kaggle', 'web-probe', 'up', '--']))
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp) / 'profile'
+            (home / 'kaggle/services/web-probe-demo').mkdir(parents=True)
+            kcfg = Path(temp) / 'kaggle-ext'
+            kcfg.mkdir()
+            (kcfg / 'accounts.json').write_text(
+                '{"version": 1, "active": "k_main", "accounts": {"k_main": {}, "k_work": {}}}',
+                encoding='utf-8',
+            )
+            with patch.dict(os.environ, {'COLABLLM_HOME': str(home), 'KAGGLE_EXT_CONFIG_DIR': str(kcfg)}):
+                self.assertEqual(candidates(['kaggle', 'web-probe', 'status', '-i', 'd']), ['demo'])
+                self.assertEqual(candidates(['kaggle', '-a', 'k_']), ['k_main', 'k_work'])
+                self.assertEqual(candidates(['kaggle', 'web-probe', 'up', '-a', 'k_']), ['k_main', 'k_work'])
+                self.assertEqual(candidates(['doctor', '--provider', 'kaggle', '-a', 'k_']), ['k_main', 'k_work'])
+
     def run_shell(self, shell, body):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

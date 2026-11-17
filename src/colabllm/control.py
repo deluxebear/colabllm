@@ -6,15 +6,16 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'lib'))
-from cli_support import UsageError, positive_seconds, run_cli
+from cli_support import UsageError, positive_seconds, run_cli, validate_account_syntax
 import colabsvc
-from colabsvc import cmd_tunnel_config, validate_domain
+from colabsvc import cmd_tunnel_config
+from runtime_core import validate_domain
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description='本项目所有运行时共享的全局配置', allow_abbrev=False)
     parser.add_argument('--command-timeout', type=positive_seconds, help='外部命令超时秒数')
-    parser.add_argument('--account', help='Colab 账户名或邮箱（全局选项兼容）')
+    parser.add_argument('--account', type=validate_account_syntax, help='账户标识（全局选项兼容）')
     parser.add_argument('--debug', action='store_true', help='输出异常堆栈')
     parser.add_argument('--quiet', action='store_true', help='静默诊断输出')
     parser.add_argument('--no-color', action='store_true', help='关闭彩色诊断输出')

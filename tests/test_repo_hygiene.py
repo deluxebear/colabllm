@@ -1,4 +1,5 @@
 """Repository hygiene: license metadata, no personal deployment details, idempotent service overrides."""
+import ast
 import importlib.util
 import re
 import sys
@@ -124,14 +125,78 @@ class RepoHygieneTest(unittest.TestCase):
 
     def test_every_service_is_registered_in_gateway_catalog(self):
         from colabllm.gateway_runtime.catalog import GATEWAY_RUNTIME_SPECS
-        from instance_discovery import discover_service_pairs
+        from instance_discovery import (
+            discover_kaggle_service_pairs,
+            discover_service_pairs,
+            kaggle_catalog_name,
+        )
 
-        paired = set(discover_service_pairs(ROOT / "src/colabllm/services"))
-        self.assertEqual(paired, set(GATEWAY_RUNTIME_SPECS.keys()))
+        colab_paired = set(discover_service_pairs(ROOT / "src/colabllm/services"))
+        kaggle_paired = {
+            kaggle_catalog_name(s)
+            for s in discover_kaggle_service_pairs(ROOT / "src/colabllm/kaggle_services")
+        }
+        self.assertEqual(colab_paired | kaggle_paired, set(GATEWAY_RUNTIME_SPECS.keys()))
         for name, spec in GATEWAY_RUNTIME_SPECS.items():
             if spec.gateway_enabled:
                 self.assertTrue(spec.allowed_v1_routes, f"{name} missing allowed_v1_routes")
                 self.assertIn(("GET", "/v1/models"), spec.allowed_v1_routes)
+
+    def test_provider_service_naming_and_stdlib_only_imports(self):
+        from instance_discovery import discover_kaggle_service_pairs, discover_service_pairs
+
+        colab_names = discover_service_pairs(ROOT / "src/colabllm/services")
+        kaggle_names = discover_kaggle_service_pairs(ROOT / "src/colabllm/kaggle_services")
+        reserved_cmds = {"help", "services", "kaggle", "doctor", "completion", "_complete", "web", "gateway", "tunnel-config"}
+
+        for name in colab_names:
+            self.assertFalse(name.startswith("kaggle-"), f"Colab service {name!r} must not use kaggle- prefix")
+            self.assertNotIn(name, reserved_cmds)
+        for short_name in kaggle_names:
+            self.assertFalse(short_name.startswith("kaggle-"), f"Kaggle short name {short_name!r} must not repeat kaggle- prefix")
+            self.assertNotIn(short_name, reserved_cmds)
+
+        pkg_root = ROOT / "src/colabllm"
+        local_modules = {
+            "colabllm",
+            "services",
+            "kaggle_services",
+            "web_ui",
+            "gateway_runtime",
+        }
+        for sub in (pkg_root, pkg_root / "lib", pkg_root / "web_ui", pkg_root / "gateway_runtime"):
+            if sub.is_dir():
+                for py in sub.glob("*.py"):
+                    local_modules.add(py.stem)
+
+        forbidden_external = {"kagglesdk", "kaggle_ext"}
+        for py in pkg_root.rglob("*.py"):
+            tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
+            # Forbid kagglesdk / kaggle_ext anywhere in the AST.
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertNotIn(alias.name.split(".", 1)[0], forbidden_external, f"{py.relative_to(ROOT)} must not import {alias.name}")
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    self.assertNotIn(node.module.split(".", 1)[0], forbidden_external, f"{py.relative_to(ROOT)} must not import {node.module}")
+
+            # Check top-level imports across the entire package, and deep AST imports for all host-side modules.
+            is_container_runtime = py.name.endswith("_runtime.py") or py.parent.name == "services"
+            nodes_to_check = tree.body if is_container_runtime else ast.walk(tree)
+            for node in nodes_to_check:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top = alias.name.split(".", 1)[0]
+                        self.assertTrue(
+                            top in sys.stdlib_module_names or top in local_modules,
+                            f"{py.relative_to(ROOT)} imports non-stdlib module {alias.name!r}",
+                        )
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    top = node.module.split(".", 1)[0]
+                    self.assertTrue(
+                        top in sys.stdlib_module_names or top in local_modules,
+                        f"{py.relative_to(ROOT)} imports non-stdlib module {node.module!r}",
+                    )
 
 
 if __name__ == "__main__":

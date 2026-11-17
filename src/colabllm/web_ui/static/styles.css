@@ -865,6 +865,18 @@ button.kpi-card.kpi-action[aria-pressed="true"] {
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
 }
 
+.badge.provider-colab {
+  background: var(--surface-subtle);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.badge.provider-kaggle {
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-subtle));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
 .badge.is-busy::before {
   content: "";
   inline-size: 6px;
@@ -1316,7 +1328,8 @@ th {
   container-type: inline-size;
 }
 
-#accounts-table {
+#accounts-table,
+#kaggle-accounts-table {
   border-collapse: separate;
   border-spacing: 0;
   --label-2: "邮箱";
@@ -1326,14 +1339,24 @@ th {
   --label-6: "Drive 授权";
 }
 
-#accounts-table thead {
+#kaggle-accounts-table {
+  --label-2: "用户名";
+  --label-3: "GPU 周配额";
+  --label-4: "TPU 周配额";
+  --label-5: "活跃会话数";
+  --label-6: "认证方式 / 状态";
+}
+
+#accounts-table thead,
+#kaggle-accounts-table thead {
   position: sticky;
   inset-block-start: 0;
   z-index: 1;
   background: var(--surface);
 }
 
-#accounts-table tbody th {
+#accounts-table tbody th,
+#kaggle-accounts-table tbody th {
   position: sticky;
   inset-inline-start: 0;
   background: var(--surface);
@@ -1361,53 +1384,67 @@ th {
   #accounts-table tbody,
   #accounts-table tr,
   #accounts-table th,
-  #accounts-table td {
+  #accounts-table td,
+  #kaggle-accounts-table,
+  #kaggle-accounts-table thead,
+  #kaggle-accounts-table tbody,
+  #kaggle-accounts-table tr,
+  #kaggle-accounts-table th,
+  #kaggle-accounts-table td {
     display: block;
   }
 
-  #accounts-table thead {
+  #accounts-table thead,
+  #kaggle-accounts-table thead {
     display: none;
   }
 
-  #accounts-table tr {
+  #accounts-table tr,
+  #kaggle-accounts-table tr {
     margin-block-end: 0.75rem;
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     overflow: clip;
   }
 
-  #accounts-table tbody th {
+  #accounts-table tbody th,
+  #kaggle-accounts-table tbody th {
     position: sticky;
     inset-block-start: 0;
     z-index: 2;
     background: var(--surface-subtle);
   }
 
-  #accounts-table td:nth-child(2)::before {
+  #accounts-table td:nth-child(2)::before,
+  #kaggle-accounts-table td:nth-child(2)::before {
     content: var(--label-2) ": ";
     color: var(--text-muted);
     font-weight: 600;
   }
 
-  #accounts-table td:nth-child(3)::before {
+  #accounts-table td:nth-child(3)::before,
+  #kaggle-accounts-table td:nth-child(3)::before {
     content: var(--label-3) ": ";
     color: var(--text-muted);
     font-weight: 600;
   }
 
-  #accounts-table td:nth-child(4)::before {
+  #accounts-table td:nth-child(4)::before,
+  #kaggle-accounts-table td:nth-child(4)::before {
     content: var(--label-4) ": ";
     color: var(--text-muted);
     font-weight: 600;
   }
 
-  #accounts-table td:nth-child(5)::before {
+  #accounts-table td:nth-child(5)::before,
+  #kaggle-accounts-table td:nth-child(5)::before {
     content: var(--label-5) ": ";
     color: var(--text-muted);
     font-weight: 600;
   }
 
-  #accounts-table td:nth-child(6)::before {
+  #accounts-table td:nth-child(6)::before,
+  #kaggle-accounts-table td:nth-child(6)::before {
     content: var(--label-6) ": ";
     color: var(--text-muted);
     font-weight: 600;

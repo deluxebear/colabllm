@@ -30,11 +30,11 @@ function loadSavedFleetView() {
 }
 
 const VIEW_META = {
-  fleet: ["舰队与实例", "管理 Google Colab 运行时生命周期、实时日志与公网隧道"],
+  fleet: ["舰队与实例", "管理 Google Colab 与 Kaggle 运行时生命周期、实时日志与公网隧道"],
   copilot: ["AI 演练场 · Copilot Studio", "基于同源代理的 OpenAI 兼容、多模态与运行时原生 API 演练场"],
   workbench: ["工作台与命令", "动态解析 CLI 子命令表单与后台任务执行流"],
-  network: ["隧道与账户", "配置项目全局主域名、核验 FRP 与只读查看多账户 Drive 状态"],
-  doctor: ["环境体检", "一键核验本机依赖、隧道后端与 Google Drive 授权状态"],
+  network: ["隧道与账户", "配置项目全局主域名、核验 FRP 与只读查看 Colab/Kaggle 多账户配额"],
+  doctor: ["环境体检", "一键核验 Colab / Kaggle 本机依赖、隧道后端与授权状态"],
 };
 
 const COMMON_UP_FLAGS = new Set([
@@ -47,6 +47,9 @@ const COMMON_UP_FLAGS = new Set([
   "--base-domain",
   "--quick-tunnel",
   "--gpu",
+  "--accelerator",
+  "--internet",
+  "--no-internet",
   "--transport",
   "--skip",
   "--hf-token",
@@ -56,6 +59,8 @@ const COMMON_UP_FLAGS = new Set([
   "--restart-delay",
   "--idle-check",
   "--max-restarts",
+  "--max-uptime",
+  "--startup-timeout",
   "--ready-timeout",
   "--detach",
   "--dry-run",
@@ -779,8 +784,27 @@ function tokenizeShellPreview(cmd) {
   return tokens;
 }
 
+function getServiceProvider(serviceName) {
+  if (!serviceName) return "colab";
+  const svc = state.servicesMap.get(serviceName);
+  if (svc && svc.provider) return svc.provider;
+  return String(serviceName).startsWith("kaggle-") ? "kaggle" : "colab";
+}
+
+function createProviderBadge(provider) {
+  const isKaggle = provider === "kaggle";
+  return el("span", {
+    className: isKaggle ? "badge provider-kaggle" : "badge provider-colab",
+    textContent: isKaggle ? "Kaggle" : "Colab",
+  });
+}
+
 function parseLifecycleTask(task) {
-  if (!task || !task.service || (task.subcommand !== "up" && task.subcommand !== "down")) {
+  if (
+    !task ||
+    !task.service ||
+    (task.subcommand !== "up" && task.subcommand !== "down" && task.subcommand !== "restart")
+  ) {
     return null;
   }
   const tokens = tokenizeShellPreview(task.command_preview);
@@ -822,8 +846,13 @@ function parseLifecycleTask(task) {
       const res = readFlagValue(i, ["--transport="]);
       transport = res.value;
       i += res.consumed;
-    } else if (tok === "--gpu" || tok.startsWith("--gpu=")) {
-      const res = readFlagValue(i, ["--gpu="]);
+    } else if (
+      tok === "--gpu" ||
+      tok.startsWith("--gpu=") ||
+      tok === "--accelerator" ||
+      tok.startsWith("--accelerator=")
+    ) {
+      const res = readFlagValue(i, ["--gpu=", "--accelerator="]);
       gpu = res.value;
       i += res.consumed;
     } else if (tok === "--all" && task.subcommand === "down") {
@@ -831,11 +860,13 @@ function parseLifecycleTask(task) {
     }
   }
 
+  const provider = getServiceProvider(task.service);
   const sessionName = instanceArg ? `${task.service}-${instanceArg}` : task.service;
   const displayLabel = instanceArg ? `${task.service} · #${instanceArg}` : task.service;
   return {
     taskId: task.task_id,
     service: task.service,
+    provider,
     subcommand: task.subcommand,
     instanceArg,
     account,
@@ -853,15 +884,24 @@ function inferLifecycleTaskHint(subcommand, rawOutput) {
   if (subcommand === "down") {
     return /delete-tunnel|tunnel/i.test(text)
       ? "正在停止实例并清理隧道..."
-      : "正在停止实例与清理 Colab 会话...";
+      : "正在停止实例与清理远端会话...";
+  }
+  if (subcommand === "restart") {
+    return "正在重启远端 Kaggle 内核并复用缓存...";
   }
   const lines = text
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   for (const line of lines.slice(-20).reverse()) {
+    if (/CT_STAGE=/i.test(line)) {
+      const stageVal = line.split("CT_STAGE=")[1]?.trim();
+      if (stageVal) return `阶段：${stageVal.slice(0, 48)}`;
+    }
     if (/runner started/i.test(line)) return "后台进程已启动，正在连接 Notebook...";
     if (/远端服务已在运行/.test(line)) return "远端服务已在运行，正在接管保活...";
+    if (/kaggle session create/i.test(line)) return "正在创建 Kaggle 会话...";
+    if (/reusing.*kaggle session/i.test(line)) return "正在复用运行中的 Kaggle 会话...";
     if (/colab dfs mount/i.test(line)) return "正在挂载 Google Drive...";
     if (/colab new/i.test(line)) return "正在申请 Colab GPU 会话 (约 10–30 秒)...";
     if (/reusing Colab session/i.test(line)) return "正在复用已有 Colab 会话...";
@@ -1413,6 +1453,29 @@ function reorderContainer(container, desiredNodes) {
   }
 }
 
+async function restartKaggleInstance(inst) {
+  if (state.readOnly) {
+    showToast("当前处于只读模式 (--read-only)，禁止重启内核", "warn");
+    return;
+  }
+  try {
+    const task = await apiFetch(`/api/instances/${encodeURIComponent(inst.service)}/restart`, {
+      method: "POST",
+      json: {
+        instance: inst.instance_arg || "",
+        account: inst.account || "",
+      },
+    });
+    const nextTasks = [task, ...state.tasks.filter((x) => x.task_id !== task.task_id)];
+    reconcileTasksAndInstances(state.rawInstances, nextTasks);
+    refreshEffectiveFleet();
+    showToast(`已触发重启 ${inst.session_name} 内核...`, "ok");
+    loadBootstrap().catch(() => {});
+  } catch (err) {
+    showToast(`重启失败: ${err.message}`, "danger");
+  }
+}
+
 function createActionCluster(surface, idSeq, getInst) {
   const popId = `inst-pop-${surface}-${idSeq}`;
   const anchorName = `--anc-${surface}-${idSeq}`;
@@ -1443,7 +1506,7 @@ function createActionCluster(surface, idSeq, getInst) {
   const sync = (inst) => {
     const urlHref = safeExternalUrl(inst.url);
     const titleText = inst.instance_arg ? `${inst.service} · #${inst.instance_arg}` : inst.service;
-    const inlineSig = `${Boolean(inst.running)}|${Boolean(inst.provisioning)}|${Boolean(inst.stopping)}|${Boolean(inst._failedTask)}|${Boolean(inst._virtual)}|${urlHref || ""}|${Boolean(inst.has_web_ui)}|${Boolean(inst.chat_compatible)}|${Boolean(state.readOnly)}|${titleText}`;
+    const inlineSig = `${Boolean(inst.running)}|${Boolean(inst.provisioning)}|${Boolean(inst.stopping)}|${Boolean(inst._failedTask)}|${Boolean(inst._virtual)}|${Boolean(inst.supports_restart)}|${urlHref || ""}|${Boolean(inst.has_web_ui)}|${Boolean(inst.chat_compatible)}|${Boolean(state.readOnly)}|${titleText}`;
     if (inlineSig !== lastInlineSig) {
       lastInlineSig = inlineSig;
       const inlineButtons = [];
@@ -1500,6 +1563,17 @@ function createActionCluster(surface, idSeq, getInst) {
               className: "btn sm primary",
               textContent: "AI 演练场",
               onClick: () => copilotController?.openInstanceInCopilot(getInst()),
+            }),
+          );
+        }
+        if (inst.supports_restart) {
+          inlineButtons.push(
+            el("button", {
+              type: "button",
+              className: "btn sm secondary",
+              disabled: state.readOnly,
+              textContent: "重启内核",
+              onClick: () => restartKaggleInstance(getInst()),
             }),
           );
         }
@@ -1688,6 +1762,7 @@ function getOrUpdateInstanceNodes(inst) {
     // 1. Card node
     const cardTitleEl = el("strong");
     const cardStageEl = el("span", { className: "muted" });
+    const cardProviderEl = el("span", { className: "badge" });
     const cardBadgeEl = el("span", { className: "badge" });
     const metaAccountEl = el("span");
     const metaDriveEl = el("span");
@@ -1703,7 +1778,7 @@ function getOrUpdateInstanceNodes(inst) {
         "div",
         { className: "card-head" },
         el("div", { className: "card-title-group" }, cardTitleEl, cardStageEl),
-        cardBadgeEl,
+        el("div", { className: "card-badges" }, cardProviderEl, cardBadgeEl),
       ),
       el(
         "div",
@@ -1781,6 +1856,7 @@ function getOrUpdateInstanceNodes(inst) {
       cardArticle,
       cardTitleEl,
       cardStageEl,
+      cardProviderEl,
       cardBadgeEl,
       metaAccountEl,
       metaDriveEl,
@@ -1828,16 +1904,26 @@ function getOrUpdateInstanceNodes(inst) {
   const relTime = formatRelativeTime(updatedTs);
   const catLabel = getInstanceCategoryLabel(inst);
 
+  const provider = inst.provider || getServiceProvider(inst.service);
+  const isKaggle = provider === "kaggle";
+  const providerLabel = isKaggle ? "Kaggle" : "Colab";
+
   // Patch Card
   entry.cardArticle.dataset.state = stateKey;
   entry.cardTitleEl.textContent = titleText;
   entry.cardStageEl.textContent = stageText;
+  entry.cardProviderEl.className = isKaggle ? "badge provider-kaggle" : "badge provider-colab";
+  entry.cardProviderEl.textContent = providerLabel;
   entry.cardBadgeEl.className = badgeCls;
   entry.cardBadgeEl.textContent = inst.state_label || "";
   entry.metaAccountEl.textContent = `账户: ${inst.account || "-"}`;
-  entry.metaDriveEl.textContent = `Drive: ${inst.drive_account || "无"}`;
+  entry.metaDriveEl.textContent = isKaggle
+    ? `内核: ${inst.kernel_session_id || inst.stage || "-"}`
+    : `Drive: ${inst.drive_account || "无"}`;
   entry.metaTransportEl.textContent = `传输: ${inst.transport || "-"}`;
-  entry.metaGpuEl.textContent = `GPU: ${inst.session_gpu || "-"}`;
+  entry.metaGpuEl.textContent = isKaggle
+    ? `加速: ${inst.accelerator || inst.session_gpu || "cpu"}`
+    : `GPU: ${inst.session_gpu || "-"}`;
   entry.metaUpdatedEl.textContent = `活跃: ${relTime.short}`;
   if (relTime.full) entry.metaUpdatedEl.title = relTime.full;
   else entry.metaUpdatedEl.removeAttribute("title");
@@ -1851,16 +1937,19 @@ function getOrUpdateInstanceNodes(inst) {
   const nameSortVal = inst.instance_arg ? `${inst.service} #${inst.instance_arg}` : inst.service;
   entry.tdName.dataset.value = nameSortVal;
   entry.tdNameTitle.textContent = titleText;
-  entry.tdNameCat.textContent = catLabel;
+  entry.tdNameCat.textContent = `[${providerLabel}] ${catLabel}`;
 
-  const acctSortVal = `${inst.account || ""} ${inst.drive_account || ""}`.trim();
+  const acctSortVal = `${inst.account || ""} ${inst.drive_account || inst.kernel_session_id || ""}`.trim();
   entry.tdAccount.dataset.value = acctSortVal;
   entry.tdAcctMain.textContent = inst.account || "-";
-  entry.tdAcctDrive.textContent = `Drive: ${inst.drive_account || "无"}`;
+  entry.tdAcctDrive.textContent = isKaggle
+    ? `内核: ${inst.kernel_session_id || "-"}`
+    : `Drive: ${inst.drive_account || "无"}`;
 
-  const gpuSortVal = `${inst.session_gpu || ""} ${inst.transport || ""}`.trim();
+  const gpuDisplay = isKaggle ? (inst.accelerator || inst.session_gpu || "cpu") : (inst.session_gpu || "-");
+  const gpuSortVal = `${gpuDisplay} ${inst.transport || ""}`.trim();
   entry.tdGpu.dataset.value = gpuSortVal;
-  entry.tdGpuMain.textContent = inst.session_gpu || "-";
+  entry.tdGpuMain.textContent = gpuDisplay;
   entry.tdGpuTrans.textContent = inst.transport || "-";
 
   entry.tdUpdated.dataset.value = String(updatedTs);
@@ -1872,11 +1961,19 @@ function getOrUpdateInstanceNodes(inst) {
   entry.grpInstLabel.textContent = inst.instance_arg ? `#${inst.instance_arg}` : "默认实例";
   entry.grpBadgeEl.className = badgeCls;
   entry.grpBadgeEl.textContent = inst.state_label || "";
-  entry.grpStageEl.textContent = stageText;
+  entry.grpStageEl.textContent = `[${providerLabel}] ${stageText}`;
   entry.grpMetaEl.replaceChildren(
     el("span", { textContent: `账户: ${inst.account || "-"}` }),
-    el("span", { textContent: `Drive: ${inst.drive_account || "无"}` }),
-    el("span", { textContent: `GPU: ${inst.session_gpu || "-"}` }),
+    el("span", {
+      textContent: isKaggle
+        ? `内核: ${inst.kernel_session_id || inst.stage || "-"}`
+        : `Drive: ${inst.drive_account || "无"}`,
+    }),
+    el("span", {
+      textContent: isKaggle
+        ? `加速: ${inst.accelerator || inst.session_gpu || "cpu"}`
+        : `GPU: ${inst.session_gpu || "-"}`,
+    }),
     el("span", { textContent: `传输: ${inst.transport || "-"}` }),
     el("span", { textContent: `活跃: ${relTime.short}`, title: relTime.full || undefined }),
   );
@@ -2377,7 +2474,9 @@ function renderServices() {
 
   const cards = filtered.map((svc) => {
     const runningNum = runningCountBySvc.get(svc.name) || 0;
-    const badges = [];
+    const provider = svc.provider || getServiceProvider(svc.name);
+    const isKaggle = provider === "kaggle";
+    const badges = [createProviderBadge(provider)];
     if (runningNum > 0) {
       badges.push(el("span", { className: "badge ok", textContent: `● ${runningNum} 运行中` }));
     }
@@ -2408,7 +2507,7 @@ function renderServices() {
       el(
         "div",
         { className: "card-meta" },
-        el("span", { textContent: `GPU: ${svc.gpu || "CPU"}` }),
+        el("span", { textContent: isKaggle ? `加速: ${svc.accelerator || "cpu"}` : `GPU: ${svc.gpu || "CPU"}` }),
         el("span", { textContent: `端口: ${svc.service_port} -> ${svc.public_port}` }),
         el("span", { textContent: `鉴权: ${svc.auth}` }),
       ),
@@ -2522,25 +2621,27 @@ function formatAccountSessionsCell(quota, isLoading) {
   return el("span", { className: "muted", textContent: isLoading ? "查询中..." : "-" });
 }
 
-function renderTunnelAndAccounts() {
-  const tunnelSummary = document.getElementById("tunnel-summary");
-  const t = state.tunnel || {};
-  const frp = t.frp || {};
-  const items = [
-    ["当前后端 (--transport)", t.transport || "cloudflare"],
-    ["项目主域名", t.base_domain || "未设置（Named Tunnel 将回退 Quick Tunnel）"],
-    ["环境变量覆盖", t.environment_override || "无"],
-    ["FRP 配置", frp.configured ? `${frp.server_addr || ""}:${frp.server_port || ""} (domain=${frp.domain || ""})` : "未配置"],
-  ];
-  const nodes = [];
-  for (const [k, v] of items) {
-    nodes.push(el("span", { className: "kv-key", textContent: k }), el("span", { className: "kv-val", textContent: v }));
+function formatKaggleQuotaCell(quota, available, isLoading) {
+  if (quota && quota.remaining_hours !== null && quota.remaining_hours !== undefined) {
+    const rem = Number(quota.remaining_hours);
+    const total = quota.total_hours !== null && quota.total_hours !== undefined ? Number(quota.total_hours) : null;
+    const used = quota.used_hours !== null && quota.used_hours !== undefined ? Number(quota.used_hours) : null;
+    const cls = rem > 2 ? "badge ok" : rem > 0.15 ? "badge warn" : "badge danger";
+    const text = total !== null ? `${rem.toFixed(1)} / ${total.toFixed(1)}h` : `剩余 ${rem.toFixed(1)}h`;
+    const children = [el("span", { className: cls, textContent: text })];
+    if (used !== null) {
+      children.push(el("span", { className: "quota-sub", textContent: `已用 ${used.toFixed(1)}h` }));
+    }
+    return el("div", { className: "quota-stack" }, ...children);
   }
-  tunnelSummary.replaceChildren(...nodes);
-  document.getElementById("tunnel-base-domain").value = t.base_domain || "";
+  if (!available) {
+    return el("span", { className: "muted", textContent: isLoading ? "查询中..." : "待刷新" });
+  }
+  return el("span", { className: "muted", textContent: "-" });
+}
 
+function renderColabAccountsSection(ac, isLoading) {
   const acctSummary = document.getElementById("accounts-summary");
-  const ac = state.accounts || {};
   const us = ac.usage_summary || null;
   let usageTotalText = "待查询（点击刷新可用量）";
   if (state.accountsUsageLoading && !us) {
@@ -2569,7 +2670,6 @@ function renderTunnelAndAccounts() {
 
   const tbody = document.getElementById("accounts-tbody");
   const list = ac.accounts || [];
-  const isLoading = Boolean(state.accountsUsageLoading);
   if (!list.length) {
     if (ac.legacy_quota) {
       const hasConsent = Boolean(ac.legacy_drive_consent);
@@ -2607,31 +2707,169 @@ function renderTunnelAndAccounts() {
   tbody.replaceChildren(...trs);
 }
 
+function renderKaggleAccountsSection(ac, isLoading) {
+  const kSummary = document.getElementById("kaggle-accounts-summary");
+  const kTbody = document.getElementById("kaggle-accounts-tbody");
+  if (!kSummary || !kTbody) return;
+
+  const kSnap = ac.kaggle || null;
+  let kStatusText = "待查询（点击刷新可用量）";
+  if (isLoading && !kSnap) {
+    kStatusText = "正在查询 Kaggle 配额...";
+  } else if (ac.kaggle_error) {
+    kStatusText = `配置错误: ${ac.kaggle_error}`;
+  } else if (kSnap) {
+    kStatusText = kSnap.available
+      ? `已连接 (${Object.keys(kSnap.accounts || {}).length} 个账户)`
+      : `降级/不可用: ${kSnap.error || "kaggle CLI 未就绪"}`;
+  }
+  kSummary.replaceChildren(
+    el("span", { className: "kv-key", textContent: "生效 Kaggle 账户" }),
+    el("span", { className: "kv-val", textContent: `${ac.kaggle_effective_account || "未解析"} (${ac.kaggle_effective_source || "-"})` }),
+    el("span", { className: "kv-key", textContent: "配额查询状态" }),
+    el("span", { className: "kv-val", textContent: kStatusText }),
+  );
+
+  const kList = ac.kaggle_accounts || [];
+  if (!kList.length) {
+    const emptyMsg = ac.kaggle_error || (kSnap && !kSnap.available && kSnap.error) || "未检测到 kaggle-ext 账户配置";
+    kTbody.replaceChildren(
+      el("tr", null, el("td", { colSpan: "6", className: "muted", textContent: emptyMsg })),
+    );
+    return;
+  }
+
+  const available = Boolean(kSnap && kSnap.available);
+  const kTrs = kList.map((ka) => {
+    const u = ka.usage || (kSnap?.accounts || {})[ka.name] || null;
+    const sessText =
+      u && u.active_sessions_count !== null && u.active_sessions_count !== undefined
+        ? `${u.active_sessions_count} 个`
+        : available
+          ? "未获取"
+          : "-";
+    let authNode;
+    if (u) {
+      const ok = Boolean(u.authenticated);
+      const cls = ok ? "badge ok" : "badge danger";
+      const lbl = `${u.auth_method || "auth"} · ${ok ? "已认证" : u.error || "未认证"}`;
+      authNode = el("span", { className: cls, textContent: lbl });
+    } else if (kSnap && !available && kSnap.error) {
+      authNode = el("span", { className: "badge warn", title: kSnap.error, textContent: "离线索引" });
+    } else {
+      authNode = el("span", { className: "muted", textContent: isLoading ? "查询中..." : "待刷新" });
+    }
+    return el(
+      "tr",
+      null,
+      el("th", { scope: "row", textContent: `${ka.name}${ka.active ? " (默认)" : ""}` }),
+      el("td", { textContent: ka.username ? `@${ka.username.replace(/^@/, "")}` : "-" }),
+      el("td", null, formatKaggleQuotaCell(u?.gpu_quota, available, isLoading)),
+      el("td", null, formatKaggleQuotaCell(u?.tpu_quota, available, isLoading)),
+      el("td", { textContent: sessText }),
+      el("td", null, authNode),
+    );
+  });
+  kTbody.replaceChildren(...kTrs);
+}
+
+function renderTunnelAndAccounts() {
+  const tunnelSummary = document.getElementById("tunnel-summary");
+  const t = state.tunnel || {};
+  const frp = t.frp || {};
+  const items = [
+    ["当前后端 (--transport)", t.transport || "cloudflare"],
+    ["项目主域名", t.base_domain || "未设置（Named Tunnel 将回退 Quick Tunnel）"],
+    ["环境变量覆盖", t.environment_override || "无"],
+    ["FRP 配置", frp.configured ? `${frp.server_addr || ""}:${frp.server_port || ""} (domain=${frp.domain || ""})` : "未配置"],
+  ];
+  const nodes = [];
+  for (const [k, v] of items) {
+    nodes.push(el("span", { className: "kv-key", textContent: k }), el("span", { className: "kv-val", textContent: v }));
+  }
+  tunnelSummary.replaceChildren(...nodes);
+  document.getElementById("tunnel-base-domain").value = t.base_domain || "";
+
+  const ac = state.accounts || {};
+  const isLoading = Boolean(state.accountsUsageLoading);
+  renderColabAccountsSection(ac, isLoading);
+  renderKaggleAccountsSection(ac, isLoading);
+}
+
+function getProviderAccountOptions(provider) {
+  if (provider === "kaggle") {
+    return (state.accounts?.kaggle_accounts || []).map((a) => ({
+      value: a.name,
+      label: a.username ? `${a.name} (@${a.username.replace(/^@/, "")})` : a.name,
+    }));
+  }
+  return (state.accounts?.accounts || []).map((a) => {
+    const u = a.quota?.usage;
+    if (!u) return { value: a.name, label: a.name };
+    const bal = Number(u.balance || 0).toFixed(1);
+    const cnt = Number(u.assignments_count || 0);
+    return { value: a.name, label: `${a.name} (${bal} CCU · ${cnt > 0 ? `${cnt}活跃` : "空闲"})` };
+  });
+}
+
+function refreshUpAccountSelector() {
+  const svc = document.getElementById("up-service")?.value || "";
+  const opts = getProviderAccountOptions(getServiceProvider(svc));
+  fillSelectOptions(document.getElementById("up-account"), opts, {
+    emptyLabel: "自动解析",
+    valueFn: (o) => o.value,
+    labelFn: (o) => o.label,
+  });
+}
+
+function refreshWorkbenchAccountSelector() {
+  const svc = document.getElementById("wb-service")?.value || "";
+  const opts = getProviderAccountOptions(getServiceProvider(svc));
+  fillSelectOptions(document.getElementById("wb-account"), opts, {
+    emptyLabel: "默认规则解析",
+    valueFn: (o) => o.value,
+    labelFn: (o) => o.label,
+  });
+}
+
+function refreshDoctorAccountSelector() {
+  const provider = document.getElementById("doctor-provider")?.value || "colab";
+  let opts;
+  if (provider === "kaggle") {
+    opts = getProviderAccountOptions("kaggle");
+  } else if (provider === "all") {
+    opts = [
+      ...getProviderAccountOptions("colab").map((o) => ({ value: o.value, label: `[Colab] ${o.label}` })),
+      ...getProviderAccountOptions("kaggle").map((o) => ({ value: o.value, label: `[Kaggle] ${o.label}` })),
+    ];
+  } else {
+    opts = getProviderAccountOptions("colab");
+  }
+  fillSelectOptions(document.getElementById("doctor-account"), opts, {
+    emptyLabel: "自动解析",
+    valueFn: (o) => o.value,
+    labelFn: (o) => o.label,
+  });
+}
+
 function populateAccountSelectors() {
   const accts = state.accounts?.accounts || [];
   const names = accts.map((a) => a.name);
-  fillSelectOptions(document.getElementById("up-account"), accts, {
-    emptyLabel: "自动解析",
-    valueFn: (a) => a.name,
-    labelFn: (a) => {
-      const u = a.quota?.usage;
-      if (!u) return a.name;
-      const bal = Number(u.balance || 0).toFixed(1);
-      const cnt = Number(u.assignments_count || 0);
-      return `${a.name} (${bal} CCU · ${cnt > 0 ? `${cnt}活跃` : "空闲"})`;
-    },
-  });
+  refreshUpAccountSelector();
   fillSelectOptions(document.getElementById("up-drive-account"), names, { emptyLabel: "自动解析" });
-  fillSelectOptions(document.getElementById("wb-account"), names, { emptyLabel: "默认规则解析" });
-  fillSelectOptions(document.getElementById("doctor-account"), names, { emptyLabel: "自动解析" });
+  refreshWorkbenchAccountSelector();
+  refreshDoctorAccountSelector();
   fillSelectOptions(document.getElementById("doctor-drive-account"), names, { emptyLabel: "跟随账户绑定" });
 }
 
 async function refreshAccountsUsage({ force = false, silent = true } = {}) {
   if (state.accountsUsageLoading) return;
-  const btn = document.getElementById("accounts-usage-refresh-btn");
+  const btns = [
+    document.getElementById("accounts-usage-refresh-btn"),
+    document.getElementById("kaggle-accounts-usage-refresh-btn"),
+  ].filter(Boolean);
   state.accountsUsageLoading = true;
-  if (btn) {
+  for (const btn of btns) {
     btn.disabled = true;
     btn.classList.add("is-busy");
     btn.textContent = "查询中...";
@@ -2642,15 +2880,15 @@ async function refreshAccountsUsage({ force = false, silent = true } = {}) {
     state.accounts = await apiFetch(`/api/accounts/usage${q}`, { timeoutMs: 25000 });
     populateAccountSelectors();
     if (!silent) {
-      showToast("已更新各账户 Colab 可用量", "ok", 2200);
+      showToast("已更新 Colab 与 Kaggle 账户配额", "ok", 2200);
     }
   } catch (err) {
     if (!silent) {
-      showToast(`查询 Colab 可用量失败: ${err.message}`, "danger");
+      showToast(`查询账户可用量失败: ${err.message}`, "danger");
     }
   } finally {
     state.accountsUsageLoading = false;
-    if (btn) {
+    for (const btn of btns) {
       btn.disabled = false;
       btn.classList.remove("is-busy");
       btn.textContent = "刷新可用量";
@@ -2791,21 +3029,18 @@ function getUpPayload(dryRun) {
       extra[ctrl.field.id] = val;
     }
   }
+  const svcName = document.getElementById("up-service").value;
+  const isKaggle = getServiceProvider(svcName) === "kaggle";
   const mode = document.getElementById("up-tunnel-mode").value;
   const domainVal = document.getElementById("up-domain-input").value.trim();
-  return {
+  const basePayload = {
     instance: document.getElementById("up-instance").value.trim(),
     account: document.getElementById("up-account").value.trim(),
-    drive_account: document.getElementById("up-drive-account").value.trim(),
     tunnel_mode: mode,
     domain: mode === "domain" ? domainVal : "",
     base_domain: mode === "base_domain" ? domainVal : "",
-    gpu: document.getElementById("up-gpu").value.trim(),
     transport: document.getElementById("up-transport").value.trim(),
-    skip: document.getElementById("up-skip").value.trim(),
-    hf_token: document.getElementById("up-hf-token").value.trim(),
     auto_restart: document.getElementById("up-auto-restart").checked,
-    no_drive: document.getElementById("up-no-drive").checked,
     new_credentials: document.getElementById("up-new-credentials").checked,
     restart_delay: document.getElementById("up-restart-delay").value.trim(),
     idle_check: document.getElementById("up-idle-check").value.trim(),
@@ -2814,30 +3049,101 @@ function getUpPayload(dryRun) {
     extra,
     dry_run: Boolean(dryRun),
   };
+  if (isKaggle) {
+    return {
+      ...basePayload,
+      accelerator: document.getElementById("up-accelerator").value.trim(),
+      internet: document.getElementById("up-internet").checked,
+      max_uptime: document.getElementById("up-max-uptime").value.trim(),
+      startup_timeout: document.getElementById("up-startup-timeout").value.trim(),
+    };
+  }
+  return {
+    ...basePayload,
+    drive_account: document.getElementById("up-drive-account").value.trim(),
+    gpu: document.getElementById("up-gpu").value.trim(),
+    skip: document.getElementById("up-skip").value.trim(),
+    hf_token: document.getElementById("up-hf-token").value.trim(),
+    no_drive: document.getElementById("up-no-drive").checked,
+  };
+}
+
+function syncUpDialogProviderMode(serviceName) {
+  const svcObj = state.servicesMap.get(serviceName);
+  const isKaggle = (svcObj?.provider || getServiceProvider(serviceName)) === "kaggle";
+  const toggleHidden = (id, hidden) => {
+    const node = document.getElementById(id);
+    if (node) node.hidden = hidden;
+  };
+  toggleHidden("up-drive-account-wrap", isKaggle);
+  toggleHidden("up-gpu-wrap", isKaggle);
+  toggleHidden("up-colab-extra-row", isKaggle);
+  toggleHidden("up-no-drive-wrap", isKaggle);
+  toggleHidden("up-accelerator-wrap", !isKaggle);
+  toggleHidden("up-internet-wrap", !isKaggle);
+  toggleHidden("up-max-uptime-wrap", !isKaggle);
+  toggleHidden("up-startup-timeout-wrap", !isKaggle);
+
+  const maxRestartsLbl = document.getElementById("up-max-restarts-label");
+  const maxRestartsInput = document.getElementById("up-max-restarts");
+  if (maxRestartsLbl && maxRestartsInput) {
+    if (isKaggle) {
+      maxRestartsLbl.textContent = "--max-restarts (默认 3，0 禁用重启)";
+      maxRestartsInput.placeholder = "3";
+    } else {
+      maxRestartsLbl.textContent = "--max-restarts (0 不限)";
+      maxRestartsInput.placeholder = "0";
+    }
+  }
+  if (isKaggle) {
+    const netEl = document.getElementById("up-internet");
+    if (netEl && netEl.dataset.forService !== serviceName) {
+      netEl.checked = svcObj?.enable_internet !== false;
+      netEl.dataset.forService = serviceName;
+    }
+  }
+  refreshUpAccountSelector();
 }
 
 function updateUpCommandPreview() {
   const svc = document.getElementById("up-service").value;
   if (!svc) return;
+  const svcObj = state.servicesMap.get(svc);
+  const isKaggle = (svcObj?.provider || getServiceProvider(svc)) === "kaggle";
   const p = getUpPayload(false);
-  const args = ["colabllm", svc];
+  const args = isKaggle
+    ? ["colabllm", "kaggle", svcObj?.short_name || svc.replace(/^kaggle-/, "")]
+    : ["colabllm", svc];
   if (p.instance) args.push("-i", p.instance);
   if (p.account) args.push("--account", p.account);
-  if (p.drive_account) args.push("--drive-account", p.drive_account);
+  if (!isKaggle && p.drive_account) args.push("--drive-account", p.drive_account);
   args.push("up");
   if (p.tunnel_mode === "quick") args.push("--quick-tunnel");
   else if (p.tunnel_mode === "domain") args.push(p.domain ? `--domain=${p.domain}` : "--domain");
   else if (p.tunnel_mode === "base_domain" && p.base_domain) args.push("--base-domain", p.base_domain);
-  if (p.gpu) args.push("--gpu", p.gpu);
+  if (isKaggle) {
+    if (p.accelerator) args.push("--accelerator", p.accelerator);
+    args.push(p.internet ? "--internet" : "--no-internet");
+  } else {
+    if (p.gpu) args.push("--gpu", p.gpu);
+  }
   if (p.transport) args.push("--transport", p.transport);
-  if (p.skip) args.push("--skip", p.skip);
-  if (p.no_drive) args.push("--no-drive");
-  if (p.hf_token) args.push("--hf-token", "***");
+  if (!isKaggle) {
+    if (p.skip) args.push("--skip", p.skip);
+    if (p.no_drive) args.push("--no-drive");
+    if (p.hf_token) args.push("--hf-token", "***");
+  }
   if (p.new_credentials) args.push("--new-credentials");
   if (p.auto_restart) args.push("--auto-restart");
   if (p.restart_delay) args.push("--restart-delay", p.restart_delay);
   if (p.idle_check) args.push("--idle-check", p.idle_check);
-  if (p.max_restarts && Number(p.max_restarts) > 0) args.push("--max-restarts", p.max_restarts);
+  if (p.max_restarts !== "" && (isKaggle ? Number(p.max_restarts) >= 0 : Number(p.max_restarts) > 0)) {
+    args.push("--max-restarts", p.max_restarts);
+  }
+  if (isKaggle) {
+    if (p.max_uptime) args.push("--max-uptime", p.max_uptime);
+    if (p.startup_timeout) args.push("--startup-timeout", p.startup_timeout);
+  }
   if (p.ready_timeout) args.push("--ready-timeout", p.ready_timeout);
   for (const ctrl of upExtraControllers) {
     const val = ctrl.readValue();
@@ -2854,6 +3160,7 @@ function updateUpCommandPreview() {
 }
 
 async function renderUpExtraFields(serviceName) {
+  syncUpDialogProviderMode(serviceName);
   const container = document.getElementById("up-extra-fields");
   container.replaceChildren(el("p", { className: "muted", textContent: "加载参数中..." }));
   upExtraControllers = [];
@@ -2885,6 +3192,7 @@ async function openUpDialog(serviceName = "", instanceArg = "", accountName = ""
   const dlg = document.getElementById("up-dialog");
   const svcSelect = document.getElementById("up-service");
   if (serviceName) svcSelect.value = serviceName;
+  syncUpDialogProviderMode(svcSelect.value);
   document.getElementById("up-instance").value = instanceArg || "";
   document.getElementById("up-account").value = accountName || "";
   document.getElementById("up-dryrun-output").hidden = true;
@@ -3261,6 +3569,7 @@ async function renderWorkbenchFields() {
 async function selectWorkbenchService(serviceName, subcommandName = "") {
   const svcSelect = document.getElementById("wb-service");
   svcSelect.value = serviceName;
+  refreshWorkbenchAccountSelector();
   const schema = await ensureSchema(serviceName);
   const subs = schema.subcommands || [];
   const subSelect = document.getElementById("wb-subcommand");
@@ -3756,14 +4065,31 @@ function initInteractions() {
   document.getElementById("accounts-usage-refresh-btn")?.addEventListener("click", async () => {
     await refreshAccountsUsage({ force: true, silent: false });
   });
+  document.getElementById("kaggle-accounts-usage-refresh-btn")?.addEventListener("click", async () => {
+    await refreshAccountsUsage({ force: true, silent: false });
+  });
 
   // Doctor
+  const syncDoctorProviderMode = () => {
+    const provider = document.getElementById("doctor-provider")?.value || "colab";
+    const hideDrive = provider === "kaggle";
+    const drvWrap = document.getElementById("doctor-drive-wrap");
+    const noDrvWrap = document.getElementById("doctor-no-drive-wrap");
+    if (drvWrap) drvWrap.hidden = hideDrive;
+    if (noDrvWrap) noDrvWrap.hidden = hideDrive;
+    refreshDoctorAccountSelector();
+  };
+  document.getElementById("doctor-provider")?.addEventListener("change", syncDoctorProviderMode);
+  syncDoctorProviderMode();
+
   document.getElementById("doctor-run-btn").addEventListener("click", async () => {
     const banner = document.getElementById("doctor-banner");
     const tbody = document.getElementById("doctor-tbody");
+    const provider = document.getElementById("doctor-provider")?.value || "colab";
     banner.textContent = "正在执行环境体检...";
     try {
       const q = new URLSearchParams({
+        provider,
         online: document.getElementById("doctor-online").checked ? "1" : "0",
         no_drive: document.getElementById("doctor-no-drive").checked ? "1" : "0",
         account: document.getElementById("doctor-account").value.trim(),
@@ -3771,7 +4097,7 @@ function initInteractions() {
         transport: document.getElementById("doctor-transport").value.trim(),
       });
       const res = await apiFetch(`/api/doctor?${q.toString()}`, { timeoutMs: 70000 });
-      banner.textContent = `体检完成：overall=${res.ok ? "PASS" : "FAIL"} | transport=${res.transport || "-"} | account=${res.account || "-"}`;
+      banner.textContent = `体检完成：overall=${res.ok ? "PASS" : "FAIL"} | provider=${res.provider || provider} | transport=${res.transport || "-"} | account=${res.account || "-"}`;
       const trs = (res.checks || []).map((c) => {
         const tone = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "danger";
         return el(

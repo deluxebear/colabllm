@@ -373,6 +373,69 @@ class IntrospectionTest(unittest.TestCase):
         self.assertNotIn('r2_super_secret_xyz', r2_preview)
         self.assertIn('***', r2_preview)
 
+    def test_kaggle_introspection_preview_and_max_restarts_zero(self):
+        catalog = introspect.get_service_catalog()
+        self.assertIn('kaggle-web-probe', catalog)
+        meta = catalog['kaggle-web-probe']
+        self.assertEqual(meta['provider'], 'kaggle')
+        self.assertEqual(meta['short_name'], 'web-probe')
+        self.assertTrue(meta['has_web_ui'])
+        self.assertFalse(meta['chat_compatible'])
+        self.assertFalse(meta['openai_compatible'])
+        self.assertTrue(meta['supports_restart'])
+        self.assertIn('web-probe.py', meta['script_path'])
+
+        k_argv, k_preview = introspect.build_up_argv(
+            'kaggle-web-probe',
+            {
+                'instance': '1',
+                'account': 'k_main',
+                'tunnel_mode': 'quick',
+                'accelerator': 'cpu',
+                'internet': False,
+                'auto_restart': True,
+                'max_restarts': 0,
+                'max_uptime': '2h',
+                'startup_timeout': '120',
+                'dry_run': True,
+            },
+        )
+        self.assertEqual(
+            k_argv,
+            [
+                '-i', '1',
+                '--account', 'k_main',
+                'up',
+                '--quick-tunnel',
+                '--accelerator', 'cpu',
+                '--no-internet',
+                '--auto-restart',
+                '--startup-timeout', '120',
+                '--max-uptime', '2h',
+                '--max-restarts', '0',
+                '--dry-run',
+            ],
+        )
+        self.assertTrue(k_preview.startswith('colabllm kaggle web-probe '))
+        self.assertIn('--max-restarts 0', k_preview)
+
+        # Colab still preserves val > 0 filter on max_restarts=0
+        c_argv, _ = introspect.build_up_argv('ollama', {'max_restarts': 0})
+        self.assertNotIn('--max-restarts', c_argv)
+
+        # Cross-provider flags are rejected cleanly
+        with self.assertRaises(UsageError):
+            introspect.build_up_argv('kaggle-web-probe', {'no_drive': True})
+
+        r_argv, r_preview = introspect.build_cli_argv(
+            'kaggle-web-probe',
+            'plan',
+            instance='2',
+            account='k_main',
+        ) if 'plan' in meta['subcommand_names'] else ([], '')
+        self.assertEqual(r_argv, [])
+        self.assertEqual(r_preview, '')
+
 
 class WebServerIntegrationTest(unittest.TestCase):
     def setUp(self):
@@ -387,11 +450,17 @@ class WebServerIntegrationTest(unittest.TestCase):
         colab_stub = self.bin_dir / 'colab'
         colab_stub.write_text('#!/bin/sh\nexit 99\n', encoding='utf-8')
         colab_stub.chmod(0o755)
+        kaggle_stub = self.bin_dir / 'kaggle'
+        kaggle_stub.write_text('#!/bin/sh\nexit 99\n', encoding='utf-8')
+        kaggle_stub.chmod(0o755)
         self._env_patch = patch.dict(
             os.environ,
             {
                 'COLABLLM_HOME': str(self.home_dir),
                 'XDG_CONFIG_HOME': str(self.xdg_dir),
+                'KAGGLE_EXT_CONFIG_DIR': str(self.xdg_dir / 'kaggle-ext'),
+                'COLABLLM_KAGGLE_ACCOUNT': '',
+                'KAGGLE_ACCOUNT': '',
                 'HOME': str(self.user_dir),
                 'PATH': str(self.bin_dir) + os.pathsep + os.environ.get('PATH', ''),
             },
@@ -1796,6 +1865,285 @@ assert.equal(ckDrawerTarget.value, 'indextts');
             0,
             f'Node copilot test failed (rc={proc.returncode}):\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}',
         )
+
+    def test_kaggle_dual_provider_state_bootstrap_doctor_restart_and_proxy_audit(self):
+        kaggle_cfg = self.xdg_dir / 'kaggle-ext'
+        kaggle_cfg.mkdir(parents=True, exist_ok=True)
+        (kaggle_cfg / 'accounts.json').write_text(
+            json.dumps({
+                'active': 'k_main',
+                'accounts': {'k_main': {'username': 'alice_k'}, 'k_alt': {'username': 'bob_k'}},
+            }),
+            encoding='utf-8',
+        )
+
+        calls_log = self.tmp / 'kaggle_calls.log'
+        kaggle_stub = self.bin_dir / 'kaggle'
+        kaggle_stub.write_text(
+            f'''#!{sys.executable}
+import json, sys
+from pathlib import Path
+with open({str(calls_log)!r}, 'a', encoding='utf-8') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+args = sys.argv[1:]
+if args[:2] == ['ext', 'doctor']:
+    print(json.dumps({{'ok': True}}))
+    sys.exit(0)
+if args[:2] in (['session', '--help'], ['account', '--help']):
+    print('ok')
+    sys.exit(0)
+sys.exit(0)
+''',
+            encoding='utf-8',
+        )
+        kaggle_stub.chmod(0o755)
+
+        received_headers: list[str] = []
+
+        class _ProbeUpstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def do_GET(self):
+                received_headers.append(self.headers.get('Authorization', ''))
+                body = json.dumps({'status': 'ok', 'service': 'web-probe'}).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _ProbeUpstream)
+        up_th = threading.Thread(target=upstream.serve_forever, daemon=True)
+        up_th.start()
+
+        try:
+            up_port = upstream.server_address[1]
+            k_inst_dir = self.home_dir / 'kaggle' / 'services' / 'web-probe'
+            k_inst_dir.mkdir(parents=True, exist_ok=True)
+            (k_inst_dir / 'state.json').write_text(
+                json.dumps({
+                    'schema_version': 1,
+                    'provider': 'kaggle',
+                    'base_service': 'web-probe',
+                    'catalog_service': 'kaggle-web-probe',
+                    'account': 'k_main',
+                    'accelerator': 'cpu',
+                    'url': f'http://127.0.0.1:{up_port}',
+                    'auth_user': 'probe_user',
+                    'auth_pass': 'probe_pass_secret_xyz',
+                    'api_token': 'probe_tok_secret_abc',
+                    'runner_exit': 0,
+                }),
+                encoding='utf-8',
+            )
+
+            # Verify state_store dual-root listing and field shape.
+            catalog = introspect.get_service_catalog()
+            listed = state_store.list_all_instances(catalog)
+            k_items = [x for x in listed if x['provider'] == 'kaggle']
+            self.assertEqual(len(k_items), 1)
+            self.assertEqual(k_items[0]['service'], 'kaggle-web-probe')
+            self.assertEqual(k_items[0]['short_name'], 'web-probe')
+            self.assertEqual(k_items[0]['session_name'], 'kaggle-web-probe')
+            self.assertEqual(k_items[0]['storage_session'], 'web-probe')
+
+            # Start console with a Colab default_account to verify zero cross-provider leakage.
+            srv = web_server.WebConsoleServer(('127.0.0.1', 0), default_account='colab_default')
+            th = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.1}, daemon=True)
+            th.start()
+            self._servers.append((srv, th))
+            port = srv.server_address[1]
+            cookie, csrf = self._authenticate(srv, port)
+            hdrs = {'Cookie': cookie, 'X-ColabLLM-CSRF': csrf, 'Content-Type': 'application/json'}
+            conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+            try:
+                # 1. /api/bootstrap uses zero subprocesses & shows offline kaggle_accounts.
+                conn.request('GET', '/api/bootstrap', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                boot = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertFalse(calls_log.exists())
+                self.assertIsNone(boot['accounts']['kaggle'])
+                k_names = [a['name'] for a in boot['accounts']['kaggle_accounts']]
+                self.assertEqual(k_names, ['k_alt', 'k_main'])
+
+                # 2. Kaggle up --dry-run does NOT inherit Colab default_account & preserves --max-restarts 0.
+                conn.request(
+                    'POST',
+                    '/api/instances/kaggle-web-probe/up',
+                    body=json.dumps({
+                        'instance': 'chk1',
+                        'tunnel_mode': 'quick',
+                        'accelerator': 'cpu',
+                        'auto_restart': True,
+                        'max_restarts': 0,
+                        'dry_run': True,
+                    }),
+                    headers=hdrs,
+                )
+                r = conn.getresponse()
+                dry_up = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertIn('colabllm kaggle web-probe', dry_up['command'])
+                self.assertIn('--max-restarts 0', dry_up['command'])
+                self.assertNotIn('colab_default', dry_up['command'])
+
+                # 3. Kaggle restart --dry-run works & does NOT inject Colab default_account.
+                conn.request(
+                    'POST',
+                    '/api/instances/kaggle-web-probe/restart',
+                    body=json.dumps({'dry_run': True}),
+                    headers=hdrs,
+                )
+                r = conn.getresponse()
+                dry_rst = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertIn('colabllm kaggle web-probe restart', dry_rst['command'])
+                self.assertNotIn('colab_default', dry_rst['command'])
+
+                # 4. /api/doctor?provider=kaggle skips Colab & does not leak colab_default.
+                conn.request('GET', '/api/doctor?provider=kaggle', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                doc = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(doc.get('provider'), 'kaggle')
+                self.assertNotIn('colab_default', str(doc))
+
+                # 5. /api/proxy/kaggle-web-probe/default/health proxies & writes 0600 sanitized web.log.
+                conn.request('GET', '/api/proxy/kaggle-web-probe/default/health', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                health = json.loads(r.read().decode('utf-8'))
+                self.assertEqual(r.status, 200)
+                self.assertEqual(health['status'], 'ok')
+                self.assertTrue(received_headers[-1].startswith('Basic '))
+
+                web_log = self.home_dir / 'web' / 'web.log'
+                self.assertTrue(web_log.is_file())
+                self.assertEqual(stat.S_IMODE(web_log.stat().st_mode), 0o600)
+                log_text = web_log.read_text(encoding='utf-8')
+                self.assertNotIn('probe_pass_secret_xyz', log_text)
+                self.assertNotIn('probe_tok_secret_abc', log_text)
+                last_rec = json.loads(log_text.strip().splitlines()[-1])
+                self.assertEqual(last_rec['provider'], 'kaggle')
+                self.assertEqual(last_rec['service'], 'kaggle-web-probe')
+                self.assertEqual(last_rec['instance'], 'default')
+                self.assertEqual(last_rec['status'], 200)
+                self.assertIsNone(last_rec['error'])
+
+                # 6. Proxy failure writes error audit without leaking secrets.
+                upstream.shutdown()
+                upstream.server_close()
+                conn.request('GET', '/api/proxy/kaggle-web-probe/default/health', headers={'Cookie': cookie})
+                r = conn.getresponse()
+                r.read()
+                self.assertEqual(r.status, 502)
+                log_lines = web_log.read_text(encoding='utf-8').strip().splitlines()
+                err_rec = json.loads(log_lines[-1])
+                self.assertEqual(err_rec['provider'], 'kaggle')
+                self.assertEqual(err_rec['status'], 502)
+                self.assertTrue(err_rec['error'])
+            finally:
+                conn.close()
+        finally:
+            upstream.server_close()
+
+    def test_kaggle_accounts_usage_normal_partial_degraded_and_cache_reset(self):
+        kaggle_cfg = self.xdg_dir / 'kaggle-ext'
+        kaggle_cfg.mkdir(parents=True, exist_ok=True)
+        (kaggle_cfg / 'accounts.json').write_text(
+            json.dumps({'active': 'main', 'accounts': {'main': {'username': 'alice'}}}),
+            encoding='utf-8',
+        )
+        mode_file = self.tmp / 'kaggle_mode.txt'
+        mode_file.write_text('normal', encoding='utf-8')
+        calls_log = self.tmp / 'kaggle_usage_calls.log'
+
+        kaggle_stub = self.bin_dir / 'kaggle'
+        kaggle_stub.write_text(
+            f'''#!{sys.executable}
+import json, sys
+from pathlib import Path
+with open({str(calls_log)!r}, 'a', encoding='utf-8') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\\n')
+mode = Path({str(mode_file)!r}).read_text(encoding='utf-8').strip()
+args = sys.argv[1:]
+if mode == 'broken':
+    sys.stderr.write('kaggle auth error\\n')
+    sys.exit(2)
+if args == ['account', 'status', '--json']:
+    print(json.dumps([{{
+        'account': 'main',
+        'active': True,
+        'username': 'alice',
+        'auth_method': 'access_token',
+        'authenticated': True,
+        'gpu_quota': {{'used_hours': 2.5, 'remaining_hours': 27.5, 'total_hours': 30.0}},
+        'tpu_quota': {{'used_hours': 0.0, 'remaining_hours': 20.0, 'total_hours': 20.0}},
+        'refresh_at': None,
+        'error': None,
+    }}]))
+    sys.exit(0)
+if args == ['session', 'list', '--all-accounts', '--json']:
+    if mode == 'partial':
+        sys.stderr.write('session list unavailable\\n')
+        sys.exit(1)
+    print(json.dumps([
+        {{'name': 'web-probe', 'account': 'main', 'state': 'active'}},
+        {{'name': 'old-one', 'account': 'main', 'state': 'stopped'}},
+    ]))
+    sys.exit(0)
+sys.exit(2)
+''',
+            encoding='utf-8',
+        )
+        kaggle_stub.chmod(0o755)
+
+        srv, port = self._start_console(read_only=False)
+        cookie, _ = self._authenticate(srv, port)
+        conn = http.client.HTTPConnection('127.0.0.1', port, timeout=10)
+        try:
+            # 1. Normal path: status + session list both succeed.
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            ov1 = json.loads(r.read().decode('utf-8'))
+            self.assertEqual(r.status, 200)
+            k1 = ov1['kaggle']
+            self.assertTrue(k1['available'])
+            self.assertIsNone(k1['error'])
+            self.assertEqual(k1['accounts']['main']['gpu_quota']['remaining_hours'], 27.5)
+            self.assertEqual(k1['accounts']['main']['active_sessions_count'], 1)
+            count_after_first = len(calls_log.read_text(encoding='utf-8').splitlines())
+
+            # Cached hit does not respawn kaggle CLI.
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(len(calls_log.read_text(encoding='utf-8').splitlines()), count_after_first)
+
+            # 2. clear_accounts_usage_cache clears Kaggle cache; partial session list failure degrades cleanly.
+            runner_bridge.clear_accounts_usage_cache()
+            self.assertIsNone(runner_bridge.get_cached_kaggle_usage())
+            mode_file.write_text('partial', encoding='utf-8')
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            k2 = json.loads(r.read().decode('utf-8'))['kaggle']
+            self.assertTrue(k2['available'])
+            self.assertIsNone(k2['accounts']['main']['active_sessions_count'])
+            self.assertEqual(k2['accounts']['main']['gpu_quota']['remaining_hours'], 27.5)
+
+            # 3. Full degradation on account status failure.
+            runner_bridge.clear_accounts_usage_cache()
+            mode_file.write_text('broken', encoding='utf-8')
+            conn.request('GET', '/api/accounts/usage', headers={'Cookie': cookie})
+            r = conn.getresponse()
+            k3 = json.loads(r.read().decode('utf-8'))['kaggle']
+            self.assertFalse(k3['available'])
+            self.assertIn('kaggle auth error', k3['error'])
+            self.assertEqual(k3['accounts'], {})
+        finally:
+            conn.close()
 
 
 if __name__ == '__main__':

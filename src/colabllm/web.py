@@ -22,7 +22,7 @@ for _path in (str(_LIB_DIR), str(_SRC_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from cli_support import CliError, UsageError, positive_seconds, run_cli  # noqa: E402
+from cli_support import CliError, UsageError, positive_seconds, run_cli, validate_account_syntax  # noqa: E402
 from colab_accounts import validate_account  # noqa: E402
 from local_daemon import (  # noqa: E402
     _display_host,
@@ -44,7 +44,7 @@ _DAEMON_ENV = '_COLABLLM_WEB_DAEMON'
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='colabllm', allow_abbrev=False)
     parser.add_argument('--command-timeout', type=positive_seconds, help='外部命令超时秒数')
-    parser.add_argument('--account', metavar='ACCOUNT', type=validate_account, help='Colab 账户名或邮箱')
+    parser.add_argument('--account', metavar='ACCOUNT', type=validate_account_syntax, help='默认 Colab 账户名或邮箱（全局选项）')
     parser.add_argument('--debug', action='store_true', help='输出异常堆栈')
     parser.add_argument('--quiet', action='store_true', help='静默诊断输出')
     parser.add_argument('--no-color', action='store_true', help='关闭彩色诊断输出')
@@ -239,7 +239,8 @@ def _start_detached(args: argparse.Namespace) -> int:
     web_dir, state_path, log_path, _ = _daemon_paths()
     private_dir(web_dir)
     state_path.unlink(missing_ok=True)
-    log_path.write_bytes(b'')
+    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
     log_path.chmod(0o600)
 
     cmd = _build_daemon_child_cmd(args)
@@ -388,6 +389,8 @@ def _serve_single_instance(args: argparse.Namespace, *, is_daemon_child: bool) -
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if getattr(args, 'account', None) is not None:
+        args.account = validate_account(args.account)
     is_daemon_child = os.environ.get(_DAEMON_ENV) == '1'
     if not is_daemon_child:
         if args.json and not (args.detach or args.status or args.stop):

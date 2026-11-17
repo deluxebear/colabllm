@@ -10,8 +10,17 @@ GENERATED_PREFIX = '<!-- Generated from docs/'
 
 
 def runtime_names():
-    return sorted(path.stem for path in (ROOT/'src/colabllm/services').glob('*.py')
-                  if path.with_suffix('.ipynb').is_file())
+    colab = [
+        path.stem
+        for path in (ROOT / 'src/colabllm/services').glob('*.py')
+        if path.with_suffix('.ipynb').is_file()
+    ]
+    kaggle = [
+        f'kaggle-{path.stem}'
+        for path in (ROOT / 'src/colabllm/kaggle_services').glob('*.py')
+        if path.name != '__init__.py' and path.with_suffix('.ipynb').is_file()
+    ]
+    return sorted([*colab, *kaggle])
 
 
 def synchronize(check=False):

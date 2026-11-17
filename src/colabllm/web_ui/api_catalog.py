@@ -748,6 +748,28 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             {"label": "自动登录获取 JWT (/api/auth/login)", "method": "POST", "path": "api/auth/login", "body": {}},
         ],
     },
+    "kaggle-web-probe": {
+        "primary_surface": "inspector",
+        "surfaces": ["inspector"],
+        "openai_compatible": False,
+        "default_model": "kaggle-web-probe",
+        "api_style": "kaggle-web-probe",
+        "health_path": "health",
+        "models_path": "",
+        "features": {
+            "web_ui": True,
+            "cpu_only": True,
+            "cache_probe": True,
+        },
+        "suggestions": [
+            "检查 Kaggle web-probe 健康状态 (/health) 与 /kaggle/working/.ct-cache 状态",
+            "通过内置网页首页 (/) 验证 Caddy Basic Auth 与隧道端到端连通性",
+        ],
+        "endpoint_presets": [
+            {"label": "健康检查 (/health)", "method": "GET", "path": "health"},
+            {"label": "探针网页 (/)", "method": "GET", "path": ""},
+        ],
+    },
 }
 
 

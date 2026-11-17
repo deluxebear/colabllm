@@ -535,6 +535,30 @@
                 </table>
               </div>
             </section>
+
+            <section id="kaggle-accounts-section" class="card">
+              <div class="block-header">
+                <h2 id="kaggle-accounts-card-heading">Kaggle 多账户与每周配额状态</h2>
+                <button type="button" id="kaggle-accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              </div>
+              <p class="muted">仅只读读取 ~/.config/kaggle-ext/accounts.json 账户索引，并通过 kaggle CLI 查询 GPU/TPU 每周可用额度与活跃会话，不读取凭据原文。</p>
+              <div id="kaggle-accounts-summary" class="kv-list"></div>
+              <div id="kaggle-accounts-table-wrap" tabindex="0" role="region" aria-labelledby="kaggle-accounts-card-heading" class="table-wrap accounts-table-wrap">
+                <table id="kaggle-accounts-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">账户名</th>
+                      <th scope="col">用户名</th>
+                      <th scope="col">GPU 周配额</th>
+                      <th scope="col">TPU 周配额</th>
+                      <th scope="col">活跃会话数</th>
+                      <th scope="col">认证方式 / 状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="kaggle-accounts-tbody"></tbody>
+                </table>
+              </div>
+            </section>
           </div>
         </section>
 
@@ -547,10 +571,18 @@
             </div>
             <div class="workbench-controls">
               <label>
-                <span>Colab 账户 (-a)</span>
-                <select id="doctor-account"><option value="">自动解析</option></select>
+                <span>检查平台 (--provider)</span>
+                <select id="doctor-provider">
+                  <option value="colab">colab</option>
+                  <option value="kaggle">kaggle</option>
+                  <option value="all">all (双平台)</option>
+                </select>
               </label>
               <label>
+                <span>计算账户 (-a)</span>
+                <select id="doctor-account"><option value="">自动解析</option></select>
+              </label>
+              <label id="doctor-drive-wrap">
                 <span>共享 Drive 账户</span>
                 <select id="doctor-drive-account"><option value="">跟随账户绑定</option></select>
               </label>
@@ -568,7 +600,7 @@
                   <span>联网只读核验 (--online)</span>
                   <input id="doctor-online" type="checkbox" switch>
                 </label>
-                <label class="switch-row">
+                <label id="doctor-no-drive-wrap" class="switch-row">
                   <span>跳过 Drive 检查 (--no-drive)</span>
                   <input id="doctor-no-drive" type="checkbox" switch>
                 </label>
@@ -616,7 +648,7 @@
           <span>计算账户 (-a / --account)</span>
           <select id="up-account"><option value="">自动解析</option></select>
         </label>
-        <label>
+        <label id="up-drive-account-wrap">
           <span>共享 Drive 账户 (--drive-account)</span>
           <select id="up-drive-account"><option value="">自动解析</option></select>
         </label>
@@ -637,7 +669,7 @@
         </label>
       </div>
       <div class="two-col">
-        <label>
+        <label id="up-gpu-wrap">
           <span>GPU 覆盖 (--gpu)</span>
           <select id="up-gpu">
             <option value="">服务默认</option>
@@ -649,6 +681,16 @@
             <option value="none">none (仅 CPU)</option>
           </select>
         </label>
+        <label id="up-accelerator-wrap" hidden>
+          <span>加速器 (--accelerator)</span>
+          <select id="up-accelerator">
+            <option value="">服务默认</option>
+            <option value="cpu">cpu (纯 CPU)</option>
+            <option value="NvidiaTeslaT4">NvidiaTeslaT4 (T4 GPU)</option>
+            <option value="NvidiaTeslaT4Highmem">NvidiaTeslaT4Highmem</option>
+            <option value="TpuV5E8">TpuV5E8 (TPU v5e-8)</option>
+          </select>
+        </label>
         <label>
           <span>隧道后端覆盖 (--transport)</span>
           <select id="up-transport">
@@ -658,7 +700,7 @@
           </select>
         </label>
       </div>
-      <div class="two-col">
+      <div id="up-colab-extra-row" class="two-col">
         <label>
           <span>跳过 Cell (--skip，如 1,2)</span>
           <input id="up-skip" type="text" placeholder="1,2">
@@ -673,9 +715,13 @@
           <span>守护自动重启 (--auto-restart)</span>
           <input id="up-auto-restart" type="checkbox" switch>
         </label>
-        <label class="switch-row">
+        <label id="up-no-drive-wrap" class="switch-row">
           <span>不挂载 Drive (--no-drive)</span>
           <input id="up-no-drive" type="checkbox" switch>
+        </label>
+        <label id="up-internet-wrap" class="switch-row" hidden>
+          <span>容器互联网访问 (--internet)</span>
+          <input id="up-internet" type="checkbox" switch checked>
         </label>
         <label class="switch-row">
           <span>轮换凭据 (--new-credentials)</span>
@@ -687,8 +733,10 @@
         <div class="two-col">
           <label><span>--restart-delay (秒)</span><input id="up-restart-delay" type="number" step="any" min="0.1" placeholder="3"></label>
           <label><span>--idle-check (秒)</span><input id="up-idle-check" type="number" step="any" min="1" placeholder="300"></label>
-          <label><span>--max-restarts (0 不限)</span><input id="up-max-restarts" type="number" step="1" min="0" placeholder="0"></label>
+          <label><span id="up-max-restarts-label">--max-restarts (0 不限)</span><input id="up-max-restarts" type="number" step="1" min="0" placeholder="0"></label>
           <label><span>--ready-timeout (秒)</span><input id="up-ready-timeout" type="number" step="any" min="1" placeholder="默认"></label>
+          <label id="up-max-uptime-wrap" hidden><span>--max-uptime (如 6h 或 3600)</span><input id="up-max-uptime" type="text" placeholder="6h"></label>
+          <label id="up-startup-timeout-wrap" hidden><span>--startup-timeout (秒)</span><input id="up-startup-timeout" type="number" step="any" min="1" placeholder="600"></label>
         </div>
         <div id="up-extra-fields" class="schema-fields"></div>
       </details>
@@ -735,7 +783,7 @@
     </div>
     <form method="dialog" id="remove-form" class="dialog-body">
       <p id="remove-dialog-desc"></p>
-      <p class="muted">仅删除本机状态目录 (~/.colabllm/services/...)，不会影响 Google Drive 数据或运行中的会话。</p>
+      <p class="muted">仅删除本机状态目录（如 services/ 或 kaggle/services/ 下的本地记录），不会影响远端数据或运行中的会话。</p>
       <div class="dialog-actions">
         <button value="cancel" autofocus class="btn secondary">取消</button>
         <button value="confirm" class="btn danger">确认移除</button>

@@ -40,6 +40,11 @@ colabllm comfyui up
 colabllm ollama up --dry-run
 colabllm unlimited-ocr --help
 
+# Kaggle 纯 CPU / 多账户扩展运行时（独立子命令命名空间）
+colabllm kaggle services                  # 列出全部 Kaggle 运行时
+colabllm kaggle web-probe up --quick-tunnel
+colabllm doctor --provider kaggle         # 独立核验 kaggle CLI 与 kaggle-ext 扩展
+
 # 项目级配置与本地控制台/网关也使用同一入口
 colabllm web
 colabllm web -d                         # 后台运行，并支持 --status / --stop
@@ -58,12 +63,14 @@ colabllm frp-status
 
 ```text
 ~/.colabllm/
-├── tunnel-config.json           # 全局主域名与 FRP 设置
-├── services/<name>/state.json   # 实例凭据、会话、隧道与 runner PID
-├── services/<name>/run.log      # 日志；执行用 notebook 也在实例目录
-├── web/                         # 本地 Web 控制台状态与 web.log
-├── gateway/                     # 本地聚合网关 tokens.json、state.json 与 gateway.log (0600)
-└── frp/<server-id>.json         # FRP 私密凭据
+├── tunnel-config.json                # 全局主域名与 FRP 设置
+├── services/<name>/state.json        # Colab 实例凭据、会话、隧道与 runner PID
+├── services/<name>/run.log           # Colab 运行日志；执行用 notebook 也在实例目录
+├── kaggle/services/<name>/state.json # Kaggle 实例凭据、Kernel 会话、隧道与 runner PID
+├── kaggle/services/<name>/run.log    # Kaggle 运行日志；clean.ipynb 与 runtime.env 在实例目录
+├── web/                              # 本地 Web 控制台状态与 web.log
+├── gateway/                          # 本地聚合网关 tokens.json、state.json 与 gateway.log (0600)
+└── frp/<server-id>.json              # FRP 私密凭据
 ```
 
 `colab`、`cf` 和 `ssh` 的授权/配置仍由各自工具管理；Google Drive 数据仍保存在远端。
@@ -228,6 +235,7 @@ colabllm longcat-avatar job JOB_ID --wait --timeout 300
 # 默认只检查本机依赖、Drive 扩展、当前或指定账户授权文件与用户配置
 colabllm doctor
 colabllm doctor -a gpu2 --online --timeout 10
+colabllm doctor --provider kaggle --online --timeout 10
 colabllm doctor --json --transport quick --no-drive
 
 # 额外验证 Colab、Cloudflare、SSH 授权，按选中的后端执行限时只读检查
@@ -313,6 +321,7 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 | **Ollama（含 Qwen3.8-27B BF16 预设）** | `T4` / `G4` | Caddy (Basic Auth + Bearer + `x-api-key`) | `https://ollama.example.com` | [docs/ollama.md](https://github.com/deluxebear/colabllm/blob/master/docs/ollama.md) |
 | **Unsloth Studio** | `L4` | 内置 Web 登录 (`builtin`) | `https://unsloth-studio.example.com` | [docs/unsloth-studio.md](https://github.com/deluxebear/colabllm/blob/master/docs/unsloth-studio.md) |
 | **Cloudflare R2 → Google Drive 迁移 (`r2-migrate`)** | `CPU` (`--high-mem`) | Caddy + Web UI (`caddy`) | `https://r2-migrate.example.com` | [docs/r2-migrate.md](https://github.com/deluxebear/colabllm/blob/master/docs/r2-migrate.md) |
+| **Kaggle HTTP 连通性与缓存探针 (`colabllm kaggle web-probe`)** | `CPU` (`kaggle`) | Caddy + Web UI (`caddy`) | `https://kaggle-web-probe.example.com` | [docs/kaggle-web-probe.md](https://github.com/deluxebear/colabllm/blob/master/docs/kaggle-web-probe.md) |
 
 ### 文本与编程大模型选型说明（Colab G4 硬件边界）
 
@@ -340,11 +349,13 @@ src/colabllm/
 ├── control.py                 # 全局域名与 FRP 管理
 ├── gateway.py                 # 常驻多模型聚合网关命令行入口
 ├── gateway_runtime/           # 网关能力目录、鉴权、亲和路由与 HTTP/1.1 转发
+├── kaggle_cli.py              # Kaggle 命名空间子命令入口 (`colabllm kaggle`)
+├── kaggle_services/           # Kaggle <short_name>.py + <short_name>.ipynb；随包安装
 ├── utility.py                 # 通用工具子命令
 ├── web.py                     # 本地可视化 Web 控制台入口
 ├── web_ui/                    # 本地浏览器控制台服务与静态资源
-├── lib/                       # 本地共享 runner、状态、HTTP/音频工具与 FRP 实现
-└── services/                  # <name>.py + <name>.ipynb；随包安装
+├── lib/                       # 本地共享 runner、状态、HTTP/音频工具、Kaggle 生命周期与 FRP 实现
+└── services/                  # Colab <name>.py + <name>.ipynb；随包安装
 templates/                     # notebook 生成器 build_notebooks.py 与嵌入 notebook 的独立模块
 docs/                          # 各运行时与 FRP/通用操作文档
 skills/colabllm/               # 随包分发的用户 Agent Skill（references 由 docs 同步生成）

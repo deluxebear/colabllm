@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import hmac
+import http.client
 import http.cookies
 import http.server
 import json
@@ -18,7 +21,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from cli_support import CliError, UsageError, origin as parse_origin, safe_urlopen
+from cli_support import CliError, UsageError, origin as parse_origin, positive_seconds, safe_urlopen
+from colab_accounts import validate_account
+from colabsvc import validate_instance
+from instance_discovery import parse_catalog_name
+from kaggle_accounts import validate_kaggle_account
+from kagglesvc import validate_kaggle_instance, validate_kaggle_session_name
+from paths import private_dir, user_home
+from runtime_core import create_private_rotating_logger, redact_runtime_secrets
 from . import introspect, runner_bridge, state_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -130,6 +140,9 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
         self._sse_lock = threading.Lock()
         self._events_sse: list[threading.Event] = []
         self._aux_sse: list[threading.Event] = []
+        self._web_log_lock = threading.Lock()
+        self._web_logger: Any = None
+        self._web_log_handler: Any = None
         self.task_manager = runner_bridge.TaskManager(on_change=self.invalidate_events_snapshot)
 
         bound_host = server_address[0].strip().lower()
@@ -220,6 +233,38 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
             if ev in bucket:
                 bucket.remove(ev)
 
+    def write_proxy_audit(
+        self,
+        *,
+        method: str,
+        service: str,
+        instance: str,
+        provider: str,
+        status: int | None,
+        error: str | None = None,
+        known_secrets: tuple[str, ...] = (),
+    ) -> None:
+        safe_error = redact_runtime_secrets(str(error), known_secrets) if error else None
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "method": method,
+            "service": service,
+            "instance": instance or "default",
+            "provider": provider,
+            "status": status,
+            "error": safe_error,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with self._web_log_lock:
+            if self._web_logger is None:
+                log_path = user_home() / "web" / "web.log"
+                private_dir(log_path.parent)
+                self._web_logger, self._web_log_handler = create_private_rotating_logger(
+                    log_path,
+                    logger_name=f"colabllm.web.{id(self)}",
+                )
+            self._web_logger.info(line)
+
     def shutdown(self) -> None:
         self.stop_event.set()
         with self._sse_lock:
@@ -230,6 +275,17 @@ class WebConsoleServer(http.server.ThreadingHTTPServer):
             ev.set()
         super().shutdown()
         self.task_manager.shutdown_all()
+
+    def server_close(self) -> None:
+        with self._web_log_lock:
+            if self._web_logger is not None and self._web_log_handler is not None:
+                self._web_logger.removeHandler(self._web_log_handler)
+            if self._web_log_handler is not None:
+                with contextlib.suppress(Exception):
+                    self._web_log_handler.close()
+            self._web_log_handler = None
+            self._web_logger = None
+        super().server_close()
 
 
 class WebRequestHandler(http.server.BaseHTTPRequestHandler):
@@ -477,11 +533,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 body = self._read_json_body()
                 svc_name = str(body.get("service") or "").strip()
                 subcommand = str(body.get("subcommand") or "").strip()
+                provider, _ = parse_catalog_name(svc_name)
+                account_val = body.get("account")
+                if not account_val and provider == "colab":
+                    account_val = self.server.default_account
                 argv, preview = introspect.build_cli_argv(
                     svc_name,
                     subcommand,
                     instance=body.get("instance"),
-                    account=body.get("account") or self.server.default_account,
+                    account=account_val,
                     values=body.get("values") or {},
                 )
                 catalog = introspect.get_service_catalog()
@@ -503,9 +563,12 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             if path == "/api/doctor" and method == "GET":
                 if self._require_api_auth() is None:
                     return
+                provider = query.get("provider", [""])[0].strip() or None
                 online = _truthy(query.get("online", ["0"])[0])
                 no_drive = _truthy(query.get("no_drive", ["0"])[0])
-                acct = query.get("account", [""])[0].strip() or self.server.default_account
+                acct = query.get("account", [""])[0].strip() or (
+                    self.server.default_account if provider in (None, "", "colab") else None
+                )
                 drv_acct = query.get("drive_account", [""])[0].strip() or None
                 transport = query.get("transport", [""])[0].strip() or None
                 timeout_raw = query.get("timeout", ["10"])[0].strip() or "10"
@@ -519,6 +582,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     drive_account=drv_acct,
                     transport=transport,
                     no_drive=no_drive,
+                    provider=provider,
                     timeout=timeout_val,
                 )
                 self._send_json(200, report)
@@ -528,10 +592,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 if self._require_api_auth() is None:
                     return
                 refresh = _truthy(query.get("refresh", ["0"])[0])
-                snap = runner_bridge.fetch_accounts_usage(refresh=refresh)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    colab_fut = pool.submit(runner_bridge.fetch_accounts_usage, refresh=refresh)
+                    kaggle_fut = pool.submit(runner_bridge.fetch_kaggle_accounts_usage, refresh=refresh)
+                    snap = colab_fut.result()
+                    kaggle_snap = kaggle_fut.result()
                 overview = state_store.accounts_overview(
                     default_account=self.server.default_account,
                     usage_snapshot=snap,
+                    kaggle_usage_snapshot=kaggle_snap,
                 )
                 self._send_json(200, overview)
                 return
@@ -634,6 +703,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         accounts = state_store.accounts_overview(
             default_account=self.server.default_account,
             usage_snapshot=runner_bridge.get_cached_accounts_usage(),
+            kaggle_usage_snapshot=runner_bridge.get_cached_kaggle_usage(),
         )
         tunnel = state_store.tunnel_overview()
         tasks = self.server.task_manager.list_tasks()
@@ -711,11 +781,13 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             raise UsageError(f"未知运行时服务: {svc_name}")
         script_path = catalog[svc_name]["script_path"]
 
+        provider, short_name = parse_catalog_name(svc_name)
+
         if action == "up" and method == "POST":
             if self._require_api_auth(require_csrf=True, write_action=True) is None:
                 return
             body = self._read_json_body()
-            if not body.get("account") and self.server.default_account:
+            if not body.get("account") and provider == "colab" and self.server.default_account:
                 body["account"] = self.server.default_account
             argv, preview = introspect.build_up_argv(svc_name, body)
             if body.get("dry_run"):
@@ -733,6 +805,48 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(202, task)
             return
 
+        if action == "restart" and method == "POST":
+            if self._require_api_auth(require_csrf=True, write_action=True) is None:
+                return
+            if not catalog[svc_name].get("supports_restart") or provider != "kaggle":
+                raise UsageError(f"{svc_name} 不支持 restart 操作")
+            body = self._read_json_body()
+            inst = str(body.get("instance") or "").strip()
+            if inst == "default":
+                inst = ""
+            account = str(body.get("account") or "").strip()
+            argv: list[str] = []
+            if inst:
+                validate_kaggle_instance(inst)
+                validate_kaggle_session_name(f"{short_name}-{inst}")
+                argv.extend(["-i", inst])
+            if account:
+                argv.extend(["--account", validate_kaggle_account(account)])
+            argv.append("restart")
+            if body.get("new_credentials"):
+                argv.append("--new-credentials")
+            raw_rt = body.get("ready_timeout")
+            if raw_rt is not None and str(raw_rt).strip() != "":
+                rt_val = positive_seconds(str(raw_rt).strip())
+                argv.extend(["--ready-timeout", f"{rt_val:g}"])
+            dry_run = bool(body.get("dry_run"))
+            argv.append("--dry-run" if dry_run else "--detach")
+            preview = introspect.format_command_preview(svc_name, argv)
+            if dry_run:
+                res = runner_bridge.run_dry_run(script_path, argv)
+                self._send_json(200, {"dry_run": True, "command": preview, "output": res["output"]})
+            else:
+                task = self.server.task_manager.start_task(
+                    service_name=svc_name,
+                    script_path=script_path,
+                    subcommand="restart",
+                    argv=argv,
+                    command_preview=preview,
+                )
+                self.server.invalidate_events_snapshot()
+                self._send_json(202, task)
+            return
+
         if action == "down" and method == "POST":
             if self._require_api_auth(require_csrf=True, write_action=True) is None:
                 return
@@ -741,15 +855,17 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             if inst == "default":
                 inst = ""
             account = str(body.get("account") or "").strip()
-            argv: list[str] = []
+            argv = []
             if inst:
-                from colabsvc import validate_instance
-
-                argv.extend(["-i", validate_instance(inst)])
+                if provider == "kaggle":
+                    validate_kaggle_instance(inst)
+                    validate_kaggle_session_name(f"{short_name}-{inst}")
+                    argv.extend(["-i", inst])
+                else:
+                    argv.extend(["-i", validate_instance(inst)])
             if account:
-                from colab_accounts import validate_account
-
-                argv.extend(["--account", validate_account(account)])
+                acct_val = validate_kaggle_account(account) if provider == "kaggle" else validate_account(account)
+                argv.extend(["--account", acct_val])
             argv.append("down")
             if body.get("all"):
                 argv.append("--all")
@@ -782,7 +898,13 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
             inst = query.get("instance", [""])[0].strip()
             account = query.get("account", [""])[0].strip() or None
-            report = runner_bridge.run_probe(script_path, instance_arg=inst, account=account)
+            report = runner_bridge.run_probe(
+                script_path,
+                instance_arg=inst,
+                account=account,
+                provider=provider,
+                short_name=short_name,
+            )
             self._send_json(200, report)
             return
 
@@ -994,9 +1116,26 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
         req = urllib.request.Request(target_url, data=body, headers=req_headers, method=method)
         head_only = method == "HEAD"
+        provider, _ = parse_catalog_name(svc_name)
+        inst_display = inst_raw if inst_raw else "default"
+        known_secrets = tuple(
+            str(st[k])
+            for k in ("auth_pass", "api_token", "login_pass")
+            if st.get(k)
+        )
 
+        streamed = False
         try:
             with safe_urlopen(req, timeout=180) as resp:
+                self.server.write_proxy_audit(
+                    method=method,
+                    service=svc_name,
+                    instance=inst_display,
+                    provider=provider,
+                    status=resp.status,
+                    known_secrets=known_secrets,
+                )
+                streamed = True
                 self._stream_proxy_response(
                     resp.status,
                     resp.headers.get("Content-Type", ""),
@@ -1004,6 +1143,15 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                     head_only=head_only,
                 )
         except urllib.error.HTTPError as err:
+            self.server.write_proxy_audit(
+                method=method,
+                service=svc_name,
+                instance=inst_display,
+                provider=provider,
+                status=err.code,
+                error=f"HTTP {err.code}",
+                known_secrets=known_secrets,
+            )
             raw_err = b"" if head_only else err.read()
             ct = _sanitize_proxy_content_type(err.headers.get("Content-Type", "text/plain; charset=utf-8"))
             self.send_response(err.code)
@@ -1021,8 +1169,20 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             if not head_only:
                 self.wfile.write(raw_err)
-        except urllib.error.URLError as err:
-            raise CliError(f"远端代理请求失败: {err.reason}") from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+            if streamed:
+                raise
+            reason = getattr(err, "reason", None) or str(err)
+            self.server.write_proxy_audit(
+                method=method,
+                service=svc_name,
+                instance=inst_display,
+                provider=provider,
+                status=502,
+                error=f"URLError: {reason}",
+                known_secrets=known_secrets,
+            )
+            raise CliError(f"远端代理请求失败: {reason}") from None
 
     def _stream_proxy_response(
         self,

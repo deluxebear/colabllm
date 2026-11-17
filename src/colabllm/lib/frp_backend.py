@@ -7,9 +7,27 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 from cli_support import command_timeout
 from pathlib import Path
 from paths import private_dir, write_private
+from runtime_core import (
+    COLAB_NAMESPACE,
+    ProviderNamespace,
+    cf_json as _core_cf_json,
+    find_zone as _core_find_zone,
+    load_tunnel_config as _core_load_tunnel_config,
+    save_tunnel_config as _core_save_tunnel_config,
+    validate_domain as _core_validate_domain,
+)
+
+
+def _provider_helper(namespace: ProviderNamespace, attr: str, default):
+    if namespace.provider == 'colab':
+        mod = sys.modules.get('colabsvc')
+        if mod is not None and hasattr(mod, attr):
+            return getattr(mod, attr)
+    return default
 
 
 def validate_config(config):
@@ -57,12 +75,16 @@ def credentials_path(state_root, config):
 
 
 def configure(args, state_root):
-    from colabsvc import load_tunnel_config, save_tunnel_config, validate_domain, find_zone
-    saved=load_tunnel_config()
+    colab_mod = sys.modules.get('colabsvc')
+    use_colab = colab_mod is not None and state_root == getattr(colab_mod, 'STATE_ROOT', None)
+    saved = colab_mod.load_tunnel_config() if use_colab and hasattr(colab_mod, 'load_tunnel_config') else _core_load_tunnel_config(state_root=state_root)
     if args.disable:
         if saved.get('frp'):
             saved['frp']['enabled']=False
-            save_tunnel_config(saved)
+            if use_colab and hasattr(colab_mod, 'save_tunnel_config'):
+                colab_mod.save_tunnel_config(saved)
+            else:
+                _core_save_tunnel_config(saved, state_root=state_root)
         return saved
     supplied=any(getattr(args,k,None) is not None for k in ('server_ip','ssh','base_domain','server_port'))
     if not supplied:
@@ -72,28 +94,33 @@ def configure(args, state_root):
              ssh=args.ssh or previous.get('ssh'),server_port=args.server_port or previous.get('server_port',7000),
              project_id=previous.get('project_id') or secrets.token_hex(16))
     cfg=validate_config(cfg)
-    base=validate_domain(args.base_domain or saved.get('base_domain',''))
+    base=_core_validate_domain(args.base_domain or saved.get('base_domain',''))
     for executable in ('ssh','cf'):
         if not shutil.which(executable):
             raise ValueError(f'{executable} CLI not found')
-    find_zone(base)  # Verify Cloudflare account/zone before touching the server.
+    find_zone_fn = _provider_helper(COLAB_NAMESPACE, 'find_zone', _core_find_zone)
+    find_zone_fn(base)  # Verify Cloudflare account/zone before touching the server.
     result=remote(cfg,dict(action='provision',server_ip=cfg['server_ip'],server_port=cfg['server_port']))
     if not result.get('token') or 'BEGIN CERTIFICATE' not in result.get('ca_cert',''):
         raise RuntimeError('FRP provisioner did not return client credentials')
     write_private(credentials_path(state_root,cfg),result)
     saved.update(base_domain=base,frp=cfg)
-    save_tunnel_config(saved)
+    if use_colab and hasattr(colab_mod, 'save_tunnel_config'):
+        colab_mod.save_tunnel_config(saved)
+    else:
+        _core_save_tunnel_config(saved, state_root=state_root)
     return saved
 
 
-def ensure_dns(svc, config, hostname):
-    from colabsvc import cf_json, find_zone
-    zone=find_zone(hostname)
-    records=cf_json('dns','records','list','-z',zone['id'],'--name',hostname)
-    owner='colabsvc-frp '+config['project_id']+' '+svc.name
-    # Permit switching this project's existing Cloudflare named-tunnel record;
-    # it must carry our existing service ownership comment.
-    allowed={owner,'colabsvc '+svc.name}
+def ensure_dns(svc, config, hostname, *, namespace: ProviderNamespace = COLAB_NAMESPACE, cf_json_fn=None, find_zone_fn=None):
+    cf_fn = cf_json_fn or _provider_helper(namespace, 'cf_json', _core_cf_json)
+    fz_fn = find_zone_fn or _provider_helper(namespace, 'find_zone', lambda h: _core_find_zone(h, cf_json_fn=cf_fn))
+    zone=fz_fn(hostname)
+    records=cf_fn('dns','records','list','-z',zone['id'],'--name',hostname)
+    owner=f"{namespace.frp_owner_prefix} {config['project_id']} {svc.name}"
+    # Permit switching this project's existing Cloudflare named-tunnel record
+    # belonging to the SAME provider namespace; never cross-claim between Colab & Kaggle.
+    allowed={owner,f"{namespace.dns_owner_prefix} {svc.name}"}
     if any(record.get('comment') not in allowed for record in records) or len(records)>1:
         raise ValueError(f'DNS conflict for {hostname}; existing records are not exclusively managed by this service')
     record_type='AAAA' if ipaddress.ip_address(config['server_ip']).version==6 else 'A'
@@ -102,37 +129,48 @@ def ensure_dns(svc, config, hostname):
         record=records[0]
         previous={k:record[k] for k in ('type','name','content','proxied','ttl','comment') if k in record}
         if any(record.get(k)!=v for k,v in body.items() if k!='ttl'):
-            cf_json('dns','records','edit',record['id'],'-z',zone['id'],'--body',json.dumps(body))
+            cf_fn('dns','records','edit',record['id'],'-z',zone['id'],'--body',json.dumps(body))
     else:
-        record=cf_json('dns','records','create','-z',zone['id'],'--body',json.dumps(body))
+        record=cf_fn('dns','records','create','-z',zone['id'],'--body',json.dumps(body))
     return dict(zone_id=zone['id'],dns_owner=owner,dns_record_id=record['id'],
                 _previous=previous if records else None)
 
 
-def rollback_dns(dns, hostname):
-    from colabsvc import cf_json
-    for record in cf_json('dns','records','list','-z',dns['zone_id'],'--name',hostname):
+def rollback_dns(dns, hostname, *, namespace: ProviderNamespace = COLAB_NAMESPACE, cf_json_fn=None):
+    cf_fn = cf_json_fn or _provider_helper(namespace, 'cf_json', _core_cf_json)
+    for record in cf_fn('dns','records','list','-z',dns['zone_id'],'--name',hostname):
         if record['id']!=dns['dns_record_id'] or record.get('comment')!=dns['dns_owner']:
             continue
         if dns['_previous'] is None:
-            cf_json('dns','records','delete',record['id'],'-z',dns['zone_id'],'--force')
+            cf_fn('dns','records','delete',record['id'],'-z',dns['zone_id'],'--force')
         else:
-            cf_json('dns','records','edit',record['id'],'-z',dns['zone_id'],
-                    '--body',json.dumps(dns['_previous']))
+            cf_fn('dns','records','edit',record['id'],'-z',dns['zone_id'],
+                  '--body',json.dumps(dns['_previous']))
 
 
-def ensure_route(svc, config, hostname, state_root):
+def ensure_route(svc, config, hostname, state_root, *, namespace: ProviderNamespace = COLAB_NAMESPACE, cf_json_fn=None, find_zone_fn=None):
     # Read credentials before mutating remote routes or DNS.
     credential=json.loads(credentials_path(state_root,config).read_text())
-    dns=ensure_dns(svc,config,hostname)
+    if namespace == COLAB_NAMESPACE and cf_json_fn is None and find_zone_fn is None:
+        dns=ensure_dns(svc,config,hostname)
+    else:
+        dns=ensure_dns(svc,config,hostname,namespace=namespace,cf_json_fn=cf_json_fn,find_zone_fn=find_zone_fn)
+    remote_service=(
+        f"{namespace.service_prefix}{svc.name}"
+        if namespace.service_prefix and not svc.name.startswith(namespace.service_prefix)
+        else svc.name
+    )
     try:
-        result=remote(config,dict(action='route',project_id=config['project_id'],service=svc.name,hostname=hostname,
+        result=remote(config,dict(action='route',project_id=config['project_id'],service=remote_service,hostname=hostname,
                                   profile='comfyui' if svc.base_name=='comfyui' else None))
     except Exception:
-        rollback_dns(dns,hostname)
+        if namespace == COLAB_NAMESPACE and cf_json_fn is None:
+            rollback_dns(dns,hostname)
+        else:
+            rollback_dns(dns,hostname,namespace=namespace,cf_json_fn=cf_json_fn)
         raise
     dns.pop('_previous')
-    state=dict(transport='frp',hostname=hostname,frp={**config,**result},**dns)
+    state=dict(transport='frp',hostname=hostname,remote_service=remote_service,frp={**config,**result},**dns)
     env=dict(CT_TRANSPORT='frp',CT_PUBLIC_HOSTNAME=hostname,
              CT_FRP_SERVER_IP=config['server_ip'],CT_FRP_SERVER_PORT=str(config['server_port']),
              CT_FRP_REMOTE_PORT=str(result['remote_port']),CT_FRP_PROXY_NAME=result['proxy_name'],
@@ -143,10 +181,15 @@ def ensure_route(svc, config, hostname, state_root):
     return state,env
 
 
-def remove_route(state, service_name):
-    from colabsvc import cf_json
+def remove_route(state, service_name, *, namespace: ProviderNamespace = COLAB_NAMESPACE, cf_json_fn=None):
+    cf_fn = cf_json_fn or _provider_helper(namespace, 'cf_json', _core_cf_json)
     config=state['frp']
-    remote(config,dict(action='remove',project_id=config['project_id'],service=service_name,hostname=state['hostname']))
-    for record in cf_json('dns','records','list','-z',state['zone_id'],'--name',state['hostname']):
+    remote_service=state.get('remote_service') or (
+        f"{namespace.service_prefix}{service_name}"
+        if namespace.service_prefix and not service_name.startswith(namespace.service_prefix)
+        else service_name
+    )
+    remote(config,dict(action='remove',project_id=config['project_id'],service=remote_service,hostname=state['hostname']))
+    for record in cf_fn('dns','records','list','-z',state['zone_id'],'--name',state['hostname']):
         if record['id']==state.get('dns_record_id') and record.get('comment')==state.get('dns_owner'):
-            cf_json('dns','records','delete',record['id'],'-z',state['zone_id'],'--force')
+            cf_fn('dns','records','delete',record['id'],'-z',state['zone_id'],'--force')

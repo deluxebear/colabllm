@@ -11,13 +11,24 @@ GLOBAL_COMMANDS = ('tunnel-config', 'frp-config', 'frp-status')
 UTILITY_COMMANDS = ('doctor', 'completion', 'skill')
 WEB_COMMANDS = ('web',)
 GATEWAY_COMMANDS = ('gateway',)
-_ACCOUNT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
+KAGGLE_COMMANDS = ('kaggle',)
+_ACCOUNT_SYNTAX_RE = re.compile(r'^@?[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
+_COLAB_ACCOUNT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
 
 
 def services():
     """Discover service pairs without importing or starting their implementation."""
     return {p.stem: p for p in sorted((ROOT / 'services').glob('*.py'))
             if p.with_suffix('.ipynb').is_file()}
+
+
+def kaggle_services():
+    """Discover Kaggle service pairs without importing or starting their implementation."""
+    kdir = ROOT / 'kaggle_services'
+    if not kdir.is_dir():
+        return {}
+    return {p.stem: p for p in sorted(kdir.glob('*.py'))
+            if p.name != '__init__.py' and p.with_suffix('.ipynb').is_file()}
 
 
 def _valid_timeout(raw):
@@ -28,9 +39,14 @@ def _valid_timeout(raw):
         return False
 
 
-def _valid_account(raw):
+def _valid_account_syntax(raw):
     val = (raw or '').strip() if isinstance(raw, str) else ''
-    return bool(val and '..' not in val and _ACCOUNT_RE.fullmatch(val))
+    return bool(val and '..' not in val and '/' not in val and '\\' not in val and '\x00' not in val and _ACCOUNT_SYNTAX_RE.fullmatch(val))
+
+
+def _valid_colab_account(raw):
+    val = (raw or '').strip() if isinstance(raw, str) else ''
+    return bool(val and '..' not in val and _COLAB_ACCOUNT_RE.fullmatch(val))
 
 
 def _package_version():
@@ -48,6 +64,7 @@ def _package_version():
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     flags = []
+    pre_account = None
     while argv:
         if argv[0] in ('--debug', '--quiet', '--no-color'):
             flags.append(argv.pop(0))
@@ -65,15 +82,18 @@ def main(argv=None):
             flags.append(argv.pop(0))
         elif argv[0].startswith('--account='):
             arg = argv.pop(0)
-            if not _valid_account(arg.split('=', 1)[1]):
-                print('colabllm: --account 需要有效的 Colab 账户名或邮箱', file=sys.stderr)
+            val = arg.split('=', 1)[1]
+            if not _valid_account_syntax(val):
+                print('colabllm: --account 账户标识格式无效', file=sys.stderr)
                 return 2
+            pre_account = val
             flags.append(arg)
         elif argv[0] == '--account':
             flags.append(argv.pop(0))
-            if not argv or not _valid_account(argv[0]):
-                print('colabllm: --account 需要有效的 Colab 账户名或邮箱', file=sys.stderr)
+            if not argv or not _valid_account_syntax(argv[0]):
+                print('colabllm: --account 账户标识格式无效', file=sys.stderr)
                 return 2
+            pre_account = argv[0]
             flags.append(argv.pop(0))
         else:
             break
@@ -82,20 +102,21 @@ def main(argv=None):
     available = services()
     if not argv or argv[0] in ('-h', '--help', 'help'):
         print('用法: colabllm <运行时> <命令> [参数...]\n'
+              '      colabllm kaggle <运行时> <命令> [参数...]\n'
               '      colabllm <全局配置命令> [参数...]\n'
               '\n'
-              '运行时: ' + ', '.join(available) + '\n'
-              '全局命令: ' + ', '.join((*GLOBAL_COMMANDS, *UTILITY_COMMANDS, *WEB_COMMANDS, *GATEWAY_COMMANDS)) + '\n\n'
+              'Colab 运行时: ' + ', '.join(available) + '\n'
+              'Kaggle 运行时: ' + (', '.join(kaggle_services()) or '(无)') + '\n'
+              '全局命令: ' + ', '.join((*KAGGLE_COMMANDS, *GLOBAL_COMMANDS, *UTILITY_COMMANDS, *WEB_COMMANDS, *GATEWAY_COMMANDS)) + '\n\n'
               '示例:\n'
               '  colabllm unlimited-ocr up\n'
+              '  colabllm kaggle web-probe up --quick-tunnel\n'
               '  colabllm unlimited-ocr up -a work --drive-account main\n'
-              '  colabllm unlimited-ocr ocr ./documents -O ./results\n'
-              '  colabllm qwen3-tts up -i 2\n'
               '  colabllm web\n'
               '  colabllm gateway --detach\n'
               '  colabllm tunnel-config\n\n'
               '全局选项: --account ACCOUNT、--debug、--quiet、--no-color、--command-timeout SECONDS\n'
-              'colabllm services 列出运行时；<运行时> --help 查看原有命令和参数。')
+              'colabllm services 列出 Colab 运行时；colabllm kaggle services 列出 Kaggle 运行时。')
         return 0
     if argv == ['--version']:
         print('colabllm ' + _package_version())
@@ -108,12 +129,51 @@ def main(argv=None):
             return 2
         print('\n'.join(available))
         return 0
-    if command in available:
+    if command == 'kaggle':
+        while remaining:
+            tok = remaining[0]
+            if tok in ('-a', '--account'):
+                if len(remaining) < 2 or not _valid_account_syntax(remaining[1]):
+                    print(f'colabllm: {tok} 需要有效的 Kaggle 账户标识', file=sys.stderr)
+                    return 2
+                flags.extend(['--account', remaining[1]])
+                remaining = remaining[2:]
+            elif tok.startswith('--account='):
+                val = tok.split('=', 1)[1]
+                if not _valid_account_syntax(val):
+                    print('colabllm: --account 需要有效的 Kaggle 账户标识', file=sys.stderr)
+                    return 2
+                flags.extend(['--account', val])
+                remaining = remaining[1:]
+            else:
+                break
+        k_avail = kaggle_services()
+        if not remaining or remaining[0] in ('-h', '--help', 'services', '--list'):
+            script = ROOT / 'kaggle_cli.py'
+        elif remaining[0] == 'help':
+            if len(remaining) >= 2 and remaining[1] in k_avail:
+                script = k_avail[remaining[1]]
+                remaining = [*remaining[2:], '--help']
+            else:
+                script = ROOT / 'kaggle_cli.py'
+        elif remaining[0] in k_avail:
+            script = k_avail[remaining[0]]
+            remaining = remaining[1:]
+        else:
+            print(f'未知 Kaggle 运行时: {remaining[0]}\n使用 colabllm kaggle --help 查看可用运行时。', file=sys.stderr)
+            return 2
+    elif command in available:
+        if pre_account is not None and not _valid_colab_account(pre_account):
+            print('colabllm: --account 需要有效的 Colab 账户名或邮箱', file=sys.stderr)
+            return 2
         script = available[command]
     elif command in (*UTILITY_COMMANDS, '_complete'):
         script = ROOT / 'utility.py'
         remaining = [command, *remaining]
     elif command in WEB_COMMANDS:
+        if pre_account is not None and not _valid_colab_account(pre_account):
+            print('colabllm: --account 需要有效的 Colab 账户名或邮箱', file=sys.stderr)
+            return 2
         script = ROOT / 'web.py'
         remaining = [command, *remaining]
     elif command in GATEWAY_COMMANDS:

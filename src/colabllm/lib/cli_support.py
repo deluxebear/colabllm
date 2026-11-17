@@ -5,6 +5,7 @@ import http.client
 import math
 import time
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -53,6 +54,43 @@ def diagnostic(message, color=None):
     if color and not NO_COLOR and not os.environ.get('NO_COLOR') and sys.stderr.isatty():
         message = f'\033[{color}m{message}\033[0m'
     print(message, file=sys.stderr, flush=True)
+
+
+_ACCOUNT_SYNTAX_RE = re.compile(r'^@?[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$')
+_DURATION_RE = re.compile(r'^([0-9]+(?:\.[0-9]+)?)([smh]?)$', re.IGNORECASE)
+_DURATION_UNITS = {'': 1, 's': 1, 'm': 60, 'h': 3600}
+
+
+def validate_account_syntax(value):
+    val = value.strip() if isinstance(value, str) else ''
+    if not val or '..' in val or '/' in val or '\\' in val or '\x00' in val or not _ACCOUNT_SYNTAX_RE.fullmatch(val):
+        raise UsageError('账户标识格式无效（须为 1–64 位字母、数字或 . _ @ -，不能包含路径字符或 ..）')
+    return val
+
+
+def duration_seconds(value):
+    if isinstance(value, bool):
+        raise ValueError('时长必须是正整数秒或 <N>s|m|h')
+    if isinstance(value, (int, float)):
+        num = float(value)
+        if not math.isfinite(num) or num <= 0:
+            raise ValueError('时长必须大于 0')
+        secs = int(round(num))
+        if secs <= 0:
+            raise ValueError('时长必须至少为 1 秒')
+        return secs
+    raw = value.strip() if isinstance(value, str) else ''
+    match = _DURATION_RE.fullmatch(raw)
+    if not match:
+        raise ValueError('时长格式无效；请填写正整数秒或 <N>s / <N>m / <N>h（如 6h）')
+    num = float(match.group(1))
+    unit = match.group(2).lower()
+    if not math.isfinite(num) or num <= 0:
+        raise ValueError('时长必须大于 0')
+    secs = int(round(num * _DURATION_UNITS[unit]))
+    if secs <= 0:
+        raise ValueError('时长必须至少为 1 秒')
+    return secs
 
 
 def nonnegative_seconds(value):

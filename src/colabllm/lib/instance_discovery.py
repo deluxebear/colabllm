@@ -1,6 +1,7 @@
 """Stateless discovery of paired service definitions and local runtime instance state."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -9,14 +10,78 @@ from typing import Callable, Iterable, Literal
 from processes import runner_alive
 
 INSTANCE_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
+KAGGLE_CATALOG_PREFIX = "kaggle-"
+KAGGLE_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,46}[A-Za-z0-9])?$")
+KAGGLE_SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,47}$")
+
+
+@dataclass(frozen=True)
+class ProviderServiceSpec:
+    provider: Literal["colab", "kaggle"]
+    short_name: str
+    catalog_name: str
+    script_path: Path
+    notebook_path: Path
+
+
+def kaggle_catalog_name(short_name: str) -> str:
+    return f"{KAGGLE_CATALOG_PREFIX}{short_name}"
+
+
+def parse_catalog_name(name: str) -> tuple[Literal["colab", "kaggle"], str]:
+    if name.startswith(KAGGLE_CATALOG_PREFIX) and len(name) > len(KAGGLE_CATALOG_PREFIX):
+        return ("kaggle", name[len(KAGGLE_CATALOG_PREFIX):])
+    return ("colab", name)
 
 
 def discover_service_pairs(services_dir: Path | None = None) -> tuple[str, ...]:
-    """Return sorted service names having paired .py and .ipynb definitions."""
+    """Return sorted Colab service names having paired .py and .ipynb definitions."""
     target = services_dir if services_dir is not None else Path(__file__).resolve().parents[1] / "services"
     if not target.is_dir():
         return ()
     return tuple(sorted(p.stem for p in target.glob("*.py") if p.with_suffix(".ipynb").is_file()))
+
+
+def discover_kaggle_service_pairs(kaggle_services_dir: Path | None = None) -> tuple[str, ...]:
+    """Return sorted Kaggle short service names having paired .py and .ipynb definitions."""
+    target = (
+        kaggle_services_dir
+        if kaggle_services_dir is not None
+        else Path(__file__).resolve().parents[1] / "kaggle_services"
+    )
+    if not target.is_dir():
+        return ()
+    return tuple(sorted(p.stem for p in target.glob("*.py") if p.name != "__init__.py" and p.with_suffix(".ipynb").is_file()))
+
+
+def discover_all_provider_services(
+    *,
+    services_dir: Path | None = None,
+    kaggle_services_dir: Path | None = None,
+) -> dict[str, ProviderServiceSpec]:
+    """Return mapping of catalog_name -> ProviderServiceSpec across Colab and Kaggle."""
+    pkg_dir = Path(__file__).resolve().parents[1]
+    colab_dir = services_dir if services_dir is not None else pkg_dir / "services"
+    kaggle_dir = kaggle_services_dir if kaggle_services_dir is not None else pkg_dir / "kaggle_services"
+    specs: dict[str, ProviderServiceSpec] = {}
+    for name in discover_service_pairs(colab_dir):
+        specs[name] = ProviderServiceSpec(
+            provider="colab",
+            short_name=name,
+            catalog_name=name,
+            script_path=colab_dir / f"{name}.py",
+            notebook_path=colab_dir / f"{name}.ipynb",
+        )
+    for short in discover_kaggle_service_pairs(kaggle_dir):
+        cat = kaggle_catalog_name(short)
+        specs[cat] = ProviderServiceSpec(
+            provider="kaggle",
+            short_name=short,
+            catalog_name=cat,
+            script_path=kaggle_dir / f"{short}.py",
+            notebook_path=kaggle_dir / f"{short}.ipynb",
+        )
+    return specs
 
 
 def match_service_name(session_name: str, service_names: Iterable[str]) -> tuple[str, str] | None:
@@ -29,7 +94,13 @@ def match_service_name(session_name: str, service_names: Iterable[str]) -> tuple
     return None
 
 
-def list_instance_dir_names(services_dir: Path, service: str, service_names: Iterable[str]) -> list[str]:
+def list_instance_dir_names(
+    services_dir: Path,
+    service: str,
+    service_names: Iterable[str],
+    *,
+    instance_re: re.Pattern[str] = INSTANCE_ID_RE,
+) -> list[str]:
     """List instance IDs for a service purely from directory names without reading state.json."""
     if not services_dir.is_dir():
         return []
@@ -43,7 +114,7 @@ def list_instance_dir_names(services_dir: Path, service: str, service_names: Ite
         if any(entry.name == other or entry.name.startswith(other + "-") for other in longer):
             continue
         inst = entry.name[len(prefix):]
-        if INSTANCE_ID_RE.fullmatch(inst):
+        if instance_re.fullmatch(inst):
             results.append(inst)
     return sorted(results)
 

@@ -19,6 +19,138 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+CADDY_VERSION = "2.10.2"
+
+_SHARED_PROC_AND_CADDY_HELPERS = r'''
+CADDY_VERSION = "''' + CADDY_VERSION + r'''"
+
+def ct_write_private_text(path, content):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.chmod(path, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+def ct_proc_start_time(pid):
+    try:
+        fields = open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8", errors="replace").read().rsplit(")", 1)[1].split()
+        if fields[0] == "Z":
+            return None
+        return fields[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+def ct_stop_marked_proc(name, timeout=10):
+    import signal
+    marker = f"{WORK}/{name}.proc.json"
+    if not os.path.exists(marker):
+        return
+    try:
+        info = json.loads(open(marker, "r", encoding="utf-8").read())
+        pid = int(info.get("pid") or 0)
+        start_time = info.get("start_time")
+    except (OSError, ValueError, TypeError):
+        pid, start_time = 0, None
+    if pid > 0 and start_time and ct_proc_start_time(pid) == start_time:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if ct_proc_start_time(pid) != start_time:
+                break
+            try:
+                os.killpg(os.getpgid(pid), sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, sig)
+                except (ProcessLookupError, OSError):
+                    break
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if ct_proc_start_time(pid) != start_time:
+                    break
+                time.sleep(0.1)
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+
+def ct_spawn_marked(name, args, env=None, cwd=None):
+    ct_stop_marked_proc(name)
+    proc = ct_spawn(name, args, env=env, cwd=cwd)
+    marker = f"{WORK}/{name}.proc.json"
+    ct_write_private_text(marker, json.dumps({"pid": proc.pid, "start_time": ct_proc_start_time(proc.pid)}))
+    return proc
+
+def _ct_file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def ct_ensure_caddy():
+    import hashlib, platform, tarfile, tempfile
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+    dest = f"{BIN_DIR}/caddy"
+    status_label = "miss"
+    manifest = f"{CACHE_DIR}/manifests/caddy.json" if CACHE_DIR else ""
+    if os.path.exists(dest):
+        if not manifest:
+            return dest
+        try:
+            meta = json.loads(open(manifest, "r", encoding="utf-8").read())
+            if meta.get("artifact") == "caddy" and meta.get("version") == CADDY_VERSION and meta.get("sha256") == _ct_file_sha256(dest):
+                print("CT_CACHE_EVENT artifact=caddy status=hit", flush=True)
+                return dest
+        except (OSError, ValueError):
+            pass
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        status_label = "corrupt_rebuilt"
+    asset = f"caddy_{CADDY_VERSION}_linux_{arch}.tar.gz"
+    checks_asset = f"caddy_{CADDY_VERSION}_checksums.txt"
+    base = f"https://github.com/caddyserver/caddy/releases/download/v{CADDY_VERSION}/"
+    os.makedirs(BIN_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        tgz = os.path.join(tmp, asset)
+        with urllib.request.urlopen(base + asset, timeout=60) as src, open(tgz, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        checks = urllib.request.urlopen(base + checks_asset, timeout=60).read().decode("utf-8")
+        expected = next((line.split()[0] for line in checks.splitlines() if line.split() and line.split()[-1].lstrip("*") == asset), None)
+        algo = {64: hashlib.sha256, 128: hashlib.sha512}.get(len(expected or ""))
+        if algo is None or algo(open(tgz, "rb").read()).hexdigest() != expected:
+            raise RuntimeError(f"Caddy checksum verification failed for {asset}")
+        partial = f"{dest}.{os.getpid()}.partial"
+        try:
+            with tarfile.open(tgz) as tar:
+                entry = tar.getmember("caddy")
+                with tar.extractfile(entry) as src, open(partial, "wb") as out:
+                    shutil.copyfileobj(src, out)
+            os.chmod(partial, 0o755)
+            os.replace(partial, dest)
+        finally:
+            if os.path.exists(partial):
+                os.unlink(partial)
+    if manifest:
+        os.makedirs(os.path.dirname(manifest), exist_ok=True)
+        tmp_m = f"{manifest}.{os.getpid()}.tmp"
+        with open(tmp_m, "w", encoding="utf-8") as mf:
+            mf.write(json.dumps({
+                "artifact": "caddy",
+                "version": CADDY_VERSION,
+                "sha256": _ct_file_sha256(dest),
+                "bin_path": dest,
+                "verified_at": time.strftime("%%Y-%%m-%%dT%%H:%%M:%%SZ", time.gmtime()),
+            }, indent=2) + "\n")
+        os.replace(tmp_m, manifest)
+        print(f"CT_CACHE_EVENT artifact=caddy status={status_label}", flush=True)
+    return dest
+'''
 
 CONFIG = r'''# @title 0. Config -- values come from `colab exec --env` (defaults allow running in the Colab UI)
 import json, os, re, secrets, shutil, stat, subprocess, sys, time, urllib.request, urllib.error
@@ -34,8 +166,14 @@ TUNNEL_TOKEN = os.environ.get("CT_TUNNEL_TOKEN", "")            # set -> fixed d
 PUBLIC_HOST  = os.environ.get("CT_PUBLIC_HOSTNAME", "")
 CREDS_FROM_ENV = bool(os.environ.get("CT_AUTH_PASS"))
 
-WORK = "/content/ct"                                            # logs + binaries of this notebook
-os.makedirs(WORK, exist_ok=True)
+WORK = os.environ.get("CT_WORK_DIR", "/content/ct")             # logs + runtime configs (0700)
+CACHE_DIR = os.environ.get("CT_CACHE_DIR", "")
+BIN_DIR = os.environ.get("CT_BIN_DIR", "/usr/local/bin")
+os.makedirs(WORK, mode=0o700, exist_ok=True)
+os.chmod(WORK, 0o700)
+os.makedirs(BIN_DIR, exist_ok=True)
+if BIN_DIR not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")
 for _p in ("/content/drive/MyDrive/colab-llm/hf_token.txt",
            "/content/drive/MyDrive/colab-services/hf_token.txt",
            "/content/drive/MyDrive/colab-services/qwen-flash/hf_token.txt"):
@@ -53,11 +191,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 PROCS = {}                                                      # name -> (Popen, restart function)
 
 def ct_spawn(name, args, env=None, cwd=None):
-    """Start a background process; output goes to /content/ct/<name>.log."""
-    with open(f"{WORK}/{name}.log", "a") as logf:   # child keeps its own dup of the fd
+    """Start a background process; output goes to <WORK>/<name>.log (0600)."""
+    lp = f"{WORK}/{name}.log"
+    fd = os.open(lp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(lp, 0o600)
+    with os.fdopen(fd, "a") as logf:   # child keeps its own dup of the fd
         return subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, cwd=cwd,
                                 env={**os.environ, **(env or {})}, start_new_session=True)
-
+''' + _SHARED_PROC_AND_CADDY_HELPERS + r'''
 def ct_stop_proc(proc, timeout=15):
     """Terminate a ct_spawn process group, escalating to SIGKILL after a bounded wait."""
     import signal
@@ -115,9 +256,10 @@ def ct_public_gate(public_url, probe, verify_auth, log, timeout=120, interval=8)
     raise RuntimeError(f"Public endpoint {public_url} failed readiness verification within {timeout}s")
 
 def ct_watchdog(health, start_service, log, *, service_key="service", log_name="service",
-                interval=60, grace=900, dead_markers=(), heartbeat=None):
+                interval=60, grace=900, dead_markers=(), heartbeat=None, heartbeat_interval=None):
     """Supervise PROCS forever: restart dead processes, debounce health failures after reloads."""
     started = time.monotonic()
+    last_heartbeat = started
     failures = 0
     grace_until = time.monotonic()
     log_offset = ct_log_size(log_name)
@@ -157,9 +299,11 @@ def ct_watchdog(health, start_service, log, *, service_key="service", log_name="
             failures += 1
         if failures >= 6:
             restart_service("6 consecutive failed health checks")
-        if heartbeat is not None:
+        now_m = time.monotonic()
+        if heartbeat is not None and (heartbeat_interval is None or (now_m - last_heartbeat) >= heartbeat_interval):
+            last_heartbeat = now_m
             try:
-                heartbeat(int(time.monotonic() - started))
+                heartbeat(int(now_m - started))
             except Exception as err:
                 log(f"[watchdog] heartbeat warning: {err}")
 
@@ -184,6 +328,7 @@ def ct_tail(name, n=30):
 def ct_fetch_binary(path, url):
     if not os.path.exists(path):
         partial = f"{path}.{os.getpid()}.partial"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with urllib.request.urlopen(url, timeout=60) as src, open(partial, "wb") as dst:
             shutil.copyfileobj(src, dst)
         os.chmod(partial, os.stat(partial).st_mode | stat.S_IEXEC)
@@ -194,27 +339,185 @@ print(f"service={SERVICE} port={SERVICE_PORT} auth={AUTH} public_port={PUBLIC_PO
       f"tunnel={'named ' + PUBLIC_HOST if TUNNEL_TOKEN else 'quick'} data={DATA_DIR}")
 '''
 
+KAGGLE_CONFIG = r'''# @title 0. Setup & Env -- Kaggle dual-zone layout (/kaggle/working/.ct-cache vs 0700 /tmp/ct-runtime)
+import json, os, re, secrets, shutil, stat, subprocess, sys, time, urllib.request, urllib.error
+
+print("CT_CELL=0/5:setup", flush=True)
+print("CT_STAGE=setup", flush=True)
+
+SERVICE      = os.environ.get("CT_SERVICE", "%(name)s")
+SERVICE_PORT = int(os.environ.get("CT_SERVICE_PORT", "%(service_port)d"))
+AUTH         = os.environ.get("CT_AUTH", "%(auth)s")
+PUBLIC_PORT  = int(os.environ.get("CT_PUBLIC_PORT", "%(public_port)d"))
+AUTH_USER    = os.environ.get("CT_AUTH_USER", "colabllm")
+AUTH_PASS    = os.environ.get("CT_AUTH_PASS") or secrets.token_urlsafe(18)
+API_TOKEN    = os.environ.get("CT_API_TOKEN") or "sk-" + secrets.token_urlsafe(32)
+TUNNEL_TOKEN = os.environ.get("CT_TUNNEL_TOKEN", "")
+PUBLIC_HOST  = os.environ.get("CT_PUBLIC_HOSTNAME", "")
+CREDS_FROM_ENV = bool(os.environ.get("CT_AUTH_PASS"))
+
+WORK = os.environ.get("CT_WORK_DIR", "/tmp/ct-runtime")
+CACHE_DIR = os.environ.get("CT_CACHE_DIR", "/kaggle/working/.ct-cache")
+BIN_DIR = os.environ.get("CT_BIN_DIR", f"{CACHE_DIR}/bin")
+os.makedirs(WORK, mode=0o700, exist_ok=True)
+os.chmod(WORK, 0o700)
+os.makedirs(CACHE_DIR, mode=0o755, exist_ok=True)
+os.makedirs(BIN_DIR, mode=0o755, exist_ok=True)
+if BIN_DIR not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")
+
+PROCS = {}
+
+def ct_emit_disk_stat(path_str):
+    p = path_str
+    while not os.path.exists(p) and os.path.dirname(p) != p:
+        p = os.path.dirname(p)
+    try:
+        free_mb = int(shutil.disk_usage(p).free // (1024 * 1024))
+    except OSError:
+        free_mb = 0
+    print(f"CT_DISK_STAT path={path_str} free_mb={free_mb}", flush=True)
+
+def ct_spawn(name, args, env=None, cwd=None):
+    """Start a background process; output goes to <WORK>/<name>.log (0600)."""
+    lp = f"{WORK}/{name}.log"
+    fd = os.open(lp, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.chmod(lp, 0o600)
+    with os.fdopen(fd, "a") as logf:
+        return subprocess.Popen(args, stdout=logf, stderr=subprocess.STDOUT, cwd=cwd,
+                                env={**os.environ, **(env or {})}, start_new_session=True)
+''' + _SHARED_PROC_AND_CADDY_HELPERS + r'''
+def ct_stop_proc(proc, timeout=15):
+    import signal
+    if proc is None or proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                proc.send_signal(sig)
+            except ProcessLookupError:
+                return
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+def ct_log_size(name):
+    p = f"{WORK}/{name}.log"
+    return os.path.getsize(p) if os.path.exists(p) else 0
+
+def ct_log_since(name, offset):
+    p = f"{WORK}/{name}.log"
+    if not os.path.exists(p):
+        return ""
+    with open(p, "rb") as handle:
+        handle.seek(min(offset, os.path.getsize(p)))
+        return handle.read().decode("utf-8", errors="replace")
+
+def ct_public_gate(public_url, probe, verify_auth, log, timeout=120, interval=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            code = probe()
+        except Exception as err:
+            log(f"Public probe pending ({type(err).__name__}: {err})")
+            time.sleep(interval)
+            continue
+        if code == 200:
+            verify_auth()
+            return
+        log(f"Public probe pending (HTTP {code})")
+        time.sleep(interval)
+    raise RuntimeError(f"Public endpoint {public_url} failed readiness verification within {timeout}s")
+
+def ct_watchdog(health, start_service, log, *, service_key="service", log_name="service",
+                interval=30, grace=60, dead_markers=(), heartbeat=None, heartbeat_interval=120):
+    started = time.monotonic()
+    last_heartbeat = started
+    failures = 0
+    grace_until = time.monotonic()
+    log_offset = ct_log_size(log_name)
+
+    def restart_service(reason):
+        nonlocal failures, grace_until, log_offset
+        log(f"[watchdog] {reason}; restarting {service_key}")
+        ct_stop_proc(PROCS[service_key][0])
+        PROCS[service_key] = (start_service(), start_service)
+        failures = 0
+        grace_until = time.monotonic() + grace
+        log_offset = ct_log_size(log_name)
+
+    while True:
+        time.sleep(interval)
+        for name, (proc, restart) in list(PROCS.items()):
+            if proc.poll() is not None:
+                log(f"[watchdog] {name} exited with {proc.returncode}; restarting\n{ct_tail(name, 20)}")
+                PROCS[name] = (restart(), restart)
+                if name == service_key:
+                    failures = 0
+                    grace_until = time.monotonic() + grace
+                    log_offset = ct_log_size(log_name)
+        if dead_markers:
+            fresh = ct_log_since(log_name, log_offset)
+            log_offset += len(fresh.encode("utf-8", errors="replace"))
+            if any(marker in fresh for marker in dead_markers):
+                restart_service("Detected dead worker marker in service log")
+                continue
+        try:
+            healthy = bool(health())
+        except Exception:
+            healthy = False
+        if healthy:
+            failures = 0
+        elif time.monotonic() >= grace_until:
+            failures += 1
+        if failures >= 6:
+            restart_service("6 consecutive failed health checks")
+        now_m = time.monotonic()
+        if heartbeat is not None and (heartbeat_interval is None or (now_m - last_heartbeat) >= heartbeat_interval):
+            last_heartbeat = now_m
+            try:
+                heartbeat(int(now_m - started))
+            except Exception as err:
+                log(f"[watchdog] heartbeat warning: {err}")
+
+def ct_wait_http(url, timeout=600, ok=lambda code: code < 500):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                if ok(r.status): return r.status
+        except urllib.error.HTTPError as e:
+            if ok(e.code): return e.code
+        except Exception:
+            pass
+        time.sleep(2)
+    raise TimeoutError(f"{url} not ready after {timeout}s")
+
+def ct_tail(name, n=30):
+    p = f"{WORK}/{name}.log"
+    return "".join(open(p, errors="replace").readlines()[-n:]) if os.path.exists(p) else ""
+
+ct_emit_disk_stat(CACHE_DIR)
+ct_emit_disk_stat(WORK)
+print(f"service={SERVICE} port={SERVICE_PORT} auth={AUTH} public_port={PUBLIC_PORT} "
+      f"tunnel={'named ' + PUBLIC_HOST if TUNNEL_TOKEN else 'quick'} work={WORK} cache={CACHE_DIR}", flush=True)
+'''
+
 CADDY_TEMPLATE = r'''# @title 3. Auth layer -- Caddy: basic auth for browsers, `Authorization: Bearer <token>` for API clients
 # PUBLIC_PORT must be free on the VM: Colab itself uses 8080 (runtime server) and 8012 (colab dfs shim).
 # Only used when the service has no auth of its own (CT_AUTH=caddy). The service itself listens on
 # 127.0.0.1 only, cloudflared targets Caddy, so every public request passes through auth.
 REWRITE_HOST = __REWRITE_HOST__   # True: send Host: 127.0.0.1:<port> upstream (Ollama & co. reject foreign Host headers)
-import platform
-CADDY_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
 
 def start_caddy():
-    if not os.path.exists("/usr/local/bin/caddy"):
-        tag = json.loads(urllib.request.urlopen(
-            "https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=30).read())["tag_name"]
-        tgz = "/tmp/caddy.tgz"
-        with urllib.request.urlopen(f"https://github.com/caddyserver/caddy/releases/download/{tag}/"
-                                    f"caddy_{tag.lstrip('v')}_linux_{CADDY_ARCH}.tar.gz", timeout=60) as src, \
-                open(tgz, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+    caddy_bin = ct_ensure_caddy()
     import hashlib
     cookie_tok = hashlib.sha256(f"ct-cookie-v2:{AUTH_USER}:{AUTH_PASS}:{API_TOKEN}".encode()).hexdigest()
-    hashed = subprocess.check_output(["caddy", "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
+    hashed = subprocess.check_output([caddy_bin, "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
     upstream = f"""reverse_proxy 127.0.0.1:{SERVICE_PORT} {{
             {"header_up Host {upstream_hostport}" if REWRITE_HOST else ""}
             {"header_up Origin http://{upstream_hostport}" if REWRITE_HOST else ""}
@@ -246,9 +549,8 @@ __EXTRA_PROXY_LINES__            flush_interval -1
     }}
 }}
 """
-    open(f"{WORK}/Caddyfile", "w").write(caddyfile)
-    subprocess.run(["pkill", "-f", "caddy run"], check=False)
-    return ct_spawn("caddy", ["caddy", "run", "--config", f"{WORK}/Caddyfile", "--adapter", "caddyfile"])
+    ct_write_private_text(f"{WORK}/Caddyfile", caddyfile)
+    return ct_spawn_marked("caddy", [caddy_bin, "run", "--config", f"{WORK}/Caddyfile", "--adapter", "caddyfile"])
 
 AUTH_OK = False   # cell 4 refuses to open the tunnel unless this becomes True (fail closed)
 if AUTH == "caddy":
@@ -521,21 +823,12 @@ print(subprocess.run(["ollama", "ps"], env={**os.environ, **OLLAMA_ENV}, capture
 '''
 
 OLLAMA_CADDY = r'''# @title 3. Auth & compatible API routing -- Caddy (Basic Auth + Bearer + Anthropic X-Api-Key + --compat filter)
-import hashlib, platform
-CADDY_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine(), "amd64")
+import hashlib
 
 def start_caddy():
-    if not os.path.exists("/usr/local/bin/caddy"):
-        tag = json.loads(urllib.request.urlopen(
-            "https://api.github.com/repos/caddyserver/caddy/releases/latest", timeout=30).read())["tag_name"]
-        tgz = "/tmp/caddy.tgz"
-        with urllib.request.urlopen(f"https://github.com/caddyserver/caddy/releases/download/{tag}/"
-                                    f"caddy_{tag.lstrip('v')}_linux_{CADDY_ARCH}.tar.gz", timeout=60) as src, \
-                open(tgz, "wb") as dst:
-            shutil.copyfileobj(src, dst)
-        subprocess.run(["tar", "-xzf", tgz, "-C", "/usr/local/bin", "caddy"], check=True)
+    caddy_bin = ct_ensure_caddy()
     cookie_tok = hashlib.sha256(f"ct-cookie-v2:{AUTH_USER}:{AUTH_PASS}:{API_TOKEN}".encode()).hexdigest()
-    hashed = subprocess.check_output(["caddy", "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
+    hashed = subprocess.check_output([caddy_bin, "hash-password", "--plaintext", AUTH_PASS], text=True).strip()
     caddyfile = render_ollama_caddyfile(
         public_port=PUBLIC_PORT,
         service_port=SERVICE_PORT,
@@ -546,9 +839,8 @@ def start_caddy():
         compat_apis=OLLAMA_COMPAT,
         read_only_models=OLLAMA_READ_ONLY_MODELS,
     )
-    open(f"{WORK}/Caddyfile", "w", encoding="utf-8").write(caddyfile)
-    subprocess.run(["pkill", "-f", "caddy run"], check=False)
-    return ct_spawn("caddy", ["caddy", "run", "--config", f"{WORK}/Caddyfile", "--adapter", "caddyfile"])
+    ct_write_private_text(f"{WORK}/Caddyfile", caddyfile)
+    return ct_spawn_marked("caddy", [caddy_bin, "run", "--config", f"{WORK}/Caddyfile", "--adapter", "caddyfile"])
 
 AUTH_OK = False
 if AUTH == "caddy":
@@ -6109,6 +6401,121 @@ ct_watchdog(
 )
 '''
 
+def kaggle_notebook(title, intro, cfg, *, install_cell, service_cell, proxy_cell, tunnel_cell, watchdog_cell):
+    cells = [
+        md(f"# {title}\n\n{intro}\n\nRun via `colabllm kaggle <short_name> up`."),
+        code(KAGGLE_CONFIG % cfg),
+        code(install_cell),
+        code(service_cell),
+        code(proxy_cell),
+        code(tunnel_cell),
+        code(watchdog_cell),
+    ]
+    for i, c in enumerate(cells):
+        c["id"] = f"kcell-{i}"
+    meta = {
+        "colab": {"provenance": []},
+        "kernelspec": {"display_name": "Python 3", "name": "python3"},
+    }
+    return {"cells": cells, "metadata": meta, "nbformat": 4, "nbformat_minor": 5}
+
+
+KAGGLE_WEB_PROBE_CFG = dict(
+    name="web-probe",
+    service_port=18090,
+    auth="caddy",
+    public_port=18080,
+)
+KAGGLE_WEB_PROBE_INSTALL = r'''# @title 1. Install & Verify Binaries -- cache caddy in /kaggle/working/.ct-cache/bin
+print("CT_CELL=1/5:install", flush=True)
+print("CT_STAGE=install", flush=True)
+CADDY_BIN = ct_ensure_caddy()
+print(f"Verified caddy binary at {CADDY_BIN}", flush=True)
+'''
+KAGGLE_WEB_PROBE_SERVICE = (
+    "# @title 2. Start Probe App -- pure-stdlib HTTP connectivity diagnostic on 127.0.0.1:18090\n"
+    "print('CT_CELL=2/5:service', flush=True)\n"
+    "print('CT_STAGE=service', flush=True)\n"
+    "_APP_PATH = f'{WORK}/kaggle_web_probe_app.py'\n"
+    "ct_write_private_text(_APP_PATH, " + repr((ROOT / "templates/kaggle_web_probe_app.py").read_text(encoding="utf-8")) + ")\n"
+    "def start_service():\n"
+    "    return ct_spawn_marked('service', [sys.executable, _APP_PATH], env={\n"
+    "        'PYTHONUNBUFFERED': '1',\n"
+    "        'CT_SERVICE': SERVICE,\n"
+    "        'CT_SERVICE_PORT': str(SERVICE_PORT),\n"
+    "        'CT_CACHE_DIR': CACHE_DIR,\n"
+    "        'CT_WORK_DIR': WORK,\n"
+    "    })\n\n"
+    "PROCS['service'] = (start_service(), start_service)\n"
+    "ct_wait_http(f'http://127.0.0.1:{SERVICE_PORT}/health', timeout=60, ok=lambda c: c == 200)\n"
+    "print(f'web-probe listening on 127.0.0.1:{SERVICE_PORT}', flush=True)\n"
+)
+KAGGLE_WEB_PROBE_PROXY = (
+    "print('CT_CELL=3/5:proxy', flush=True)\n"
+    "print('CT_STAGE=proxy', flush=True)\n"
+    + render_caddy_cell(rewrite_host=True, extra_proxy_lines="header_down -Set-Cookie")
+)
+KAGGLE_WEB_PROBE_TUNNEL = (
+    "print('CT_CELL=4/5:tunnel', flush=True)\n"
+    "print('CT_STAGE=tunnel', flush=True)\n"
+    + TUNNEL
+)
+KAGGLE_WEB_PROBE_WATCHDOG = r'''# @title 5. Verify Auth Gate, Signal CT_READY & Keep-Alive Watchdog
+import base64
+print("CT_CELL=5/5:watchdog", flush=True)
+print("CT_STAGE=running", flush=True)
+
+def _kp_log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [web-probe] {msg}", flush=True)
+
+def _kp_public_probe():
+    creds = base64.b64encode(f"{AUTH_USER}:{AUTH_PASS}".encode("utf-8")).decode("ascii")
+    req = urllib.request.Request(
+        PUBLIC_URL.rstrip("/") + "/health",
+        headers={"Authorization": f"Basic {creds}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != "ok":
+            raise RuntimeError(f"Public /health returned unexpected payload: {data}")
+        return resp.status
+
+def _kp_verify_auth():
+    req_unauth = urllib.request.Request(PUBLIC_URL.rstrip("/") + "/", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        urllib.request.urlopen(req_unauth, timeout=15)
+        raise RuntimeError("Unauthenticated GET / unexpectedly succeeded!")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 without credentials, got {err.code}")
+        if err.headers.get("Set-Cookie"):
+            raise RuntimeError("Public 401 leaked Set-Cookie")
+
+ct_public_gate(PUBLIC_URL, _kp_public_probe, _kp_verify_auth, _kp_log, timeout=180, interval=8)
+if not CREDS_FROM_ENV:
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _kp_local_health():
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=10) as resp:
+        return resp.status == 200 and json.loads(resp.read().decode("utf-8")).get("status") == "ok"
+
+ct_watchdog(
+    _kp_local_health,
+    start_service,
+    _kp_log,
+    service_key="service",
+    log_name="service",
+    interval=30,
+    grace=60,
+    heartbeat_interval=120,
+    heartbeat=lambda up_s: _kp_log(f"heartbeat | up={up_s}s | free_mb={int(shutil.disk_usage(CACHE_DIR).free // (1024 * 1024))}"),
+)
+'''
+
+
 if __name__ == "__main__":
     write(ROOT / "src/colabllm/services/minimax-h3-image.ipynb",
           notebook("MiniMax-H3-Image (G4 / H100 / A100 · SGLang Diffusion 6-Step PDD Native 4K T2I & 1–16 Ref I2I)",
@@ -6267,3 +6674,14 @@ if __name__ == "__main__":
                    "`free-only` / `unlimited` + CDN cache bypass).",
                    R2_MIGRATE_CFG, R2_MIGRATE_SETUP, R2_MIGRATE_SERVICE,
                    keepalive=R2_MIGRATE_KEEPALIVE, accelerator=None))
+    write(ROOT / "src/colabllm/kaggle_services/web-probe.ipynb",
+          kaggle_notebook(
+              "Kaggle Web Probe (CPU · Cache & Isolation Diagnostic)",
+              "Pure-CPU connectivity, `/kaggle/working/.ct-cache` binary cache, and `/tmp/ct-runtime` isolation probe.",
+              KAGGLE_WEB_PROBE_CFG,
+              install_cell=KAGGLE_WEB_PROBE_INSTALL,
+              service_cell=KAGGLE_WEB_PROBE_SERVICE,
+              proxy_cell=KAGGLE_WEB_PROBE_PROXY,
+              tunnel_cell=KAGGLE_WEB_PROBE_TUNNEL,
+              watchdog_cell=KAGGLE_WEB_PROBE_WATCHDOG,
+          ))

@@ -17,7 +17,7 @@ import ssl
 import sys
 import threading
 import time
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 import urllib.parse
 
 _LIB_DIR = str(Path(__file__).resolve().parents[1] / "lib")
@@ -25,6 +25,7 @@ if _LIB_DIR not in sys.path:
     sys.path.insert(0, _LIB_DIR)
 
 from http_client import BROWSER_UA  # noqa: E402
+from instance_discovery import parse_catalog_name  # noqa: E402
 from paths import private_dir, user_home  # noqa: E402
 
 from .auth import (  # noqa: E402
@@ -47,6 +48,7 @@ from .routing import (  # noqa: E402
     build_upstream_connection,
     compute_upstream_auth_header,
     extract_affinity_key,
+    format_runtime_cli,
     INSTANCE_ID_RE,
 )
 
@@ -74,6 +76,8 @@ class GatewayConfig:
     max_affinity_entries: int = 1024
     state_root: Path | None = None
     services_dir: Path | None = None
+    kaggle_services_dir: Path | None = None
+    specs: Mapping[str, RuntimeGatewaySpec] | None = None
 
 
 @dataclass
@@ -85,6 +89,8 @@ class RequestContext:
     method: str = ""
     raw_path: str = ""
     normalized_v1_path: str = ""
+    provider: str | None = None
+    account: str | None = None
     pinned_runtime: str | None = None
     pinned_instance: str | None = None
     upstream_model: str | None = None
@@ -446,7 +452,10 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         svc = svc_part
                         pinned_inst = None
-                    spec = get_runtime_spec(svc)
+                    ctx.pinned_runtime = svc
+                    ctx.pinned_instance = pinned_inst
+                    ctx.provider = parse_catalog_name(svc)[0]
+                    spec = get_runtime_spec(svc, self.server.router.specs)
                     if spec is None or not spec.gateway_enabled:
                         raise GatewayError(
                             501,
@@ -460,8 +469,6 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                             oai_type="permission_error",
                             oai_code="route_forbidden",
                         )
-                    ctx.pinned_runtime = svc
-                    ctx.pinned_instance = pinned_inst
                     ctx.normalized_v1_path = "/v1/audio/voices"
                     rep = self.server.router.resolve_prefixed_voice_replica(svc, pinned_inst)
                     status_out, ttfb_ms, err_class = self._forward_simple_get(
@@ -515,7 +522,7 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             # Validate POST target path against union of gateway-enabled routes before sending 100 Continue / reading body.
-            exact_posts, prefix_posts = all_root_post_routes()
+            exact_posts, prefix_posts = all_root_post_routes(self.server.router.specs)
             is_valid_post = method == "POST" and (
                 clean_path in exact_posts or any(clean_path.startswith(pref) for pref in prefix_posts)
             )
@@ -554,6 +561,13 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             ctx.stream = bool(isinstance(prepared.parsed_body, dict) and prepared.parsed_body.get("stream") is True)
 
             # Step 6: Resolve target model & runtime
+            if isinstance(prepared.requested_model, str) and "@" in prepared.requested_model:
+                rhs_preview = prepared.requested_model.rpartition("@")[2].strip()
+                if not rhs_preview.lower().startswith("sha256:"):
+                    rt_cand = rhs_preview.partition(":")[0]
+                    if rt_cand in self.server.router.specs or rt_cand.startswith("kaggle-"):
+                        ctx.pinned_runtime = rt_cand
+                        ctx.provider = parse_catalog_name(rt_cand)[0]
             if not prepared.requested_model or "@" not in prepared.requested_model or prepared.requested_model.rpartition("@")[2].lower().startswith("sha256:"):
                 hint_ids = [item["id"] for item in self.server.router.list_aggregated_models()]
             else:
@@ -562,8 +576,9 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
             ctx.pinned_runtime = target.runtime
             ctx.pinned_instance = target.pinned_instance
             ctx.upstream_model = target.upstream_model
+            ctx.provider = parse_catalog_name(target.runtime)[0]
 
-            spec = get_runtime_spec(target.runtime)
+            spec = get_runtime_spec(target.runtime, self.server.router.specs)
             assert spec is not None
 
             # Step 7: Policy guard, parameter rewrite, candidate discovery, concurrency & failover forwarding
@@ -623,6 +638,8 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                     "path": clean_path,
                     "token_id": ctx.token_id,
                     "token_name": ctx.token_name,
+                    "provider": ctx.provider,
+                    "account": ctx.account,
                     "runtime": ctx.pinned_runtime,
                     "instance": ctx.pinned_instance,
                     "requested_model": ctx.requested_model,
@@ -662,6 +679,9 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
         """Forward read-only GET requests (e.g. prefixed voices lookup) with 401 refresh support."""
         cfg = self.server.config
         auth_header = rep.auth_header
+        ctx.pinned_instance = rep.instance
+        ctx.provider = rep.provider
+        ctx.account = rep.account
         for attempt in range(2):
             conn: http.client.HTTPConnection | None = None
             resp: http.client.HTTPResponse | None = None
@@ -709,7 +729,7 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                     resp.read()
                     raise GatewayError(
                         504,
-                        "Cloudflare Quick Tunnel 等待上游响应超时 (524)",
+                        f"Cloudflare Quick Tunnel 等待上游响应超时 (524)；建议改用 {format_runtime_cli(rep.service, 'up --transport frp')}",
                         oai_type="timeout_error",
                         oai_code="cf_edge_524",
                         anth_type="api_error",
@@ -805,6 +825,8 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
 
                 tried_keys.add(rep.key)
                 ctx.pinned_instance = rep.instance
+                ctx.provider = rep.provider
+                ctx.account = rep.account
                 try:
                     result = self._attempt_single_replica(
                         ctx=ctx,
@@ -921,7 +943,7 @@ class GatewayRequestHandler(http.server.BaseHTTPRequestHandler):
                     resp.read()
                     raise GatewayError(
                         504,
-                        "Cloudflare Quick Tunnel 等待首包响应超过约 100s (HTTP 524)；建议开启流式输出 stream: true 或改用 colabllm <svc> up --transport frp",
+                        f"Cloudflare Quick Tunnel 等待首包响应超过约 100s (HTTP 524)；建议开启流式输出 stream: true 或改用 {format_runtime_cli(rep.service, 'up --transport frp')}",
                         oai_type="timeout_error",
                         oai_code="cf_edge_524",
                         anth_type="api_error",
@@ -1145,6 +1167,7 @@ class GatewayHTTPServer(http.server.ThreadingHTTPServer):
         self.router = GatewayRouter(
             state_root=self.state_root,
             services_dir=self.config.services_dir,
+            kaggle_services_dir=self.config.kaggle_services_dir,
             max_concurrent=self.config.max_concurrent,
             slot_wait_timeout=self.config.slot_wait_timeout,
             affinity_grace_timeout=self.config.affinity_grace_timeout,
@@ -1152,6 +1175,7 @@ class GatewayHTTPServer(http.server.ThreadingHTTPServer):
             probe_timeout=self.config.probe_timeout,
             probe_ttl_seconds=self.config.probe_ttl_seconds,
             max_affinity_entries=self.config.max_affinity_entries,
+            specs=self.config.specs,
         )
         self._audit_lock = threading.Lock()
         self._audit_logger, self._audit_handler = _create_audit_logger(self.gateway_dir / "gateway.log")

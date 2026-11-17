@@ -26,7 +26,7 @@ sys.path.insert(0, str(ROOT / "src/colabllm/lib"))
 
 from colabllm.gateway_runtime import GatewayConfig, GatewayHTTPServer  # noqa: E402
 from colabllm.gateway_runtime.auth import GatewayError, TokenStore  # noqa: E402
-from colabllm.gateway_runtime.catalog import GATEWAY_RUNTIME_SPECS, parse_slot_capacity  # noqa: E402
+from colabllm.gateway_runtime.catalog import GATEWAY_RUNTIME_SPECS, RuntimeGatewaySpec, parse_slot_capacity  # noqa: E402
 from colabllm.gateway_runtime.routing import extract_affinity_key  # noqa: E402
 from processes import process_identity  # noqa: E402
 
@@ -93,6 +93,8 @@ class GatewayTestMixin:
         home: Path,
         session_dir: str,
         *,
+        provider: str = "colab",
+        account: str | None = None,
         url: str = "http://127.0.0.1:9",
         api_token: str = "upstream-secret",
         ready: bool = True,
@@ -100,11 +102,13 @@ class GatewayTestMixin:
         env_map: dict | None = None,
         extra: dict | None = None,
     ) -> Path:
-        inst_dir = home / "services" / session_dir
+        root_dir = home / "kaggle" / "services" if provider == "kaggle" else home / "services"
+        inst_dir = root_dir / session_dir
         inst_dir.mkdir(parents=True, exist_ok=True)
         pid = os.getpid() if alive else 9999999
         ident = process_identity(os.getpid()) if alive else "dead-identity"
         payload = {
+            "provider": provider,
             "url": url,
             "api_token": api_token,
             "ready": ready,
@@ -114,6 +118,8 @@ class GatewayTestMixin:
             "transport": "cloudflare",
             "env": env_map or {},
         }
+        if account is not None:
+            payload["account"] = account
         if extra:
             payload.update(extra)
         sp = inst_dir / "state.json"
@@ -957,7 +963,7 @@ class GatewayDeepMatrixTests(GatewayTestMixin, unittest.TestCase):
             last_rec = json.loads(log_lines[-1])
             expected_keys = {
                 "ts", "request_id", "client_address", "method", "path",
-                "token_id", "token_name", "runtime", "instance",
+                "token_id", "token_name", "provider", "account", "runtime", "instance",
                 "requested_model", "upstream_model", "status",
                 "duration_ms", "ttfb_ms", "error_class",
             }
@@ -1096,6 +1102,182 @@ class GatewayDeepMatrixTests(GatewayTestMixin, unittest.TestCase):
             )
             self.assertEqual(c_dis, 503)
             self.assertEqual(json.loads(raw_dis)["error"]["code"], "runtime_compat_disabled")
+
+
+class GatewayMultiProviderTests(GatewayTestMixin, unittest.TestCase):
+    def test_kaggle_web_probe_blocked_501_and_kaggle_path_blocked_403(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _, probe_url = self.start_mock(
+                lambda rec: (200, {"Content-Type": "application/json"}, json.dumps({"status": "ok"}).encode())
+            )
+            _, qwen_url = self.start_mock(
+                lambda rec: (
+                    200,
+                    {"Content-Type": "application/json"},
+                    json.dumps({"object": "list", "data": [{"id": "qwen3.8"}]}).encode(),
+                )
+            )
+            self.write_instance(
+                home,
+                "web-probe",
+                provider="kaggle",
+                account="k_probe",
+                url=probe_url,
+                extra={"base_service": "web-probe", "catalog_service": "kaggle-web-probe"},
+            )
+            self.write_instance(home, "qwen-flash", url=qwen_url, account="c_main")
+
+            srv, port, token = self.start_gateway(home)
+            auth_h = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            # 1. /gateway/status excludes gateway_enabled=False kaggle-web-probe, includes Colab replica with provider/account
+            c_st, _, raw_st = self.http_req(port, "GET", "/gateway/status", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(c_st, 200)
+            snap = json.loads(raw_st)
+            services_in_status = {item["service"] for item in snap["instances"]}
+            self.assertNotIn("kaggle-web-probe", services_in_status)
+            self.assertEqual(services_in_status, {"qwen-flash"})
+            self.assertEqual(snap["instances"][0]["provider"], "colab")
+            self.assertEqual(snap["instances"][0]["account"], "c_main")
+
+            # 2. /v1/models excludes kaggle-web-probe
+            c_mod, _, raw_mod = self.http_req(port, "GET", "/v1/models", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(c_mod, 200)
+            self.assertFalse(any("web-probe" in m["id"] for m in json.loads(raw_mod)["data"]))
+
+            # 3. Direct routing to kaggle-web-probe returns 501 (chat & voice prefix)
+            c_501, _, raw_501 = self.http_req(
+                port,
+                "POST",
+                "/v1/chat/completions",
+                headers=auth_h,
+                body=json.dumps({"model": "probe@kaggle-web-probe", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            )
+            self.assertEqual(c_501, 501)
+            self.assertEqual(json.loads(raw_501)["error"]["code"], "service_unregistered")
+
+            c_v501, _, _ = self.http_req(
+                port,
+                "GET",
+                "/r/kaggle-web-probe/v1/audio/voices",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            self.assertEqual(c_v501, 501)
+
+            # 4. /kaggle/* local container scheme in media fields returns 403 policy_blocked
+            c_403, _, raw_403 = self.http_req(
+                port,
+                "POST",
+                "/v1/chat/completions",
+                headers=auth_h,
+                body=json.dumps({
+                    "model": "qwen3.8@qwen-flash",
+                    "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "/kaggle/working/secret.png"}}]}],
+                }).encode(),
+            )
+            self.assertEqual(c_403, 403)
+            self.assertEqual(json.loads(raw_403)["error"]["code"], "drive_path_blocked")
+
+            # Verify 17-key audit log captured provider="kaggle" and runtime="kaggle-web-probe"
+            log_recs = [json.loads(line) for line in (home / "gateway/gateway.log").read_text(encoding="utf-8").splitlines() if line.strip()]
+            probe_recs = [r for r in log_recs if r.get("runtime") == "kaggle-web-probe"]
+            self.assertGreaterEqual(len(probe_recs), 2)
+            self.assertTrue(all(r["provider"] == "kaggle" for r in probe_recs))
+            self.assertEqual(len(probe_recs[-1].keys()), 17)
+
+    def test_custom_specs_propagation_and_enabled_kaggle_replica_routing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            mock_srv, mock_url = self.start_mock(
+                lambda rec: (
+                    (200, {"Content-Type": "application/json"}, json.dumps({"object": "list", "data": [{"id": "k-chat"}]}).encode())
+                    if rec["path"] == "/v1/models"
+                    else (
+                        200,
+                        {"Content-Type": "application/json"},
+                        json.dumps({
+                            "path": rec["path"],
+                            "model": json.loads(rec["body"].decode()).get("model"),
+                        }).encode(),
+                    )
+                )
+            )
+            sp = self.write_instance(
+                home,
+                "mock-llm-1",
+                provider="kaggle",
+                account="k_team",
+                url=mock_url,
+                extra={"base_service": "mock-llm", "catalog_service": "kaggle-mock-llm"},
+            )
+            custom_specs = {
+                **GATEWAY_RUNTIME_SPECS,
+                "kaggle-mock-llm": RuntimeGatewaySpec(
+                    gateway_enabled=True,
+                    mode="chat_only",
+                    allowed_v1_routes=(
+                        ("GET", "/v1/models"),
+                        ("POST", "/v1/chat/completions"),
+                        ("POST", "/v1/custom_probe"),
+                    ),
+                    allowed_v1_prefixes=(("GET", "/v1/models/"),),
+                ),
+            }
+            srv, port, token = self.start_gateway(home, specs=custom_specs)
+            auth_h = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+            # 1. /gateway/status reports provider="kaggle" and account="k_team"
+            c_st, _, raw_st = self.http_req(port, "GET", "/gateway/status", headers={"Authorization": f"Bearer {token}"})
+            self.assertEqual(c_st, 200)
+            k_insts = [i for i in json.loads(raw_st)["instances"] if i["service"] == "kaggle-mock-llm"]
+            self.assertEqual(len(k_insts), 1)
+            self.assertEqual(k_insts[0]["provider"], "kaggle")
+            self.assertEqual(k_insts[0]["account"], "k_team")
+            self.assertEqual(k_insts[0]["instance"], "1")
+
+            # 2. Custom POST route from injected specs is accepted by all_root_post_routes & get_runtime_spec
+            c_cust, _, raw_cust = self.http_req(
+                port,
+                "POST",
+                "/v1/custom_probe",
+                headers=auth_h,
+                body=json.dumps({"model": "k-chat@kaggle-mock-llm"}).encode(),
+            )
+            self.assertEqual(c_cust, 200)
+            self.assertEqual(json.loads(raw_cust)["path"], "/v1/custom_probe")
+
+            # 3. Standard chat completions works (request rewritten -> k-chat upstream, response symmetrically rewritten back)
+            c_chat, _, raw_chat = self.http_req(
+                port,
+                "POST",
+                "/v1/chat/completions",
+                headers=auth_h,
+                body=json.dumps({"model": "k-chat@kaggle-mock-llm:1", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            )
+            self.assertEqual(c_chat, 200)
+            self.assertEqual(json.loads(raw_chat)["model"], "k-chat@kaggle-mock-llm:1")
+            self.assertEqual(json.loads(mock_srv.requests[-1]["body"].decode())["model"], "k-chat")
+            last_rec = json.loads((home / "gateway/gateway.log").read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertEqual(last_rec["provider"], "kaggle")
+            self.assertEqual(last_rec["account"], "k_team")
+            self.assertEqual(last_rec["runtime"], "kaggle-mock-llm")
+            self.assertEqual(last_rec["instance"], "1")
+            self.assertEqual(len(last_rec.keys()), 17)
+
+            # 4. When Kaggle replica is STARTING (ready=False), 503 hint uses `colabllm kaggle mock-llm status`
+            st_data = json.loads(sp.read_text(encoding="utf-8"))
+            st_data["ready"] = False
+            sp.write_text(json.dumps(st_data), encoding="utf-8")
+            c_503, _, raw_503 = self.http_req(
+                port,
+                "POST",
+                "/v1/chat/completions",
+                headers=auth_h,
+                body=json.dumps({"model": "k-chat@kaggle-mock-llm:1", "messages": [{"role": "user", "content": "hi"}]}).encode(),
+            )
+            self.assertEqual(c_503, 503)
+            self.assertIn("colabllm kaggle mock-llm status", json.loads(raw_503)["error"]["message"])
 
 
 if __name__ == "__main__":

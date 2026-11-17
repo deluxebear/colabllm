@@ -62,6 +62,14 @@ from colab_ws import has_native_colab_session, run_single_ws_session
 import mux
 from protocol import NotebookProtocol
 from processes import process_identity, runner_alive, stop_owned_process
+import runtime_core as _core
+from runtime_core import (
+    COLAB_NAMESPACE,
+    nonnegative_int,
+    probe,
+    validate_domain,
+    validate_instance,
+)
 
 STATE_ROOT = user_home()
 DEFAULT_ZONE = "example.com"
@@ -132,156 +140,32 @@ def extract_account_arg(argv: list[str] | None = None) -> tuple[str | None, list
 
 def extract_instance_arg(argv: list[str] | None = None) -> tuple[str | None, list[str]]:
     """Extract `-i <id>` / `--instance <id>` from anywhere in argv so it works before or after the subcommand."""
-    args = list(sys.argv[1:] if argv is None else argv)
-    inst = os.environ.get("CT_INSTANCE") or None
-    cleaned = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            cleaned.extend(args[i:])
-            break
-        if a in ("-i", "--instance"):
-            if i + 1 >= len(args) or args[i + 1].startswith("-"):
-                raise UsageError(f"{a} 需要有效的实例 ID")
-            inst = validate_instance(args[i + 1])
-            i += 2
-        elif a.startswith("--instance="):
-            inst = validate_instance(a.split("=", 1)[1])
-            i += 1
-        elif a.startswith("-i") and not a.startswith("--") and len(a) > 2:
-            inst = validate_instance(a[2:])
-            i += 1
-        else:
-            cleaned.append(a)
-            i += 1
-    return validate_instance(inst) if inst is not None else None, cleaned
-
-
-def validate_instance(value):
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}", value):
-        raise UsageError("实例 ID 须为 1–64 位字母、数字、下划线或连字符，且不能以连字符开头")
-    return value
+    return _core.extract_instance_arg(argv, validator=validate_instance)
 
 
 def apply_instance(svc: Service, inst: str | None) -> Service:
     """Apply an instance suffix (`-i 2` -> `<base>-2`, domain `<host>-2.<zone>`) to `svc` in place."""
-    if inst is not None:
-        validate_instance(inst)
-    base = svc.base_name or svc.name
-    svc.base_name = base
-    base_host = svc.base_default_hostname
-    if base_host is None:
-        base_host = svc.default_hostname
-        svc.base_default_hostname = base_host
-    svc.instance = inst
-    if not inst:
-        svc.name = base
-        svc.default_hostname = base_host
-        return svc
-    suffix = f"-{inst}"
-    svc.name = base if base.endswith(suffix) else f"{base}{suffix}"
-    if base_host:
-        if "." in base_host:
-            sub, rest = base_host.split(".", 1)
-            svc.default_hostname = f"{sub}{suffix}.{rest}" if not sub.endswith(suffix) else base_host
-        else:
-            svc.default_hostname = f"{base_host}{suffix}" if not base_host.endswith(suffix) else base_host
-    return svc
-
-
-def validate_domain(value: str) -> str:
-    """Accept DNS hostnames, never URLs, wildcard patterns, ports or IPs."""
-    try:
-        host = value.strip().rstrip('.').encode('idna').decode('ascii').lower()
-    except (UnicodeError, AttributeError):
-        raise ValueError('域名格式无效，请填写 example.com，不包含协议、端口或路径') from None
-    labels = host.split('.')
-    if len(host) > 253 or len(labels) < 2 or any(
-        not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', label) for label in labels
-    ):
-        raise ValueError('域名格式无效，请填写 example.com，不包含协议、端口或路径')
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return host
-    raise ValueError('请填写 DNS 域名，不能使用 IP 地址')
+    return _core.apply_instance(svc, inst, validator=validate_instance)
 
 
 def load_tunnel_config() -> dict:
-    path = STATE_ROOT / 'tunnel-config.json'
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-    except (ValueError, UnicodeError) as error:
-        raise RuntimeError(f"配置文件损坏：{path}；请修复该 JSON 文件或从备份恢复") from error
-    if not isinstance(data, dict):
-        raise ValueError('tunnel-config.json 必须是 JSON 对象')
-    if data.get('base_domain'):
-        data['base_domain']=validate_domain(data['base_domain'])
-    if data.get('frp') is not None:
-        from frp_backend import validate_config
-        data['frp']=validate_config(data['frp'])
-    return data
+    return _core.load_tunnel_config(state_root=STATE_ROOT)
 
 
 def save_tunnel_config(data: dict) -> None:
-    from frp_backend import write_private
-    path=STATE_ROOT/'tunnel-config.json'
-    if data:
-        write_private(path,data)
-    else:
-        path.unlink(missing_ok=True)
+    _core.save_tunnel_config(data, state_root=STATE_ROOT)
 
 
 def tunnel_transport(args) -> str:
-    explicit=getattr(args,'transport',None)
-    if getattr(args,'quick_tunnel',False):
-        if explicit=='frp':
-            raise ValueError('--quick-tunnel cannot be used with --transport frp')
-        return 'cloudflare'
-    if explicit:
-        return explicit
-    return 'frp' if load_tunnel_config().get('frp',{}).get('enabled') else 'cloudflare'
+    return _core.tunnel_transport(args, state_root=STATE_ROOT)
 
 
 def tunnel_hostname(svc: Service, args) -> str | None:
-    if getattr(args, 'quick_tunnel', False):
-        return None
-    domain = getattr(args, 'domain', None)
-    if domain and domain not in (True, '@default'):
-        return validate_domain(domain)
-    base = (getattr(args, 'base_domain', None) or os.environ.get('COLABSVC_BASE_DOMAIN')
-            or load_tunnel_config().get('base_domain'))
-    if not base:
-        return None
-    base = validate_domain(base)
-    # Keep service aliases (qwen, transcribe, etc.) and instance suffixes,
-    # replacing only their historical base domain.
-    alias = svc.default_hostname or svc.name
-    if '.' in alias:
-        alias = alias.split('.', 1)[0]
-    return validate_domain(f'{alias}.{base}')
+    return _core.tunnel_hostname(svc, args, namespace=COLAB_NAMESPACE, state_root=STATE_ROOT)
 
 
 def cmd_tunnel_config(args) -> None:
-    path = STATE_ROOT / 'tunnel-config.json'
-    saved=load_tunnel_config()
-    if args.clear:
-        if saved.get('frp',{}).get('enabled'):
-            raise ValueError('FRP requires a base domain; disable FRP before clearing it')
-        saved.pop('base_domain',None)
-        save_tunnel_config(saved)
-    elif args.base_domain is not None:
-        saved['base_domain']=validate_domain(args.base_domain)
-        save_tunnel_config(saved)
-    saved = load_tunnel_config()
-    print(json.dumps({'base_domain': saved.get('base_domain'),
-                      'transport': 'frp' if saved.get('frp',{}).get('enabled') else 'cloudflare',
-                      'frp': saved.get('frp'),
-                      'environment_override': os.environ.get('COLABSVC_BASE_DOMAIN') or None,
-                      'config_file': str(path)}, ensure_ascii=False, indent=2))
+    _core.cmd_tunnel_config(args, state_root=STATE_ROOT)
 
 
 def _known_service_names() -> set[str]:
@@ -448,57 +332,9 @@ def cf_json(*args: str):
 
 
 # --------------------------------------------------------------------------- state
-class State:
+class State(_core.LockedState):
     def __init__(self, svc: Service):
-        self.dir = STATE_ROOT / "services" / svc.name
-        self.path = self.dir / "state.json"
-
-    def load(self) -> dict:
-        try:
-            data = json.loads(self.path.read_text()) if self.path.exists() else {}
-            if not isinstance(data, dict):
-                raise ValueError("expected an object")
-            return data
-        except (ValueError, UnicodeError) as error:
-            raise RuntimeError(f"状态文件损坏：{self.path}；请修复该 JSON 文件或从备份恢复") from error
-
-    @contextlib.contextmanager
-    def lock(self, name="state", blocking=True):
-        private_dir(STATE_ROOT)
-        private_dir(self.dir.parent)
-        private_dir(self.dir)
-        with (self.dir / f".{name}.lock").open("a") as lockfile:
-            os.chmod(lockfile.name, 0o600)
-            try:
-                fcntl.flock(lockfile, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-            except BlockingIOError:
-                raise RuntimeError(f"{self.dir.name} 正在执行其他生命周期操作，请稍后重试") from None
-            try:
-                yield
-            finally:
-                fcntl.flock(lockfile, fcntl.LOCK_UN)
-
-    def update(self, change):
-        with self.lock():
-            st = change(self.load())
-            fd, filename = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=self.dir)
-            temporary = Path(filename)
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as output:
-                    json.dump(st, output, indent=2, ensure_ascii=False)
-                    output.flush()
-                    os.fsync(output.fileno())
-                temporary.replace(self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
-            return st
-
-    def save(self, **kw) -> dict:
-        return self.update(lambda st: {**st, **kw})
-
-    @property
-    def log_path(self) -> Path:
-        return self.dir / "run.log"
+        super().__init__(svc.name, COLAB_NAMESPACE, state_root=STATE_ROOT)
 
 
 # --------------------------------------------------------------------------- notebook
@@ -561,79 +397,31 @@ def build_notebook(src: Path, skip: set[int]) -> tuple[dict, list[str]]:
 
 # --------------------------------------------------------------------------- Cloudflare (cf CLI)
 def find_zone(hostname: str) -> dict:
-    zones = cf_json("zones", "list")
-    match = [z for z in zones if hostname == z["name"] or hostname.endswith("." + z["name"])]
-    if not match:
-        die(f"no Cloudflare zone in this account matches {hostname}")
-    return max(match, key=lambda z: len(z["name"]))
+    return _core.find_zone(hostname, cf_json_fn=cf_json)
 
 
 def ensure_named_tunnel(svc: Service, hostname: str) -> dict:
     """Idempotently create tunnel `colab-<svc>`, point <hostname> at it, return id + token."""
-    name = f"colab-{svc.name}"
-    found = [t for t in cf_json("tunnels", "list", "--name", name, "--is-deleted", "false") if t["name"] == name]
-    if found:
-        tunnel = found[0]
-        log(f"cf: reusing tunnel {name} ({tunnel['id']})")
-    else:
-        tunnel = cf_json("tunnels", "create", "--name", name, "--config-source", "cloudflare")
-        log(f"cf: created tunnel {name} ({tunnel['id']})")
-    tid = tunnel["id"]
-
-    ingress = [{"hostname": hostname, "service": f"http://localhost:{svc.tunnel_port}"},
-               {"service": "http_status:404"}]
-    # NB: the --tunnel-config-* flags of `cf` (beta) demand unrelated Access flags -> use --body
-    cf_json("tunnels", "config", "update", tid, "--body", json.dumps({"config": {"ingress": ingress}}))
-    log(f"cf: ingress {hostname} -> http://localhost:{svc.tunnel_port}")
-
-    zone = find_zone(hostname)
-    target = f"{tid}.cfargotunnel.com"
-    body = json.dumps({"type": "CNAME", "name": hostname, "content": target, "proxied": True,
-                       "comment": f"colabsvc {svc.name}"})
-    records = cf_json("dns", "records", "list", "-z", zone["id"], "--name", hostname)
-    if len(records)>1:
-        raise ValueError(f'DNS conflict for {hostname}: multiple existing records')
-    if not records:
-        cf_json("dns", "records", "create", "-z", zone["id"], "--body", body)
-        log(f"cf: DNS CNAME {hostname} -> {target} (created)")
-    elif records[0]["type"] == "CNAME" and records[0]["content"] == target:
-        log(f"cf: DNS CNAME {hostname} already points at the tunnel")
-    elif records[0].get('comment')==f'colabsvc {svc.name}' or (
-        records[0].get('comment')==State(svc).load().get('frp_route',{}).get('dns_owner')
-        and records[0].get('comment','').startswith('colabsvc-frp ')
-    ):
-        cf_json("dns", "records", "edit", records[0]["id"], "-z", zone["id"], "--body", body)
-        log(f"cf: DNS CNAME {hostname} -> {target} (updated from {records[0]['content']})")
-    else:
-        die(f"{hostname} already has a {records[0]['type']} record; refusing to overwrite it")
-
-    prev_cf = State(svc).load().get("cloudflare_route") or {}
-    old_host, old_zone = prev_cf.get("hostname"), prev_cf.get("zone_id")
-    if old_host and old_zone and old_host != hostname:
-        for old_rec in cf_json("dns", "records", "list", "-z", old_zone, "--name", old_host):
-            if (
-                old_rec.get("type") == "CNAME"
-                and old_rec.get("content") == target
-                and old_rec.get("comment") == f"colabsvc {svc.name}"
-            ):
-                run(["cf", "dns", "records", "delete", old_rec["id"], "-z", old_zone, "--force"], capture=True)
-                log(f"cf: removed previous DNS CNAME {old_host}")
-
-    token = cf_json("tunnels", "token", "get", tid)
-    return {"tunnel_id": tid, "tunnel_name": name, "zone_id": zone["id"], "hostname": hostname, "token": token}
+    return _core.ensure_named_tunnel(
+        svc,
+        hostname,
+        namespace=COLAB_NAMESPACE,
+        state_root=STATE_ROOT,
+        cf_json_fn=cf_json,
+        find_zone_fn=find_zone,
+        run_fn=run,
+        log_fn=log,
+    )
 
 
 def delete_named_tunnel(st: dict) -> None:
-    host, tid = st.get("hostname"), st.get("tunnel_id")
-    if host and tid and st.get("zone_id"):
-        for r in cf_json("dns", "records", "list", "-z", st["zone_id"], "--name", host):
-            if r.get("type") == "CNAME" and r.get("content", "").startswith(tid):
-                run(["cf", "dns", "records", "delete", r["id"], "-z", st["zone_id"], "--force"], capture=True)
-                log(f"cf: deleted DNS record {host}")
-    if tid:
-        run(["cf", "tunnels", "connections", "cleanup", tid, "--force"], capture=True, check=False)
-        run(["cf", "tunnels", "delete", tid, "--force"], capture=True)
-        log(f"cf: deleted tunnel {st.get('tunnel_name')}")
+    _core.delete_named_tunnel(
+        st,
+        namespace=COLAB_NAMESPACE,
+        cf_json_fn=cf_json,
+        run_fn=run,
+        log_fn=log,
+    )
 
 
 def _write_private_notebook(nb_path: Path, built: dict, env: dict | None = None) -> None:
@@ -676,16 +464,6 @@ DEFAULT_COLAB_REQUEST_TIMEOUT = 60
 DEFAULT_PREFLIGHT_RETRIES = 2
 DEFAULT_PREFLIGHT_RETRY_DELAY = 2.0
 DEFAULT_PREFLIGHT_HANG_GRACE = 0.5
-
-
-def nonnegative_int(value: str) -> int:
-    try:
-        parsed = int(value)
-    except ValueError:
-        raise ValueError("整数格式无效") from None
-    if parsed < 0:
-        raise ValueError("数值不能小于 0")
-    return parsed
 
 
 def parse_colab_session_status(session_name: str, returncode: int, stdout: str = "", stderr: str = "") -> str:
@@ -1739,29 +1517,6 @@ def _wait_ready(svc, proc, timeout=None):
     except KeyboardInterrupt:
         raise
     show_info(svc, do_probe=True, reveal=False)
-
-
-def probe(
-    url: str,
-    auth: tuple[str, str] | None = None,
-    bearer: str | None = None,
-    *,
-    timeout: float = 15.0,
-) -> str:
-    ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
-    req = urllib.request.Request(url, headers={"User-Agent": ua})
-    if auth:
-        import base64
-        req.add_header("Authorization", "Basic " + base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode())
-    elif bearer:
-        req.add_header("Authorization", f"Bearer {bearer}")
-    try:
-        with safe_urlopen(req, timeout=timeout) as r:
-            return str(r.status)
-    except urllib.error.HTTPError as e:
-        return str(e.code)
-    except Exception as e:
-        return f"error ({type(e).__name__})"
 
 
 def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, remote_session: str | None = None):

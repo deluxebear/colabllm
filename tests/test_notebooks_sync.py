@@ -27,13 +27,17 @@ class NotebookSyncTest(unittest.TestCase):
             generated = sorted((root / "src/colabllm/services").glob("*.ipynb"))
             self.assertEqual({p.name for p in generated},
                              {p.name for p in (ROOT / "src/colabllm/services").glob("*.ipynb")})
-            for path in [*generated, root / "templates/service.ipynb"]:
+            kaggle_generated = sorted((root / "src/colabllm/kaggle_services").glob("*.ipynb"))
+            self.assertEqual({p.name for p in kaggle_generated},
+                             {p.name for p in (ROOT / "src/colabllm/kaggle_services").glob("*.ipynb")})
+            for path in [*generated, *kaggle_generated, root / "templates/service.ipynb"]:
                 committed = ROOT / path.relative_to(root)
                 self.assertEqual(path.read_text(encoding="utf-8"), committed.read_text(encoding="utf-8"),
                                  f"{committed.relative_to(ROOT)} is stale; run python3 templates/build_notebooks.py")
 
     def test_notebooks_have_no_unresolved_placeholders_or_legacy_patterns(self):
-        for path in (ROOT / "src/colabllm/services").glob("*.ipynb"):
+        for path in [*(ROOT / "src/colabllm/services").glob("*.ipynb"),
+                     *(ROOT / "src/colabllm/kaggle_services").glob("*.ipynb")]:
             source = "".join("".join(c["source"]) if isinstance(c["source"], list) else c["source"]
                              for c in json.loads(path.read_text())["cells"])
             for marker in ("__BEFORE_READY__", "_SOURCE__", "__EXTRA_", "__TITLE__", "__WORK__"):
@@ -41,6 +45,15 @@ class NotebookSyncTest(unittest.TestCase):
             self.assertNotIn("urlretrieve(", source, path.name)
             self.assertNotIn('"--allowed-local-media-path", "/content"', source, path.name)
             self.assertNotIn('client_host in ("127.0.0.1"', source, path.name)
+            self.assertNotIn('"caddy run"', source, path.name)
+        for path in (ROOT / "src/colabllm/kaggle_services").glob("*.ipynb"):
+            source = "".join("".join(c["source"]) if isinstance(c["source"], list) else c["source"]
+                             for c in json.loads(path.read_text())["cells"])
+            self.assertNotIn("/content/drive", source, path.name)
+            self.assertIn("/kaggle/working/.ct-cache", source, path.name)
+            self.assertIn("/tmp/ct-runtime", source, path.name)
+            self.assertIn("CT_CACHE_EVENT", source, path.name)
+            self.assertIn("CT_DISK_STAT", source, path.name)
 
 
 class AsgiCommonTest(unittest.TestCase):
@@ -325,6 +338,52 @@ class UnslothAuthHelperTest(unittest.TestCase):
         nb = (ROOT / "src/colabllm/services/unsloth-studio.ipynb").read_text(encoding="utf-8")
         self.assertIn("unsloth_auth_helper.py", nb)
         self.assertIn("ensure_unsloth_admin_password", nb)
+
+
+class KaggleWebProbeAppTest(unittest.TestCase):
+    def test_probe_app_routes_and_security_headers(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        app_mod = importlib.import_module("kaggle_web_probe_app")
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_dir = Path(tmp) / ".ct-cache"
+            (cache_dir / "manifests").mkdir(parents=True)
+            (cache_dir / "manifests/caddy.json").write_text(
+                json.dumps({"artifact": "caddy", "version": "2.10.2", "sha256": "abc123", "verified_at": "2026-11-17T00:00:00Z"}),
+                encoding="utf-8",
+            )
+            srv = app_mod.serve_probe(host="127.0.0.1", port=0, service_name="web-probe", cache_dir=str(cache_dir), work_dir=tmp)
+            self.addCleanup(srv.server_close)
+            thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            thread.start()
+            self.addCleanup(srv.shutdown)
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+            with urllib.request.urlopen(base + "/health", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(data["status"], "ok")
+                self.assertEqual(data["service"], "web-probe")
+                self.assertIsInstance(data["uptime_seconds"], int)
+                self.assertEqual(data["cache_dir"], str(cache_dir))
+                self.assertIsInstance(data["free_mb"], int)
+
+            with urllib.request.urlopen(base + "/", timeout=5) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertIn("text/html", resp.headers.get("Content-Type", ""))
+                self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertIn("frame-ancestors 'none'", resp.headers.get("Content-Security-Policy", ""))
+                html_body = resp.read().decode("utf-8")
+                self.assertIn('<meta name="color-scheme" content="light dark">', html_body)
+                self.assertIn("2.10.2", html_body)
+
+            for v1_path in ("/v1/models", "/v1/chat/completions"):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(base + v1_path, timeout=5)
+                self.assertEqual(ctx.exception.code, 404)
+                self.assertEqual(json.loads(ctx.exception.read().decode("utf-8"))["error"], "not_supported")
 
 
 if __name__ == "__main__":

@@ -75,6 +75,7 @@ FORBIDDEN_DRIVE_SCHEME_PREFIXES = (
     "http://",
     "https://",
     "/content/",
+    "/kaggle/",
     "mydrive/",
     "./",
     "../",

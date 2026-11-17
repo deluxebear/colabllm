@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -15,10 +16,13 @@ import threading
 import time
 from typing import Any, Callable
 
-from cli_support import CliError, UsageError
+from cli_support import CliError, UsageError, validate_account_syntax
 from colab_accounts import list_account_names, validate_account
 from colabsvc import validate_instance
+from kaggle_accounts import kaggle_subprocess_env, validate_kaggle_account
+from kagglesvc import validate_kaggle_instance, validate_kaggle_session_name
 from processes import process_identity, stop_owned_process
+from runtime_core import LineBufferedSecretRedactor, redact_runtime_secrets
 from .state_store import strip_ansi
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +33,13 @@ _USAGE_LOCK = threading.Lock()
 _USAGE_COND = threading.Condition(_USAGE_LOCK)
 _USAGE_INFLIGHT = False
 _USAGE_CACHE: dict[str, Any] | None = None
+
+_KAGGLE_USAGE_CACHE_TTL = 60.0
+_KAGGLE_USAGE_LOCK = threading.Lock()
+_KAGGLE_USAGE_COND = threading.Condition(_KAGGLE_USAGE_LOCK)
+_KAGGLE_USAGE_INFLIGHT = False
+_KAGGLE_USAGE_CACHE: dict[str, Any] | None = None
+_KAGGLE_USAGE_FETCHED_AT = 0.0
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -151,7 +162,21 @@ class TaskManager:
                 self._tasks.pop(tid, None)
                 self._procs.pop(tid, None)
 
+    def _append_task_text(self, task: ManagedTask, text: str) -> None:
+        if not text:
+            return
+        with task.cond:
+            task.chunks.append(text)
+            task.total_bytes += len(text.encode("utf-8", errors="replace"))
+            while task.total_bytes > _MAX_TASK_OUTPUT_BYTES and len(task.chunks) > 1:
+                dropped = task.chunks.pop(0)
+                task.total_bytes -= len(dropped.encode("utf-8", errors="replace"))
+                task.truncated = True
+            task.cond.notify_all()
+        self._notify_change()
+
     def _pump_output(self, task: ManagedTask, proc: subprocess.Popen[bytes]) -> None:
+        redactor = LineBufferedSecretRedactor(max_buffer=65536)
         try:
             if proc.stdout is not None:
                 while True:
@@ -161,16 +186,12 @@ class TaskManager:
                     text = strip_ansi(chunk.decode("utf-8", errors="replace"))
                     if not text:
                         continue
-                    with task.cond:
-                        task.chunks.append(text)
-                        task.total_bytes += len(text.encode("utf-8", errors="replace"))
-                        while task.total_bytes > _MAX_TASK_OUTPUT_BYTES and len(task.chunks) > 1:
-                            dropped = task.chunks.pop(0)
-                            task.total_bytes -= len(dropped.encode("utf-8", errors="replace"))
-                            task.truncated = True
-                        task.cond.notify_all()
-                    self._notify_change()
+                    safe_text = redactor.feed(text, final=False)
+                    self._append_task_text(task, safe_text)
         finally:
+            rem = redactor.feed("", final=True)
+            if rem:
+                self._append_task_text(task, rem)
             if proc.stdout is not None:
                 with contextlib.suppress(OSError):
                     proc.stdout.close()
@@ -251,7 +272,8 @@ def run_dry_run(script_path: str | Path, argv: list[str], *, timeout: float = 20
         )
     except subprocess.TimeoutExpired:
         raise CliError("dry-run 预览超时", 124) from None
-    output = strip_ansi(((res.stdout or "") + "\n" + (res.stderr or "")).strip())
+    raw_output = strip_ansi(((res.stdout or "") + "\n" + (res.stderr or "")).strip())
+    output = redact_runtime_secrets(raw_output)
     if res.returncode != 0:
         raise CliError(output or f"dry-run 执行失败 ({res.returncode})", res.returncode)
     return {"ok": True, "output": output}
@@ -262,14 +284,27 @@ def run_probe(
     *,
     instance_arg: str = "",
     account: str | None = None,
+    provider: str = "colab",
+    short_name: str = "",
     timeout: float = 30.0,
 ) -> dict[str, Any]:
     cmd = [sys.executable, str(script_path)]
     inst = (instance_arg or "").strip()
-    if inst and inst != "default":
-        cmd.extend(["-i", validate_instance(inst)])
-    if account and str(account).strip():
-        cmd.extend(["--account", validate_account(str(account).strip())])
+    if provider == "kaggle":
+        if inst and inst != "default":
+            validate_kaggle_instance(inst)
+            if short_name:
+                validate_kaggle_session_name(f"{short_name}-{inst}")
+            cmd.extend(["-i", inst])
+        if account and str(account).strip():
+            cmd.extend(["--account", validate_kaggle_account(str(account).strip())])
+        env = kaggle_subprocess_env(None, base_env=_subprocess_env())
+    else:
+        if inst and inst != "default":
+            cmd.extend(["-i", validate_instance(inst)])
+        if account and str(account).strip():
+            cmd.extend(["--account", validate_account(str(account).strip())])
+        env = _subprocess_env()
     cmd.extend(["status", "--json"])
     try:
         res = subprocess.run(
@@ -278,13 +313,13 @@ def run_probe(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_subprocess_env(),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         raise CliError("健康探针超时", 124) from None
 
     stdout_clean = strip_ansi((res.stdout or "").strip())
-    stderr_clean = strip_ansi((res.stderr or "").strip())
+    stderr_clean = redact_runtime_secrets(strip_ansi((res.stderr or "").strip()))
     if stdout_clean:
         try:
             data = json.loads(stdout_clean)
@@ -295,7 +330,10 @@ def run_probe(
                 return data
         except ValueError:
             pass
-    raise CliError(stderr_clean or stdout_clean or f"状态探测失败 ({res.returncode})", res.returncode or 1)
+    raise CliError(
+        redact_runtime_secrets(stderr_clean or stdout_clean) or f"状态探测失败 ({res.returncode})",
+        res.returncode or 1,
+    )
 
 
 def run_doctor(
@@ -305,16 +343,28 @@ def run_doctor(
     drive_account: str | None = None,
     transport: str | None = None,
     no_drive: bool = False,
+    provider: str | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
+    if provider is not None and provider not in ("colab", "kaggle", "all"):
+        raise UsageError(f"不支持的检查平台: {provider}")
     cmd = [sys.executable, str(PKG_ROOT / "utility.py"), "doctor", "--json", "--timeout", f"{float(timeout):g}"]
+    if provider:
+        cmd.extend(["--provider", provider])
     if online:
         cmd.append("--online")
-    if no_drive:
+    if no_drive and provider != "kaggle":
         cmd.append("--no-drive")
     if account and str(account).strip():
-        cmd.extend(["-a", validate_account(str(account).strip())])
-    if drive_account and str(drive_account).strip():
+        acct_str = str(account).strip()
+        if provider == "kaggle":
+            validated_acct = validate_kaggle_account(acct_str)
+        elif provider == "all":
+            validated_acct = validate_account_syntax(acct_str)
+        else:
+            validated_acct = validate_account(acct_str)
+        cmd.extend(["-a", validated_acct])
+    if drive_account and str(drive_account).strip() and provider != "kaggle":
         cmd.extend(["--drive-account", validate_account(str(drive_account).strip())])
     if transport:
         if transport not in ("quick", "cloudflare", "frp"):
@@ -322,6 +372,11 @@ def run_doctor(
         cmd.extend(["--transport", transport])
 
     proc_timeout = max(15.0, float(timeout) * (6 if online else 3))
+    env = (
+        kaggle_subprocess_env(None, base_env=_subprocess_env())
+        if provider in ("kaggle", "all")
+        else _subprocess_env()
+    )
     try:
         res = subprocess.run(
             cmd,
@@ -329,7 +384,7 @@ def run_doctor(
             capture_output=True,
             text=True,
             timeout=proc_timeout,
-            env=_subprocess_env(),
+            env=env,
         )
     except subprocess.TimeoutExpired:
         raise CliError("doctor 检查超时", 124) from None
@@ -387,10 +442,163 @@ def get_cached_accounts_usage(*, max_age: float | None = None) -> dict[str, Any]
 
 
 def clear_accounts_usage_cache() -> None:
-    """Reset the in-memory Colab quota cache (mainly for tests)."""
-    global _USAGE_CACHE
+    """Reset the in-memory Colab and Kaggle quota caches (mainly for tests)."""
+    global _USAGE_CACHE, _KAGGLE_USAGE_CACHE, _KAGGLE_USAGE_FETCHED_AT
     with _USAGE_COND:
         _USAGE_CACHE = None
+    with _KAGGLE_USAGE_COND:
+        _KAGGLE_USAGE_CACHE = None
+        _KAGGLE_USAGE_FETCHED_AT = 0.0
+
+
+def get_cached_kaggle_usage(*, max_age: float | None = None) -> dict[str, Any] | None:
+    """Return cached Kaggle quota/session snapshot without spawning subprocesses."""
+    ttl = _KAGGLE_USAGE_CACHE_TTL if max_age is None else float(max_age)
+    with _KAGGLE_USAGE_COND:
+        if _KAGGLE_USAGE_CACHE is None:
+            return None
+        if ttl >= 0 and (time.time() - _KAGGLE_USAGE_FETCHED_AT) > ttl:
+            return None
+        return dict(_KAGGLE_USAGE_CACHE)
+
+
+def _normalize_kaggle_quota(raw: Any) -> dict[str, float | None] | None:
+    if not isinstance(raw, dict):
+        return None
+    out: dict[str, float | None] = {}
+    for key in ("used_hours", "remaining_hours", "total_hours"):
+        val = raw.get(key)
+        if val is None:
+            out[key] = None
+        else:
+            try:
+                out[key] = round(float(val), 2)
+            except (TypeError, ValueError):
+                out[key] = None
+    if all(v is None for v in out.values()):
+        return None
+    return out
+
+
+def fetch_kaggle_accounts_usage(*, refresh: bool = False, timeout: float = 20.0) -> dict[str, Any]:
+    """Query Kaggle weekly quota & session counts via kaggle CLI with 60s single-flight caching."""
+    global _KAGGLE_USAGE_INFLIGHT, _KAGGLE_USAGE_CACHE, _KAGGLE_USAGE_FETCHED_AT
+
+    with _KAGGLE_USAGE_COND:
+        if (
+            not refresh
+            and _KAGGLE_USAGE_CACHE is not None
+            and (time.time() - _KAGGLE_USAGE_FETCHED_AT) < _KAGGLE_USAGE_CACHE_TTL
+        ):
+            return dict(_KAGGLE_USAGE_CACHE)
+        if _KAGGLE_USAGE_INFLIGHT:
+            _KAGGLE_USAGE_COND.wait(timeout=timeout + 5.0)
+            if not refresh and _KAGGLE_USAGE_CACHE is not None:
+                return dict(_KAGGLE_USAGE_CACHE)
+        _KAGGLE_USAGE_INFLIGHT = True
+
+    try:
+        env = kaggle_subprocess_env(None, base_env=_subprocess_env())
+        kaggle_bin = shutil.which("kaggle", path=env.get("PATH"))
+        fetched_at_ts = time.time()
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        error_msg: str | None = None
+        by_account: dict[str, dict[str, Any]] = {}
+        available = False
+
+        if not kaggle_bin:
+            error_msg = "未找到 kaggle CLI"
+        else:
+            status_records: list[Any] | None = None
+            try:
+                res = subprocess.run(
+                    [kaggle_bin, "account", "status", "--json"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                )
+                stdout_clean = strip_ansi((res.stdout or "").strip())
+                stderr_clean = redact_runtime_secrets(strip_ansi((res.stderr or "").strip()))
+                if res.returncode != 0:
+                    error_msg = stderr_clean or stdout_clean or f"kaggle account status 退出码 {res.returncode}"
+                elif not stdout_clean:
+                    error_msg = "kaggle account status 返回空输出"
+                else:
+                    parsed = json.loads(stdout_clean)
+                    if isinstance(parsed, list):
+                        status_records = parsed
+                    else:
+                        error_msg = "kaggle account status --json 返回格式无效"
+            except subprocess.TimeoutExpired:
+                error_msg = "查询 kaggle account status 超时"
+            except OSError as err:
+                error_msg = str(err)
+            except ValueError:
+                error_msg = "无法解析 kaggle account status --json 输出"
+
+            if status_records is not None:
+                available = True
+                session_counts: dict[str, int] | None = None
+                try:
+                    sres = subprocess.run(
+                        [kaggle_bin, "session", "list", "--all-accounts", "--json"],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=min(10.0, timeout),
+                        env=env,
+                    )
+                    if sres.returncode == 0:
+                        s_out = strip_ansi((sres.stdout or "").strip())
+                        s_parsed = json.loads(s_out) if s_out else []
+                        if isinstance(s_parsed, list):
+                            session_counts = {}
+                            inactive_states = {"stopped", "cancelled", "dead", "reclaimed", "complete", "error"}
+                            for sess in s_parsed:
+                                if not isinstance(sess, dict):
+                                    continue
+                                acct_key = str(sess.get("account") or "").strip()
+                                if not acct_key:
+                                    continue
+                                state_val = str(sess.get("state") or "active").strip().lower()
+                                if state_val not in inactive_states:
+                                    session_counts[acct_key] = session_counts.get(acct_key, 0) + 1
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    session_counts = None
+
+                for item in status_records:
+                    if not isinstance(item, dict) or not item.get("account"):
+                        continue
+                    acct_name = str(item["account"]).strip()
+                    by_account[acct_name] = {
+                        "account": acct_name,
+                        "active": bool(item.get("active")),
+                        "username": item.get("username"),
+                        "auth_method": item.get("auth_method"),
+                        "authenticated": bool(item.get("authenticated")),
+                        "gpu_quota": _normalize_kaggle_quota(item.get("gpu_quota")),
+                        "tpu_quota": _normalize_kaggle_quota(item.get("tpu_quota")),
+                        "active_sessions_count": None if session_counts is None else session_counts.get(acct_name, 0),
+                        "refresh_at": item.get("refresh_at"),
+                        "error": str(item["error"]) if item.get("error") else None,
+                    }
+
+        snapshot: dict[str, Any] = {
+            "available": available,
+            "error": error_msg,
+            "fetched_at": fetched_at,
+            "accounts": by_account,
+        }
+        with _KAGGLE_USAGE_COND:
+            _KAGGLE_USAGE_CACHE = snapshot
+            _KAGGLE_USAGE_FETCHED_AT = fetched_at_ts
+            return dict(snapshot)
+    finally:
+        with _KAGGLE_USAGE_COND:
+            _KAGGLE_USAGE_INFLIGHT = False
+            _KAGGLE_USAGE_COND.notify_all()
 
 
 def _normalize_account_quota(

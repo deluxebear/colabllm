@@ -27,12 +27,12 @@ Issues = "https://github.com/deluxebear/colabllm/issues"
 Changelog = "https://github.com/deluxebear/colabllm/blob/master/CHANGELOG.md"
 
 [tool.setuptools]
-packages = ["colabllm", "colabllm.web_ui", "colabllm.gateway_runtime"]
+packages = ["colabllm", "colabllm.services", "colabllm.kaggle_services", "colabllm.web_ui", "colabllm.gateway_runtime"]
 package-dir = {"" = "src"}
 include-package-data = false
 
 [tool.setuptools.package-data]
-colabllm = ["lib/*.py", "services/*.py", "services/*.ipynb"]
+colabllm = ["lib/*.py", "services/*.py", "services/*.ipynb", "kaggle_services/*.py", "kaggle_services/*.ipynb"]
 "colabllm.web_ui" = ["static/*"]
 
 [tool.setuptools.data-files]
