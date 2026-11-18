@@ -87,6 +87,7 @@ const state = {
   activeView: "fleet",
   activeFleetPanel: "fleet-panel-instances",
   fleetView: loadSavedFleetView(),
+  networkProviderFilter: "all",
   instanceStatusFilter: "all",
   instanceSortKey: "status",
   instanceSortDir: "ascending",
@@ -549,7 +550,7 @@ function switchView(viewName) {
   const [title, subtitle] = VIEW_META[viewName] || ["ColabLLM", ""];
   document.getElementById("view-title").textContent = title;
   document.getElementById("view-subtitle").textContent = subtitle;
-  if (viewName === "tunnel" && !state.accounts?.usage_summary && !state.accountsUsageLoading) {
+  if (viewName === "network" && !state.accounts?.usage_summary && !state.accountsUsageLoading) {
     void refreshAccountsUsage({ force: false, silent: true });
   }
 }
@@ -2577,17 +2578,86 @@ function renderTasksList() {
   box.replaceChildren(...rows);
 }
 
-function formatAccountQuotaCell(quota, isLoading) {
+function makeSummaryPill(key, val, badgeNode = null) {
+  return el(
+    "div",
+    { className: "net-summary-pill" },
+    el("span", { className: "kv-key", textContent: key }),
+    el("span", { className: "kv-val", textContent: val }),
+    badgeNode,
+  );
+}
+
+function makeQuotaMeter(value, max, tone, label) {
+  const safeMax = Number.isFinite(max) && max > 0 ? max : 100;
+  const clamped = Math.max(0, Math.min(safeMax, Number.isFinite(value) ? value : 0));
+  return el("progress", {
+    className: "quota-meter",
+    max: String(safeMax),
+    value: String(clamped),
+    "data-tone": tone || "ok",
+    "aria-label": label,
+  });
+}
+
+function makeMetaTile(label, valText, { badgeText = null, badgeCls = "badge", subText = null } = {}) {
+  const valChildren = [el("span", { textContent: valText })];
+  if (badgeText) {
+    valChildren.push(el("span", { className: badgeCls, textContent: badgeText }));
+  }
+  return el(
+    "div",
+    { className: "net-meta-tile" },
+    el("span", { className: "net-meta-label", textContent: label }),
+    el("div", { className: "net-meta-val" }, ...valChildren),
+    subText ? el("span", { className: "net-meta-sub", textContent: subText }) : null,
+  );
+}
+
+function makeAccountNameCell(name, { active = false, effective = false, providerCls = "provider-colab" } = {}) {
+  return el(
+    "th",
+    { scope: "row" },
+    el(
+      "div",
+      { className: "acct-name-wrap" },
+      el("span", { textContent: name }),
+      active ? el("span", { className: `badge ${providerCls}`, textContent: "默认" }) : null,
+      effective && !active ? el("span", { className: "badge ok", textContent: "生效" }) : null,
+    ),
+  );
+}
+
+function formatAccountQuotaCell(quota, isLoading, maxPoolBalance = 100) {
   if (quota && quota.usage) {
     const bal = Number(quota.usage.balance || 0);
     const estHours = quota.usage.estimated_hours;
-    const badgeCls = bal > 0 ? (bal >= 10 ? "badge ok" : "badge warn") : "badge";
-    const badgeText = bal > 0 ? `${bal.toFixed(2)} CCU` : "0.00 CCU · 免费额度";
-    const children = [el("span", { className: badgeCls, textContent: badgeText })];
-    if (estHours) {
-      children.push(el("span", { className: "quota-sub", textContent: `约可跑 ${estHours}h` }));
+    if (bal > 0) {
+      const tone = bal >= 10 ? "ok" : "warn";
+      const children = [
+        el(
+          "div",
+          { className: "quota-head-row" },
+          el("span", { className: "quota-num", textContent: `${bal.toFixed(2)} CCU` }),
+          el("span", { className: `badge ${tone}`, textContent: bal >= 10 ? "充足" : "偏低" }),
+        ),
+        makeQuotaMeter(bal, Math.max(100, maxPoolBalance), tone, `Colab 可用量 ${bal.toFixed(2)} CCU`),
+      ];
+      if (estHours) {
+        children.push(el("span", { className: "quota-sub", textContent: `约可跑 ${estHours}h` }));
+      }
+      return el("div", { className: "quota-stack" }, ...children);
     }
-    return el("div", { className: "quota-stack" }, ...children);
+    return el(
+      "div",
+      { className: "quota-stack" },
+      el(
+        "div",
+        { className: "quota-head-row" },
+        el("span", { className: "quota-num muted", textContent: "0.00 CCU" }),
+        el("span", { className: "badge", textContent: "免费额度" }),
+      ),
+    );
   }
   if (quota && quota.error) {
     const shortErr = String(quota.error).slice(0, 72);
@@ -2605,13 +2675,20 @@ function formatAccountSessionsCell(quota, isLoading) {
   if (quota && quota.usage) {
     const rate = Number(quota.usage.rate_hourly || 0);
     const cnt = Number(quota.usage.assignments_count || 0);
-    const primary = `${rate.toFixed(2)}/h · ${cnt > 0 ? `${cnt} 台活跃` : "空闲"}`;
-    const children = [el("span", { textContent: primary })];
+    const children = [
+      el(
+        "div",
+        { className: "quota-head-row" },
+        el("span", { className: "quota-num", textContent: `${rate.toFixed(2)}/h` }),
+        el("span", { className: cnt > 0 ? "badge ok" : "badge", textContent: cnt > 0 ? `${cnt} 台活跃` : "空闲" }),
+      ),
+    ];
     if (Array.isArray(quota.assignments) && quota.assignments.length) {
-      const desc = quota.assignments
-        .map((a) => (a.name && a.name !== "?" ? `${a.name} (${a.hardware || "CPU"})` : (a.hardware || "CPU")))
-        .join("、");
-      children.push(el("span", { className: "quota-sub", textContent: desc }));
+      const chips = quota.assignments.map((a) => {
+        const txt = a.name && a.name !== "?" ? `${a.name} · ${a.hardware || "CPU"}` : (a.hardware || "CPU");
+        return el("span", { className: "session-chip", textContent: txt });
+      });
+      children.push(el("div", { className: "session-chips" }, ...chips));
     }
     return el("div", { className: "quota-stack" }, ...children);
   }
@@ -2621,14 +2698,23 @@ function formatAccountSessionsCell(quota, isLoading) {
   return el("span", { className: "muted", textContent: isLoading ? "查询中..." : "-" });
 }
 
-function formatKaggleQuotaCell(quota, available, isLoading) {
+function formatKaggleQuotaCell(quota, label, available, isLoading) {
   if (quota && quota.remaining_hours !== null && quota.remaining_hours !== undefined) {
     const rem = Number(quota.remaining_hours);
     const total = quota.total_hours !== null && quota.total_hours !== undefined ? Number(quota.total_hours) : null;
     const used = quota.used_hours !== null && quota.used_hours !== undefined ? Number(quota.used_hours) : null;
-    const cls = rem > 2 ? "badge ok" : rem > 0.15 ? "badge warn" : "badge danger";
+    const tone = rem > 2 ? "ok" : rem > 0.15 ? "warn" : "danger";
     const text = total !== null ? `${rem.toFixed(1)} / ${total.toFixed(1)}h` : `剩余 ${rem.toFixed(1)}h`;
-    const children = [el("span", { className: cls, textContent: text })];
+    const pctText = total !== null && total > 0 ? `${Math.round((rem / total) * 100)}%` : (rem > 0.15 ? "可用" : "耗尽");
+    const children = [
+      el(
+        "div",
+        { className: "quota-head-row" },
+        el("span", { className: "quota-num", textContent: text }),
+        el("span", { className: `badge ${tone}`, textContent: pctText }),
+      ),
+      makeQuotaMeter(rem, total || Math.max(rem, 30), tone, `${label} ${text}`),
+    ];
     if (used !== null) {
       children.push(el("span", { className: "quota-sub", textContent: `已用 ${used.toFixed(1)}h` }));
     }
@@ -2640,49 +2726,66 @@ function formatKaggleQuotaCell(quota, available, isLoading) {
   return el("span", { className: "muted", textContent: "-" });
 }
 
+function applyNetworkProviderFilter() {
+  const filter = state.networkProviderFilter || "all";
+  document.querySelectorAll("[data-net-provider]").forEach((btn) => {
+    btn.setAttribute("aria-pressed", btn.dataset.netProvider === filter ? "true" : "false");
+  });
+  const colabSec = document.getElementById("colab-accounts-section");
+  const kaggleSec = document.getElementById("kaggle-accounts-section");
+  if (colabSec) colabSec.hidden = filter === "kaggle";
+  if (kaggleSec) kaggleSec.hidden = filter === "colab";
+}
+
 function renderColabAccountsSection(ac, isLoading) {
   const acctSummary = document.getElementById("accounts-summary");
   const us = ac.usage_summary || null;
-  let usageTotalText = "待查询（点击刷新可用量）";
+  let usageTotalVal = "待查询";
+  let usageBadge = null;
   if (state.accountsUsageLoading && !us) {
-    usageTotalText = "正在查询实时额度...";
+    usageTotalVal = "查询中...";
   } else if (us) {
     if (!us.supported) {
-      usageTotalText = us.error || "colab CLI 不可用";
+      usageTotalVal = us.error || "colab CLI 不可用";
+      usageBadge = el("span", { className: "badge warn", textContent: "未就绪" });
     } else if (us.error && !(us.totals && us.totals.queried_accounts > 0)) {
-      usageTotalText = `查询失败: ${us.error}`;
+      usageTotalVal = `查询失败: ${us.error}`;
+      usageBadge = el("span", { className: "badge danger", textContent: "错误" });
     } else {
       const tot = us.totals || {};
       const bal = Number(tot.total_balance || 0).toFixed(2);
       const rate = Number(tot.total_rate_hourly || 0).toFixed(2);
       const activeCnt = Number(tot.total_assignments || 0);
-      usageTotalText = `${bal} CCU · ${rate}/h · ${activeCnt} 台活跃 (${us.fetched_time || "-"})`;
+      usageTotalVal = `${bal} CCU · ${rate}/h`;
+      usageBadge = el("span", { className: activeCnt > 0 ? "badge ok" : "badge", textContent: activeCnt > 0 ? `${activeCnt} 台活跃` : "全部空闲" });
     }
   }
   acctSummary.replaceChildren(
-    el("span", { className: "kv-key", textContent: "生效计算账户" }),
-    el("span", { className: "kv-val", textContent: `${ac.effective_account || "未解析"} (${ac.effective_source || "-"})` }),
-    el("span", { className: "kv-key", textContent: "生效共享 Drive" }),
-    el("span", { className: "kv-val", textContent: `${ac.effective_drive_account || "无"} (${ac.drive_source || "-"})` }),
-    el("span", { className: "kv-key", textContent: "Colab 可用量合计" }),
-    el("span", { className: "kv-val", textContent: usageTotalText }),
+    makeSummaryPill("生效计算账户", `${ac.effective_account || "未解析"} (${ac.effective_source || "-"})`),
+    makeSummaryPill("生效共享 Drive", `${ac.effective_drive_account || "无"} (${ac.drive_source || "-"})`),
+    makeSummaryPill("Colab 可用量合计", usageTotalVal, usageBadge),
   );
 
   const tbody = document.getElementById("accounts-tbody");
   const list = ac.accounts || [];
+  const maxPoolBalance = Math.max(
+    100,
+    ...list.map((a) => Number(a.quota?.usage?.balance || 0)),
+    Number(ac.legacy_quota?.usage?.balance || 0),
+  );
   if (!list.length) {
     if (ac.legacy_quota) {
       const hasConsent = Boolean(ac.legacy_drive_consent);
       tbody.replaceChildren(
         el(
           "tr",
-          null,
-          el("th", { scope: "row", textContent: "默认账户 (单账户)" }),
+          { className: "is-effective-account" },
+          makeAccountNameCell("默认账户 (单账户)", { active: true, effective: true, providerCls: "provider-colab" }),
           el("td", { textContent: "-" }),
-          el("td", null, formatAccountQuotaCell(ac.legacy_quota, isLoading)),
+          el("td", null, formatAccountQuotaCell(ac.legacy_quota, isLoading, maxPoolBalance)),
           el("td", null, formatAccountSessionsCell(ac.legacy_quota, isLoading)),
           el("td", { textContent: "-" }),
-          el("td", null, el("span", { className: `badge ${hasConsent ? "ok" : "warn"}`, textContent: hasConsent ? "已授权文件" : "无本地授权" })),
+          el("td", null, el("span", { className: `badge ${hasConsent ? "ok" : "warn"}`, textContent: hasConsent ? "已授权" : "未授权" })),
         ),
       );
       return;
@@ -2695,13 +2798,13 @@ function renderColabAccountsSection(ac, isLoading) {
   const trs = list.map((a) =>
     el(
       "tr",
-      null,
-      el("th", { scope: "row", textContent: `${a.name}${a.active ? " (默认)" : ""}` }),
-      el("td", { textContent: a.email || "-" }),
-      el("td", null, formatAccountQuotaCell(a.quota, isLoading)),
+      { className: a.effective ? "is-effective-account" : "" },
+      makeAccountNameCell(a.name, { active: Boolean(a.active), effective: Boolean(a.effective), providerCls: "provider-colab" }),
+      el("td", null, el("span", { className: "acct-id-mono", textContent: a.email || "-" })),
+      el("td", null, formatAccountQuotaCell(a.quota, isLoading, maxPoolBalance)),
       el("td", null, formatAccountSessionsCell(a.quota, isLoading)),
-      el("td", { textContent: a.drive_account || "-" }),
-      el("td", null, el("span", { className: `badge ${a.has_drive_consent ? "ok" : "warn"}`, textContent: a.has_drive_consent ? "已授权文件" : "无本地授权" })),
+      el("td", null, el("span", { className: "acct-id-mono", textContent: a.drive_account || "-" })),
+      el("td", null, el("span", { className: `badge ${a.has_drive_consent ? "ok" : "warn"}`, textContent: a.has_drive_consent ? "已授权" : "未授权" })),
     ),
   );
   tbody.replaceChildren(...trs);
@@ -2713,21 +2816,25 @@ function renderKaggleAccountsSection(ac, isLoading) {
   if (!kSummary || !kTbody) return;
 
   const kSnap = ac.kaggle || null;
-  let kStatusText = "待查询（点击刷新可用量）";
+  let kStatusText = "待查询";
+  let kStatusBadge = null;
   if (isLoading && !kSnap) {
     kStatusText = "正在查询 Kaggle 配额...";
   } else if (ac.kaggle_error) {
     kStatusText = `配置错误: ${ac.kaggle_error}`;
+    kStatusBadge = el("span", { className: "badge danger", textContent: "异常" });
   } else if (kSnap) {
-    kStatusText = kSnap.available
-      ? `已连接 (${Object.keys(kSnap.accounts || {}).length} 个账户)`
-      : `降级/不可用: ${kSnap.error || "kaggle CLI 未就绪"}`;
+    if (kSnap.available) {
+      kStatusText = `已连接 (${Object.keys(kSnap.accounts || {}).length} 个账户)`;
+      kStatusBadge = el("span", { className: "badge ok", textContent: "在线" });
+    } else {
+      kStatusText = kSnap.error || "kaggle CLI 未就绪";
+      kStatusBadge = el("span", { className: "badge warn", textContent: "降级" });
+    }
   }
   kSummary.replaceChildren(
-    el("span", { className: "kv-key", textContent: "生效 Kaggle 账户" }),
-    el("span", { className: "kv-val", textContent: `${ac.kaggle_effective_account || "未解析"} (${ac.kaggle_effective_source || "-"})` }),
-    el("span", { className: "kv-key", textContent: "配额查询状态" }),
-    el("span", { className: "kv-val", textContent: kStatusText }),
+    makeSummaryPill("生效 Kaggle 账户", `${ac.kaggle_effective_account || "未解析"} (${ac.kaggle_effective_source || "-"})`),
+    makeSummaryPill("配额查询状态", kStatusText, kStatusBadge),
   );
 
   const kList = ac.kaggle_accounts || [];
@@ -2742,18 +2849,26 @@ function renderKaggleAccountsSection(ac, isLoading) {
   const available = Boolean(kSnap && kSnap.available);
   const kTrs = kList.map((ka) => {
     const u = ka.usage || (kSnap?.accounts || {})[ka.name] || null;
-    const sessText =
-      u && u.active_sessions_count !== null && u.active_sessions_count !== undefined
-        ? `${u.active_sessions_count} 个`
-        : available
-          ? "未获取"
-          : "-";
+    let sessNode;
+    if (u && u.active_sessions_count !== null && u.active_sessions_count !== undefined) {
+      const cnt = Number(u.active_sessions_count || 0);
+      sessNode = el("span", { className: cnt > 0 ? "badge ok" : "badge", textContent: cnt > 0 ? `${cnt} 个活跃` : "0 个" });
+    } else {
+      sessNode = el("span", { className: "muted", textContent: available ? "未获取" : "-" });
+    }
     let authNode;
     if (u) {
       const ok = Boolean(u.authenticated);
       const cls = ok ? "badge ok" : "badge danger";
-      const lbl = `${u.auth_method || "auth"} · ${ok ? "已认证" : u.error || "未认证"}`;
-      authNode = el("span", { className: cls, textContent: lbl });
+      const lbl = `${u.auth_method || "auth"} · ${ok ? "已认证" : "未认证"}`;
+      authNode = ok
+        ? el("span", { className: cls, textContent: lbl })
+        : el(
+            "div",
+            { className: "quota-stack" },
+            el("span", { className: cls, textContent: lbl }),
+            u.error ? el("span", { className: "quota-sub", textContent: String(u.error).slice(0, 48) }) : null,
+          );
     } else if (kSnap && !available && kSnap.error) {
       authNode = el("span", { className: "badge warn", title: kSnap.error, textContent: "离线索引" });
     } else {
@@ -2761,39 +2876,190 @@ function renderKaggleAccountsSection(ac, isLoading) {
     }
     return el(
       "tr",
-      null,
-      el("th", { scope: "row", textContent: `${ka.name}${ka.active ? " (默认)" : ""}` }),
-      el("td", { textContent: ka.username ? `@${ka.username.replace(/^@/, "")}` : "-" }),
-      el("td", null, formatKaggleQuotaCell(u?.gpu_quota, available, isLoading)),
-      el("td", null, formatKaggleQuotaCell(u?.tpu_quota, available, isLoading)),
-      el("td", { textContent: sessText }),
+      { className: ka.effective ? "is-effective-account" : "" },
+      makeAccountNameCell(ka.name, { active: Boolean(ka.active), effective: Boolean(ka.effective), providerCls: "provider-kaggle" }),
+      el("td", null, el("span", { className: "acct-id-mono", textContent: ka.username ? `@${ka.username.replace(/^@/, "")}` : "-" })),
+      el("td", null, formatKaggleQuotaCell(u?.gpu_quota, `${ka.name} GPU 周配额`, available, isLoading)),
+      el("td", null, formatKaggleQuotaCell(u?.tpu_quota, `${ka.name} TPU 周配额`, available, isLoading)),
+      el("td", null, sessNode),
       el("td", null, authNode),
     );
   });
   kTbody.replaceChildren(...kTrs);
 }
 
+function renderNetworkKpis(t, ac, isLoading) {
+  const frp = t.frp && typeof t.frp === "object" ? t.frp : null;
+  const frpEnabled = Boolean(frp && frp.enabled);
+  const frpIp = frp?.server_ip || "";
+  const frpPort = frp?.server_port || 7000;
+  const effectiveDomain = t.environment_override || t.base_domain || "";
+
+  const tVal = document.getElementById("net-kpi-transport");
+  const tBadge = document.getElementById("net-kpi-transport-badge");
+  const tSub = document.getElementById("net-kpi-transport-sub");
+  if (tVal && tBadge && tSub) {
+    if (t.transport === "frp" && frpEnabled) {
+      tVal.textContent = "FRP 固定路由";
+      tBadge.className = "badge ok";
+      tBadge.textContent = "已启用";
+      tSub.textContent = frpIp ? `${frpIp}:${frpPort}${frp?.ssh ? ` · ${frp.ssh}` : ""}` : "已启用全局 FRP";
+    } else if (effectiveDomain) {
+      tVal.textContent = "Cloudflare 命名";
+      tBadge.className = "badge ok";
+      tBadge.textContent = "固定域名";
+      tSub.textContent = `基于主域名 ${effectiveDomain}`;
+    } else {
+      tVal.textContent = "Cloudflare Quick";
+      tBadge.className = "badge warn";
+      tBadge.textContent = "临时隧道";
+      tSub.textContent = "每次启动生成临时 trycloudflare 地址";
+    }
+  }
+
+  const dVal = document.getElementById("net-kpi-domain");
+  const dBadge = document.getElementById("net-kpi-domain-badge");
+  const dSub = document.getElementById("net-kpi-domain-sub");
+  if (dVal && dBadge && dSub) {
+    dVal.textContent = effectiveDomain || "未设置";
+    dBadge.hidden = !t.environment_override;
+    dBadge.className = "badge warn";
+    dSub.textContent = t.environment_override
+      ? `来自 COLABSVC_BASE_DOMAIN（文件值: ${t.base_domain || "未设"}）`
+      : (t.base_domain ? "自动隔离 Colab 与 Kaggle 子域路由" : "保存后可用于固定域名与 FRP");
+  }
+
+  const cVal = document.getElementById("net-kpi-colab");
+  const cBadge = document.getElementById("net-kpi-colab-badge");
+  const cSub = document.getElementById("net-kpi-colab-sub");
+  const cCount = (ac.accounts || []).length;
+  const us = ac.usage_summary || null;
+  if (cVal && cBadge && cSub) {
+    if (us && us.supported && !(us.error && !(us.totals && us.totals.queried_accounts > 0))) {
+      const tot = us.totals || {};
+      const bal = Number(tot.total_balance || 0).toFixed(2);
+      const rate = Number(tot.total_rate_hourly || 0).toFixed(2);
+      const activeCnt = Number(tot.total_assignments || 0);
+      cVal.textContent = `${bal} CCU`;
+      cBadge.className = activeCnt > 0 ? "badge ok" : "badge";
+      cBadge.textContent = activeCnt > 0 ? `${activeCnt} 台活跃` : `${cCount || 1} 个账户`;
+      cSub.textContent = `${cCount || 1} 个账户 · 消耗 ${rate}/h`;
+    } else {
+      cVal.textContent = isLoading ? "查询中..." : `${cCount} 个账户`;
+      cBadge.className = "badge";
+      cBadge.textContent = isLoading ? "加载中" : "待刷新";
+      cSub.textContent = `当前生效: ${ac.effective_account || "未解析"}`;
+    }
+  }
+
+  const kVal = document.getElementById("net-kpi-kaggle");
+  const kBadge = document.getElementById("net-kpi-kaggle-badge");
+  const kSub = document.getElementById("net-kpi-kaggle-sub");
+  const kList = ac.kaggle_accounts || [];
+  const kSnap = ac.kaggle || null;
+  if (kVal && kBadge && kSub) {
+    if (kSnap && kSnap.available) {
+      let gpuRem = 0;
+      let tpuRem = 0;
+      let activeK = 0;
+      let authedK = 0;
+      for (const rec of Object.values(kSnap.accounts || {})) {
+        if (rec?.authenticated) authedK += 1;
+        if (rec?.gpu_quota?.remaining_hours != null) gpuRem += Number(rec.gpu_quota.remaining_hours);
+        if (rec?.tpu_quota?.remaining_hours != null) tpuRem += Number(rec.tpu_quota.remaining_hours);
+        if (rec?.active_sessions_count != null) activeK += Number(rec.active_sessions_count);
+      }
+      kVal.textContent = `GPU ${gpuRem.toFixed(1)}h · TPU ${tpuRem.toFixed(1)}h`;
+      kBadge.className = activeK > 0 ? "badge ok" : "badge";
+      kBadge.textContent = activeK > 0 ? `${activeK} 个活跃` : `${authedK}/${kList.length} 已认证`;
+      kSub.textContent = `共 ${kList.length} 个账户 · 生效 ${ac.kaggle_effective_account || "未解析"}`;
+    } else {
+      kVal.textContent = isLoading ? "查询中..." : `${kList.length} 个账户`;
+      kBadge.className = ac.kaggle_error || (kSnap && kSnap.error) ? "badge warn" : "badge";
+      kBadge.textContent = isLoading ? "加载中" : (kSnap && !kSnap.available ? "降级" : "待刷新");
+      kSub.textContent = `当前生效: ${ac.kaggle_effective_account || "未解析"}`;
+    }
+  }
+}
+
 function renderTunnelAndAccounts() {
   const tunnelSummary = document.getElementById("tunnel-summary");
   const t = state.tunnel || {};
-  const frp = t.frp || {};
-  const items = [
-    ["当前后端 (--transport)", t.transport || "cloudflare"],
-    ["项目主域名", t.base_domain || "未设置（Named Tunnel 将回退 Quick Tunnel）"],
-    ["环境变量覆盖", t.environment_override || "无"],
-    ["FRP 配置", frp.configured ? `${frp.server_addr || ""}:${frp.server_port || ""} (domain=${frp.domain || ""})` : "未配置"],
-  ];
-  const nodes = [];
-  for (const [k, v] of items) {
-    nodes.push(el("span", { className: "kv-key", textContent: k }), el("span", { className: "kv-val", textContent: v }));
+  const frp = t.frp && typeof t.frp === "object" ? t.frp : null;
+  const frpEnabled = Boolean(frp && frp.enabled);
+  const frpIp = frp?.server_ip || "";
+  const frpPort = frp?.server_port || 7000;
+  const effectiveDomain = t.environment_override || t.base_domain;
+
+  let frpTileVal = "未配置";
+  let frpTileBadge = null;
+  let frpBadgeCls = "badge";
+  let frpTileSub = "如需启用请执行 colabllm frp-config";
+  if (frpEnabled) {
+    frpTileVal = frpIp ? `${frpIp}:${frpPort}` : "已启用";
+    frpTileBadge = "已启用";
+    frpBadgeCls = "badge ok";
+    const extras = [];
+    if (frp?.ssh) extras.push(`SSH ${frp.ssh}`);
+    if (frp?.project_id) extras.push(`id=${String(frp.project_id).slice(0, 8)}`);
+    frpTileSub = extras.join(" · ") || "共享 FRP 路由可用";
+  } else if (frpIp) {
+    frpTileVal = `${frpIp}:${frpPort}`;
+    frpTileBadge = "已停用";
+    frpBadgeCls = "badge warn";
+    frpTileSub = frp?.ssh ? `SSH ${frp.ssh}` : "配置文件中已禁用 FRP";
   }
-  tunnelSummary.replaceChildren(...nodes);
-  document.getElementById("tunnel-base-domain").value = t.base_domain || "";
+
+  tunnelSummary.replaceChildren(
+    makeMetaTile("当前后端 (--transport)", (t.transport || "cloudflare").toUpperCase(), {
+      badgeText: t.transport === "frp" ? "FRP" : (t.base_domain ? "CF 命名" : "Quick"),
+      badgeCls: t.transport === "frp" || t.base_domain ? "badge provider-colab" : "badge warn",
+      subText: t.config_file ? `配置: ${t.config_file}` : null,
+    }),
+    makeMetaTile("FRP 服务端配置", frpTileVal, {
+      badgeText: frpTileBadge,
+      badgeCls: frpBadgeCls,
+      subText: frpTileSub,
+    }),
+    makeMetaTile("环境变量覆盖", t.environment_override || "无", {
+      subText: t.environment_override ? "COLABSVC_BASE_DOMAIN 优先于配置文件" : "COLABSVC_BASE_DOMAIN 未设置",
+    }),
+    makeMetaTile("子域派生预览", effectiveDomain ? `*.${effectiveDomain}` : "未配置主域名", {
+      subText: effectiveDomain ? `<alias>.${effectiveDomain} / kaggle-<alias>.${effectiveDomain}` : "将使用 trycloudflare 临时地址",
+    }),
+  );
+
+  const domainInput = document.getElementById("tunnel-base-domain");
+  const saveBtn = document.getElementById("tunnel-save-btn");
+  const clearBtn = document.getElementById("tunnel-clear-btn");
+  if (domainInput) {
+    domainInput.value = t.base_domain || "";
+    domainInput.disabled = state.readOnly;
+  }
+  if (saveBtn) saveBtn.disabled = state.readOnly;
+  if (clearBtn) clearBtn.disabled = state.readOnly;
 
   const ac = state.accounts || {};
   const isLoading = Boolean(state.accountsUsageLoading);
+  renderNetworkKpis(t, ac, isLoading);
   renderColabAccountsSection(ac, isLoading);
   renderKaggleAccountsSection(ac, isLoading);
+
+  const colabCnt = (ac.accounts || []).length || (ac.legacy_quota ? 1 : 0);
+  const kaggleCnt = (ac.kaggle_accounts || []).length;
+  const setTxt = (id, v) => {
+    const node = document.getElementById(id);
+    if (node) node.textContent = String(v);
+  };
+  setTxt("net-count-all", colabCnt + kaggleCnt);
+  setTxt("net-count-colab", colabCnt);
+  setTxt("net-count-kaggle", kaggleCnt);
+  const updatedHint = document.getElementById("net-quota-updated");
+  if (updatedHint) {
+    const ts = ac.usage_summary?.fetched_time || ac.kaggle?.fetched_time;
+    updatedHint.textContent = ts ? `配额快照时间: ${ts}` : "";
+  }
+  applyNetworkProviderFilter();
 }
 
 function getProviderAccountOptions(provider) {
@@ -4051,15 +4317,37 @@ function initInteractions() {
   });
 
   document.getElementById("frp-probe-btn").addEventListener("click", async () => {
+    const btn = document.getElementById("frp-probe-btn");
+    const wrap = document.getElementById("frp-status-wrap");
     const out = document.getElementById("frp-status-output");
+    if (wrap) wrap.hidden = false;
     out.hidden = false;
     out.textContent = "正在探测 FRP 状态...";
+    btn.disabled = true;
+    btn.classList.add("is-busy");
     try {
       const res = await apiFetch("/api/frp-status", { timeoutMs: 40000 });
       out.textContent = JSON.stringify(res, null, 2);
     } catch (err) {
       out.textContent = `FRP 检查失败: ${err.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.classList.remove("is-busy");
     }
+  });
+
+  document.getElementById("frp-status-close-btn")?.addEventListener("click", () => {
+    const wrap = document.getElementById("frp-status-wrap");
+    const out = document.getElementById("frp-status-output");
+    if (wrap) wrap.hidden = true;
+    if (out) out.hidden = true;
+  });
+
+  document.querySelectorAll("[data-net-provider]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.networkProviderFilter = btn.dataset.netProvider || "all";
+      applyNetworkProviderFilter();
+    });
   });
 
   document.getElementById("accounts-usage-refresh-btn")?.addEventListener("click", async () => {

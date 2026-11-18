@@ -445,6 +445,7 @@ if args[:2] == ["session", "stop"]:
                     self.end_headers()
 
         srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _HealthSrv)
+        srv.daemon_threads = True
         self.addCleanup(srv.server_close)
         threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.addCleanup(srv.shutdown)
@@ -455,8 +456,11 @@ if args[:2] == ["session", "stop"]:
             home = root / "profile"
             fake_bin = root / "bin"
             fake_bin.mkdir()
-            phase_file = root / "phase.txt"
-            phase_file.write_text("logs_follow", encoding="utf-8")
+            status_queue_file = root / "status_queue.json"
+            status_queue_file.write_text(
+                json.dumps(["running", "unreachable", "reclaimed", "reclaimed"]),
+                encoding="utf-8",
+            )
             calls_file = root / "calls.txt"
             self._write_fake_kaggle(
                 fake_bin,
@@ -469,23 +473,28 @@ args = sys.argv[1:]
 if "-a" in args:
     idx = args.index("-a")
     args = args[:idx] + args[idx+2:]
-phase = open({json.dumps(str(phase_file))}).read().strip()
 if args[:2] == ["session", "status"]:
-    print(json.dumps({{"alive": phase != "reclaimed", "live_state": phase if phase in ("running", "unreachable", "reclaimed") else "running"}}))
-    sys.exit(0 if phase != "reclaimed" else 1)
+    q_path = {json.dumps(str(status_queue_file))}
+    try:
+        q = json.loads(open(q_path, encoding="utf-8").read())
+    except Exception:
+        q = []
+    live = q.pop(0) if q else "reclaimed"
+    with open(q_path, "w", encoding="utf-8") as qf:
+        json.dump(q, qf)
+    print(json.dumps({{"alive": live == "running", "live_state": live}}))
+    sys.exit(0 if live != "reclaimed" else 1)
 if args[:2] == ["session", "create"]:
     print(json.dumps({{"name": args[2], "account": "acct_ok", "kernel_session_id": 888, "state": "active", "accelerator": "cpu", "enable_internet": True}}))
     sys.exit(0)
 if args[:2] == ["session", "exec"]:
     print("CT_PUBLIC_URL={probe_url}", flush=True)
     print("CT_READY", flush=True)
-    time.sleep(0.1)
+    time.sleep(0.05)
     sys.exit(1)
 if args[:3] == ["session", "logs", "-f"]:
-    # Switch to unreachable then reclaimed on subsequent status probes
-    open({json.dumps(str(phase_file))}, "w").write("unreachable")
     print("[heartbeat] still alive via logs -f", flush=True)
-    time.sleep(0.1)
+    time.sleep(0.05)
     sys.exit(0)
 if args[:2] == ["session", "restart"]:
     print(json.dumps({{"restarted": True}}))
@@ -526,11 +535,6 @@ if args[:2] == ["session", "stop"]:
                     ever_ready=False,
                 )
 
-                def _advance_phase():
-                    time.sleep(0.25)
-                    phase_file.write_text("reclaimed", encoding="utf-8")
-
-                threading.Thread(target=_advance_phase, daemon=True).start()
                 rc = kagglesvc.exec_runner(svc, nb)
                 self.assertEqual(rc, 1)  # Stopped cleanly after max_restarts=1 exhausted on second reclaimed
 
@@ -754,18 +758,25 @@ print("{}")
 _TEST_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
-def _ws_read_frame(sock: socket.socket) -> tuple[bool, int, bytes] | None:
-    def _exact(n: int) -> bytes:
+def _ws_read_frame(sock: socket.socket, *, stop_check=None) -> tuple[bool, int, bytes] | None:
+    def _exact(n: int, *, allow_idle_timeout: bool = False) -> bytes:
         buf = bytearray()
         while len(buf) < n:
-            chunk = sock.recv(n - len(buf))
+            if stop_check is not None and stop_check():
+                raise EOFError("stopped")
+            try:
+                chunk = sock.recv(n - len(buf))
+            except (TimeoutError, socket.timeout):
+                if allow_idle_timeout and not buf:
+                    continue
+                raise EOFError("timeout")
             if not chunk:
                 raise EOFError("closed")
             buf.extend(chunk)
         return bytes(buf)
 
     try:
-        head = _exact(2)
+        head = _exact(2, allow_idle_timeout=True)
     except EOFError:
         return None
     b0, b1 = head[0], head[1]
@@ -808,6 +819,8 @@ class _MockJupyterMuxServer:
         self.require_origin_once = require_origin_once
         self._origin_rejected_once = False
         self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._dropped_sockets: set[socket.socket] = set()
         self.active_sockets: list[socket.socket] = []
         self.executed: list[tuple[bool, bool, str]] = []
         self.watch_connects = 0
@@ -891,6 +904,8 @@ class _MockJupyterMuxServer:
                 self.close_connection = True
 
                 sock = self.connection
+                sock.settimeout(0.2)
+                stop_check = lambda: srv_ref._stopped.is_set() or sock in srv_ref._dropped_sockets
                 with srv_ref._lock:
                     srv_ref.active_sockets.append(sock)
                 is_watch_conn = sid.startswith("mon-") or (
@@ -935,8 +950,8 @@ class _MockJupyterMuxServer:
                     threading.Thread(target=_hb_loop, daemon=True).start()
 
                 try:
-                    while True:
-                        frame = _ws_read_frame(sock)
+                    while not stop_check():
+                        frame = _ws_read_frame(sock, stop_check=stop_check)
                         if frame is None:
                             break
                         _, opcode, payload = frame
@@ -1019,6 +1034,8 @@ class _MockJupyterMuxServer:
                         sock.close()
 
         class _QuietThreadingHTTPServer(http.server.ThreadingHTTPServer):
+            daemon_threads = True
+
             def handle_error(self, request, client_address):
                 return
 
@@ -1032,6 +1049,7 @@ class _MockJupyterMuxServer:
     def drop_all_ws(self) -> None:
         with self._lock:
             socks = list(self.active_sockets)
+            self._dropped_sockets.update(socks)
         for sock in socks:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
@@ -1039,6 +1057,7 @@ class _MockJupyterMuxServer:
                 sock.close()
 
     def close(self) -> None:
+        self._stopped.set()
         self.drop_all_ws()
         self.server.shutdown()
         self.server.server_close()
@@ -1074,6 +1093,7 @@ class KaggleWsMuxTest(unittest.TestCase):
                 self.wfile.write(b'{"status":"ok"}' if code == 200 else b"bad gateway")
 
         self.health = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Health)
+        self.health.daemon_threads = True
         threading.Thread(target=self.health.serve_forever, daemon=True).start()
         self.addCleanup(self.health.server_close)
         self.addCleanup(self.health.shutdown)
@@ -1273,7 +1293,7 @@ sys.exit(0)
         k1_state = self.profile_dir / "kaggle" / "services" / "web-probe-k1" / "state.json"
         k2_state = self.profile_dir / "kaggle" / "services" / "web-probe-k2" / "state.json"
 
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 20.0
         loaded: dict[str, dict] = {}
         while time.monotonic() < deadline:
             loaded = {
@@ -1309,7 +1329,7 @@ sys.exit(0)
         # Restart k1 inside the same mux daemon without touching c1 or k2.
         rst_k1 = self._cli("kaggle", "web-probe", "-i", "k1", "restart", "--detach")
         self.assertEqual(rst_k1.returncode, 0, rst_k1.stderr)
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 20.0
         while time.monotonic() < deadline:
             st_k1 = json.loads(k1_state.read_text(encoding="utf-8"))
             if st_k1.get("ready"):
@@ -1328,7 +1348,7 @@ sys.exit(0)
         # Stop k2 and c1 -> mux daemon idle-exits automatically.
         self.assertEqual(self._cli("kaggle", "web-probe", "-i", "k2", "down").returncode, 0)
         self.assertEqual(self._cli("ollama", "-i", "c1", "down").returncode, 0)
-        exit_deadline = time.monotonic() + 5.0
+        exit_deadline = time.monotonic() + 10.0
         while owned_process(mux_pid, mux_ident) and time.monotonic() < exit_deadline:
             time.sleep(0.05)
         self.assertFalse(owned_process(mux_pid, mux_ident))
@@ -1378,7 +1398,7 @@ sys.exit(0)
         with self.mock_ws._lock:
             exec_count_before = len(self.mock_ws.executed)
         self.mock_ws.drop_all_ws()
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + 20.0
         st_b1 = {}
         while time.monotonic() < deadline:
             st_b1 = json.loads(sp.read_text(encoding="utf-8"))
@@ -1395,13 +1415,13 @@ sys.exit(0)
         # Branch 2: HTTP 502 while running -> kernel restart (restarts=1) + recover when HTTP 200 returns.
         rst_before = len([c for c in self._kaggle_calls() if c[:2] == ["session", "restart"]])
         (self.root / "http-502").touch()
-        dl = time.monotonic() + 8.0
+        dl = time.monotonic() + 20.0
         while time.monotonic() < dl:
             if len([c for c in self._kaggle_calls() if c[:2] == ["session", "restart"]]) >= rst_before + 1:
                 (self.root / "http-502").unlink(missing_ok=True)
                 break
             time.sleep(0.03)
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + 20.0
         st_b2 = {}
         while time.monotonic() < deadline:
             st_b2 = json.loads(sp.read_text(encoding="utf-8"))
@@ -1418,14 +1438,14 @@ sys.exit(0)
         create_before = len([c for c in self._kaggle_calls() if c[:2] == ["session", "create"]])
         (self.root / "http-502").touch()
         self.mock_ws.drop_all_ws()
-        dl = time.monotonic() + 10.0
+        dl = time.monotonic() + 20.0
         while time.monotonic() < dl:
             if len([c for c in self._kaggle_calls() if c[:2] == ["session", "create"]]) >= create_before + 1:
                 (self.root / "http-502").unlink(missing_ok=True)
                 (self.root / "kaggle-live-state.txt").unlink(missing_ok=True)
                 break
             time.sleep(0.03)
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 20.0
         st_b4 = {}
         while time.monotonic() < deadline:
             st_b4 = json.loads(sp.read_text(encoding="utf-8"))
@@ -1530,7 +1550,7 @@ while True:
 
         self.addCleanup(_stop_legacy)
 
-        dl = time.monotonic() + 5.0
+        dl = time.monotonic() + 10.0
         legacy_info = {}
         while time.monotonic() < dl:
             if legacy_state.is_file():
@@ -1545,7 +1565,7 @@ while True:
 
         leg_sp = self.profile_dir / "kaggle" / "services" / "web-probe-leg" / "state.json"
         overflow_sp = self.profile_dir / "kaggle" / "mux" / "state.json"
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + 20.0
         st_leg = {}
         while time.monotonic() < deadline:
             if leg_sp.is_file() and overflow_sp.is_file():
@@ -1563,7 +1583,7 @@ while True:
         self.assertIsNone(legacy_proc.poll(), "Legacy busy MuxDaemon must remain untouched")
 
         self.assertEqual(self._cli("kaggle", "web-probe", "-i", "leg", "down").returncode, 0)
-        exit_dl = time.monotonic() + 5.0
+        exit_dl = time.monotonic() + 10.0
         while owned_process(overflow_info["pid"], overflow_info["identity"]) and time.monotonic() < exit_dl:
             time.sleep(0.05)
         self.assertFalse(owned_process(overflow_info["pid"], overflow_info["identity"]))

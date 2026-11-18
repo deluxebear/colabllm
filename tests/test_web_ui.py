@@ -1611,6 +1611,8 @@ sys.exit(2)
 
         self.assertIn('id="logs-copy-btn"', index_html)
         self.assertIn('id="accounts-usage-refresh-btn"', index_html)
+        self.assertIn('id="net-kpi-strip"', index_html)
+        self.assertIn('autocorrect="off"', index_html)
         self.assertIn('role="region"', index_html)
         self.assertIn('command="--copy"', index_html)
         self.assertIn('commandfor="wb-cmd-preview"', index_html)
@@ -1627,6 +1629,9 @@ sys.exit(2)
         self.assertIn('.badge.is-busy::before', styles_css)
         self.assertIn('flex-shrink: 0;', styles_css)
         self.assertIn('@container (width < 580px)', styles_css)
+        self.assertIn('@container tunnel-card (min-width: 760px)', styles_css)
+        self.assertIn('progress.quota-meter::-webkit-progress-value', styles_css)
+        self.assertIn('progress.quota-meter::-moz-progress-bar', styles_css)
         self.assertIn('field-sizing: content', copilot_css)
         self.assertIn('@supports (position-area: block-end)', copilot_css)
         self.assertIn('@supports (animation-timeline: scroll())', copilot_css)
@@ -1637,6 +1642,27 @@ sys.exit(2)
         self.assertIn('reconcileTasksAndInstances', app_js)
         self.assertIn('inferLifecycleTaskHint', app_js)
         self.assertIn('initCopilotStudio', app_js)
+        self.assertIn('frp?.server_ip', app_js)
+        self.assertIn('viewName === "network"', app_js)
+        self.assertNotIn('frp.configured', app_js)
+
+        tunnel_cfg = {
+            'base_domain': 'example.com',
+            'frp': {
+                'enabled': True,
+                'server_ip': '203.0.113.10',
+                'server_port': 7000,
+                'ssh': 'root@frp.example.com',
+                'project_id': 'a' * 32,
+            },
+        }
+        (self.home_dir / 'tunnel-config.json').write_text(json.dumps(tunnel_cfg), encoding='utf-8')
+        overview = state_store.tunnel_overview()
+        self.assertEqual(overview['transport'], 'frp')
+        self.assertTrue(overview['frp']['enabled'])
+        self.assertEqual(overview['frp']['server_ip'], '203.0.113.10')
+        self.assertEqual(overview['frp']['server_port'], 7000)
+        self.assertEqual(overview['frp']['ssh'], 'root@frp.example.com')
 
         self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')

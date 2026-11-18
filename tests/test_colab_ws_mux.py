@@ -319,6 +319,7 @@ class _MockColabRuntimeServer:
                         sock.close()
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     @property
@@ -364,6 +365,7 @@ class ColabWsMuxTest(unittest.TestCase):
                 self.wfile.write(b"ok" if code == 200 else b"bad gateway")
 
         self.health = ThreadingHTTPServer(("127.0.0.1", 0), Health)
+        self.health.daemon_threads = True
         threading.Thread(target=self.health.serve_forever, daemon=True).start()
         self.addCleanup(self.health.server_close)
         self.addCleanup(self.health.shutdown)

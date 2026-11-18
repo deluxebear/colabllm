@@ -492,74 +492,154 @@
           </div>
         </section>
 
-        <!-- View 3: Tunnel & Multi-Account -->
-        <section id="view-network" class="view-section" hidden>
-          <div class="two-col-grid">
-            <section class="card">
-              <h2>全局隧道与域名 (tunnel-config)</h2>
-              <div class="kv-list" id="tunnel-summary"></div>
-              <form id="tunnel-form" class="schema-form">
-                <label>
-                  <span>项目全局主域名 (--base-domain)</span>
-                  <input id="tunnel-base-domain" type="text" placeholder="example.com">
-                </label>
-                <div class="form-actions">
-                  <button type="submit" class="btn primary">保存主域名</button>
-                  <button type="button" id="tunnel-clear-btn" class="btn secondary">清除主域名</button>
-                  <button type="button" id="frp-probe-btn" class="btn secondary">检查 FRP 状态</button>
+        <!-- View 4: Tunnel & Multi-Account -->
+        <section id="view-network" class="view-section net-view" hidden>
+          <div class="kpi-strip net-kpi-strip" id="net-kpi-strip">
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">公网传输后端</span>
+                <span id="net-kpi-transport-badge" class="badge">-</span>
+              </div>
+              <strong id="net-kpi-transport">-</strong>
+              <span id="net-kpi-transport-sub" class="net-kpi-sub muted">-</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">项目全局主域名</span>
+                <span id="net-kpi-domain-badge" class="badge" hidden>环境变量覆盖</span>
+              </div>
+              <strong id="net-kpi-domain" class="net-mono">-</strong>
+              <span id="net-kpi-domain-sub" class="net-kpi-sub muted">-</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">Colab 可用算力池</span>
+                <span id="net-kpi-colab-badge" class="badge">-</span>
+              </div>
+              <strong id="net-kpi-colab" class="net-tabular">-</strong>
+              <span id="net-kpi-colab-sub" class="net-kpi-sub muted">-</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">Kaggle 每周加速配额</span>
+                <span id="net-kpi-kaggle-badge" class="badge">-</span>
+              </div>
+              <strong id="net-kpi-kaggle" class="net-tabular">-</strong>
+              <span id="net-kpi-kaggle-sub" class="net-kpi-sub muted">-</span>
+            </article>
+          </div>
+
+          <article class="card net-tunnel-card">
+            <header class="block-header net-section-header">
+              <div class="net-title-group">
+                <div class="net-title-wrap">
+                  <h2 id="tunnel-card-heading">全局隧道与域名配置</h2>
+                  <code class="net-path-chip">~/.colabllm/tunnel-config.json</code>
+                </div>
+                <p class="muted net-section-desc">管理跨 Colab 与 Kaggle 共享的主域名与公网路由后端（FRP 与 Cloudflare 自动按平台前缀隔离 DNS 归属）。</p>
+              </div>
+              <div class="net-header-actions">
+                <button type="button" id="frp-probe-btn" class="btn sm secondary">探测 FRP 状态</button>
+              </div>
+            </header>
+
+            <div class="net-tunnel-body">
+              <div class="net-meta-grid" id="tunnel-summary" aria-label="当前隧道与路由状态"></div>
+
+              <form id="tunnel-form" class="net-domain-form" aria-labelledby="tunnel-card-heading">
+                <div class="net-field-group">
+                  <label for="tunnel-base-domain">项目全局主域名 (<code>--base-domain</code>)</label>
+                  <div class="net-input-row">
+                    <input id="tunnel-base-domain" name="base_domain" type="text" placeholder="example.com" autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="done" aria-describedby="tunnel-domain-hint">
+                    <button type="submit" id="tunnel-save-btn" class="btn primary">保存主域名</button>
+                    <button type="button" id="tunnel-clear-btn" class="btn secondary">清除</button>
+                  </div>
+                  <p id="tunnel-domain-hint" class="net-field-hint muted">Colab 实例默认派生 <code>&lt;alias&gt;.&lt;domain&gt;</code>，Kaggle 实例默认派生 <code>kaggle-&lt;alias&gt;.&lt;domain&gt;</code>。</p>
                 </div>
               </form>
+            </div>
+
+            <div id="frp-status-wrap" class="terminal-wrap net-frp-terminal" hidden>
+              <div class="terminal-head">
+                <span>FRP 远端路由探测输出 (<code>colabllm frp-status</code>)</span>
+                <button type="button" id="frp-status-close-btn" class="btn sm secondary">收起</button>
+              </div>
               <pre id="frp-status-output" class="log-viewer" hidden></pre>
-            </section>
+            </div>
+          </article>
 
-            <section class="card">
-              <div class="block-header">
-                <h2 id="accounts-card-heading">Colab 多账户与共享 Drive 状态</h2>
-                <button type="button" id="accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
-              </div>
-              <p class="muted">仅只读读取 ~/.config/colab-cli 账户索引与授权文件，并通过 colab CLI 查询各账户剩余计算单元（CCU）与活跃会话，不读取 OAuth 凭据原文。</p>
-              <div id="accounts-summary" class="kv-list"></div>
-              <div id="accounts-table-wrap" tabindex="0" role="region" aria-labelledby="accounts-card-heading" class="table-wrap accounts-table-wrap">
-                <table id="accounts-table">
-                  <thead>
-                    <tr>
-                      <th scope="col">账户名</th>
-                      <th scope="col">邮箱</th>
-                      <th scope="col">Colab 可用量</th>
-                      <th scope="col">消耗速率 / 活跃会话</th>
-                      <th scope="col">绑定 Drive</th>
-                      <th scope="col">Drive 授权</th>
-                    </tr>
-                  </thead>
-                  <tbody id="accounts-tbody"></tbody>
-                </table>
-              </div>
-            </section>
-
-            <section id="kaggle-accounts-section" class="card">
-              <div class="block-header">
-                <h2 id="kaggle-accounts-card-heading">Kaggle 多账户与每周配额状态</h2>
-                <button type="button" id="kaggle-accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
-              </div>
-              <p class="muted">仅只读读取 ~/.config/kaggle-ext/accounts.json 账户索引，并通过 kaggle CLI 查询 GPU/TPU 每周可用额度与活跃会话，不读取凭据原文。</p>
-              <div id="kaggle-accounts-summary" class="kv-list"></div>
-              <div id="kaggle-accounts-table-wrap" tabindex="0" role="region" aria-labelledby="kaggle-accounts-card-heading" class="table-wrap accounts-table-wrap">
-                <table id="kaggle-accounts-table">
-                  <thead>
-                    <tr>
-                      <th scope="col">账户名</th>
-                      <th scope="col">用户名</th>
-                      <th scope="col">GPU 周配额</th>
-                      <th scope="col">TPU 周配额</th>
-                      <th scope="col">活跃会话数</th>
-                      <th scope="col">认证方式 / 状态</th>
-                    </tr>
-                  </thead>
-                  <tbody id="kaggle-accounts-tbody"></tbody>
-                </table>
-              </div>
-            </section>
+          <div class="net-provider-bar">
+            <div class="status-pills" role="group" aria-label="按平台筛选账户面板">
+              <button type="button" class="filter-pill" data-net-provider="all" aria-pressed="true">
+                <span>全部平台</span><span class="pill-count" id="net-count-all">0</span>
+              </button>
+              <button type="button" class="filter-pill" data-net-provider="colab" aria-pressed="false">
+                <span>Google Colab</span><span class="pill-count" id="net-count-colab">0</span>
+              </button>
+              <button type="button" class="filter-pill" data-net-provider="kaggle" aria-pressed="false">
+                <span>Kaggle</span><span class="pill-count" id="net-count-kaggle">0</span>
+              </button>
+            </div>
+            <span id="net-quota-updated" class="muted net-updated-hint"></span>
           </div>
+
+          <article id="colab-accounts-section" class="card net-provider-card">
+            <header class="block-header net-section-header">
+              <div class="net-title-group">
+                <div class="net-title-wrap">
+                  <span class="badge provider-colab">Colab</span>
+                  <h2 id="accounts-card-heading">Colab 多账户与共享 Drive 状态</h2>
+                </div>
+                <p class="muted net-section-desc">只读读取 <code>~/.config/colab-cli</code> 账户索引与授权文件，通过 <code>colab</code> CLI 查询剩余计算单元（CCU）与活跃会话，不读取 OAuth 凭据原文。</p>
+              </div>
+              <button type="button" id="accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+            </header>
+            <div id="accounts-summary" class="net-summary-pills"></div>
+            <div id="accounts-table-wrap" tabindex="0" role="region" aria-labelledby="accounts-card-heading" class="table-wrap accounts-table-wrap">
+              <table id="accounts-table">
+                <thead>
+                  <tr>
+                    <th scope="col">账户名</th>
+                    <th scope="col">邮箱</th>
+                    <th scope="col">Colab 可用量</th>
+                    <th scope="col">消耗速率 / 活跃会话</th>
+                    <th scope="col">绑定 Drive</th>
+                    <th scope="col">Drive 授权</th>
+                  </tr>
+                </thead>
+                <tbody id="accounts-tbody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article id="kaggle-accounts-section" class="card net-provider-card">
+            <header class="block-header net-section-header">
+              <div class="net-title-group">
+                <div class="net-title-wrap">
+                  <span class="badge provider-kaggle">Kaggle</span>
+                  <h2 id="kaggle-accounts-card-heading">Kaggle 多账户与每周配额状态</h2>
+                </div>
+                <p class="muted net-section-desc">只读读取 <code>~/.config/kaggle-ext/accounts.json</code> 账户索引，通过 <code>kaggle</code> CLI 查询每周 GPU/TPU 可用额度与活跃会话，不读取凭据原文。</p>
+              </div>
+              <button type="button" id="kaggle-accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+            </header>
+            <div id="kaggle-accounts-summary" class="net-summary-pills"></div>
+            <div id="kaggle-accounts-table-wrap" tabindex="0" role="region" aria-labelledby="kaggle-accounts-card-heading" class="table-wrap accounts-table-wrap">
+              <table id="kaggle-accounts-table">
+                <thead>
+                  <tr>
+                    <th scope="col">账户名</th>
+                    <th scope="col">用户名</th>
+                    <th scope="col">GPU 周配额</th>
+                    <th scope="col">TPU 周配额</th>
+                    <th scope="col">活跃会话数</th>
+                    <th scope="col">认证方式 / 状态</th>
+                  </tr>
+                </thead>
+                <tbody id="kaggle-accounts-tbody"></tbody>
+              </table>
+            </div>
+          </article>
         </section>
 
         <!-- View 4: Doctor -->
