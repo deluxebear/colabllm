@@ -13,22 +13,35 @@
   <script nonce="__CSP_NONCE__" type="module" src="/static/app.js"></script>
 </head>
 <body>
+  <a href="#view-title" class="skip-link visually-hidden">跳至主内容</a>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">
+      <a href="/fleet" class="brand" data-route-link data-view="fleet">
         <img src="/static/favicon.svg" alt="" width="28" height="28">
         <div>
           <strong>ColabLLM</strong>
           <small id="app-version">v...</small>
         </div>
-      </div>
+      </a>
 
-      <nav aria-label="主导航" class="side-nav">
-        <button type="button" class="nav-btn" data-view="fleet" aria-current="page">舰队与实例</button>
-        <button type="button" class="nav-btn" data-view="copilot">AI 演练场</button>
-        <button type="button" class="nav-btn" data-view="workbench">工作台与命令</button>
-        <button type="button" class="nav-btn" data-view="network">隧道与账户</button>
-        <button type="button" class="nav-btn" data-view="doctor">环境体检</button>
+      <nav aria-label="主菜单" class="side-nav">
+        <a href="/fleet" class="nav-btn" data-view="fleet" aria-current="page">
+          <span>舰队与实例</span>
+          <span id="nav-badge-fleet" class="nav-count" hidden>0</span>
+        </a>
+        <a href="/copilot" class="nav-btn" data-view="copilot">
+          <span>AI 演练场</span>
+        </a>
+        <a href="/workbench" class="nav-btn" data-view="workbench">
+          <span>工作台与命令</span>
+          <span id="nav-badge-tasks" class="nav-count warn" hidden>0</span>
+        </a>
+        <a href="/network" class="nav-btn" data-view="network">
+          <span>隧道与账户</span>
+        </a>
+        <a href="/doctor" class="nav-btn" data-view="doctor">
+          <span>环境体检</span>
+        </a>
       </nav>
 
       <div class="sidebar-footer">
@@ -46,8 +59,11 @@
     <div class="main-area">
       <header class="topbar">
         <div class="topbar-title">
-          <h1 id="view-title">舰队与实例</h1>
-          <p id="view-subtitle">管理 Google Colab 运行时生命周期、实时日志与公网隧道</p>
+          <div class="topbar-heading-row">
+            <button type="button" id="history-back-btn" class="btn sm secondary back-nav-btn" hidden aria-label="返回上一视图">← 返回</button>
+            <h1 id="view-title" tabindex="-1">舰队与实例</h1>
+          </div>
+          <p id="view-subtitle">管理 Google Colab 与 Kaggle 运行时生命周期、实时日志与公网隧道</p>
         </div>
         <div class="topbar-actions">
           <span id="readonly-badge" class="badge warn" hidden>只读模式 (--read-only)</span>
@@ -69,10 +85,10 @@
               <span class="kpi-label">已就绪服务</span>
               <strong id="kpi-ready">0</strong>
             </button>
-            <div class="kpi-card">
+            <button type="button" class="kpi-card kpi-action" id="kpi-card-transport" data-kpi-action="network">
               <span class="kpi-label">全局传输后端</span>
               <strong id="kpi-transport">-</strong>
-            </div>
+            </button>
             <button type="button" class="kpi-card kpi-action" id="kpi-card-services" data-kpi-action="catalog" aria-pressed="false">
               <span class="kpi-label">可用运行时</span>
               <strong id="kpi-services">0</strong>
@@ -102,48 +118,59 @@
                   </div>
                 </div>
 
-                <div class="instance-toolbar">
-                  <div class="instance-toolbar-row">
-                    <input id="instance-search" type="search" placeholder="搜索服务、#实例、域名或账户... (按 / 聚焦)" aria-label="搜索实例">
-                    <select id="instance-account-filter" aria-label="按账户筛选">
-                      <option value="all">全部账户</option>
-                    </select>
-                    <select id="instance-category-filter" aria-label="按分类筛选">
-                      <option value="all">全部分类</option>
-                    </select>
-                    <select id="instance-sort" aria-label="排序方式">
-                      <option value="status">状态优先</option>
-                      <option value="updated">最近活跃</option>
-                      <option value="name">名称 A–Z</option>
-                    </select>
-                  </div>
-                  <div class="instance-toolbar-row instance-toolbar-sub">
-                    <div class="status-pills" role="group" aria-label="按运行状态筛选">
-                      <button type="button" class="filter-pill" data-status-filter="all" aria-pressed="true">
-                        <span>全部</span><span class="pill-count" data-count-for="all">0</span>
-                      </button>
-                      <button type="button" class="filter-pill" data-status-filter="running" aria-pressed="false">
-                        <span>运行中</span><span class="pill-count" data-count-for="running">0</span>
-                      </button>
-                      <button type="button" class="filter-pill" data-status-filter="ready" aria-pressed="false">
-                        <span>已就绪</span><span class="pill-count" data-count-for="ready">0</span>
-                      </button>
-                      <button type="button" class="filter-pill" data-status-filter="error" aria-pressed="false">
-                        <span>异常</span><span class="pill-count" data-count-for="error">0</span>
-                      </button>
-                      <button type="button" class="filter-pill" data-status-filter="stopped" aria-pressed="false">
-                        <span>已停止</span><span class="pill-count" data-count-for="stopped">0</span>
-                      </button>
+                <search class="search-region" aria-label="筛选与排序实例">
+                  <div class="instance-toolbar">
+                    <div class="instance-toolbar-row">
+                      <input id="instance-search" type="search" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="搜索服务、#实例、域名或账户... (按 / 聚焦)" aria-label="搜索实例">
+                      <select id="instance-provider-filter" aria-label="按运行平台筛选">
+                        <option value="all">全部平台</option>
+                        <option value="colab">Google Colab</option>
+                        <option value="kaggle">Kaggle</option>
+                      </select>
+                      <select id="instance-account-filter" aria-label="按账户筛选">
+                        <option value="all">全部账户</option>
+                      </select>
+                      <select id="instance-category-filter" aria-label="按分类筛选">
+                        <option value="all">全部分类</option>
+                      </select>
+                      <select id="instance-sort" aria-label="排序方式">
+                        <option value="status">状态优先</option>
+                        <option value="updated">最近活跃</option>
+                        <option value="name">名称 A–Z</option>
+                      </select>
                     </div>
-                    <label id="collapse-stopped-wrap" class="switch-row compact-switch">
-                      <span>折叠已停止</span>
-                      <input id="collapse-stopped-toggle" type="checkbox" switch>
-                    </label>
+                    <div class="instance-toolbar-row instance-toolbar-sub">
+                      <div class="status-pills" role="group" aria-label="按运行状态筛选">
+                        <button type="button" class="filter-pill" data-status-filter="all" aria-pressed="true">
+                          <span>全部</span><span class="pill-count" data-count-for="all">0</span>
+                        </button>
+                        <button type="button" class="filter-pill" data-status-filter="running" aria-pressed="false">
+                          <span>运行中</span><span class="pill-count" data-count-for="running">0</span>
+                        </button>
+                        <button type="button" class="filter-pill" data-status-filter="ready" aria-pressed="false">
+                          <span>已就绪</span><span class="pill-count" data-count-for="ready">0</span>
+                        </button>
+                        <button type="button" class="filter-pill" data-status-filter="error" aria-pressed="false">
+                          <span>异常</span><span class="pill-count" data-count-for="error">0</span>
+                        </button>
+                        <button type="button" class="filter-pill" data-status-filter="stopped" aria-pressed="false">
+                          <span>已停止</span><span class="pill-count" data-count-for="stopped">0</span>
+                        </button>
+                      </div>
+                      <label id="collapse-stopped-wrap" class="switch-row compact-switch">
+                        <span>折叠已停止</span>
+                        <input id="collapse-stopped-toggle" type="checkbox" switch>
+                      </label>
+                    </div>
                   </div>
-                </div>
+                </search>
 
                 <div id="empty-all-instances" class="card empty-state-card" hidden>
-                  <p class="muted">尚无运行中或历史记录的 Colab 实例。点击右上角“启动新实例”即可创建。</p>
+                  <p class="muted">尚无运行中或历史记录的 Colab / Kaggle 实例。可从运行时目录挑选服务，或直接点击右上角“启动新实例”。</p>
+                  <div class="empty-state-actions">
+                    <button type="button" class="btn sm primary" commandfor="up-dialog" command="show-modal" data-open-up>启动新实例</button>
+                    <button type="button" id="empty-browse-catalog-btn" class="btn sm secondary">浏览运行时目录</button>
+                  </div>
                 </div>
 
                 <div id="empty-filtered-instances" class="card empty-state-card" hidden>
@@ -196,19 +223,29 @@
             <div role="tabpanel" id="fleet-panel-catalog" aria-labelledby="fleet-tab-catalog" tabindex="0" hidden="until-found">
               <div class="panel-body">
                 <div class="block-header">
-                  <h2>全部运行时目录</h2>
-                  <div class="filter-bar">
-                    <input id="service-search" type="search" placeholder="筛选服务名称或说明..." aria-label="筛选运行时">
-                    <select id="category-filter" aria-label="按分类筛选">
-                      <option value="all">全部分类</option>
-                      <option value="llm">LLM 与推理</option>
-                      <option value="image">图像生成与编辑</option>
-                      <option value="audio">语音合成 / 转写 / 音效</option>
-                      <option value="video">视频与原生工作流 UI</option>
-                      <option value="ocr">文档 OCR</option>
-                      <option value="other">其他运行时</option>
-                    </select>
+                  <div class="block-title-row">
+                    <h2>全部运行时目录</h2>
+                    <span class="muted" id="services-count">0 个运行时</span>
                   </div>
+                  <search class="search-region" aria-label="筛选运行时目录">
+                    <div class="filter-bar">
+                      <input id="service-search" type="search" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="筛选服务名称或说明..." aria-label="筛选运行时">
+                      <select id="catalog-provider-filter" aria-label="按平台筛选运行时">
+                        <option value="all">全部平台</option>
+                        <option value="colab">Google Colab</option>
+                        <option value="kaggle">Kaggle</option>
+                      </select>
+                      <select id="category-filter" aria-label="按分类筛选">
+                        <option value="all">全部分类</option>
+                        <option value="llm">LLM 与推理</option>
+                        <option value="image">图像生成与编辑</option>
+                        <option value="audio">语音合成 / 转写 / 音效</option>
+                        <option value="video">视频与原生工作流 UI</option>
+                        <option value="ocr">文档 OCR</option>
+                        <option value="other">其他运行时</option>
+                      </select>
+                    </div>
+                  </search>
                 </div>
                 <div id="services-grid" class="cards-grid"></div>
               </div>
@@ -240,6 +277,7 @@
               <span id="ck-status-pill" class="badge neutral">等待选择实例</span>
               <span id="ck-proxy-url-hint" class="muted ck-mono"></span>
               <p id="ck-capabilities-summary" class="muted ck-cap-summary"></p>
+              <button type="button" id="ck-launch-empty-btn" class="btn sm primary" commandfor="up-dialog" command="show-modal" data-open-up hidden>启动新实例</button>
             </div>
           </div>
 
@@ -428,11 +466,15 @@
           <div class="tabs-shell">
             <div class="tablist" focusgroup="tablist nomemory" aria-label="工作台模式">
               <button type="button" class="tab-btn" id="tab-cli" aria-selected="true" focusgroupstart data-panel="panel-cli">通用命令表单</button>
-              <button type="button" class="tab-btn" id="tab-tasks" aria-selected="false" data-panel="panel-tasks">任务执行记录</button>
+              <button type="button" class="tab-btn" id="tab-tasks" aria-selected="false" data-panel="panel-tasks"><span>任务执行记录</span> <span id="wb-tasks-tab-count" class="pill-count">0</span></button>
             </div>
 
             <div role="tabpanel" id="panel-cli" aria-labelledby="tab-cli" tabindex="0">
               <div class="panel-body">
+                <div id="wb-running-quickbar" class="wb-quickbar" hidden>
+                  <span class="muted">快捷填入运行中实例：</span>
+                  <div id="wb-running-chips" class="session-chips"></div>
+                </div>
                 <div class="workbench-controls">
                   <label>
                     <span>运行时</span>
@@ -444,7 +486,7 @@
                   </label>
                   <label>
                     <span>实例 ID (-i，可空)</span>
-                    <input id="wb-instance" type="text" placeholder="默认实例留空">
+                    <input id="wb-instance" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="默认实例留空">
                   </label>
                   <label>
                     <span>计算账户 (--account，可空)</span>
@@ -473,7 +515,17 @@
                 <div class="terminal-wrap">
                   <div class="terminal-head">
                     <span>命令输出流</span>
-                    <span id="wb-task-status" class="badge">待命</span>
+                    <div class="terminal-head-actions">
+                      <span id="wb-task-status" class="badge">待命</span>
+                      <span class="copy-wrap">
+                        <button type="button" id="wb-copy-output" class="btn sm secondary copy-btn" command="--copy" commandfor="wb-output">
+                          <span class="copy-icon" aria-hidden="true"></span>
+                          <span>复制输出</span>
+                        </button>
+                        <span class="copy-tip" role="status"></span>
+                      </span>
+                      <button type="button" id="wb-clear-output" class="btn sm secondary">清空</button>
+                    </div>
                   </div>
                   <pre id="wb-output" class="log-viewer">选择服务与子命令后可在此直接预览参数并执行。</pre>
                 </div>
@@ -483,8 +535,16 @@
             <div role="tabpanel" id="panel-tasks" aria-labelledby="tab-tasks" hidden="until-found">
               <div class="panel-body">
                 <div class="block-header">
-                  <h3>近期后台任务</h3>
-                  <span class="muted">点击任意任务可跳转到“通用命令表单”查看完整输出</span>
+                  <div class="block-title-row">
+                    <h2>近期后台任务</h2>
+                    <span class="muted">点击任意任务可跳转查看完整输出流</span>
+                  </div>
+                  <div class="status-pills" role="group" aria-label="按任务状态筛选">
+                    <button type="button" class="filter-pill" data-task-filter="all" aria-pressed="true"><span>全部</span><span class="pill-count" data-task-count="all">0</span></button>
+                    <button type="button" class="filter-pill" data-task-filter="running" aria-pressed="false"><span>运行中</span><span class="pill-count" data-task-count="running">0</span></button>
+                    <button type="button" class="filter-pill" data-task-filter="succeeded" aria-pressed="false"><span>成功</span><span class="pill-count" data-task-count="succeeded">0</span></button>
+                    <button type="button" class="filter-pill" data-task-filter="failed" aria-pressed="false"><span>失败</span><span class="pill-count" data-task-count="failed">0</span></button>
+                  </div>
                 </div>
                 <div id="tasks-list" class="tasks-list"></div>
               </div>
@@ -592,11 +652,15 @@
                 </div>
                 <p class="muted net-section-desc">只读读取 <code>~/.config/colab-cli</code> 账户索引与授权文件，通过 <code>colab</code> CLI 查询剩余计算单元（CCU）与活跃会话，不读取 OAuth 凭据原文。</p>
               </div>
-              <button type="button" id="accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              <div class="net-header-actions">
+                <a href="/doctor?provider=colab" class="btn secondary sm" data-route-link>环境体检</a>
+                <button type="button" id="accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              </div>
             </header>
             <div id="accounts-summary" class="net-summary-pills"></div>
             <div id="accounts-table-wrap" tabindex="0" role="region" aria-labelledby="accounts-card-heading" class="table-wrap accounts-table-wrap">
               <table id="accounts-table">
+                <caption class="sr-only">Colab 多账户配额与共享 Drive 授权列表</caption>
                 <thead>
                   <tr>
                     <th scope="col">账户名</th>
@@ -621,11 +685,15 @@
                 </div>
                 <p class="muted net-section-desc">只读读取 <code>~/.config/kaggle-ext/accounts.json</code> 账户索引，通过 <code>kaggle</code> CLI 查询每周 GPU/TPU 可用额度与活跃会话，不读取凭据原文。</p>
               </div>
-              <button type="button" id="kaggle-accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              <div class="net-header-actions">
+                <a href="/doctor?provider=kaggle" class="btn secondary sm" data-route-link>环境体检</a>
+                <button type="button" id="kaggle-accounts-usage-refresh-btn" class="btn secondary sm">刷新可用量</button>
+              </div>
             </header>
             <div id="kaggle-accounts-summary" class="net-summary-pills"></div>
             <div id="kaggle-accounts-table-wrap" tabindex="0" role="region" aria-labelledby="kaggle-accounts-card-heading" class="table-wrap accounts-table-wrap">
               <table id="kaggle-accounts-table">
+                <caption class="sr-only">Kaggle 多账户每周配额与认证状态列表</caption>
                 <thead>
                   <tr>
                     <th scope="col">账户名</th>
@@ -642,65 +710,131 @@
           </article>
         </section>
 
-        <!-- View 4: Doctor -->
-        <section id="view-doctor" class="view-section" hidden>
-          <section class="card">
-            <div class="block-header">
-              <h2>环境依赖与授权体检 (doctor)</h2>
-              <button type="button" id="doctor-run-btn" class="btn primary">运行体检</button>
-            </div>
-            <div class="workbench-controls">
-              <label>
-                <span>检查平台 (--provider)</span>
-                <select id="doctor-provider">
-                  <option value="colab">colab</option>
-                  <option value="kaggle">kaggle</option>
-                  <option value="all">all (双平台)</option>
-                </select>
-              </label>
-              <label>
-                <span>计算账户 (-a)</span>
-                <select id="doctor-account"><option value="">自动解析</option></select>
-              </label>
-              <label id="doctor-drive-wrap">
-                <span>共享 Drive 账户</span>
-                <select id="doctor-drive-account"><option value="">跟随账户绑定</option></select>
-              </label>
-              <label>
-                <span>隧道检查模式</span>
-                <select id="doctor-transport">
-                  <option value="">跟随当前配置</option>
-                  <option value="quick">quick</option>
-                  <option value="cloudflare">cloudflare</option>
-                  <option value="frp">frp</option>
-                </select>
-              </label>
-              <div class="switch-group">
-                <label class="switch-row">
-                  <span>联网只读核验 (--online)</span>
-                  <input id="doctor-online" type="checkbox" switch>
+        <!-- View 5: Doctor -->
+        <section id="view-doctor" class="view-section net-view" hidden>
+          <div class="kpi-strip net-kpi-strip" id="doctor-kpi-strip" hidden>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">总体结论</span>
+                <span id="doctor-kpi-badge" class="badge">-</span>
+              </div>
+              <strong id="doctor-kpi-overall">-</strong>
+              <span id="doctor-kpi-sub" class="net-kpi-sub muted">-</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">通过检查项</span>
+                <span class="badge ok">PASS</span>
+              </div>
+              <strong id="doctor-kpi-ok" class="net-tabular">0</strong>
+              <span class="net-kpi-sub muted">依赖与配置正常</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">警告检查项</span>
+                <span class="badge warn">WARN</span>
+              </div>
+              <strong id="doctor-kpi-warn" class="net-tabular">0</strong>
+              <span class="net-kpi-sub muted">可选或降级项提示</span>
+            </article>
+            <article class="kpi-card net-kpi-card">
+              <div class="net-kpi-top">
+                <span class="kpi-label">未通过项</span>
+                <span class="badge danger">FAIL</span>
+              </div>
+              <strong id="doctor-kpi-fail" class="net-tabular">0</strong>
+              <span class="net-kpi-sub muted">阻塞启动的异常项</span>
+            </article>
+          </div>
+
+          <article class="card">
+            <header class="block-header net-section-header">
+              <div class="net-title-group">
+                <h2 id="doctor-heading">环境依赖与授权体检 (doctor)</h2>
+                <p class="muted net-section-desc">核验 Colab / Kaggle CLI 扩展、账户授权凭据、共享 Drive 挂载与 Cloudflare / FRP 隧道就绪状态。</p>
+              </div>
+              <div class="net-header-actions">
+                <button type="button" id="doctor-preset-all-btn" class="btn sm secondary">一键双平台体检</button>
+                <a href="/network" class="btn sm secondary" data-route-link>隧道与账户配置</a>
+              </div>
+            </header>
+
+            <form id="doctor-form" class="doctor-form" aria-labelledby="doctor-heading">
+              <div class="workbench-controls">
+                <label for="doctor-provider">
+                  <span>检查平台 (--provider)</span>
+                  <select id="doctor-provider" name="provider">
+                    <option value="colab">colab</option>
+                    <option value="kaggle">kaggle</option>
+                    <option value="all">all (双平台)</option>
+                  </select>
                 </label>
-                <label id="doctor-no-drive-wrap" class="switch-row">
-                  <span>跳过 Drive 检查 (--no-drive)</span>
-                  <input id="doctor-no-drive" type="checkbox" switch>
+                <label for="doctor-account">
+                  <span>计算账户 (-a)</span>
+                  <select id="doctor-account" name="account"><option value="">自动解析</option></select>
+                </label>
+                <label id="doctor-drive-wrap" for="doctor-drive-account">
+                  <span>共享 Drive 账户</span>
+                  <select id="doctor-drive-account" name="drive_account"><option value="">跟随账户绑定</option></select>
+                </label>
+                <label for="doctor-transport">
+                  <span>隧道检查模式</span>
+                  <select id="doctor-transport" name="transport">
+                    <option value="">跟随当前配置</option>
+                    <option value="quick">quick</option>
+                    <option value="cloudflare">cloudflare</option>
+                    <option value="frp">frp</option>
+                  </select>
                 </label>
               </div>
+              <div class="doctor-actions-row">
+                <div class="switch-group">
+                  <label class="switch-row">
+                    <span>联网只读核验 (--online)</span>
+                    <input id="doctor-online" type="checkbox" switch>
+                  </label>
+                  <label id="doctor-no-drive-wrap" class="switch-row">
+                    <span>跳过 Drive 检查 (--no-drive)</span>
+                    <input id="doctor-no-drive" type="checkbox" switch>
+                  </label>
+                </div>
+                <button type="submit" id="doctor-run-btn" class="btn primary">运行体检</button>
+              </div>
+            </form>
+
+            <div id="doctor-banner" class="doctor-banner muted" role="status">尚未执行体检：点击“运行体检”或“一键双平台体检”开始诊断。</div>
+
+            <div id="doctor-toolbar" class="net-provider-bar" hidden>
+              <div class="status-pills" role="group" aria-label="筛选体检检查项">
+                <button type="button" class="filter-pill" data-doctor-filter="all" aria-pressed="true">
+                  <span>全部检查项</span><span class="pill-count" id="doctor-count-all">0</span>
+                </button>
+                <button type="button" class="filter-pill" data-doctor-filter="issues" aria-pressed="false">
+                  <span>仅异常与警告</span><span class="pill-count" id="doctor-count-issues">0</span>
+                </button>
+              </div>
+              <button type="button" id="doctor-copy-btn" class="btn sm secondary">复制体检报告</button>
             </div>
-            <div id="doctor-banner" class="muted"></div>
-            <div class="table-wrap">
-              <table>
+
+            <div id="doctor-table-wrap" class="table-wrap accounts-table-wrap doctor-table-wrap" tabindex="0" role="region" aria-labelledby="doctor-heading">
+              <table id="doctor-table">
+                <caption class="sr-only">环境依赖与授权体检检查项列表</caption>
                 <thead>
                   <tr>
-                    <th>状态</th>
-                    <th>检查项</th>
-                    <th>说明</th>
-                    <th>必需</th>
+                    <th scope="col">检查项</th>
+                    <th scope="col">状态</th>
+                    <th scope="col">说明与建议</th>
+                    <th scope="col">级别</th>
                   </tr>
                 </thead>
-                <tbody id="doctor-tbody"></tbody>
+                <tbody id="doctor-tbody">
+                  <tr>
+                    <td colspan="4" class="muted">点击上方“运行体检”后将在此列出逐项诊断结果。</td>
+                  </tr>
+                </tbody>
               </table>
             </div>
-          </section>
+          </article>
         </section>
       </main>
     </div>
@@ -720,7 +854,7 @@
         </label>
         <label>
           <span>实例 ID (-i，默认实例留空)</span>
-          <input id="up-instance" type="text" placeholder="例如 2 或 gpu1">
+          <input id="up-instance" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="例如 2 或 gpu1">
         </label>
       </div>
       <div class="two-col">
@@ -745,7 +879,7 @@
         </label>
         <label id="up-domain-wrap" hidden>
           <span id="up-domain-label">自定义域名（留空则使用服务别名+主域名）</span>
-          <input id="up-domain-input" type="text" placeholder="example.com">
+          <input id="up-domain-input" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="example.com">
         </label>
       </div>
       <div class="two-col">
@@ -783,7 +917,7 @@
       <div id="up-colab-extra-row" class="two-col">
         <label>
           <span>跳过 Cell (--skip，如 1,2)</span>
-          <input id="up-skip" type="text" placeholder="1,2">
+          <input id="up-skip" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="1,2">
         </label>
         <label>
           <span>HuggingFace Token (--hf-token，可选)</span>
@@ -815,7 +949,7 @@
           <label><span>--idle-check (秒)</span><input id="up-idle-check" type="number" step="any" min="1" placeholder="300"></label>
           <label><span id="up-max-restarts-label">--max-restarts (0 不限)</span><input id="up-max-restarts" type="number" step="1" min="0" placeholder="0"></label>
           <label><span>--ready-timeout (秒)</span><input id="up-ready-timeout" type="number" step="any" min="1" placeholder="默认"></label>
-          <label id="up-max-uptime-wrap" hidden><span>--max-uptime (如 6h 或 3600)</span><input id="up-max-uptime" type="text" placeholder="6h"></label>
+          <label id="up-max-uptime-wrap" hidden><span>--max-uptime (如 6h 或 3600)</span><input id="up-max-uptime" type="text" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="6h"></label>
           <label id="up-startup-timeout-wrap" hidden><span>--startup-timeout (秒)</span><input id="up-startup-timeout" type="number" step="any" min="1" placeholder="600"></label>
         </div>
         <div id="up-extra-fields" class="schema-fields"></div>
@@ -895,13 +1029,15 @@
       <button type="button" class="btn icon-btn" commandfor="logs-dialog" command="close" aria-label="关闭日志">✕</button>
     </div>
     <div class="dialog-body">
-      <div class="filter-bar">
-        <input id="logs-filter" type="search" placeholder="高亮或过滤关键词..." aria-label="过滤日志">
-        <label class="switch-row">
-          <span>自动滚动到底部</span>
-          <input id="logs-autoscroll" type="checkbox" switch checked>
-        </label>
-      </div>
+      <search class="search-region" aria-label="过滤日志内容">
+        <div class="filter-bar">
+          <input id="logs-filter" type="search" autocorrect="off" autocapitalize="none" spellcheck="false" placeholder="高亮或过滤关键词..." aria-label="过滤日志">
+          <label class="switch-row">
+            <span>自动滚动到底部</span>
+            <input id="logs-autoscroll" type="checkbox" switch checked>
+          </label>
+        </div>
+      </search>
       <pre id="logs-viewer" class="log-viewer tall"></pre>
       <div class="dialog-actions">
         <span class="copy-wrap">

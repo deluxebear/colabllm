@@ -546,12 +546,44 @@ class WebServerIntegrationTest(unittest.TestCase):
             csp = r.getheader('Content-Security-Policy') or ''
             self.assertIn("require-trusted-types-for 'script'", csp)
             self.assertIn("script-src 'nonce-", csp)
+
+            # 3b. Unauthenticated deep-link SPA route preserves validated next param and blocks open redirects.
+            conn.request('GET', '/network?provider=kaggle')
+            r = conn.getresponse()
+            deep_gate = r.read().decode('utf-8')
+            self.assertEqual(r.status, 200)
+            self.assertIn('name="next" value="/network?provider=kaggle"', deep_gate)
+
+            conn.request('GET', f'/auth?token={srv.bootstrap_token}&next=%2Fnetwork%3Fprovider%3Dkaggle')
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 303)
+            self.assertEqual(r.getheader('Location'), '/network?provider=kaggle')
+
+            conn.request('GET', f'/auth?token={srv.bootstrap_token}&next=%2F%2Fevil.example')
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 303)
+            self.assertEqual(r.getheader('Location'), '/')
         finally:
             conn.close()
 
         cookie_hdr, csrf = self._authenticate(srv, port)
         conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
         try:
+            # 3c. Authenticated SPA view routes serve console HTML; unknown routes still return 404.
+            for spa_path in ('/fleet', '/copilot', '/workbench', '/network', '/doctor'):
+                conn.request('GET', spa_path, headers={'Cookie': cookie_hdr})
+                r = conn.getresponse()
+                html = r.read().decode('utf-8')
+                self.assertEqual(r.status, 200, spa_path)
+                self.assertIn('id="history-back-btn"', html)
+                self.assertIn("require-trusted-types-for 'script'", r.getheader('Content-Security-Policy') or '')
+
+            conn.request('GET', '/unknown-route', headers={'Cookie': cookie_hdr})
+            r = conn.getresponse()
+            r.read()
+            self.assertEqual(r.status, 404)
             # 4. Missing CSRF fails with 403; valid CSRF saves tunnel config in COLABLLM_HOME.
             body = json.dumps({'base_domain': 'example.com'}).encode('utf-8')
             conn.request('POST', '/api/tunnel', body=body, headers={'Cookie': cookie_hdr, 'Content-Type': 'application/json'})
@@ -1647,6 +1679,16 @@ sys.exit(2)
         self.assertNotIn('frp.configured', app_js)
         self.assertIn('未纳管远端 · ', app_js)
         self.assertIn('.session-chip.unmanaged', styles_css)
+        self.assertIn('href="/fleet"', index_html)
+        self.assertIn('id="history-back-btn"', index_html)
+        self.assertIn('id="doctor-form"', index_html)
+        self.assertIn('id="instance-provider-filter"', index_html)
+        self.assertIn('id="catalog-provider-filter"', index_html)
+        self.assertIn('popstate', app_js)
+        self.assertIn('pushState', app_js)
+        self.assertIn('startViewTransition', app_js)
+        self.assertIn('#doctor-table', styles_css)
+        self.assertIn('s === "pass" || s === "ok"', app_js)
 
         tunnel_cfg = {
             'base_domain': 'example.com',

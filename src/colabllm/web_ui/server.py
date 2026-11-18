@@ -40,6 +40,29 @@ STATIC_FILES: dict[str, str] = {
     "copilot_studios.js": "application/javascript; charset=utf-8",
     "favicon.svg": "image/svg+xml",
 }
+SPA_VIEW_PATHS: frozenset[str] = frozenset({
+    "/",
+    "/fleet",
+    "/copilot",
+    "/workbench",
+    "/network",
+    "/doctor",
+})
+
+
+def _safe_spa_next_path(raw: str | None) -> str:
+    """Return a validated same-origin SPA route target or '/'."""
+    text = (raw or "").strip()
+    if not text or any(ch in text for ch in ("\r", "\n", "\x00", "\\")):
+        return "/"
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme or parsed.netloc:
+        return "/"
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return "/"
+    if parsed.path not in SPA_VIEW_PATHS:
+        return "/"
+    return f"{parsed.path}?{parsed.query}" if parsed.query else parsed.path
 _PROXY_SAFE_TYPES = (
     "application/json",
     "text/event-stream",
@@ -428,7 +451,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         if sec_site and sec_site not in ("same-origin", "none"):
             is_top_nav = (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/auth")
+                and (path in SPA_VIEW_PATHS or path == "/auth")
                 and sec_mode == "navigate"
                 and sec_dest not in ("object", "embed", "iframe")
             )
@@ -484,8 +507,8 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._handle_static(path[len("/static/") :])
                 return
 
-            if path == "/" and method in ("GET", "HEAD"):
-                self._handle_index()
+            if path in SPA_VIEW_PATHS and method in ("GET", "HEAD"):
+                self._handle_index(request_target=self.path)
                 return
 
             if path == "/api/bootstrap" and method == "GET":
@@ -647,11 +670,16 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def _handle_auth(self, query: dict[str, list[str]]) -> None:
         token = (query.get("token") or [""])[0].strip()
+        redirect_to = _safe_spa_next_path((query.get("next") or [""])[0])
+        next_param = "" if redirect_to == "/" else redirect_to
         if not token or not hmac.compare_digest(token, self.server.bootstrap_token):
             nonce = _make_nonce()
             self._send_html(
                 403,
-                _render_auth_gate_html("访问令牌无效或缺失，请重新复制终端输出的完整控制台地址。"),
+                _render_auth_gate_html(
+                    "访问令牌无效或缺失，请重新复制终端输出的完整控制台地址。",
+                    next_path=next_param,
+                ),
                 csp_nonce=nonce,
             )
             return
@@ -659,7 +687,7 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(303)
         self._add_common_headers()
         self.send_header("Set-Cookie", f"colabllm_sid={sid}; HttpOnly; SameSite=Strict; Path=/")
-        self.send_header("Location", "/")
+        self.send_header("Location", redirect_to)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -681,13 +709,14 @@ class WebRequestHandler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _handle_index(self) -> None:
+    def _handle_index(self, *, request_target: str = "/") -> None:
         nonce = _make_nonce()
         session_nonce = self._session_nonce()
         if session_nonce is None:
+            safe_next = _safe_spa_next_path(request_target)
             self._send_html(
                 200,
-                _render_auth_gate_html(""),
+                _render_auth_gate_html("", next_path="" if safe_next == "/" else safe_next),
                 csp_nonce=nonce,
             )
             return
@@ -1249,8 +1278,13 @@ def _truthy(val: str) -> bool:
     return (val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _render_auth_gate_html(message: str) -> str:
+def _render_auth_gate_html(message: str, *, next_path: str = "") -> str:
     msg_html = f'<p class="auth-error">{_escape_html(message)}</p>' if message else ""
+    next_html = (
+        f'\n      <input type="hidden" name="next" value="{_escape_html(next_path)}">'
+        if next_path
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1266,7 +1300,7 @@ def _render_auth_gate_html(message: str) -> str:
     <h1>ColabLLM Web 控制台</h1>
     <p>请输入终端启动时输出的一次性访问令牌（Token）以建立受保护的本地会话。</p>
     {msg_html}
-    <form method="get" action="/auth" class="auth-gate-form">
+    <form method="get" action="/auth" class="auth-gate-form">{next_html}
       <label for="gate-token">启动令牌</label>
       <input id="gate-token" name="token" type="password" required autocomplete="off" autofocus placeholder="粘贴 token 参数值">
       <button type="submit" class="btn primary">进入控制台</button>

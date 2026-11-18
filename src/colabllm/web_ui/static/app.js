@@ -67,6 +67,23 @@ const COMMON_UP_FLAGS = new Set([
   "--show-secrets",
 ]);
 
+const VIEW_PATHS = {
+  fleet: "/fleet",
+  copilot: "/copilot",
+  workbench: "/workbench",
+  network: "/network",
+  doctor: "/doctor",
+};
+
+const PATH_TO_VIEW = new Map([
+  ["/", "fleet"],
+  ["/fleet", "fleet"],
+  ["/copilot", "copilot"],
+  ["/workbench", "workbench"],
+  ["/network", "network"],
+  ["/doctor", "doctor"],
+]);
+
 const state = {
   version: "",
   readOnly: READ_ONLY,
@@ -91,6 +108,12 @@ const state = {
   instanceStatusFilter: "all",
   instanceSortKey: "status",
   instanceSortDir: "ascending",
+  taskStatusFilter: "all",
+  doctorFilter: "all",
+  lastDoctorReport: null,
+  routeDepth: 0,
+  pendingCopilotRoute: null,
+  pendingWorkbenchRoute: null,
   activeTaskId: null,
   activeTaskSource: null,
   eventsSource: null,
@@ -256,12 +279,14 @@ function setupFeatureFallbacks() {
   if (!Object.hasOwn(HTMLElement.prototype, "focusGroup")) {
     document.querySelectorAll(".tablist[focusgroup]").forEach((tablist) => {
       tablist.setAttribute("role", "tablist");
-      const tabs = Array.from(tablist.querySelectorAll(".tab-btn"));
-      tabs.forEach((t) => {
+      const allTabs = () => Array.from(tablist.querySelectorAll(".tab-btn"));
+      const visibleTabs = () => allTabs().filter((t) => !t.hidden);
+      allTabs().forEach((t) => {
         t.setAttribute("role", "tab");
-        t.tabIndex = t.getAttribute("aria-selected") === "true" ? 0 : -1;
+        t.tabIndex = t.getAttribute("aria-selected") === "true" && !t.hidden ? 0 : -1;
       });
       tablist.addEventListener("keydown", (evt) => {
+        const tabs = visibleTabs();
         const current = document.activeElement;
         const idx = tabs.indexOf(current);
         if (idx < 0) return;
@@ -272,8 +297,8 @@ function setupFeatureFallbacks() {
         else if (evt.key === "End") next = tabs.length - 1;
         if (next >= 0) {
           evt.preventDefault();
-          tabs.forEach((t, i) => {
-            t.tabIndex = i === next ? 0 : -1;
+          allTabs().forEach((t) => {
+            t.tabIndex = t === tabs[next] ? 0 : -1;
           });
           tabs[next].focus();
         }
@@ -538,31 +563,149 @@ function syncKpiStates() {
   );
 }
 
-function switchView(viewName) {
-  state.activeView = viewName;
-  document.querySelectorAll(".nav-btn").forEach((btn) => {
-    if (btn.dataset.view === viewName) btn.setAttribute("aria-current", "page");
-    else btn.removeAttribute("aria-current");
-  });
-  document.querySelectorAll(".view-section").forEach((sec) => {
-    sec.hidden = sec.id !== `view-${viewName}`;
-  });
-  const [title, subtitle] = VIEW_META[viewName] || ["ColabLLM", ""];
-  document.getElementById("view-title").textContent = title;
-  document.getElementById("view-subtitle").textContent = subtitle;
-  if (viewName === "network" && !state.accounts?.usage_summary && !state.accountsUsageLoading) {
+function parseLocationRoute(loc = window.location) {
+  const path = String(loc.pathname || "/").replace(/\/+$/, "") || "/";
+  const view = PATH_TO_VIEW.get(path) || "fleet";
+  const params = new URLSearchParams(loc.search || "");
+  return { view, params };
+}
+
+function buildRouteHref(viewName, params = {}) {
+  const basePath = VIEW_PATHS[viewName] || "/fleet";
+  const q = new URLSearchParams();
+  for (const [k, raw] of Object.entries(params || {})) {
+    const val = String(raw ?? "").trim();
+    if (!val) continue;
+    if (k === "tab" && (val === "instances" || val === "cli")) continue;
+    if ((k === "status" || k === "provider") && val === "all" && viewName !== "doctor") continue;
+    if (k === "provider" && viewName === "network" && val === "all") continue;
+    q.set(k, val);
+  }
+  const qs = q.toString();
+  return qs ? `${basePath}?${qs}` : basePath;
+}
+
+function syncBackButton() {
+  const btn = document.getElementById("history-back-btn");
+  if (!btn) return;
+  const onHomeDefault =
+    state.activeView === "fleet" &&
+    state.activeFleetPanel === "fleet-panel-instances" &&
+    window.location.search === "";
+  const canGoBack = state.routeDepth > 0 || !onHomeDefault;
+  btn.hidden = !canGoBack;
+  if (state.routeDepth > 0) {
+    btn.setAttribute("aria-label", "返回上一视图");
+    btn.title = "返回上一浏览记录（浏览器后退）";
+  } else {
+    btn.setAttribute("aria-label", "返回舰队与实例");
+    btn.title = "返回舰队与实例首页";
+  }
+}
+
+function navigateBack() {
+  if (state.routeDepth > 0) {
+    window.history.back();
+    return;
+  }
+  switchView("fleet", { params: {} });
+}
+
+function getActiveViewRouteParams(viewName) {
+  if (viewName === "fleet") {
+    const out = {};
+    if (state.activeFleetPanel === "fleet-panel-catalog") out.tab = "catalog";
+    if (state.instanceStatusFilter && state.instanceStatusFilter !== "all") out.status = state.instanceStatusFilter;
+    return out;
+  }
+  if (viewName === "network") {
+    return state.networkProviderFilter && state.networkProviderFilter !== "all"
+      ? { provider: state.networkProviderFilter }
+      : {};
+  }
+  if (viewName === "workbench") {
+    const activePanel = document.querySelector("#view-workbench .tab-btn[aria-selected='true']")?.dataset.panel;
+    return activePanel === "panel-tasks" ? { tab: "tasks" } : {};
+  }
+  return {};
+}
+
+function switchView(viewName, options = {}) {
+  const targetView = VIEW_META[viewName] ? viewName : "fleet";
+  const { params = null, replace = false, fromPopState = false, skipTransition = false } = options;
+  const viewChanged = state.activeView !== targetView;
+  const routeHref = buildRouteHref(targetView, params !== null ? params : getActiveViewRouteParams(targetView));
+  const currentHref = `${window.location.pathname}${window.location.search}`;
+
+  if (!fromPopState && routeHref !== currentHref) {
+    if (replace) {
+      window.history.replaceState({ colabllmRoute: true, depth: state.routeDepth }, "", routeHref);
+    } else {
+      state.routeDepth += 1;
+      window.history.pushState({ colabllmRoute: true, depth: state.routeDepth }, "", routeHref);
+    }
+  }
+
+  const activeEl = document.activeElement;
+  const activeViewSec = activeEl instanceof Element ? activeEl.closest(".view-section") : null;
+  const focusLeavingHiddenView = Boolean(activeViewSec && activeViewSec.id !== `view-${targetView}`);
+  const backBtn = document.getElementById("history-back-btn");
+  const backBtnWasFocused = Boolean(backBtn && activeEl === backBtn);
+
+  const applyViewDom = () => {
+    state.activeView = targetView;
+    document.querySelectorAll(".nav-btn").forEach((btn) => {
+      if (btn.dataset.view === targetView) btn.setAttribute("aria-current", "page");
+      else btn.removeAttribute("aria-current");
+    });
+    document.querySelectorAll(".view-section").forEach((sec) => {
+      sec.hidden = sec.id !== `view-${targetView}`;
+    });
+    const [title, subtitle] = VIEW_META[targetView] || ["ColabLLM", ""];
+    document.getElementById("view-title").textContent = title;
+    document.getElementById("view-subtitle").textContent = subtitle;
+    document.title = `${title} | ColabLLM Web 控制台`;
+    syncBackButton();
+  };
+
+  const restoreFocusIfNeeded = () => {
+    const backBtnHiddenAfter = Boolean(backBtn && backBtn.hidden);
+    if (focusLeavingHiddenView || (backBtnWasFocused && backBtnHiddenAfter)) {
+      document.getElementById("view-title")?.focus({ preventScroll: true });
+    }
+  };
+
+  const canTransition =
+    viewChanged &&
+    !skipTransition &&
+    typeof document.startViewTransition === "function" &&
+    document.visibilityState === "visible" &&
+    window.matchMedia("(prefers-reduced-motion: no-preference)").matches;
+
+  if (canTransition) {
+    const transition = document.startViewTransition(applyViewDom);
+    transition.finished.finally(restoreFocusIfNeeded);
+  } else {
+    applyViewDom();
+    restoreFocusIfNeeded();
+  }
+
+  if ((viewName === "network" || targetView === "network") && !state.accounts?.usage_summary && !state.accountsUsageLoading) {
     void refreshAccountsUsage({ force: false, silent: true });
   }
 }
 
-function activateTab(panelId) {
+function activateTab(panelId, { syncUrl = false } = {}) {
   const targetPanel = document.getElementById(panelId);
   if (!targetPanel) return;
   const scope = targetPanel.closest(".tabs-shell") || document;
   const inactiveHiddenVal = "onbeforematch" in HTMLElement.prototype ? "until-found" : "";
+  const tablist = scope.querySelector(":scope > .tablist");
 
+  let selectedBtn = null;
   scope.querySelectorAll(":scope > .tablist > .tab-btn").forEach((btn) => {
     const active = btn.dataset.panel === panelId;
+    if (active) selectedBtn = btn;
     btn.setAttribute("aria-selected", active ? "true" : "false");
     if (active) btn.setAttribute("focusgroupstart", "");
     else btn.removeAttribute("focusgroupstart");
@@ -570,6 +713,9 @@ function activateTab(panelId) {
       btn.tabIndex = active ? 0 : -1;
     }
   });
+  if (selectedBtn && tablist && tablist.scrollWidth > tablist.clientWidth) {
+    selectedBtn.scrollIntoView?.({ block: "nearest", inline: "nearest", container: "nearest" });
+  }
   scope.querySelectorAll(':scope > [role="tabpanel"]').forEach((panel) => {
     if (panel.id === panelId) panel.removeAttribute("hidden");
     else panel.setAttribute("hidden", inactiveHiddenVal);
@@ -578,16 +724,166 @@ function activateTab(panelId) {
   if (scope.closest("#view-fleet")) {
     state.activeFleetPanel = panelId;
     syncKpiStates();
+    if (syncUrl && state.activeView === "fleet") {
+      const nextParams = {
+        tab: panelId === "fleet-panel-catalog" ? "catalog" : "",
+        status: state.instanceStatusFilter !== "all" ? state.instanceStatusFilter : "",
+      };
+      const href = buildRouteHref("fleet", nextParams);
+      if (href !== `${window.location.pathname}${window.location.search}`) {
+        state.routeDepth += 1;
+        window.history.pushState({ colabllmRoute: true, depth: state.routeDepth }, "", href);
+        syncBackButton();
+      }
+    }
+  } else if (scope.closest("#view-workbench") && syncUrl && state.activeView === "workbench") {
+    const href = buildRouteHref("workbench", {
+      tab: panelId === "panel-tasks" ? "tasks" : "",
+    });
+    if (href !== `${window.location.pathname}${window.location.search}`) {
+      state.routeDepth += 1;
+      window.history.pushState({ colabllmRoute: true, depth: state.routeDepth }, "", href);
+      syncBackButton();
+    }
   }
 }
 
+function syncDoctorProviderMode() {
+  const provider = document.getElementById("doctor-provider")?.value || "colab";
+  const hideDrive = provider === "kaggle";
+  const drvWrap = document.getElementById("doctor-drive-wrap");
+  const noDrvWrap = document.getElementById("doctor-no-drive-wrap");
+  if (drvWrap) drvWrap.hidden = hideDrive;
+  if (noDrvWrap) noDrvWrap.hidden = hideDrive;
+  refreshDoctorAccountSelector();
+}
+
+async function applyPendingBootstrapRoutes() {
+  if (!state.bootstrapSeeded) return;
+  if (state.pendingCopilotRoute && copilotController) {
+    const req = state.pendingCopilotRoute;
+    state.pendingCopilotRoute = null;
+    copilotController.applyRouteParams(req);
+  }
+  if (state.pendingWorkbenchRoute) {
+    const req = state.pendingWorkbenchRoute;
+    state.pendingWorkbenchRoute = null;
+    if (req.instance !== undefined) {
+      const instIn = document.getElementById("wb-instance");
+      if (instIn) instIn.value = req.instance;
+    }
+    if (req.account) {
+      const acctSel = document.getElementById("wb-account");
+      if (acctSel && Array.from(acctSel.options).some((o) => o.value === req.account)) {
+        acctSel.value = req.account;
+      }
+    }
+    if (req.service && state.servicesMap.has(req.service)) {
+      await selectWorkbenchService(req.service, req.sub || "");
+    }
+    if (req.task) {
+      const matched = state.tasks.find((t) => t.task_id === req.task);
+      if (matched) attachTaskStream(matched.task_id, matched);
+    }
+  }
+}
+
+function applyRouteFromLocation({ fromPopState = false, skipTransition = false } = {}) {
+  const { view, params } = parseLocationRoute();
+
+  if (view === "fleet") {
+    const tab = params.get("tab") === "catalog" ? "fleet-panel-catalog" : "fleet-panel-instances";
+    activateTab(tab, { syncUrl: false });
+    const statusParam = params.get("status");
+    if (statusParam && ["all", "running", "ready", "error", "stopped"].includes(statusParam)) {
+      state.instanceStatusFilter = statusParam;
+    } else if (fromPopState && !params.has("status")) {
+      state.instanceStatusFilter = "all";
+    }
+    const provParam = params.get("provider");
+    const instProvSel = document.getElementById("instance-provider-filter");
+    const catProvSel = document.getElementById("catalog-provider-filter");
+    if (provParam && ["all", "colab", "kaggle"].includes(provParam)) {
+      if (instProvSel) instProvSel.value = provParam;
+      if (catProvSel) catProvSel.value = provParam;
+    } else if (fromPopState && !params.has("provider")) {
+      if (instProvSel) instProvSel.value = "all";
+      if (catProvSel) catProvSel.value = "all";
+    }
+    syncKpiStates();
+    if (state.bootstrapSeeded) {
+      renderInstances();
+      renderServices();
+    }
+  } else if (view === "copilot") {
+    const cpReq = {
+      session: params.get("session") || "",
+      service: params.get("service") || "",
+      surface: params.get("surface") || "",
+    };
+    if (state.bootstrapSeeded && copilotController) {
+      copilotController.applyRouteParams(cpReq);
+    } else {
+      state.pendingCopilotRoute = cpReq;
+    }
+  } else if (view === "workbench") {
+    const tab = params.get("tab") === "tasks" ? "panel-tasks" : "panel-cli";
+    activateTab(tab, { syncUrl: false });
+    const wbReq = {
+      service: params.get("service") || "",
+      sub: params.get("sub") || "",
+      instance: params.has("instance") ? params.get("instance") || "" : undefined,
+      account: params.get("account") || "",
+      task: params.get("task") || "",
+    };
+    if (wbReq.service || wbReq.sub || wbReq.instance !== undefined || wbReq.account || wbReq.task) {
+      state.pendingWorkbenchRoute = wbReq;
+      applyPendingBootstrapRoutes();
+    }
+  } else if (view === "network") {
+    const provParam = params.get("provider");
+    state.networkProviderFilter = ["all", "colab", "kaggle"].includes(provParam) ? provParam : "all";
+    applyNetworkProviderFilter();
+  } else if (view === "doctor") {
+    const provParam = params.get("provider");
+    const docProv = document.getElementById("doctor-provider");
+    if (docProv && ["colab", "kaggle", "all"].includes(provParam)) {
+      docProv.value = provParam;
+    }
+    syncDoctorProviderMode();
+  }
+
+  switchView(view, {
+    params: Object.fromEntries(params.entries()),
+    fromPopState: true,
+    skipTransition,
+  });
+}
+
 function initNavigation() {
-  document.querySelectorAll(".nav-btn").forEach((btn) => {
-    btn.addEventListener("click", () => switchView(btn.dataset.view));
+  document.addEventListener("click", (evt) => {
+    const routeLink = evt.target instanceof Element ? evt.target.closest("a.nav-btn, a[data-route-link]") : null;
+    if (!routeLink) return;
+    if (evt.metaKey || evt.ctrlKey || evt.shiftKey || evt.altKey || evt.button !== 0) return;
+    const url = new URL(routeLink.href, window.location.origin);
+    if (url.origin !== window.location.origin) return;
+    evt.preventDefault();
+    const targetPath = PATH_TO_VIEW.has(url.pathname) ? (url.pathname === "/" ? "/fleet" : url.pathname) : "/fleet";
+    const targetHref = `${targetPath}${url.search}`;
+    const currentHref = `${window.location.pathname}${window.location.search}`;
+    if (targetHref !== currentHref) {
+      state.routeDepth += 1;
+      window.history.pushState({ colabllmRoute: true, depth: state.routeDepth }, "", targetHref);
+    }
+    applyRouteFromLocation({ fromPopState: true });
   });
+
+  document.getElementById("history-back-btn")?.addEventListener("click", navigateBack);
+
   document.querySelectorAll(".tabs-shell:not(.ck-tabs-shell) > .tablist > .tab-btn").forEach((btn) => {
-    btn.addEventListener("click", () => activateTab(btn.dataset.panel));
+    btn.addEventListener("click", () => activateTab(btn.dataset.panel, { syncUrl: true }));
   });
+
   document.querySelectorAll('[role="tabpanel"]').forEach((panel) => {
     panel.addEventListener("beforematch", () => {
       if (panel.closest("#view-fleet")) {
@@ -597,9 +893,20 @@ function initNavigation() {
       } else if (panel.closest("#view-workbench")) {
         switchView("workbench");
       }
-      activateTab(panel.id);
+      activateTab(panel.id, { syncUrl: true });
     });
   });
+
+  window.addEventListener("popstate", (evt) => {
+    state.routeDepth = Number.isInteger(evt.state?.depth) ? Math.max(0, evt.state.depth) : 0;
+    applyRouteFromLocation({ fromPopState: true });
+  });
+
+  const { view, params } = parseLocationRoute();
+  const canonicalHref = buildRouteHref(view, Object.fromEntries(params.entries()));
+  state.routeDepth = Number.isInteger(window.history.state?.depth) ? Math.max(0, window.history.state.depth) : 0;
+  window.history.replaceState({ colabllmRoute: true, depth: state.routeDepth }, "", canonicalHref);
+  applyRouteFromLocation({ fromPopState: true, skipTransition: true });
 }
 
 /* Dialogs & shared schema field rendering */
@@ -1088,6 +1395,7 @@ function refreshEffectiveFleet() {
   renderInstances();
   renderServices();
   copilotController?.syncCopilotState();
+  renderWorkbenchQuickbar();
   renderTasksList();
 }
 
@@ -1160,6 +1468,12 @@ function renderKPIs() {
   document.getElementById("kpi-ready").textContent = String(ready);
   document.getElementById("kpi-transport").textContent = state.tunnel?.transport || "cloudflare";
   document.getElementById("kpi-services").textContent = String(state.services.length);
+  const fleetNavBadge = document.getElementById("nav-badge-fleet");
+  if (fleetNavBadge) {
+    fleetNavBadge.hidden = running === 0;
+    fleetNavBadge.textContent = String(running);
+    fleetNavBadge.className = running > 0 && ready === running ? "nav-count ok" : "nav-count warn";
+  }
   syncKpiStates();
 }
 
@@ -1360,8 +1674,14 @@ async function handleCopyCommand(button, target, command = "--copy") {
 }
 
 function jumpToWorkbench(inst) {
-  switchView("workbench");
-  activateTab("panel-cli");
+  activateTab("panel-cli", { syncUrl: false });
+  switchView("workbench", {
+    params: {
+      service: inst.service,
+      instance: inst.instance_arg || "",
+      account: inst.account || "",
+    },
+  });
   document.getElementById("wb-instance").value = inst.instance_arg || "";
   if (inst.account) {
     const acctSel = document.getElementById("wb-account");
@@ -2250,10 +2570,15 @@ function renderInstances() {
   syncTableSortHeaders();
 
   const q = (document.getElementById("instance-search")?.value || "").trim().toLowerCase();
+  const provFilter = document.getElementById("instance-provider-filter")?.value || "all";
   const acctFilter = document.getElementById("instance-account-filter")?.value || "all";
   const catFilter = document.getElementById("instance-category-filter")?.value || "all";
 
   const baseMatched = state.instances.filter((inst) => {
+    if (provFilter !== "all") {
+      const instProv = inst.provider || getServiceProvider(inst.service);
+      if (instProv !== provFilter) return false;
+    }
     if (acctFilter !== "all") {
       if (acctFilter === "__none__") {
         if (inst.account) return false;
@@ -2445,8 +2770,10 @@ function populateGroupedServiceSelect(selectEl) {
 
 function renderServices() {
   const q = (document.getElementById("service-search").value || "").trim().toLowerCase();
+  const provFilter = document.getElementById("catalog-provider-filter")?.value || "all";
   const cat = document.getElementById("category-filter").value;
   const grid = document.getElementById("services-grid");
+  const countEl = document.getElementById("services-count");
 
   const runningCountBySvc = new Map();
   for (const inst of state.instances) {
@@ -2456,11 +2783,23 @@ function renderServices() {
   }
 
   const filtered = state.services.filter((svc) => {
+    const svcProv = svc.provider || getServiceProvider(svc.name);
+    if (provFilter !== "all" && svcProv !== provFilter) return false;
     const svcCat = svc.category || "other";
     if (cat !== "all" && svcCat !== cat) return false;
     if (!q) return true;
     return `${svc.name} ${svc.summary || ""} ${svc.category_label || ""}`.toLowerCase().includes(q);
   });
+
+  if (countEl) {
+    if (state.services.length === 0) {
+      countEl.textContent = "0 个运行时";
+    } else if (filtered.length === state.services.length) {
+      countEl.textContent = `${state.services.length} 个运行时`;
+    } else {
+      countEl.textContent = `显示 ${filtered.length} / ${state.services.length} 个运行时`;
+    }
+  }
 
   if (filtered.length === 0) {
     grid.replaceChildren(
@@ -2468,6 +2807,21 @@ function renderServices() {
         "div",
         { className: "card empty-state-card" },
         el("p", { className: "muted", textContent: "没有匹配当前筛选条件的运行时服务。" }),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn sm secondary",
+            textContent: "重置目录筛选",
+            onClick: () => {
+              document.getElementById("service-search").value = "";
+              const pf = document.getElementById("catalog-provider-filter");
+              if (pf) pf.value = "all";
+              document.getElementById("category-filter").value = "all";
+              renderServices();
+            },
+          },
+        ),
       ),
     );
     return;
@@ -2533,8 +2887,8 @@ function renderServices() {
           className: "btn sm secondary",
           textContent: "工作台命令",
           onClick: () => {
-            switchView("workbench");
-            activateTab("panel-cli");
+            activateTab("panel-cli", { syncUrl: false });
+            switchView("workbench", { params: { service: svc.name } });
             selectWorkbenchService(svc.name);
           },
         }),
@@ -2546,30 +2900,104 @@ function renderServices() {
   grid.replaceChildren(...cards);
 }
 
+function renderWorkbenchQuickbar() {
+  const bar = document.getElementById("wb-running-quickbar");
+  const box = document.getElementById("wb-running-chips");
+  if (!bar || !box) return;
+  const running = state.instances.filter((i) => i.running && !i.stopping);
+  if (!running.length) {
+    bar.hidden = true;
+    box.replaceChildren();
+    return;
+  }
+  bar.hidden = false;
+  box.replaceChildren(
+    ...running.map((inst) =>
+      el("button", {
+        type: "button",
+        className: "session-chip wb-inst-chip",
+        textContent: `${inst.session_name}${inst.account ? ` · ${inst.account}` : ""}`,
+        title: `填入 ${inst.session_name} 至命令表单`,
+        onClick: () => {
+          document.getElementById("wb-instance").value = inst.instance_arg || "";
+          if (inst.account) {
+            const acctSel = document.getElementById("wb-account");
+            if (acctSel && Array.from(acctSel.options).some((o) => o.value === inst.account)) {
+              acctSel.value = inst.account;
+            }
+          }
+          void selectWorkbenchService(inst.service);
+        },
+      }),
+    ),
+  );
+}
+
 function renderTasksList() {
+  const counts = { all: state.tasks.length, running: 0, succeeded: 0, failed: 0 };
+  for (const t of state.tasks) {
+    if (t.status === "running") counts.running += 1;
+    else if (t.status === "succeeded") counts.succeeded += 1;
+    else counts.failed += 1;
+  }
+  const navTasksBadge = document.getElementById("nav-badge-tasks");
+  if (navTasksBadge) {
+    navTasksBadge.hidden = counts.running === 0;
+    navTasksBadge.textContent = String(counts.running);
+  }
+  const tabCount = document.getElementById("wb-tasks-tab-count");
+  if (tabCount) tabCount.textContent = String(counts.all);
+
+  document.querySelectorAll("[data-task-filter]").forEach((btn) => {
+    const f = btn.dataset.taskFilter || "all";
+    btn.setAttribute("aria-pressed", f === state.taskStatusFilter ? "true" : "false");
+    const cEl = btn.querySelector("[data-task-count]");
+    if (cEl && Object.hasOwn(counts, f)) cEl.textContent = String(counts[f]);
+  });
+
   const box = document.getElementById("tasks-list");
   if (!state.tasks.length) {
     box.replaceChildren(el("p", { className: "muted", textContent: "当前会话尚未执行后台命令。" }));
     return;
   }
-  const rows = state.tasks.map((t) => {
-    const tone = t.status === "succeeded" ? "ok" : t.status === "running" ? "warn" : "danger";
+  const filtered = state.tasks.filter((t) => {
+    if (state.taskStatusFilter === "running") return t.status === "running";
+    if (state.taskStatusFilter === "succeeded") return t.status === "succeeded";
+    if (state.taskStatusFilter === "failed") return t.status !== "running" && t.status !== "succeeded";
+    return true;
+  });
+  if (!filtered.length) {
+    box.replaceChildren(el("p", { className: "muted", textContent: "当前状态筛选下没有后台任务记录。" }));
+    return;
+  }
+
+  const rows = filtered.map((t) => {
+    const tone = t.status === "succeeded" ? "ok" : t.status === "running" ? "warn is-busy" : "danger";
+    const rel = formatRelativeTime(t.created_at);
+    const dur =
+      t.finished_at && t.created_at
+        ? `${Math.max(0, t.finished_at - t.created_at).toFixed(1)}s`
+        : (t.status === "running" ? "执行中" : "");
+    const metaText = [rel.short !== "-" ? rel.short : "", dur].filter(Boolean).join(" · ");
     return el(
-      "div",
+      "button",
       {
+        type: "button",
         className: "task-row",
-        tabindex: "0",
-        role: "button",
         onClick: () => {
-          switchView("workbench");
-          activateTab("panel-cli");
+          activateTab("panel-cli", { syncUrl: true });
           attachTaskStream(t.task_id, t);
         },
       },
       el(
         "div",
-        null,
-        el("strong", { textContent: `${t.service} ${t.subcommand}` }),
+        { className: "task-row-main" },
+        el(
+          "div",
+          { className: "task-row-head" },
+          el("strong", { textContent: `${t.service} ${t.subcommand}` }),
+          metaText ? el("span", { className: "muted task-row-meta", textContent: metaText, title: rel.full || undefined }) : null,
+        ),
         el("div", null, el("code", { textContent: t.command_preview })),
       ),
       el("span", { className: `badge ${tone}`, textContent: `${t.status}${t.returncode !== null && t.returncode !== undefined ? ` (${t.returncode})` : ""}` }),
@@ -3201,8 +3629,10 @@ async function loadBootstrap() {
   renderInstances();
   renderServices();
   copilotController?.syncCopilotState();
+  renderWorkbenchQuickbar();
   renderTasksList();
   renderTunnelAndAccounts();
+  await applyPendingBootstrapRoutes();
   if (!state.accounts?.usage_summary) {
     void refreshAccountsUsage({ force: false, silent: true });
   }
@@ -3225,6 +3655,7 @@ function applyEventsPayload(payload, { broadcast = false } = {}) {
   renderInstances();
   renderServices();
   copilotController?.syncCopilotState();
+  renderWorkbenchQuickbar();
   renderTasksList();
   if (broadcast && eventsChannel) {
     try {
@@ -3920,22 +4351,25 @@ function initInteractions() {
 
   // KPI quick-filter cards
   document.getElementById("kpi-card-running").addEventListener("click", () => {
-    switchView("fleet");
-    activateTab("fleet-panel-instances");
     state.instanceStatusFilter = "running";
+    activateTab("fleet-panel-instances", { syncUrl: false });
+    switchView("fleet", { params: { status: "running" } });
     syncKpiStates();
     renderInstances();
   });
   document.getElementById("kpi-card-ready").addEventListener("click", () => {
-    switchView("fleet");
-    activateTab("fleet-panel-instances");
     state.instanceStatusFilter = "ready";
+    activateTab("fleet-panel-instances", { syncUrl: false });
+    switchView("fleet", { params: { status: "ready" } });
     syncKpiStates();
     renderInstances();
   });
+  document.getElementById("kpi-card-transport")?.addEventListener("click", () => {
+    switchView("network");
+  });
   document.getElementById("kpi-card-services").addEventListener("click", () => {
-    switchView("fleet");
-    activateTab("fleet-panel-catalog");
+    switchView("fleet", { params: { tab: "catalog" } });
+    activateTab("fleet-panel-catalog", { syncUrl: false });
     document.getElementById("service-search")?.focus();
   });
 
@@ -3948,6 +4382,7 @@ function initInteractions() {
   };
 
   document.getElementById("instance-search").addEventListener("input", renderInstances);
+  document.getElementById("instance-provider-filter")?.addEventListener("change", renderInstances);
   document.getElementById("instance-account-filter").addEventListener("change", renderInstances);
   document.getElementById("instance-category-filter").addEventListener("change", renderInstances);
   document.getElementById("instance-sort").addEventListener("change", (e) => {
@@ -3992,8 +4427,14 @@ function initInteractions() {
 
   document.getElementById("collapse-stopped-toggle").addEventListener("change", renderInstances);
   document.getElementById("prune-replicas-btn").addEventListener("click", openPruneDialog);
+  document.getElementById("empty-browse-catalog-btn")?.addEventListener("click", () => {
+    activateTab("fleet-panel-catalog", { syncUrl: true });
+    document.getElementById("service-search")?.focus();
+  });
   document.getElementById("reset-instance-filters-btn").addEventListener("click", () => {
     document.getElementById("instance-search").value = "";
+    const provSel = document.getElementById("instance-provider-filter");
+    if (provSel) provSel.value = "all";
     document.getElementById("instance-account-filter").value = "all";
     document.getElementById("instance-category-filter").value = "all";
     state.instanceStatusFilter = "all";
@@ -4037,6 +4478,7 @@ function initInteractions() {
   });
 
   document.getElementById("service-search").addEventListener("input", renderServices);
+  document.getElementById("catalog-provider-filter")?.addEventListener("change", renderServices);
   document.getElementById("category-filter").addEventListener("change", renderServices);
 
   // Clean up modal dialog state and flush deferred toasts on close
@@ -4292,6 +4734,24 @@ function initInteractions() {
     }
   });
 
+  document.getElementById("wb-clear-output")?.addEventListener("click", () => {
+    const outEl = document.getElementById("wb-output");
+    if (outEl) outEl.textContent = "已清空输出。";
+    const statusEl = document.getElementById("wb-task-status");
+    if (statusEl && !state.activeTaskSource) {
+      statusEl.className = "badge";
+      statusEl.textContent = "待命";
+    }
+    resetCopyButtonState(document.getElementById("wb-copy-output"));
+  });
+
+  document.querySelectorAll("[data-task-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.taskStatusFilter = btn.dataset.taskFilter || "all";
+      renderTasksList();
+    });
+  });
+
   // Tunnel & FRP
   document.getElementById("tunnel-form").addEventListener("submit", async (evt) => {
     evt.preventDefault();
@@ -4358,6 +4818,12 @@ function initInteractions() {
     btn.addEventListener("click", () => {
       state.networkProviderFilter = btn.dataset.netProvider || "all";
       applyNetworkProviderFilter();
+      if (state.activeView === "network") {
+        switchView("network", {
+          params: state.networkProviderFilter === "all" ? {} : { provider: state.networkProviderFilter },
+          replace: true,
+        });
+      }
     });
   });
 
@@ -4369,23 +4835,112 @@ function initInteractions() {
   });
 
   // Doctor
-  const syncDoctorProviderMode = () => {
-    const provider = document.getElementById("doctor-provider")?.value || "colab";
-    const hideDrive = provider === "kaggle";
-    const drvWrap = document.getElementById("doctor-drive-wrap");
-    const noDrvWrap = document.getElementById("doctor-no-drive-wrap");
-    if (drvWrap) drvWrap.hidden = hideDrive;
-    if (noDrvWrap) noDrvWrap.hidden = hideDrive;
-    refreshDoctorAccountSelector();
+  const isDoctorPass = (st) => {
+    const s = String(st || "").toLowerCase();
+    return s === "pass" || s === "ok";
   };
-  document.getElementById("doctor-provider")?.addEventListener("change", syncDoctorProviderMode);
-  syncDoctorProviderMode();
+  const isDoctorWarn = (st) => String(st || "").toLowerCase() === "warn";
 
-  document.getElementById("doctor-run-btn").addEventListener("click", async () => {
+  const renderDoctorTable = () => {
+    const report = state.lastDoctorReport;
+    const tbody = document.getElementById("doctor-tbody");
+    const toolbar = document.getElementById("doctor-toolbar");
+    const kpiStrip = document.getElementById("doctor-kpi-strip");
+    if (!tbody || !report) return;
+
+    const checks = Array.isArray(report.checks) ? report.checks : [];
+    const okCnt = checks.filter((c) => isDoctorPass(c.status)).length;
+    const warnCnt = checks.filter((c) => isDoctorWarn(c.status)).length;
+    const failCnt = checks.filter((c) => !isDoctorPass(c.status) && !isDoctorWarn(c.status)).length;
+    const issueCnt = warnCnt + failCnt;
+
+    if (kpiStrip) {
+      kpiStrip.hidden = false;
+      const overallEl = document.getElementById("doctor-kpi-overall");
+      const badgeEl = document.getElementById("doctor-kpi-badge");
+      const subEl = document.getElementById("doctor-kpi-sub");
+      if (overallEl && badgeEl && subEl) {
+        overallEl.textContent = report.ok ? (warnCnt > 0 ? "体检通过 (含提示)" : "体检通过") : "存在阻断项";
+        badgeEl.className = report.ok ? "badge ok" : "badge danger";
+        badgeEl.textContent = report.ok ? "PASS" : "FAIL";
+        subEl.textContent = `${report.provider || "-"} · transport=${report.transport || "-"} · account=${report.account || "-"} (${report.checkedAt})`;
+      }
+      const setNum = (id, v) => {
+        const node = document.getElementById(id);
+        if (node) node.textContent = String(v);
+      };
+      setNum("doctor-kpi-ok", okCnt);
+      setNum("doctor-kpi-warn", warnCnt);
+      setNum("doctor-kpi-fail", failCnt);
+    }
+
+    if (toolbar) {
+      toolbar.hidden = checks.length === 0;
+      const cAll = document.getElementById("doctor-count-all");
+      const cIssues = document.getElementById("doctor-count-issues");
+      if (cAll) cAll.textContent = String(checks.length);
+      if (cIssues) cIssues.textContent = String(issueCnt);
+      toolbar.querySelectorAll("[data-doctor-filter]").forEach((btn) => {
+        btn.setAttribute("aria-pressed", btn.dataset.doctorFilter === state.doctorFilter ? "true" : "false");
+      });
+    }
+
+    const visible = state.doctorFilter === "issues" ? checks.filter((c) => !isDoctorPass(c.status)) : checks;
+    if (!visible.length) {
+      tbody.replaceChildren(
+        el(
+          "tr",
+          null,
+          el("td", {
+            colSpan: "4",
+            className: "muted",
+            textContent: checks.length ? "全部检查项均已通过，无异常或警告项。" : "未返回体检检查项。",
+          }),
+        ),
+      );
+      return;
+    }
+
+    const trs = visible.map((c) => {
+      const isPass = isDoctorPass(c.status);
+      const isWarn = isDoctorWarn(c.status);
+      const tone = isPass ? "ok" : isWarn ? "warn" : "danger";
+      const isNetworkIssue = !isPass && /frp|tunnel|domain|cloudflare|ssh/i.test(`${c.name} ${c.message}`);
+      const msgCell = el("td", null, el("span", { textContent: c.message }));
+      if (isNetworkIssue) {
+        msgCell.append(
+          " ",
+          el("a", { href: "/network", className: "doctor-fix-link", "data-route-link": true, textContent: "前往隧道配置 →" }),
+        );
+      }
+      return el(
+        "tr",
+        null,
+        el("th", { scope: "row", textContent: c.name }),
+        el("td", null, el("span", { className: `badge ${tone}`, textContent: String(c.status || "-").toUpperCase() })),
+        msgCell,
+        el("td", null, el("span", { className: c.required ? "badge" : "badge", textContent: c.required ? "必需" : "可选" })),
+      );
+    });
+    tbody.replaceChildren(...trs);
+  };
+
+  const runDoctorCheck = async () => {
+    const runBtn = document.getElementById("doctor-run-btn");
+    const presetBtn = document.getElementById("doctor-preset-all-btn");
     const banner = document.getElementById("doctor-banner");
     const tbody = document.getElementById("doctor-tbody");
+    if (!runBtn || runBtn.disabled) return;
     const provider = document.getElementById("doctor-provider")?.value || "colab";
-    banner.textContent = "正在执行环境体检...";
+
+    runBtn.disabled = true;
+    runBtn.classList.add("is-busy");
+    runBtn.textContent = "正在体检...";
+    if (presetBtn) presetBtn.disabled = true;
+    if (banner) {
+      banner.dataset.tone = "info";
+      banner.textContent = `正在执行 ${provider} 环境体检，请稍候...`;
+    }
     try {
       const q = new URLSearchParams({
         provider,
@@ -4396,22 +4951,69 @@ function initInteractions() {
         transport: document.getElementById("doctor-transport").value.trim(),
       });
       const res = await apiFetch(`/api/doctor?${q.toString()}`, { timeoutMs: 70000 });
-      banner.textContent = `体检完成：overall=${res.ok ? "PASS" : "FAIL"} | provider=${res.provider || provider} | transport=${res.transport || "-"} | account=${res.account || "-"}`;
-      const trs = (res.checks || []).map((c) => {
-        const tone = c.status === "ok" ? "ok" : c.status === "warn" ? "warn" : "danger";
-        return el(
-          "tr",
-          null,
-          el("td", null, el("span", { className: `badge ${tone}`, textContent: c.status })),
-          el("td", { textContent: c.name }),
-          el("td", { textContent: c.message }),
-          el("td", { textContent: c.required ? "必需" : "可选" }),
-        );
-      });
-      tbody.replaceChildren(...trs);
+      state.lastDoctorReport = {
+        ...res,
+        provider: res.provider || provider,
+        checkedAt: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+      };
+      if (banner) {
+        const checks = Array.isArray(res.checks) ? res.checks : [];
+        const passCnt = checks.filter((c) => isDoctorPass(c.status)).length;
+        const warnCnt = checks.filter((c) => isDoctorWarn(c.status)).length;
+        const failCnt = checks.filter((c) => !isDoctorPass(c.status) && !isDoctorWarn(c.status)).length;
+        banner.dataset.tone = res.ok ? "ok" : "danger";
+        banner.textContent = `体检完成：${res.ok ? "PASS" : "FAIL"}（通过 ${passCnt} 项${warnCnt > 0 ? ` · 警告 ${warnCnt} 项` : ""}${failCnt > 0 ? ` · 失败 ${failCnt} 项` : ""}） | 平台=${res.provider || provider} | 隧道=${res.transport || "-"} | 账户=${res.account || "-"}`;
+      }
+      renderDoctorTable();
     } catch (err) {
-      banner.textContent = `体检执行出错: ${err.message}`;
+      if (banner) {
+        banner.dataset.tone = "danger";
+        banner.textContent = `体检执行出错: ${err.message}`;
+      }
+      if (tbody && !state.lastDoctorReport) {
+        tbody.replaceChildren(el("tr", null, el("td", { colSpan: "4", className: "muted", textContent: err.message })));
+      }
+    } finally {
+      runBtn.disabled = false;
+      runBtn.classList.remove("is-busy");
+      runBtn.textContent = "运行体检";
+      if (presetBtn) presetBtn.disabled = false;
     }
+  };
+
+  document.getElementById("doctor-provider")?.addEventListener("change", syncDoctorProviderMode);
+  syncDoctorProviderMode();
+
+  document.getElementById("doctor-form")?.addEventListener("submit", (evt) => {
+    evt.preventDefault();
+    void runDoctorCheck();
+  });
+
+  document.getElementById("doctor-preset-all-btn")?.addEventListener("click", () => {
+    const provSel = document.getElementById("doctor-provider");
+    if (provSel) provSel.value = "all";
+    syncDoctorProviderMode();
+    void runDoctorCheck();
+  });
+
+  document.querySelectorAll("[data-doctor-filter]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.doctorFilter = btn.dataset.doctorFilter || "all";
+      renderDoctorTable();
+    });
+  });
+
+  document.getElementById("doctor-copy-btn")?.addEventListener("click", () => {
+    const report = state.lastDoctorReport;
+    if (!report) {
+      showToast("请先运行体检以生成报告", "warn");
+      return;
+    }
+    const header = `ColabLLM Doctor (${report.checkedAt}) overall=${report.ok ? "PASS" : "FAIL"} provider=${report.provider} transport=${report.transport || "-"} account=${report.account || "-"}`;
+    const lines = (report.checks || []).map(
+      (c) => `[${String(c.status || "-").toUpperCase()}] ${c.name} (${c.required ? "required" : "optional"}): ${c.message}`,
+    );
+    void copyTextToClipboard(`${header}\n${lines.join("\n")}`, "已复制体检报告");
   });
 
   const releaseBackgroundStreams = () => {
@@ -4475,6 +5077,7 @@ async function main() {
     },
     switchView,
   });
+  applyPendingBootstrapRoutes();
   try {
     await loadBootstrap();
     connectEventsSse();

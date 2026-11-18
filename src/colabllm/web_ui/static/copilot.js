@@ -1035,9 +1035,22 @@ export function initCopilotStudio(deps) {
     const tablist = document.getElementById("ck-surface-tablist");
     const shell = tablist?.closest(".ck-tabs-shell");
     if (!shell || !tablist) return;
+    let selectedBtn = null;
     for (const btn of tablist.querySelectorAll(":scope > .tab-btn")) {
       const match = btn.dataset.panel === panelId;
       btn.setAttribute("aria-selected", match ? "true" : "false");
+      if (match) {
+        selectedBtn = btn;
+        btn.setAttribute("focusgroupstart", "");
+      } else {
+        btn.removeAttribute("focusgroupstart");
+      }
+      if (!Object.hasOwn(HTMLElement.prototype, "focusGroup")) {
+        btn.tabIndex = match ? 0 : -1;
+      }
+    }
+    if (selectedBtn && tablist.scrollWidth > tablist.clientWidth) {
+      selectedBtn.scrollIntoView?.({ block: "nearest", inline: "nearest", container: "nearest" });
     }
     for (const panel of shell.querySelectorAll(':scope > [role="tabpanel"]')) {
       if (panel.id === panelId) {
@@ -1328,7 +1341,47 @@ export function initCopilotStudio(deps) {
       }
     }
 
+    const launchEmptyBtn = document.getElementById("ck-launch-empty-btn");
+    if (launchEmptyBtn) {
+      launchEmptyBtn.hidden = usable.length > 0;
+    }
+
     updateCapabilityUI();
+  }
+
+  function applyRouteParams({ session = "", service = "", surface = "" } = {}) {
+    const usable = getRunningInstances();
+    if (session && usable.some((i) => i.session_name === session)) {
+      selectSession(session);
+    } else if (service) {
+      const match =
+        usable.find((i) => i.service === service && i.ready && i.url) ||
+        usable.find((i) => i.service === service && i.url) ||
+        usable.find((i) => i.service === service);
+      if (match) {
+        selectSession(match.session_name);
+      } else if ((appState.services || []).some((s) => s.name === service)) {
+        ckState.selectedSession = "";
+        ckState.selectedServiceFallback = service;
+        const svc = (appState.services || []).find((s) => s.name === service);
+        const modelIn = document.getElementById("ck-model");
+        if (modelIn && svc) {
+          modelIn.value = svc.api_profile?.default_model || svc.name;
+        }
+        syncCopilotState();
+      }
+    }
+    if (surface && document.getElementById(`ck-panel-${surface}`)) {
+      const prof = getSelectedProfile();
+      const allowed = new Set(prof?.surfaces || ["chat", "inspector"]);
+      if (!ckState.showAllSurfaces && !allowed.has(surface)) {
+        ckState.showAllSurfaces = true;
+        const allBtn = document.getElementById("ck-all-surfaces-btn");
+        if (allBtn) allBtn.setAttribute("aria-pressed", "true");
+        updateCapabilityUI();
+      }
+      activateCopilotSurface(surface);
+    }
   }
 
   function openInstanceInCopilot(inst, surface = "") {
@@ -1339,8 +1392,11 @@ export function initCopilotStudio(deps) {
     }
     selectSession(inst.session_name);
     const prof = getSelectedProfile();
-    activateCopilotSurface(surface || prof?.primary_surface || "chat");
-    switchView("copilot");
+    const targetSurface = surface || prof?.primary_surface || "chat";
+    activateCopilotSurface(targetSurface);
+    switchView("copilot", {
+      params: { session: inst.session_name, surface: targetSurface },
+    });
   }
 
   function openServiceInCopilot(serviceName) {
@@ -1361,8 +1417,11 @@ export function initCopilotStudio(deps) {
       modelIn.value = svc.api_profile?.default_model || svc.name;
     }
     syncCopilotState();
-    activateCopilotSurface(svc?.api_profile?.primary_surface || "chat");
-    switchView("copilot");
+    const targetSurface = svc?.api_profile?.primary_surface || "chat";
+    activateCopilotSurface(targetSurface);
+    switchView("copilot", {
+      params: { service: serviceName, surface: targetSurface },
+    });
   }
 
   /* ---------- Event Binding ---------- */
@@ -1636,6 +1695,7 @@ export function initCopilotStudio(deps) {
 
   return {
     syncCopilotState,
+    applyRouteParams,
     openInstanceInCopilot,
     openServiceInCopilot,
     openDrawer,
