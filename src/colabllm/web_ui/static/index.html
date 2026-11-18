@@ -270,10 +270,12 @@
                 <button type="button" id="ck-probe-btn" class="btn secondary">探测 /v1/models</button>
                 <button type="button" id="ck-health-btn" class="btn secondary">健康检查</button>
                 <button type="button" id="ck-all-surfaces-btn" class="btn secondary" aria-pressed="false">显示全部面板</button>
+                <a id="ck-open-webui-link" class="btn secondary" target="_blank" rel="noopener noreferrer" hidden>打开原生 Web UI ↗</a>
                 <button type="button" id="ck-code-btn" class="btn secondary" popovertarget="ck-code-popover">导出 SDK / cURL</button>
               </div>
             </div>
             <div class="ck-context-meta">
+              <span id="ck-provider-pill" class="badge neutral" hidden></span>
               <span id="ck-status-pill" class="badge neutral">等待选择实例</span>
               <span id="ck-proxy-url-hint" class="muted ck-mono"></span>
               <p id="ck-capabilities-summary" class="muted ck-cap-summary"></p>
@@ -289,9 +291,16 @@
                   <option value="curl-proxy">cURL (本机同源代理)</option>
                   <option value="curl-direct">cURL (公网直连)</option>
                   <option value="python-openai">Python OpenAI SDK</option>
+                  <option value="python-http">Python urllib (标准库通用 REST)</option>
                 </select>
               </div>
-              <button type="button" id="ck-code-copy" class="btn small secondary">复制代码</button>
+              <span class="copy-wrap">
+                <button type="button" id="ck-code-copy" class="btn small secondary copy-btn" command="--copy" commandfor="ck-code-output">
+                  <span class="copy-icon" aria-hidden="true"></span>
+                  <span>复制代码</span>
+                </button>
+                <span class="copy-tip" role="status"></span>
+              </span>
             </div>
             <pre role="region" tabindex="0" aria-label="生成代码片段" class="ck-code-pre"><code id="ck-code-output"></code></pre>
           </div>
@@ -361,7 +370,7 @@
                         <button type="button" id="ck-drive-btn" class="btn small secondary" popovertarget="ck-drive-popover">从 Drive 导入</button>
                       </div>
                       <div class="ck-composer-right">
-                        <progress id="ck-chat-progress" class="ck-progress" hidden></progress>
+                        <progress id="ck-chat-progress" class="ck-progress" aria-label="对话生成进度" hidden></progress>
                         <button type="button" id="ck-chat-stop" class="btn small danger" hidden>停止生成</button>
                         <button type="submit" id="ck-chat-send" class="btn small primary">发送</button>
                       </div>
@@ -382,9 +391,11 @@
                   <details open class="ck-accordion">
                     <summary>推理与采样配置</summary>
                     <div class="ck-acc-body">
+                      <p id="ck-chat-runtime-hint" class="muted ck-cap-summary"></p>
                       <div class="ck-field">
                         <label for="ck-chat-system">System 提示词</label>
                         <textarea id="ck-chat-system" class="ck-autosize" rows="2" placeholder="You are a helpful assistant."></textarea>
+                        <div id="ck-system-presets" class="ck-presets-row" role="group" aria-label="System 角色预设"></div>
                       </div>
                       <label class="switch-row">
                         <span>启用流式输出 (stream)</span>
@@ -411,7 +422,11 @@
                       </div>
                       <div class="ck-two-col">
                         <div class="ck-field">
-                          <label for="ck-chat-temp">Temperature</label>
+                          <div class="ck-slider-head">
+                            <label for="ck-chat-temp">Temperature</label>
+                            <output id="ck-chat-temp-out" class="ck-mono" for="ck-chat-temp-range">0.7</output>
+                          </div>
+                          <input id="ck-chat-temp-range" class="ck-range" type="range" min="0" max="2" step="0.1" value="0.7" aria-label="Temperature 滑块">
                           <input id="ck-chat-temp" type="number" min="0" max="2" step="0.1" value="0.7">
                         </div>
                         <div class="ck-field">
@@ -1119,7 +1134,7 @@
             <input id="ck-drawer-tools" type="checkbox" switch checked>
           </label>
           <div class="ck-composer-right">
-            <progress id="ck-drawer-progress" class="ck-progress" hidden></progress>
+            <progress id="ck-drawer-progress" class="ck-progress" aria-label="侧栏生成进度" hidden></progress>
             <button type="button" id="ck-drawer-stop" class="btn small danger" hidden>停止</button>
             <button type="submit" id="ck-drawer-send" class="btn small primary">发送</button>
           </div>

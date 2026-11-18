@@ -383,6 +383,10 @@ class IntrospectionTest(unittest.TestCase):
         self.assertFalse(meta['chat_compatible'])
         self.assertFalse(meta['openai_compatible'])
         self.assertTrue(meta['supports_restart'])
+        self.assertEqual(meta['api_profile']['primary_surface'], 'specialized')
+        self.assertEqual(meta['api_profile']['surfaces'], ['specialized', 'inspector'])
+        self.assertEqual(catalog['qwen3-tts']['api_profile']['features'].get('supports_speed'), True)
+        self.assertEqual(catalog['tangoflux']['api_profile']['features'].get('supports_seed'), True)
         self.assertIn('web-probe.py', meta['script_path'])
 
         k_argv, k_preview = introspect.build_up_argv(
@@ -1689,6 +1693,22 @@ sys.exit(2)
         self.assertIn('startViewTransition', app_js)
         self.assertIn('#doctor-table', styles_css)
         self.assertIn('s === "pass" || s === "ok"', app_js)
+        self.assertIn('id="ck-open-webui-link"', index_html)
+        self.assertIn('id="ck-provider-pill"', index_html)
+        self.assertIn('id="ck-chat-temp-range"', index_html)
+        self.assertIn('id="ck-system-presets"', index_html)
+        self.assertIn('value="python-http"', index_html)
+        self.assertIn('input[type="range"].ck-range::-webkit-slider-thumb', copilot_css)
+        self.assertIn('input[type="range"].ck-range::-moz-range-thumb', copilot_css)
+        self.assertIn('.ck-mode-pill', copilot_css)
+        self.assertIn('@keyframes ck-indeterminate', copilot_css)
+        self.assertIn('getRouteParams', copilot_js)
+        self.assertIn('replayFromUserMessage', copilot_js)
+        self.assertIn('regenerateLastAssistant', copilot_js)
+        self.assertIn('onSendAudioToTranscribe', copilot_js)
+        self.assertIn('onInspectEndpoint', copilot_studios_js)
+        self.assertIn('inspectorHistory', copilot_studios_js)
+        self.assertIn('svc === "kaggle-web-probe"', copilot_studios_js)
 
         tunnel_cfg = {
             'base_domain': 'example.com',
@@ -1922,6 +1942,12 @@ ctrl.syncCopilotState();
 assert.deepEqual(ckTarget.options.filter((o) => !o.hidden).map((o) => o.value), ['r2-migrate', 'indextts']);
 assert.equal(ckTarget.value, 'indextts');
 assert.equal(ckDrawerTarget.value, 'indextts');
+
+// 5. getRouteParams & fromPopState surface restoration
+ctrl.applyRouteParams({ session: 'indextts', fromPopState: true });
+assert.deepEqual(ctrl.getRouteParams(), { session: 'indextts', surface: 'audio' });
+ctrl.applyRouteParams({ session: 'r2-migrate', surface: 'specialized' });
+assert.deepEqual(ctrl.getRouteParams(), { session: 'r2-migrate', surface: 'specialized' });
 """
         proc = subprocess.run(
             ['node', '--input-type=module', '-e', js_script],

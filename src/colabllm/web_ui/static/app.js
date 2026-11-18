@@ -623,6 +623,9 @@ function getActiveViewRouteParams(viewName) {
       ? { provider: state.networkProviderFilter }
       : {};
   }
+  if (viewName === "copilot" && copilotController?.getRouteParams) {
+    return copilotController.getRouteParams();
+  }
   if (viewName === "workbench") {
     const activePanel = document.querySelector("#view-workbench .tab-btn[aria-selected='true']")?.dataset.panel;
     return activePanel === "panel-tasks" ? { tab: "tasks" } : {};
@@ -820,6 +823,7 @@ function applyRouteFromLocation({ fromPopState = false, skipTransition = false }
       session: params.get("session") || "",
       service: params.get("service") || "",
       surface: params.get("surface") || "",
+      fromPopState,
     };
     if (state.bootstrapSeeded && copilotController) {
       copilotController.applyRouteParams(cpReq);
@@ -1617,6 +1621,27 @@ function reportCopyButton(button, ok, label) {
   );
 }
 
+async function copyWithButtonFeedback(button, text, emptyLabel = "暂无可复制内容") {
+  const val = String(text ?? "");
+  if (!val) {
+    reportCopyButton(button, false, emptyLabel);
+    return;
+  }
+  try {
+    if (!navigator.clipboard?.writeText) {
+      throw new Error("clipboard unavailable");
+    }
+    await navigator.clipboard.writeText(val);
+    reportCopyButton(button, true, "已复制");
+  } catch {
+    if (legacyCopyText(val)) {
+      reportCopyButton(button, true, "已复制");
+    } else {
+      reportCopyButton(button, false, "复制失败");
+    }
+  }
+}
+
 async function handleCopyCommand(button, target, command = "--copy") {
   if (!button || !target || !command?.startsWith("--copy")) return;
   let text = "";
@@ -1650,27 +1675,11 @@ async function handleCopyCommand(button, target, command = "--copy") {
   } else {
     text = target.matches("input, textarea") ? target.value : (target.innerText || target.textContent || "").trim();
   }
-  if (!text) {
-    reportCopyButton(
-      button,
-      false,
-      target.id === "logs-viewer" ? "暂无可复制日志" : "暂无可复制内容",
-    );
-    return;
-  }
-  try {
-    if (!navigator.clipboard?.writeText) {
-      throw new Error("clipboard unavailable");
-    }
-    await navigator.clipboard.writeText(text);
-    reportCopyButton(button, true, "已复制");
-  } catch {
-    if (legacyCopyText(text)) {
-      reportCopyButton(button, true, "已复制");
-    } else {
-      reportCopyButton(button, false, "复制失败");
-    }
-  }
+  await copyWithButtonFeedback(
+    button,
+    text,
+    target.id === "logs-viewer" ? "暂无可复制日志" : "暂无可复制内容",
+  );
 }
 
 function jumpToWorkbench(inst) {
@@ -4568,7 +4577,12 @@ function initInteractions() {
         out.hidden = true;
         out.textContent = "";
       }
-      const svc = document.getElementById("up-service")?.value;
+      const presetSvc = btn.dataset.launchService || "";
+      const upSel = document.getElementById("up-service");
+      if (presetSvc && upSel && Array.from(upSel.options).some((o) => o.value === presetSvc)) {
+        upSel.value = presetSvc;
+      }
+      const svc = upSel?.value;
       if (svc) {
         renderUpExtraFields(svc);
       }
@@ -5067,14 +5081,26 @@ async function main() {
     },
     copyText(text, successMsg = "已复制到剪贴板") {
       if (!navigator.clipboard?.writeText) {
-        showToast("当前浏览器不支持剪贴板写入", "warn");
+        if (legacyCopyText(String(text || ""))) {
+          showToast(successMsg, "ok", 2200);
+        } else {
+          showToast("当前浏览器不支持剪贴板写入", "warn");
+        }
         return Promise.resolve();
       }
       return navigator.clipboard.writeText(String(text || "")).then(
         () => showToast(successMsg, "ok", 2200),
-        () => showToast("复制失败，请手动复制", "warn"),
+        () => {
+          if (legacyCopyText(String(text || ""))) {
+            showToast(successMsg, "ok", 2200);
+          } else {
+            showToast("复制失败，请手动复制", "warn");
+          }
+        },
       );
     },
+    copyWithButtonFeedback,
+    safeExternalUrl,
     switchView,
   });
   applyPendingBootstrapRoutes();

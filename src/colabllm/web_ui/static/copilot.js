@@ -144,8 +144,30 @@ function formatEndpointTitle(endpoint) {
   return map[endpoint] || endpoint;
 }
 
+const SYSTEM_PRESETS = [
+  { label: "清空", prompt: "" },
+  {
+    label: "通用技术助手",
+    prompt: "你是一个严谨务实的全栈与 AI 系统工程助手，请先给出直接结论，再补充关键命令或代码实现。",
+  },
+  {
+    label: "代码审查",
+    prompt: "请从正确性、边界条件、并发竞态、性能与可维护性 5 个维度审查给定代码，优先指出真实风险。",
+  },
+  {
+    label: "JSON 提取",
+    prompt: "请严格输出合法的 JSON 对象，不要包含额外 Markdown 说明或非 JSON 文本。",
+  },
+  {
+    label: "中英互译",
+    prompt: "你是专业技术翻译官。如果输入是中文则译为地道准确的英文，如果是英文则译为自然流畅的简体中文。",
+  },
+];
+
+const VALID_SURFACES = new Set(["chat", "image", "audio", "transcribe", "embeddings", "specialized", "inspector"]);
+
 export function initCopilotStudio(deps) {
-  const { appState, el, toast, copyText, switchView } = deps;
+  const { appState, el, toast, copyText, copyWithButtonFeedback, safeExternalUrl, switchView } = deps;
 
   const ckState = {
     threads: [],
@@ -172,6 +194,51 @@ export function initCopilotStudio(deps) {
       ckState.blobUrls.push(url);
     }
     return url;
+  }
+
+  function makeCopyButton(getText, labelText = "复制", ariaLabel = "") {
+    const btnAttrs = { type: "button", class: "btn small secondary copy-btn" };
+    if (ariaLabel) btnAttrs["aria-label"] = ariaLabel;
+    const btn = el(
+      "button",
+      btnAttrs,
+      el("span", { class: "copy-icon", "aria-hidden": "true" }),
+      labelText ? el("span", {}, labelText) : null
+    );
+    const tip = el("span", { class: "copy-tip", role: "status" });
+    btn.addEventListener("click", () => {
+      const txt = typeof getText === "function" ? getText() : getText;
+      if (typeof copyWithButtonFeedback === "function") {
+        void copyWithButtonFeedback(btn, txt);
+      } else {
+        copyText(String(txt || ""), "已复制");
+      }
+    });
+    return el("span", { class: "copy-wrap" }, btn, tip);
+  }
+
+  function syncRangeVisual(rangeEl, outEl) {
+    if (!rangeEl) return;
+    rangeEl.style?.setProperty?.("--attr-min", rangeEl.min || "0");
+    rangeEl.style?.setProperty?.("--attr-max", rangeEl.max || "1");
+    rangeEl.style?.setProperty?.("--control-value", rangeEl.value || "0");
+    rangeEl.setAttribute("aria-valuetext", String(rangeEl.value || "0"));
+    if (outEl) outEl.textContent = String(rangeEl.value || "0");
+  }
+
+  function getRouteParams() {
+    const params = {};
+    if (ckState.selectedSession) params.session = ckState.selectedSession;
+    else if (ckState.selectedServiceFallback) params.service = ckState.selectedServiceFallback;
+    if (ckState.activeSurface) params.surface = ckState.activeSurface;
+    return params;
+  }
+
+  function getAllowedSurfaces(profile) {
+    const defaultSurfaces = profile?.primary_surface
+      ? Array.from(new Set([profile.primary_surface, "inspector"]))
+      : ["chat", "inspector"];
+    return new Set(profile?.surfaces || defaultSurfaces);
   }
 
   function proxyUrl(sessionName, subpath) {
@@ -356,13 +423,12 @@ export function initCopilotStudio(deps) {
       pushParagraphs(text.slice(lastIndex, match.index));
       const lang = match[1] || "text";
       const code = match[2];
-      const copyBtn = el("button", { type: "button", class: "btn small secondary" }, "复制代码");
-      copyBtn.addEventListener("click", () => copyText(code, "代码已复制"));
+      const copyCtrl = makeCopyButton(() => code, "复制代码", `复制 ${lang} 代码块`);
       nodes.push(
         el(
           "div",
           { class: "ck-code-block-wrap" },
-          el("div", { class: "ck-code-block-head" }, el("span", {}, lang), copyBtn),
+          el("div", { class: "ck-code-block-head" }, el("span", {}, lang), copyCtrl),
           el("pre", { role: "region", tabindex: "0", class: "ck-code-pre" }, el("code", {}, code))
         )
       );
@@ -482,15 +548,21 @@ export function initCopilotStudio(deps) {
     return card;
   }
 
-  function renderMessageNode(msg) {
+  function renderMessageNode(msg, { isLastAssistant = false } = {}) {
     const roleLabel = msg.role === "user" ? "用户" : msg.role === "assistant" ? "Copilot 助手" : "工具";
     const card = el("article", { class: "ck-msg", "data-role": msg.role });
+    const metaParts = [];
+    if (msg.model) metaParts.push(msg.model);
+    if (typeof msg.ttftMs === "number") metaParts.push(`首字 ${msg.ttftMs}ms`);
+    if (typeof msg.latencyMs === "number") metaParts.push(`耗时 ${(msg.latencyMs / 1000).toFixed(2)}s`);
+    if (!msg.isStreaming && msg.role === "assistant" && msg.content) metaParts.push(`${msg.content.length} 字`);
+
     card.appendChild(
       el(
         "div",
         { class: "ck-msg-head" },
         el("strong", {}, roleLabel),
-        msg.model ? el("span", { class: "ck-mono" }, msg.model) : null
+        metaParts.length ? el("span", { class: "ck-mono" }, metaParts.join(" · ")) : null
       )
     );
 
@@ -537,6 +609,37 @@ export function initCopilotStudio(deps) {
       bodyDiv.appendChild(el("p", { class: "muted" }, "正在思考与生成..."));
     }
     card.appendChild(bodyDiv);
+
+    if (!msg.isStreaming && (msg.role === "user" || msg.role === "assistant")) {
+      const actionNodes = [];
+      if (msg.content || msg.reasoning) {
+        actionNodes.push(
+          makeCopyButton(() => msg.content || msg.reasoning || "", "复制", `复制${roleLabel}内容`)
+        );
+      }
+      if (msg.role === "user") {
+        const editBtn = el("button", { type: "button", class: "btn small secondary" }, "填入编辑");
+        editBtn.addEventListener("click", () => {
+          const inp = document.getElementById("ck-chat-input");
+          if (inp) {
+            inp.value = msg.content || "";
+            inp.focus();
+          }
+        });
+        actionNodes.push(editBtn);
+
+        const retryBtn = el("button", { type: "button", class: "btn small secondary" }, "从此轮重试");
+        retryBtn.addEventListener("click", () => replayFromUserMessage(msg.id));
+        actionNodes.push(retryBtn);
+      } else if (isLastAssistant) {
+        const regenBtn = el("button", { type: "button", class: "btn small secondary" }, "重新生成");
+        regenBtn.addEventListener("click", () => regenerateLastAssistant(msg.id));
+        actionNodes.push(regenBtn);
+      }
+      if (actionNodes.length) {
+        card.appendChild(el("div", { class: "ck-msg-actions" }, ...actionNodes));
+      }
+    }
     return card;
   }
 
@@ -547,7 +650,16 @@ export function initCopilotStudio(deps) {
     if (welcomeEl) {
       welcomeEl.hidden = visibleMsgs.length > 0;
     }
-    feedEl.replaceChildren(...visibleMsgs.map(renderMessageNode));
+    let lastAssistantId = "";
+    for (let i = visibleMsgs.length - 1; i >= 0; i -= 1) {
+      if (visibleMsgs[i].role === "assistant") {
+        lastAssistantId = visibleMsgs[i].id;
+        break;
+      }
+    }
+    feedEl.replaceChildren(
+      ...visibleMsgs.map((m) => renderMessageNode(m, { isLastAssistant: Boolean(m.id && m.id === lastAssistantId) }))
+    );
     feedEl.scrollTop = feedEl.scrollHeight;
   }
 
@@ -722,6 +834,33 @@ export function initCopilotStudio(deps) {
     return out;
   }
 
+  function replayFromUserMessage(userMsgId) {
+    if (ckState.streaming) return toast("正在生成回复，请稍候或点击停止", "warn");
+    const thread = getActiveThread();
+    const idx = thread.messages.findIndex((m) => m.id === userMsgId && m.role === "user");
+    if (idx < 0) return;
+    const targetMsg = thread.messages[idx];
+    const carryAttachments = (targetMsg.attachments || []).filter((a) => a.url && a.url !== "[inline-media-omitted]");
+    thread.messages = thread.messages.slice(0, idx);
+    ckState.attachments = carryAttachments;
+    renderAttachmentsPreview();
+    saveThreads();
+    void sendChatPrompt(targetMsg.content || "", { fromDrawer: false });
+  }
+
+  function regenerateLastAssistant(assistantMsgId) {
+    if (ckState.streaming) return toast("正在生成回复，请稍候或点击停止", "warn");
+    const thread = getActiveThread();
+    const idx = thread.messages.findIndex((m) => m.id === assistantMsgId && m.role === "assistant");
+    if (idx < 0) return;
+    for (let u = idx - 1; u >= 0; u -= 1) {
+      if (thread.messages[u].role === "user") {
+        replayFromUserMessage(thread.messages[u].id);
+        return;
+      }
+    }
+  }
+
   async function sendChatPrompt(rawPrompt, { fromDrawer = false } = {}) {
     if (ckState.streaming) return;
     const text = String(rawPrompt || "").trim();
@@ -831,6 +970,15 @@ export function initCopilotStudio(deps) {
           if (toolsEnabled) payload.tools = CLIENT_TOOLS_META.map((t) => t.schema);
         }
 
+        const reqStartedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        let firstTokenRecorded = false;
+        const markFirstToken = () => {
+          if (firstTokenRecorded) return;
+          firstTokenRecorded = true;
+          const now = typeof performance !== "undefined" ? performance.now() : Date.now();
+          assistantMsg.ttftMs = Math.max(0, Math.round(now - reqStartedAt));
+        };
+
         const resp = await proxyFetch(target.session_name, subpath, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -867,14 +1015,17 @@ export function initCopilotStudio(deps) {
                 const delta = choice?.delta || {};
                 const rDelta = delta.reasoning_content || delta.reasoning || "";
                 if (rDelta) {
+                  markFirstToken();
                   assistantMsg.reasoning += rDelta;
                   assistantMsg.isStreamingReasoning = true;
                 }
                 if (delta.content) {
+                  markFirstToken();
                   assistantMsg.content += delta.content;
                   assistantMsg.isStreamingReasoning = false;
                 }
                 if (Array.isArray(delta.tool_calls)) {
+                  markFirstToken();
                   for (const dtc of delta.tool_calls) {
                     const idx = dtc.index ?? 0;
                     if (!tcMap.has(idx)) {
@@ -914,10 +1065,12 @@ export function initCopilotStudio(deps) {
               try {
                 const evt = JSON.parse(line);
                 if (evt.message?.thinking) {
+                  markFirstToken();
                   assistantMsg.reasoning += evt.message.thinking;
                   assistantMsg.isStreamingReasoning = true;
                 }
                 if (evt.message?.content) {
+                  markFirstToken();
                   assistantMsg.content += evt.message.content;
                   assistantMsg.isStreamingReasoning = false;
                 }
@@ -927,6 +1080,7 @@ export function initCopilotStudio(deps) {
           }
         } else {
           const data = await resp.json();
+          markFirstToken();
           if (endpoint === "responses") {
             assistantMsg.content = data.output_text || JSON.stringify(data.output || data, null, 2);
           } else if (endpoint === "completions") {
@@ -946,6 +1100,8 @@ export function initCopilotStudio(deps) {
           }
         }
 
+        const reqEndedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+        assistantMsg.latencyMs = Math.max(0, Math.round(reqEndedAt - reqStartedAt));
         assistantMsg.isStreaming = false;
         assistantMsg.isStreamingReasoning = false;
         renderAllFeeds();
@@ -1029,48 +1185,91 @@ export function initCopilotStudio(deps) {
   }
 
   /* ---------- UI Sync, Dynamic Capability Tabs & Code Export ---------- */
-  function activateCopilotSurface(surfaceId) {
+  function activateCopilotSurface(surfaceId, { syncRoute = false } = {}) {
     ckState.activeSurface = surfaceId;
     const panelId = `ck-panel-${surfaceId}`;
     const tablist = document.getElementById("ck-surface-tablist");
     const shell = tablist?.closest(".ck-tabs-shell");
-    if (!shell || !tablist) return;
-    let selectedBtn = null;
-    for (const btn of tablist.querySelectorAll(":scope > .tab-btn")) {
-      const match = btn.dataset.panel === panelId;
-      btn.setAttribute("aria-selected", match ? "true" : "false");
-      if (match) {
-        selectedBtn = btn;
-        btn.setAttribute("focusgroupstart", "");
-      } else {
-        btn.removeAttribute("focusgroupstart");
+    if (shell && tablist) {
+      let selectedBtn = null;
+      const inactiveHiddenVal =
+        typeof HTMLElement !== "undefined" && "onbeforematch" in HTMLElement.prototype ? "until-found" : "";
+      for (const btn of tablist.querySelectorAll(":scope > .tab-btn")) {
+        const match = btn.dataset.panel === panelId;
+        btn.setAttribute("aria-selected", match ? "true" : "false");
+        if (match) {
+          selectedBtn = btn;
+          btn.setAttribute("focusgroupstart", "");
+        } else {
+          btn.removeAttribute("focusgroupstart");
+        }
+        if (typeof HTMLElement === "undefined" || !Object.hasOwn(HTMLElement.prototype, "focusGroup")) {
+          btn.tabIndex = match ? 0 : -1;
+        }
       }
-      if (!Object.hasOwn(HTMLElement.prototype, "focusGroup")) {
-        btn.tabIndex = match ? 0 : -1;
+      if (selectedBtn && tablist.scrollWidth > tablist.clientWidth) {
+        selectedBtn.scrollIntoView?.({ block: "nearest", inline: "nearest", container: "nearest" });
       }
-    }
-    if (selectedBtn && tablist.scrollWidth > tablist.clientWidth) {
-      selectedBtn.scrollIntoView?.({ block: "nearest", inline: "nearest", container: "nearest" });
-    }
-    for (const panel of shell.querySelectorAll(':scope > [role="tabpanel"]')) {
-      if (panel.id === panelId) {
-        panel.removeAttribute("hidden");
-      } else {
-        panel.setAttribute("hidden", "until-found");
+      for (const panel of shell.querySelectorAll(':scope > [role="tabpanel"]')) {
+        if (panel.id === panelId) {
+          panel.removeAttribute("hidden");
+        } else {
+          panel.setAttribute("hidden", inactiveHiddenVal);
+        }
       }
     }
     updateCodeSnippet();
+    if (syncRoute && appState.activeView === "copilot") {
+      switchView("copilot", { params: getRouteParams() });
+    }
   }
 
   function updateCapabilityUI() {
     const inst = getSelectedTarget();
     const svcMeta = getSelectedServiceMeta();
     const profile = svcMeta?.api_profile;
+    const providerPill = document.getElementById("ck-provider-pill");
+    const openWebUiLink = document.getElementById("ck-open-webui-link");
+    const launchEmptyBtn = document.getElementById("ck-launch-empty-btn");
+    const driveBtn = document.getElementById("ck-drive-btn");
     const statusPill = document.getElementById("ck-status-pill");
     const proxyHint = document.getElementById("ck-proxy-url-hint");
     const capSummary = document.getElementById("ck-capabilities-summary");
     const welcomeTitle = document.getElementById("ck-welcome-title");
     const drawerModelBadge = document.getElementById("ck-drawer-model-badge");
+    const chatRuntimeHint = document.getElementById("ck-chat-runtime-hint");
+
+    const provider = inst?.provider || svcMeta?.provider || (profile?.features?.provider || "colab");
+    const isKaggle = provider === "kaggle";
+    if (providerPill) {
+      if (inst || svcMeta) {
+        const authLabel = svcMeta?.auth === "builtin" ? "Bearer" : "Basic/Auto";
+        providerPill.hidden = false;
+        providerPill.className = `badge ${isKaggle ? "provider-kaggle" : "provider-colab"}`;
+        providerPill.textContent = `${isKaggle ? "Kaggle" : "Colab"} · ${authLabel}`;
+      } else {
+        providerPill.hidden = true;
+      }
+    }
+
+    if (openWebUiLink) {
+      const safeHref =
+        inst?.url && (inst.has_web_ui || svcMeta?.has_web_ui || profile?.features?.web_ui) && typeof safeExternalUrl === "function"
+          ? safeExternalUrl(inst.url)
+          : null;
+      if (safeHref) {
+        openWebUiLink.href = safeHref;
+        openWebUiLink.hidden = false;
+      } else {
+        openWebUiLink.removeAttribute("href");
+        openWebUiLink.hidden = true;
+      }
+    }
+
+    if (driveBtn) {
+      driveBtn.disabled = isKaggle;
+      driveBtn.title = isKaggle ? "Kaggle 运行时不挂载 Google Drive" : "从 Google Drive 选择文件插入 drive:// 引用";
+    }
 
     if (inst) {
       if (statusPill) {
@@ -1085,7 +1284,7 @@ export function initCopilotStudio(deps) {
         statusPill.textContent = `${svcMeta.name} (未启动实例)`;
         statusPill.className = "badge neutral";
       }
-      if (proxyHint) proxyHint.textContent = "在「舰队与实例」启动后可通过本机同源代理直接调用";
+      if (proxyHint) proxyHint.textContent = "在「舰队与实例」或点击右侧启动按钮，就绪后可通过本机同源代理直接调用";
     } else {
       if (statusPill) {
         statusPill.textContent = "暂无运行中实例";
@@ -1093,6 +1292,22 @@ export function initCopilotStudio(deps) {
       }
       if (proxyHint) {
         proxyHint.textContent = "请先在「舰队与实例」启动运行时实例";
+      }
+    }
+
+    if (launchEmptyBtn) {
+      const usableCount = getRunningInstances().length;
+      if (!inst && svcMeta) {
+        launchEmptyBtn.hidden = false;
+        launchEmptyBtn.textContent = `启动 ${svcMeta.name}`;
+        launchEmptyBtn.dataset.launchService = svcMeta.name;
+      } else if (usableCount === 0) {
+        launchEmptyBtn.hidden = false;
+        launchEmptyBtn.textContent = "启动新实例";
+        delete launchEmptyBtn.dataset.launchService;
+      } else {
+        launchEmptyBtn.hidden = true;
+        delete launchEmptyBtn.dataset.launchService;
       }
     }
 
@@ -1106,8 +1321,23 @@ export function initCopilotStudio(deps) {
       if (feats.vision) caps.push("Vision 多模态");
       if (feats.audio_input) caps.push("Audio 音频理解");
       if (feats.async_jobs) caps.push("异步任务队列");
+      if (feats.cpu_only) caps.push("CPU 轻量探针");
       if (feats.auto_discovered) caps.push("自动发现运行时");
       capSummary.textContent = `${svcMeta?.name || "未选择"} · ${caps.join(" · ")}`;
+    }
+    if (chatRuntimeHint) {
+      if (!svcMeta) {
+        chatRuntimeHint.textContent = "未选择实例；请先启动或选择一个运行中实例。";
+      } else if (profile?.openai_compatible && (profile.surfaces || []).includes("chat")) {
+        const flags = ["支持对话补全"];
+        if (feats.thinking) flags.push("Thinking");
+        if (feats.vision) flags.push("图片输入");
+        if (feats.audio_input) flags.push("音频输入");
+        if (feats.tools) flags.push("Tools");
+        chatRuntimeHint.textContent = `${svcMeta.name}：${flags.join(" · ")}`;
+      } else {
+        chatRuntimeHint.textContent = `${svcMeta.name} 主能力为「${profile?.primary_surface || "native"}」，推荐切换至对应能力面板或 HTTP 探针测试。`;
+      }
     }
     if (welcomeTitle) {
       welcomeTitle.textContent = svcMeta ? `${svcMeta.name} · Copilot Studio` : "ColabLLM Copilot Studio";
@@ -1148,7 +1378,7 @@ export function initCopilotStudio(deps) {
     }
 
     // Filter capability tabs unless Show All Surfaces is enabled
-    const allowed = new Set(profile?.surfaces || ["chat", "inspector"]);
+    const allowed = getAllowedSurfaces(profile);
     const tablist = document.getElementById("ck-surface-tablist");
     if (tablist) {
       for (const btn of tablist.querySelectorAll(":scope > .tab-btn")) {
@@ -1162,9 +1392,9 @@ export function initCopilotStudio(deps) {
           btn.setAttribute("focusgroup", "none");
         }
       }
-      if (!ckState.showAllSurfaces && !allowed.has(ckState.activeSurface)) {
-        activateCopilotSurface(profile?.primary_surface || "chat");
-      }
+    }
+    if (!ckState.showAllSurfaces && !allowed.has(ckState.activeSurface)) {
+      activateCopilotSurface(profile?.primary_surface || "chat");
     }
 
     ckState.studios?.syncTarget(inst, svcMeta);
@@ -1192,6 +1422,73 @@ export function initCopilotStudio(deps) {
     );
   }
 
+  function buildSurfaceRequestSpec() {
+    const svc = getSelectedServiceMeta();
+    const profile = svc?.api_profile;
+    const feats = profile?.features || {};
+    const model = getSelectedModel() || profile?.default_model || svc?.name || "model";
+    const surf = ckState.activeSurface || profile?.primary_surface || "chat";
+
+    if (surf === "image") {
+      if (feats.async_jobs) {
+        return { method: "POST", path: "api/ct/jobs", body: { prompt: "Minimalist studio render", aspect: "1:1", tier: "4k" } };
+      }
+      return { method: "POST", path: "v1/images/generations", body: { model, prompt: "A serene lakeside cabin", response_format: "b64_json", n: 1 } };
+    }
+    if (surf === "audio") {
+      if (feats.sfx && !feats.tts) {
+        return { method: "POST", path: "v1/audio/generations", body: { model, prompt: "Heavy rain on wooden roof", duration: 8, steps: 25 } };
+      }
+      return { method: "POST", path: "v1/audio/speech", body: { model, input: "你好，欢迎使用 ColabLLM。", voice: "default", response_format: "wav" } };
+    }
+    if (surf === "transcribe") {
+      if (feats.salm_chat_audio) {
+        return {
+          method: "POST",
+          path: "v1/chat/completions",
+          body: {
+            model,
+            messages: [{ role: "user", content: [{ type: "text", text: "Transcribe the audio accurately." }, { type: "audio_url", audio_url: { url: "drive://audio/sample.wav" } }] }],
+            mm_processor_kwargs: { capture_ctc_timestamps: true },
+            stream: false,
+          },
+        };
+      }
+      return { method: "POST", path: "v1/audio/transcriptions", body: { model, prompt: "Transcribe cleanly." } };
+    }
+    if (surf === "embeddings") {
+      return { method: "POST", path: "v1/embeddings", body: { model, input: ["ColabLLM 同源代理", "Same-origin reverse proxy"] } };
+    }
+    if (surf === "inspector" || surf === "specialized") {
+      const m = document.getElementById("ck-http-method")?.value;
+      const p = document.getElementById("ck-http-path")?.value?.trim()?.replace(/^\/+/, "");
+      const preset = profile?.endpoint_presets?.[0] || { method: "GET", path: profile?.health_path || "health" };
+      const method = (surf === "inspector" && m ? m : preset.method || "GET").toUpperCase();
+      const path = surf === "inspector" && p !== undefined && p !== "" ? p : String(preset.path || "").replace(/^\/+/, "");
+      let body = preset.body ?? null;
+      if (surf === "inspector" && (method === "POST" || method === "PUT")) {
+        const raw = document.getElementById("ck-http-body")?.value?.trim();
+        if (raw) {
+          try {
+            body = JSON.parse(raw);
+          } catch {
+            body = raw;
+          }
+        }
+      }
+      return { method, path, body };
+    }
+
+    const endpoint = document.getElementById("ck-chat-endpoint")?.value || "chat_completions";
+    const temp = Number(document.getElementById("ck-chat-temp")?.value ?? 0.7);
+    const maxTokens = Number(document.getElementById("ck-chat-max-tokens")?.value ?? 2048);
+    if (endpoint === "responses") return { method: "POST", path: "v1/responses", body: { model, input: "Hello ColabLLM!", stream: false } };
+    if (endpoint === "completions") return { method: "POST", path: "v1/completions", body: { model, prompt: "Hello ColabLLM!", max_tokens: maxTokens, temperature: temp, stream: false } };
+    if (endpoint === "anthropic_messages") return { method: "POST", path: "v1/messages", body: { model, max_tokens: maxTokens, messages: [{ role: "user", content: "Hello ColabLLM!" }] } };
+    if (endpoint === "ollama_chat") return { method: "POST", path: "api/chat", body: { model, messages: [{ role: "user", content: "Hello ColabLLM!" }], stream: true } };
+    return { method: "POST", path: "v1/chat/completions", body: { model, messages: [{ role: "user", content: "Hello ColabLLM!" }], temperature: temp, max_tokens: maxTokens, stream: true }, stream: true };
+  }
+
   function updateCodeSnippet() {
     const codeOut = document.getElementById("ck-code-output");
     if (!codeOut) return;
@@ -1199,38 +1496,94 @@ export function initCopilotStudio(deps) {
     const inst = getSelectedTarget();
     const svc = getSelectedServiceMeta();
     const model = getSelectedModel() || svc?.api_profile?.default_model || svc?.name || "model";
-    const baseProxy = inst ? `${window.location.origin}${proxyUrl(inst.session_name, "v1")}` : `${window.location.origin}/api/proxy/<service>/<instance>/v1`;
-    const baseDirect = inst?.url ? `${inst.url.replace(/\/+$/, "")}/v1` : "https://<your-runtime-domain>/v1";
+    const spec = buildSurfaceRequestSpec();
+    const baseRootProxy = inst ? `${window.location.origin}${proxyUrl(inst.session_name, "")}` : `${window.location.origin}/api/proxy/${encodeURIComponent(svc?.name || "<service>")}/default/`;
+    const baseRootDirect = inst?.url ? `${inst.url.replace(/\/+$/, "")}/` : "https://<your-runtime-domain>/";
+    const urlProxy = `${baseRootProxy}${spec.path}`;
+    const urlDirect = `${baseRootDirect}${spec.path}`;
+    const authHeader = svc?.auth === "builtin" ? "Authorization: Bearer <YOUR_API_TOKEN>" : "Authorization: Basic <BASE64_USER_PASS>";
 
-    if (lang === "python-openai") {
+    if (lang === "python-openai" && svc?.api_profile?.openai_compatible !== false) {
+      const baseDirectV1 = `${baseRootDirect}v1`;
+      if (ckState.activeSurface === "embeddings") {
+        codeOut.textContent = [
+          "from openai import OpenAI",
+          "",
+          `client = OpenAI(base_url="${baseDirectV1}", api_key="<YOUR_API_TOKEN>")`,
+          "resp = client.embeddings.create(",
+          `    model="${model}",`,
+          '    input=["ColabLLM 同源代理", "Same-origin proxy"],',
+          ")",
+          "print(len(resp.data[0].embedding))",
+        ].join("\n");
+      } else if (ckState.activeSurface === "image") {
+        codeOut.textContent = [
+          "from openai import OpenAI",
+          "",
+          `client = OpenAI(base_url="${baseDirectV1}", api_key="<YOUR_API_TOKEN>")`,
+          "resp = client.images.generate(",
+          `    model="${model}",`,
+          '    prompt="A serene lakeside cabin at sunrise",',
+          '    response_format="b64_json",',
+          ")",
+          "print(len(resp.data[0].b64_json or ''))",
+        ].join("\n");
+      } else {
+        codeOut.textContent = [
+          "from openai import OpenAI",
+          "",
+          `client = OpenAI(base_url="${baseDirectV1}", api_key="<YOUR_API_TOKEN>")`,
+          "resp = client.chat.completions.create(",
+          `    model="${model}",`,
+          '    messages=[{"role": "user", "content": "Hello ColabLLM!"}],',
+          "    stream=True,",
+          ")",
+          "for chunk in resp:",
+          "    print(chunk.choices[0].delta.content or '', end='')",
+        ].join("\n");
+      }
+    } else if (lang === "python-openai" || lang === "python-http") {
+      const bodyExpr =
+        spec.body != null && spec.method !== "GET" && spec.method !== "HEAD"
+          ? `data = json.dumps(${JSON.stringify(spec.body, null, 2)}).encode("utf-8")`
+          : "data = None";
       codeOut.textContent = [
-        "from openai import OpenAI",
+        "import json, urllib.request",
         "",
-        `client = OpenAI(base_url="${baseDirect}", api_key="<YOUR_API_TOKEN>")`,
-        "resp = client.chat.completions.create(",
-        `    model="${model}",`,
-        '    messages=[{"role": "user", "content": "Hello ColabLLM!"}],',
-        "    stream=True,",
-        ")",
-        "for chunk in resp:",
-        "    print(chunk.choices[0].delta.content or '', end='')",
+        bodyExpr,
+        `req = urllib.request.Request("${urlDirect}", data=data, method="${spec.method}")`,
+        svc?.auth === "builtin"
+          ? 'req.add_header("Authorization", "Bearer <YOUR_API_TOKEN>")'
+          : 'req.add_header("Authorization", "Basic <BASE64_USER_PASS>")',
+        ...(spec.body != null && spec.method !== "GET" && spec.method !== "HEAD" ? ['req.add_header("Content-Type", "application/json")'] : []),
+        "with urllib.request.urlopen(req, timeout=60) as resp:",
+        "    print(resp.status, resp.read().decode('utf-8', errors='replace'))",
       ].join("\n");
     } else if (lang === "curl-direct") {
-      codeOut.textContent = [
-        `curl -N "${baseDirect}/chat/completions" \\`,
-        '  -H "Authorization: Bearer <YOUR_API_TOKEN>" \\',
-        '  -H "Content-Type: application/json" \\',
-        `  -d '{"model":"${model}","messages":[{"role":"user","content":"Hello"}],"stream":true}'`,
-      ].join("\n");
+      const lines = [
+        `curl ${spec.method === "HEAD" ? "-I" : `-X ${spec.method}${spec.stream ? " -N" : ""}`} "${urlDirect}" \\`,
+        `  -H "${authHeader}"` + (spec.body != null && spec.method !== "GET" && spec.method !== "HEAD" ? " \\" : ""),
+      ];
+      if (spec.body != null && spec.method !== "GET" && spec.method !== "HEAD") {
+        lines.push('  -H "Content-Type: application/json" \\');
+        lines.push(`  -d '${typeof spec.body === "string" ? spec.body : JSON.stringify(spec.body)}'`);
+      }
+      codeOut.textContent = lines.join("\n");
     } else {
-      codeOut.textContent = [
+      const isWrite = spec.method === "POST" || spec.method === "PUT" || spec.method === "DELETE";
+      const lines = [
         "# 浏览器同源安全代理（自动补全 Authorization，浏览器端不存密钥）",
-        `curl -N "${baseProxy}/chat/completions" \\`,
-        '  -H "Cookie: <SESSION_COOKIE>" \\',
-        '  -H "X-ColabLLM-CSRF: <CSRF_TOKEN>" \\',
-        '  -H "Content-Type: application/json" \\',
-        `  -d '{"model":"${model}","messages":[{"role":"user","content":"Hello"}],"stream":true}'`,
-      ].join("\n");
+        `curl ${spec.method === "HEAD" ? "-I" : `-X ${spec.method}${spec.stream ? " -N" : ""}`} "${urlProxy}" \\`,
+        '  -H "Cookie: <SESSION_COOKIE>"' + (isWrite ? " \\" : ""),
+      ];
+      if (isWrite) {
+        lines.push('  -H "X-ColabLLM-CSRF: <CSRF_TOKEN>"' + (spec.body != null ? " \\" : ""));
+      }
+      if (spec.body != null && spec.method !== "GET" && spec.method !== "HEAD") {
+        lines.push('  -H "Content-Type: application/json" \\');
+        lines.push(`  -d '${typeof spec.body === "string" ? spec.body : JSON.stringify(spec.body)}'`);
+      }
+      codeOut.textContent = lines.join("\n");
     }
   }
 
@@ -1259,7 +1612,7 @@ export function initCopilotStudio(deps) {
     }, 260);
   }
 
-  function selectSession(sessionName) {
+  function selectSession(sessionName, { syncRoute = false } = {}) {
     if (!sessionName) return;
     const nextCandidate = (appState.instances || []).find(
       (i) => i.session_name === sessionName && isRunningInstance(i)
@@ -1280,6 +1633,9 @@ export function initCopilotStudio(deps) {
       modelIn.value = nextSvc?.api_profile?.default_model || nextCandidate.service || "";
     }
     updateCapabilityUI();
+    if (syncRoute && appState.activeView === "copilot") {
+      switchView("copilot", { params: getRouteParams() });
+    }
   }
 
   function syncCopilotState() {
@@ -1341,15 +1697,10 @@ export function initCopilotStudio(deps) {
       }
     }
 
-    const launchEmptyBtn = document.getElementById("ck-launch-empty-btn");
-    if (launchEmptyBtn) {
-      launchEmptyBtn.hidden = usable.length > 0;
-    }
-
     updateCapabilityUI();
   }
 
-  function applyRouteParams({ session = "", service = "", surface = "" } = {}) {
+  function applyRouteParams({ session = "", service = "", surface = "", fromPopState = false } = {}) {
     const usable = getRunningInstances();
     if (session && usable.some((i) => i.session_name === session)) {
       selectSession(session);
@@ -1371,16 +1722,19 @@ export function initCopilotStudio(deps) {
         syncCopilotState();
       }
     }
-    if (surface && document.getElementById(`ck-panel-${surface}`)) {
-      const prof = getSelectedProfile();
-      const allowed = new Set(prof?.surfaces || ["chat", "inspector"]);
-      if (!ckState.showAllSurfaces && !allowed.has(surface)) {
+    const targetSurface = surface || (fromPopState ? getSelectedProfile()?.primary_surface || "chat" : "");
+    const panelValid = document.getElementById("ck-surface-tablist")
+      ? Boolean(document.getElementById(`ck-panel-${targetSurface}`))
+      : VALID_SURFACES.has(targetSurface);
+    if (targetSurface && panelValid) {
+      const allowed = getAllowedSurfaces(getSelectedProfile());
+      if (!ckState.showAllSurfaces && !allowed.has(targetSurface)) {
         ckState.showAllSurfaces = true;
         const allBtn = document.getElementById("ck-all-surfaces-btn");
         if (allBtn) allBtn.setAttribute("aria-pressed", "true");
         updateCapabilityUI();
       }
-      activateCopilotSurface(surface);
+      activateCopilotSurface(targetSurface);
     }
   }
 
@@ -1427,10 +1781,15 @@ export function initCopilotStudio(deps) {
   /* ---------- Event Binding ---------- */
   function attachImeSubmit(textarea, form) {
     if (!textarea || !form) return;
+    let lastCompositionEndAt = null;
+    textarea.addEventListener("compositionend", (event) => {
+      lastCompositionEndAt = event.timeStamp;
+    });
     textarea.addEventListener("keydown", (event) => {
-      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
+        if (event.isComposing || event.keyCode === 229) return;
+        if (lastCompositionEndAt !== null && Math.abs(event.timeStamp - lastCompositionEndAt) < 50) return;
         form.requestSubmit();
       }
     });
@@ -1440,6 +1799,10 @@ export function initCopilotStudio(deps) {
     ckState.studios = initStudios({
       el,
       toast,
+      copyText,
+      copyWithButtonFeedback,
+      makeCopyButton,
+      syncRangeVisual,
       proxyUrl,
       proxyFetch,
       getCsrfToken,
@@ -1450,9 +1813,51 @@ export function initCopilotStudio(deps) {
       onSendMediaToChat(media) {
         ckState.attachments.push(media);
         renderAttachmentsPreview();
-        activateCopilotSurface("chat");
+        activateCopilotSurface("chat", { syncRoute: true });
+      },
+      onSendAudioToTranscribe(media) {
+        activateCopilotSurface("transcribe", { syncRoute: true });
+        ckState.studios?.loadAudioForTranscribe?.(media);
+      },
+      onInspectEndpoint(preset) {
+        activateCopilotSurface("inspector", { syncRoute: true });
+        ckState.studios?.prefillInspector?.(preset);
+        updateCodeSnippet();
       },
     });
+
+    // System prompt presets & Temperature range/number sync
+    const sysPresetsBox = document.getElementById("ck-system-presets");
+    const sysTextarea = document.getElementById("ck-chat-system");
+    if (sysPresetsBox && sysTextarea) {
+      sysPresetsBox.replaceChildren(
+        ...SYSTEM_PRESETS.map((p) => {
+          const btn = el("button", { type: "button", class: "btn small secondary" }, p.label);
+          btn.addEventListener("click", () => {
+            sysTextarea.value = p.prompt;
+            sysTextarea.focus();
+          });
+          return btn;
+        })
+      );
+    }
+    const tempRange = document.getElementById("ck-chat-temp-range");
+    const tempNum = document.getElementById("ck-chat-temp");
+    const tempOut = document.getElementById("ck-chat-temp-out");
+    if (tempRange && tempNum) {
+      syncRangeVisual(tempRange, tempOut);
+      tempRange.addEventListener("input", () => {
+        tempNum.value = tempRange.value;
+        syncRangeVisual(tempRange, tempOut);
+        updateCodeSnippet();
+      });
+      tempNum.addEventListener("input", () => {
+        const clamped = Math.min(2, Math.max(0, Number(tempNum.value || 0)));
+        tempRange.value = String(clamped);
+        syncRangeVisual(tempRange, tempOut);
+        updateCodeSnippet();
+      });
+    }
 
     // Render tool badges inside right parameter panel
     const toolsCat = document.getElementById("ck-tools-catalog");
@@ -1472,7 +1877,7 @@ export function initCopilotStudio(deps) {
     // Target selectors
     for (const selId of ["ck-target", "ck-drawer-target"]) {
       document.getElementById(selId)?.addEventListener("change", (e) => {
-        selectSession(e.target.value);
+        selectSession(e.target.value, { syncRoute: true });
       });
     }
     document.getElementById("ck-model")?.addEventListener("input", () => {
@@ -1480,6 +1885,7 @@ export function initCopilotStudio(deps) {
       const b = document.getElementById("ck-drawer-model-badge");
       if (b) b.textContent = getSelectedModel() || "auto";
     });
+    document.getElementById("ck-chat-endpoint")?.addEventListener("change", updateCodeSnippet);
 
     // Show all capability tabs toggle
     const allBtn = document.getElementById("ck-all-surfaces-btn");
@@ -1493,7 +1899,7 @@ export function initCopilotStudio(deps) {
     document.getElementById("ck-surface-tablist")?.addEventListener("click", (e) => {
       const btn = e.target.closest(".tab-btn");
       if (!btn || btn.hidden) return;
-      activateCopilotSurface(btn.dataset.surface);
+      activateCopilotSurface(btn.dataset.surface, { syncRoute: true });
     });
 
     // Probe /v1/models & health
@@ -1534,12 +1940,8 @@ export function initCopilotStudio(deps) {
       }
     });
 
-    // Code export popover
+    // Code export popover (#ck-code-copy uses command="--copy" commandfor="ck-code-output")
     document.getElementById("ck-code-lang")?.addEventListener("change", updateCodeSnippet);
-    document.getElementById("ck-code-copy")?.addEventListener("click", () => {
-      const code = document.getElementById("ck-code-output")?.textContent || "";
-      copyText(code, "已复制代码片段");
-    });
 
     // Pane toggles & threads CRUD
     const ws = document.querySelector(".ck-chat-workspace");
@@ -1695,6 +2097,7 @@ export function initCopilotStudio(deps) {
 
   return {
     syncCopilotState,
+    getRouteParams,
     applyRouteParams,
     openInstanceInCopilot,
     openServiceInCopilot,

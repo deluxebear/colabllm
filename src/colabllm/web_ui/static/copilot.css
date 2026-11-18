@@ -496,13 +496,12 @@ details.ck-tool-card > summary::before {
   content: "▸";
   display: inline-block;
   font-size: 0.8em;
-  transition: transform 0.2s ease;
 }
 
 details.ck-accordion[open] > summary::before,
 details.ck-reasoning-card[open] > summary::before,
 details.ck-tool-card[open] > summary::before {
-  transform: rotate(90deg);
+  rotate: 90deg;
 }
 
 details.ck-accordion::details-content,
@@ -510,14 +509,26 @@ details.ck-reasoning-card::details-content,
 details.ck-tool-card::details-content {
   overflow: clip;
   contain: layout;
-  block-size: 0;
-  transition: block-size 0.22s ease, content-visibility 0.22s allow-discrete;
 }
 
-details.ck-accordion[open]::details-content,
-details.ck-reasoning-card[open]::details-content,
-details.ck-tool-card[open]::details-content {
-  block-size: auto;
+details.ck-accordion:not([open])::details-content,
+details.ck-reasoning-card:not([open])::details-content,
+details.ck-tool-card:not([open])::details-content {
+  block-size: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  details.ck-accordion > summary::before,
+  details.ck-reasoning-card > summary::before,
+  details.ck-tool-card > summary::before {
+    transition: rotate 0.2s ease;
+  }
+
+  details.ck-accordion::details-content,
+  details.ck-reasoning-card::details-content,
+  details.ck-tool-card::details-content {
+    transition: block-size 0.22s ease, content-visibility 0.22s allow-discrete;
+  }
 }
 
 .ck-acc-body {
@@ -663,6 +674,7 @@ textarea.ck-autosize {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  align-items: end;
 }
 
 .ck-tools-list {
@@ -699,23 +711,36 @@ textarea.ck-autosize {
 
 /* Progress Element Styling (-webkit- and -moz- strictly separated) */
 @keyframes ck-indeterminate {
+  from,
+  to {
+    inline-size: var(--progress-bar-indeterminate-size);
+    margin-right: auto;
+  }
   from {
-    background-position: 0 0;
+    translate: -100%;
   }
   to {
-    background-position: 40px 0;
+    translate: 100cqi;
   }
 }
 
 progress.ck-progress {
   container-type: inline-size;
+  --progress-bar-radius: 999px;
+  --progress-bar-indeterminate-size: 32%;
+  --progress-bar-indeterminate-animation-duration: 1.4s;
   appearance: none;
+  border: 0 solid;
+  overflow: clip;
   inline-size: 110px;
   block-size: 8px;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  overflow: hidden;
-  background-color: var(--surface-subtle);
+  border-radius: var(--progress-bar-radius);
+  background: color-mix(in srgb, var(--text) 14%, var(--surface-subtle));
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 0.12);
+}
+
+progress.ck-progress:dir(rtl) {
+  --progress-bar-indeterminate-animation: ck-indeterminate var(--progress-bar-indeterminate-animation-duration) infinite linear reverse;
 }
 
 progress.ck-progress[hidden] {
@@ -723,50 +748,283 @@ progress.ck-progress[hidden] {
 }
 
 progress.ck-progress::-webkit-progress-bar {
-  background-color: var(--surface-subtle);
-  border-radius: 999px;
+  background: transparent;
 }
 
 progress.ck-progress::-webkit-progress-value {
-  background-color: var(--accent);
-  border-radius: 999px;
+  background: var(--progress-bar-fill, var(--accent));
+  border-radius: var(--progress-bar-radius);
+  transition: inline-size 0.25s ease;
+  animation: var(--progress-bar-animation, revert-rule);
 }
 
 progress.ck-progress::-moz-progress-bar {
-  background-color: var(--accent);
-  border-radius: 999px;
+  background: var(--progress-bar-fill, var(--accent));
+  border-radius: var(--progress-bar-radius);
+  transition: inline-size 0.25s ease;
+  animation: var(--progress-bar-animation, revert-rule);
 }
 
 progress.ck-progress:indeterminate {
-  background-image: repeating-linear-gradient(
-    -45deg,
-    var(--accent) 0 10px,
-    color-mix(in srgb, var(--accent) 30%, transparent) 10px 20px
+  --progress-bar-animation: var(
+    --progress-bar-indeterminate-animation,
+    ck-indeterminate var(--progress-bar-indeterminate-animation-duration) infinite linear
   );
-  background-size: 40px 40px;
-  animation: ck-indeterminate 1s linear infinite;
-}
-
-progress.ck-progress:indeterminate::-webkit-progress-bar {
-  background: transparent;
-}
-
-progress.ck-progress:indeterminate::-moz-progress-bar {
-  background: transparent;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  progress.ck-progress:indeterminate {
-    animation-duration: 10s;
+  progress.ck-progress {
+    --progress-bar-indeterminate-animation-duration: 10s;
   }
-  details.ck-accordion::details-content,
-  details.ck-reasoning-card::details-content,
-  details.ck-tool-card::details-content,
-  details.ck-accordion > summary::before,
-  details.ck-reasoning-card > summary::before,
-  details.ck-tool-card > summary::before {
-    transition-duration: 0.01ms;
+}
+
+/* Brand-Consistent Range Slider (-webkit- and -moz- strictly separated) */
+.ck-slider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.ck-slider-head output {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="range"].ck-range {
+  --slider-track-size: 0.42rem;
+  --slider-thumb-size: 1.05rem;
+  --slider-track-radius: 999px;
+  --slider-thumb-radius: 50%;
+  --slider-track-color: color-mix(in srgb, var(--text) 20%, var(--surface-subtle));
+  --slider-fill-color: var(--accent);
+  --slider-thumb-color: var(--slider-fill-color);
+  --slider-direction: to right;
+  --attr-min: 0;
+  --attr-max: 1;
+  --control-value: 0;
+  --slider-progress: calc(progress(var(--control-value), var(--attr-min), var(--attr-max)) * 100%);
+  appearance: none;
+  inline-size: 100%;
+  block-size: 1.85rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+input[type="range"].ck-range:dir(rtl) {
+  --slider-direction: to left;
+}
+
+@supports not (opacity: progress(1, 0, 100)) {
+  input[type="range"].ck-range {
+    --slider-progress: calc(
+      (var(--control-value) - var(--attr-min)) / max(0.0001, (var(--attr-max) - var(--attr-min))) * 100%
+    );
   }
+}
+
+input[type="range"].ck-range:focus-visible {
+  outline: 2px solid var(--slider-fill-color);
+  outline-offset: 4px;
+}
+
+input[type="range"].ck-range::-webkit-slider-runnable-track {
+  block-size: var(--slider-track-size);
+  border: 0;
+  border-radius: var(--slider-track-radius);
+  background: linear-gradient(
+    var(--slider-direction),
+    var(--slider-fill-color) var(--slider-progress),
+    var(--slider-track-color) var(--slider-progress)
+  );
+}
+
+input[type="range"].ck-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  inline-size: var(--slider-thumb-size);
+  block-size: var(--slider-thumb-size);
+  margin-block-start: calc((var(--slider-track-size) - var(--slider-thumb-size)) / 2);
+  border: 2px solid var(--surface);
+  border-radius: var(--slider-thumb-radius);
+  background: var(--slider-thumb-color);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.25);
+}
+
+input[type="range"].ck-range::-moz-range-track {
+  block-size: var(--slider-track-size);
+  border: 0;
+  border-radius: var(--slider-track-radius);
+  background: var(--slider-track-color);
+}
+
+input[type="range"].ck-range::-moz-range-progress {
+  block-size: var(--slider-track-size);
+  border-radius: var(--slider-track-radius);
+  background: var(--slider-fill-color);
+}
+
+input[type="range"].ck-range::-moz-range-thumb {
+  inline-size: var(--slider-thumb-size);
+  block-size: var(--slider-thumb-size);
+  border: 2px solid var(--surface);
+  border-radius: var(--slider-thumb-radius);
+  background: var(--slider-thumb-color);
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.25);
+}
+
+/* Segmented Mode Pills (replaces stretched switch-row on radios) */
+.ck-mode-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-mode-pill {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--text);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+}
+
+.ck-mode-pill input[type="radio"] {
+  accent-color: var(--accent);
+  margin: 0;
+  inline-size: auto;
+}
+
+.ck-mode-pill:has(input:checked),
+.ck-mode-pill[data-checked="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ck-mode-pill:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Message Header & Actions */
+.ck-msg-head-right,
+.ck-msg-actions {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-msg-actions {
+  padding-block-start: 4px;
+  border-block-start: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+/* Reference Thumbnails & Studio Outputs */
+.ck-ref-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  gap: 8px;
+}
+
+.ck-ref-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  background: var(--surface-subtle);
+  display: grid;
+  gap: 4px;
+}
+
+.ck-ref-thumb {
+  inline-size: 100%;
+  block-size: 74px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.ck-ref-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.ck-matrix-cell {
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  background: color-mix(in srgb, var(--accent) var(--sim-alpha, 0%), var(--surface));
+}
+
+.ck-rank-list {
+  display: grid;
+  gap: 6px;
+}
+
+.ck-rank-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+  font-size: 0.84rem;
+}
+
+.ck-probe-kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.ck-history-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ck-output-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.ck-output-header h3 {
+  margin: 0;
+}
+
+.ck-specialized-rich {
+  display: grid;
+  gap: 10px;
+}
+
+.ck-specialized-rich:empty {
+  display: none;
+}
+
+.ck-field[hidden],
+.ck-presets-row[hidden] {
+  display: none;
 }
 
 /* Multimodal & Specialized Studios */
@@ -852,9 +1110,10 @@ progress.ck-progress:indeterminate::-moz-progress-bar {
   gap: 8px;
 }
 
-.ck-matrix-cell {
-  text-align: center;
-  font-variant-numeric: tabular-nums;
+@container (max-width: 480px) {
+  .ck-emo-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* Right-edge Scroll-Snap Swipe-to-Dismiss CopilotSidebar Drawer */

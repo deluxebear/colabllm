@@ -395,6 +395,7 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             "tts": True,
             "voice_clone": True,
             "voice_design": True,
+            "supports_speed": True,
             "sfx": False,
             "voices_crud": True,
             "drive_io": True,
@@ -432,6 +433,7 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
         "features": {
             "tts": True,
             "voice_clone": True,
+            "supports_speed": True,
             "emotion_vector_8d": True,
             "emo_alpha": True,
             "emo_text": True,
@@ -456,6 +458,7 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
         "features": {
             "tts": True,
             "voice_clone": True,
+            "supports_speed": True,
             "inline_tags": ["[sighs]", "[laughs]", "[whispers]", "[gasp]", "[pause]"],
             "multi_reference_dialogue": True,
             "batch_speech": True,
@@ -496,6 +499,7 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
         "features": {
             "tts": False,
             "sfx": True,
+            "supports_seed": True,
             "duration_range": [1, 30],
             "sample_rate": 44100,
             "stereo": True,
@@ -749,14 +753,15 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
         ],
     },
     "kaggle-web-probe": {
-        "primary_surface": "inspector",
-        "surfaces": ["inspector"],
+        "primary_surface": "specialized",
+        "surfaces": ["specialized", "inspector"],
         "openai_compatible": False,
         "default_model": "kaggle-web-probe",
         "api_style": "kaggle-web-probe",
         "health_path": "health",
         "models_path": "",
         "features": {
+            "provider": "kaggle",
             "web_ui": True,
             "cpu_only": True,
             "cache_probe": True,
@@ -766,8 +771,10 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             "通过内置网页首页 (/) 验证 Caddy Basic Auth 与隧道端到端连通性",
         ],
         "endpoint_presets": [
-            {"label": "健康检查 (/health)", "method": "GET", "path": "health"},
-            {"label": "探针网页 (/)", "method": "GET", "path": ""},
+            {"label": "健康与缓存探针 (/health)", "method": "GET", "path": "health"},
+            {"label": "轻量探活 (HEAD /health)", "method": "HEAD", "path": "health"},
+            {"label": "内置状态网页 (/)", "method": "GET", "path": ""},
+            {"label": "验证非 OpenAI 边界 (/v1/models)", "method": "GET", "path": "v1/models"},
         ],
     },
 }
