@@ -1645,6 +1645,8 @@ sys.exit(2)
         self.assertIn('frp?.server_ip', app_js)
         self.assertIn('viewName === "network"', app_js)
         self.assertNotIn('frp.configured', app_js)
+        self.assertIn('未纳管远端 · ', app_js)
+        self.assertIn('.session-chip.unmanaged', styles_css)
 
         tunnel_cfg = {
             'base_domain': 'example.com',

@@ -1717,6 +1717,12 @@ tr.is-effective-account > th {
   white-space: nowrap;
 }
 
+.session-chip.unmanaged {
+  background: var(--warn-bg);
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
 progress.quota-meter {
   appearance: none;
   border: 0 solid;

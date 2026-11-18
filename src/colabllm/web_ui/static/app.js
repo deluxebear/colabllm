@@ -2685,8 +2685,19 @@ function formatAccountSessionsCell(quota, isLoading) {
     ];
     if (Array.isArray(quota.assignments) && quota.assignments.length) {
       const chips = quota.assignments.map((a) => {
-        const txt = a.name && a.name !== "?" ? `${a.name} · ${a.hardware || "CPU"}` : (a.hardware || "CPU");
-        return el("span", { className: "session-chip", textContent: txt });
+        const hw = a.hardware || "CPU";
+        const isManaged = Boolean(a.name && a.name !== "?");
+        const txt = isManaged ? `${a.name} · ${hw}` : `未纳管远端 · ${hw}`;
+        const props = {
+          className: isManaged ? "session-chip" : "session-chip unmanaged",
+          textContent: txt,
+        };
+        if (a.endpoint) {
+          props.title = isManaged
+            ? `Endpoint: ${a.endpoint}`
+            : `云端活跃 Colab VM（未在本机 colab-cli 会话索引中）: ${a.endpoint}`;
+        }
+        return el("span", props);
       });
       children.push(el("div", { className: "session-chips" }, ...chips));
     }
