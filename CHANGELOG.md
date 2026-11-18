@@ -4,6 +4,17 @@
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-11-18
+
+### 新增与变更
+
+- **`colabllm web` 多视图历史路由与跨平台页面精细化**：新增 `/fleet`、`/copilot`、`/workbench`、`/network`、`/doctor` 语义化路由、`pushState`/`popstate` 历史回退与视图切换过渡，补充实例/目录多平台筛选、工作台活跃实例快捷填充及结构化环境体检看板。
+- **`colabllm web` AI 演练场（Copilot Studio）全 7 个子页面业务化升级**：支持子页面 URL 状态同步与按当前能力面板动态生成 cURL / Python OpenAI SDK / 标准库 `urllib` 代码；补全对话首字/总耗时遥测、消息重试/重新生成与 System 角色预设；新增图生图多参考图缩略图编排（一键插入 `<imageN>` / `<Picture N>` 标签、生成结果一键续编辑与可取消 4K 异步轮询）；新增 TTS 语速、`drama3` 批量多角色对白、`indextts` 8 维情绪滑块预设及合成音频一键送入转写/克隆联动；支持 ASR 时间戳播放实时高亮与 SRT/TXT 导出、Embeddings RAG Top-K 检索排序与余弦相似度热力矩阵、`kaggle-web-probe` 等专有运行时原生控制台增强及同源 HTTP 探针响应头与历史重放。
+
+### 修复
+
+- **区分 Colab 未纳管远端会话与体检状态配色**：在“隧道与账户”看板中将非 `colabllm` 纳管的远端 Colab 会话明确标注为 `未纳管远端`，并修正环境体检页 `PASS` 状态的绿色徽章映射与异常项统计。
+
 ## [1.2.1] - 2026-11-18
 
 ### 变更
