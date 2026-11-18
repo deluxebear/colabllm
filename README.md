@@ -1,7 +1,7 @@
-# Google Colab 大模型服务
+# ColabLLM（Google Colab / Kaggle 云端大模型与工具服务）
 
-在 Google Colab GPU 上运行大模型服务，通过 Cloudflare Tunnel（默认）或 FRP + Caddy 提供公网访问。
-遵循 **“一个服务 = 一个 notebook (`src/colabllm/services/<name>.ipynb`) + 一个执行脚本 (`src/colabllm/services/<name>.py`)”** 的约定。
+在 Google Colab（T4/L4/A100/H100/G4/CPU）与 Kaggle 交互式会话（CPU/GPU/TPU）上运行大模型与工具服务，通过 Cloudflare Tunnel（默认）或 FRP + Caddy 提供公网访问。
+遵循 **“一个服务 = 一个 notebook (`src/colabllm/services/<name>.ipynb` 或 `src/colabllm/kaggle_services/<short_name>.ipynb`) + 一个执行脚本 (`.py`)”** 的约定。
 
 ## 功能实操视频
 
@@ -40,10 +40,14 @@ colabllm comfyui up
 colabllm ollama up --dry-run
 colabllm unlimited-ocr --help
 
-# Kaggle 纯 CPU / 多账户扩展运行时（独立子命令命名空间）
-colabllm kaggle services                  # 列出全部 Kaggle 运行时
-colabllm kaggle web-probe up --quick-tunnel
-colabllm doctor --provider kaggle         # 独立核验 kaggle CLI 与 kaggle-ext 扩展
+# Kaggle 交互式会话运行时（独立子命令命名空间，不依赖 Google Drive）
+colabllm kaggle services                        # 列出全部 Kaggle 运行时
+colabllm kaggle web-probe up --quick-tunnel     # 纯 CPU 探针（不消耗 GPU/TPU 周配额）
+colabllm kaggle -a work web-probe up --domain   # 指定 Kaggle 账户并绑定固定域名 kaggle-web-probe.example.com
+colabllm kaggle web-probe restart               # 原地重启远端 Jupyter 内核并复用 /kaggle/working/.ct-cache
+colabllm kaggle web-probe status --json
+colabllm kaggle web-probe down
+colabllm doctor --provider all                  # 同时核验 Colab 与 Kaggle 本机依赖及账户状态
 
 # 项目级配置与本地控制台/网关也使用同一入口
 colabllm web
@@ -73,7 +77,7 @@ colabllm frp-status
 └── frp/<server-id>.json              # FRP 私密凭据
 ```
 
-`colab`、`cf` 和 `ssh` 的授权/配置仍由各自工具管理；Google Drive 数据仍保存在远端。
+`colab`（含 `colab-ext`）、`kaggle`（含 `kaggle-ext`）、`cf` 和 `ssh` 的授权/配置仍由各自工具管理；Google Drive 数据仍保存在远端。
 卸载使用 `uv tool uninstall colabllm`，用户配置目录保留。
 升级前先停止运行中的服务，升级后重新启动，避免后台 runner 依赖的安装文件被替换。
 
@@ -96,16 +100,19 @@ colabllm <name> down
 rsync -a --chmod=go-rwx ~/.colabllm/ <新电脑>:~/.colabllm/
 
 # 3. 新电脑：安装 colabllm，并完成外部工具授权
-#    colab 登录 + `colab drive consent`；同一 Cloudflare 账号的 `cf` 登录；FRP 后端还需能 SSH 到服务器
+#    colab 登录 + `colab drive consent`；如需 Kaggle 则完成 `kaggle account login`；
+#    同一 Cloudflare 账号的 `cf` 登录；FRP 后端还需能 SSH 到服务器
 colabllm tunnel-config            # 确认主域名与 FRP 配置已带过来
-colabllm doctor
+colabllm doctor --provider all
 
 # 4. 新电脑：启动，域名、API Key 与 FRP 路由保持不变
 colabllm <name> up --domain
+# Kaggle 运行时同理：
+colabllm kaggle web-probe up --domain
 ```
 
 `~/.colabllm/` 中与迁移相关的文件：`tunnel-config.json`（主域名、FRP `project_id`）、`frp/*.json`（FRP 客户端凭据）、
-`services/<name>/state.json`（API Key / 登录密码、隧道与 DNS 记录）。若确实需要两台电脑同时运行同一服务，
+`services/<name>/state.json` 与 `kaggle/services/<name>/state.json`（API Key / 登录密码、隧道与 DNS 记录）。若确实需要两台电脑同时运行同一服务，
 请使用不同实例（如 `-i 2`），它们使用独立的子域名、状态和 Key。
 
 ## 运行时使用指南
@@ -214,6 +221,7 @@ PyPI 上传失败时，GitHub Release 仍可下载；修复身份配置后在 Ac
 - `up --auto-restart`（可选 `--idle-check SECONDS`、`--restart-delay SECONDS`、`--max-restarts N`）开启所有运行时通用的掉线自动拉起守护：监听 `colab exec` 退出（默认 `3s` 后核实）及每 `10s` 公网边缘探针 + `--idle-check`（默认 5 分钟）兜底的 `colab status` 远端核实，网络闪断时直接重连原 VM 并在服务可用时立即恢复 `ready` 状态，VM 被 Colab 回收时立即清理残留会话并按原 GPU 规格重新建卡、挂载 Drive 与恢复服务（固定域名与 `api_token` 不变）；执行 `down` 时正常停止。
 - 同一实例的启动和停止互斥；状态事务使用文件锁和原子替换。前台/后台 runner 都记录进程启动身份，停止前校验身份并等待退出。
 - `down` 先确认远端停止成功，再停止本地连接并清理运行状态；远端停止失败时保留连接和追踪信息，便于重试。
+- **`colabllm kaggle` 运行时约定**：命令形态为 `colabllm kaggle [-a ACCOUNT] <short_name> <命令> [参数...]`（服务与实例组合会话名 `<short_name[-inst]>` 长度上限 `48` 字符）；账户解析遵循 `-a/--account` > `COLABLLM_KAGGLE_ACCOUNT` > `KAGGLE_ACCOUNT` > `kaggle-ext` 当前活动账户，并在 `state.json` 锁定实例归属账户；非 CPU 会话启动前预检每周剩余配额 `remaining_hours > 0.15` 并默认实施宿主机 `--max-uptime 6h` 上限，首次到达 `CT_READY` 前异常、中断或超时会自动调用 `kaggle session stop` 防止遗留孤儿计费会话。
 - 携带认证信息的 HTTP 请求拒绝跨来源重定向。`--url` 或服务 URL 环境变量切换来源时，需要显式提供 Token，不能自动借用原服务的凭据。来源按协议、主机和有效端口比较。
 
 ## 超时与环境诊断
@@ -249,7 +257,7 @@ colabllm doctor --online --timeout 10
 
 ## Shell 补全
 
-命令、选项和枚举值来自实际解析器；实例 ID 从 `~/.colabllm/services/` 的目录名读取，补全过程不读取凭据、不联网。
+命令、选项和枚举值来自实际解析器；实例 ID 从 `~/.colabllm/services/` 与 `~/.colabllm/kaggle/services/` 的目录名读取，同时离线补全 `colabllm kaggle` 运行时名及 `colab-ext` / `kaggle-ext` 账户名；补全过程不读取凭据、不联网。
 
 ```bash
 # Bash：在当前 Shell 加载
@@ -289,14 +297,14 @@ GitHub Actions 在 Linux/macOS、Python 3.12/3.13/3.14 上运行本地测试、�
 
 | 阶段 / 职责 | 执行位置 | 说明 |
 | --- | --- | --- |
-| 创建/复用 Colab 会话 (`colab new`) | 本地脚本 `src/colabllm/services/<name>.py` | 会话名与服务名一致，按选定账户注入 `COLAB_ACCOUNT` 隔离会话 |
-| 免浏览器挂载网盘 (`colab drive mount` / `dfs mount`) | 本地脚本 `src/colabllm/services/<name>.py` | 按账户或共享 `--drive-account` 挂载到 `/content/drive`；自动跳过 notebook 里的 `drive.mount()` |
-| Cloudflare 固定域名 | 本地脚本 (`cf` CLI) | 创建/复用 named tunnel、配置 ingress 和 DNS CNAME；未配置主域名时使用动态 URL |
-| FRP 固定域名 | 本地脚本 (`ssh` + `cf` CLI) | SSH 安装或复用服务端 frps/Caddy，通过 Cloudflare DNS 将域名指向服务器 IP |
-| 密钥生成与注入 | 本地脚本 -> `--env` | 自动生成账号密码与 Bearer Token，保存在 `~/.colabllm/services/<name>/state.json` (0600) |
-| 安装与启动服务 | 远端 `src/colabllm/services/<name>.ipynb` | 幂等安装，服务仅监听 `127.0.0.1` |
-| 安全认证层 (Caddy) | 远端 `src/colabllm/services/<name>.ipynb` | 对无自带认证的服务（如 Ollama）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
-| 启动 `cloudflared` / `frpc` 与保活 | 远端 `src/colabllm/services/<name>.ipynb` | 最后一个 cell 持续阻塞并监控子进程；本地后台进程保持 `colab exec` 连接以防 Colab 回收会话 |
+| 创建/复用远端会话 (`colab new` / `kaggle session create`) | 本地脚本 `services/` 与 `kaggle_services/` | 按选定账户隔离会话：Colab 传递 `COLAB_ACCOUNT`，Kaggle 通过 `--account` 创建私密占位内核 `<username>/kaggle-ext-s-<session>` |
+| 免浏览器挂载网盘（仅 Colab：`colab drive mount`） | 本地脚本 `src/colabllm/services/<name>.py` | Colab 按账户或共享 `--drive-account` 挂载到 `/content/drive`；Kaggle 不挂载 Google Drive，改用容器内 `/kaggle/working/.ct-cache` 持久化二进制缓存 |
+| Cloudflare 固定域名 | 本地脚本 (`cf` CLI) | 创建/复用 named tunnel、配置 ingress 与 DNS CNAME（Colab 前缀 `colabsvc`，Kaggle 前缀 `kagglesvc` 与 `kaggle-<alias>` 子域名）；未配置主域名时使用动态 URL |
+| FRP 固定域名 | 本地脚本 (`ssh` + `cf` CLI) | SSH 安装或复用服务端 `frps`/Caddy，通过 Cloudflare DNS 将域名指向服务器 IP（共享 `frps` 按平台隔离前缀 `colabsvc-frp` / `kagglesvc-frp`） |
+| 密钥生成与注入 | 本地脚本 -> `--env` / `0600 runtime.env` | 自动生成账号密码与 Bearer Token 并写入各自 `state.json` (0600)；Kaggle 通过 `--env-file` 静默注入 Kernel 内存，不在云端 Notebook 落盘明文凭据 |
+| 安装与启动服务 | 远端 `services/*.ipynb` 与 `kaggle_services/*.ipynb` | 幂等安装，服务仅监听 `127.0.0.1`；Kaggle 将含密钥配置隔离于 `/tmp/ct-runtime` (`0700`)，二进制缓存隔离于 `/kaggle/working/.ct-cache/bin/` |
+| 安全认证层 (Caddy) | 远端 Notebook | 对无自带认证的服务（如 Ollama、`web-probe`）前置 Caddy：浏览器走 Basic Auth，API 走 `Authorization: Bearer <token>` |
+| 隧道拉起与跨平台保活 (`MuxDaemon`) | 远端 Notebook + 本机单进程 `MuxDaemon` | 远端阻塞监控子进程并触发 `CT_READY`；本机默认通过共享 `MuxDaemon` 原生纯标准库 WebSocket 维持 Colab/Kaggle 保活与看门狗重连（稳态零常驻外部 CLI 子进程） |
 
 ## 各运行时使用文档
 
@@ -389,21 +397,23 @@ colabllm gateway --stop
 
 ## 本地环境与前置准备
 
-本机负责创建 Colab 会话、配置隧道、挂载网盘和维持后台连接；模型在远端运行，**本机无需 GPU、CUDA、PyTorch 或模型权重**。
+本机负责创建 Colab / Kaggle 远端会话、配置隧道、挂载网盘（Colab）和维持后台连接；模型在远端运行，**本机无需 GPU、CUDA、PyTorch 或模型权重**。
 
 ### 必需与可选依赖
 
 | 本机环境 / 工具 | 何时需要 | 说明 |
 | --- | --- | --- |
-| Linux 或 macOS | 必需 | Colab CLI 当前支持的平台；本项目后台进程管理也使用 Unix 进程组 |
-| Python 3.12+ | 必需 | 执行 `src/colabllm/services/*.py`、`src/colabllm/control.py`，满足 `google-colab-cli` 的 Python 要求 |
-| `uv` | 包安装与升级 | 隔离安装 colabllm 和 Colab CLI；Git 仅开发时需要 |
-| `colab` CLI | 必需 | PyPI 包 `google-colab-cli`，用于会话、文件操作及执行 Notebook |
-| `colab-ext` 扩展 | 默认网盘及多账户必需 | [colab-ext](https://github.com/deluxebear/colab-ext)，提供 `drive`（兼容别名 `dfs`）、多账户 `account` 与 `-a`、`ext doctor`；需单独安装 |
+| Linux 或 macOS | 必需 | Colab / Kaggle CLI 当前支持的平台；本项目后台进程管理也使用 Unix 进程组 |
+| Python 3.12+ | 必需 | 执行 `src/colabllm/services/*.py`、`kaggle_services/*.py` 与 `control.py` |
+| `uv` | 包安装与升级 | 隔离安装 `colabllm`、Colab CLI 和 Kaggle CLI；Git 仅开发时需要 |
+| `colab` CLI | 使用 Colab 运行时必需 | PyPI 包 `google-colab-cli`，用于 Colab 会话、文件操作及执行 Notebook |
+| `colab-ext` 扩展 | Colab 网盘及多账户必需 | [colab-ext](https://github.com/deluxebear/colab-ext)，提供 `drive`（兼容别名 `dfs`）、多账户 `account` 与 `-a`、`ext doctor`；需单独安装 |
+| `kaggle` CLI | 使用 Kaggle 运行时必需 | PyPI 包 `kaggle`（`uv tool install kaggle`），提供底层 Kaggle API 客户端 |
+| `kaggle-ext` 扩展 | 使用 Kaggle 运行时必需 | [kaggle-ext](https://github.com/deluxebear/kaggle-ext)，非侵入式扩展多账户 `kaggle account`、交互式会话 `kaggle session` 与 `kaggle ext doctor`；需单独安装 |
 | Node.js、npm、Cloudflare `cf` CLI | 固定域名或 FRP 模式 | 本机调用 Cloudflare API 管理 DNS；Cloudflare named tunnel 也由它配置。Quick Tunnel 不需要它 |
 | OpenSSH 客户端 `ssh` | FRP 模式；或 Colab SSH 排错 | 用于连接 FRP 服务器，复用 `~/.ssh/config` 的密钥、端口和跳板配置 |
 
-准备可使用所需 GPU 运行时的 Google/Colab 账号，以及有可用空间的 Google Drive。GPU 配额、计算单元余额和机型可用性以账号当前状态为准。首次 Google、Drive 和 Cloudflare 授权需要浏览器完成。
+使用 Colab 服务需准备可用账号及 Google Drive；使用 Kaggle 服务需准备已认证的 Kaggle 账号（每个账号通常有每周 GPU `30h` / TPU `20h` 独立配额）。首次 Google、Drive、Kaggle OAuth 和 Cloudflare 授权通常需要浏览器完成。
 
 ### 1. 安装 Colab CLI
 
@@ -491,7 +501,40 @@ colabllm ollama ps
 
 > 说明：在 `minimax-h3-image` 的 `generate` / `edit` 等生图子命令中短参数 `-a` 已用于 `--aspect`（宽高比）；若需在业务子命令前置指定账户，请统一使用长参数 `--account <账户>`（例如 `colabllm nemotron-transcribe --account gpu2 ls-drive`），而在 `up` 与 `doctor` 子命令中 `-a` 与 `--account` 均可直接使用。
 
-### 3. 安装 Cloudflare `cf` CLI
+### 3. 安装并授权 Kaggle CLI 与 `kaggle-ext` 扩展（使用 Kaggle 运行时时）
+
+仅使用 Google Colab 运行时可跳过本节；若要通过 `colabllm kaggle ...` 运行 Kaggle 会话并在 `colabllm web` 中纳管 Kaggle 多账户周配额，需在本机安装官方 [`kaggle`](https://pypi.org/project/kaggle/) CLI 与非侵入式扩展 [deluxebear/kaggle-ext](https://github.com/deluxebear/kaggle-ext)：
+
+```bash
+# 1. 安装官方 kaggle CLI（uv 隔离环境）
+uv tool install kaggle
+uv tool update-shell
+kaggle --version
+
+# 2. 安装 kaggle-ext 扩展（挂载 kaggle account / kaggle session / kaggle ext）
+curl -fsSL https://raw.githubusercontent.com/deluxebear/kaggle-ext/main/install.sh | sh
+kaggle ext version
+kaggle ext doctor
+```
+
+详细选项见 [kaggle-ext 中文说明](https://github.com/deluxebear/kaggle-ext/blob/main/README.zh-CN.md)。扩展源码保存在 `~/.kaggle-ext/`，通过 `kaggle_ext.pth` 无侵入接入 `kaggle` 工具环境（升级 `uv tool upgrade kaggle` 后可执行 `python3 "$HOME/.kaggle-ext/install.py"` 重新挂接）。多账户与 OAuth / Token 凭据保存在 `~/.config/kaggle-ext/accounts/<账户名>/`（索引文件 `~/.config/kaggle-ext/accounts.json`）：
+
+```bash
+# 登录主账户（默认 browser OAuth；无桌面环境可用 --no-launch-browser 或 --token KGAT_...）
+kaggle account login default
+# 若需追加多个 Kaggle 账户以轮换每周 GPU (30h) / TPU (20h) 配额
+kaggle account add work
+kaggle account list                    # 离线列出本机已配置账户
+kaggle account status                  # 并发核验全部账户认证及每周 GPU/TPU 剩余配额
+kaggle account use work                # 切换默认活动账户（已运行的 colabllm 实例仍锁定原账户）
+
+# 使用 colabllm doctor 端到端校验 Kaggle 依赖与扩展状态
+colabllm doctor --provider kaggle --online --timeout 10
+```
+
+本机已验证基线为 `kaggle 2.2.5` 与 `kaggle-ext 0.4.0`。
+
+### 4. 安装 Cloudflare `cf` CLI
 
 使用固定域名时，无论选择 Cloudflare Tunnel 还是 FRP，都需要在**本机**安装并授权 `cf`。这里的 `cf` 是 Cloudflare CLI，不是 Cloud Foundry CLI，也不是远端运行的 `cloudflared`。
 
@@ -508,9 +551,9 @@ cf auth whoami
 
 安装和认证说明见 [Cloudflare 官方文档](https://developers.cloudflare.com/cf/get-started/)。账号需有目标域名的 Zone/DNS 管理权限；使用 named tunnel 时还需有隧道管理权限。`cf zones list` 可检查域名是否在当前账号中。只使用 Cloudflare 动态 URL 时，可跳过本节。
 
-本机已验证的组合为 `google-colab-cli 0.7.5`、`colab-ext 0.3.0`、`cf 1.0.0-beta.26` 和 Node.js `26.13.0`。其中该 `cf` 版本的 Node.js 要求为 `^22.23.0 || ^24.22.0 || ^26.12.0`；升级版本时以 npm 包的 `engines` 声明为准，避免仅按大版本判断兼容性。
+本机已验证的组合为 `google-colab-cli 0.7.5`、`colab-ext 0.3.0`、`kaggle 2.2.5`、`kaggle-ext 0.4.0`、`cf 1.0.0-beta.26` 和 Node.js `26.13.0`。其中该 `cf` 版本的 Node.js 要求为 `^22.23.0 || ^24.22.0 || ^26.12.0`；升级版本时以 npm 包的 `engines` 声明为准，避免仅按大版本判断兼容性。
 
-### 4. FRP 模式额外要求
+### 5. FRP 模式额外要求
 
 本机需要 OpenSSH，以及能够非交互连接服务器的密钥配置：
 
@@ -527,22 +570,25 @@ ssh -o BatchMode=yes root@frpip 'id -u'
 
 ```bash
 python3 --version
-command -v colab
-colab version
+# Colab 模式检查
+command -v colab && colab version
 colab ext doctor
 colab drive show
 colab account list
+# Kaggle 模式检查（如启用）
+command -v kaggle && kaggle --version
+kaggle ext doctor
+kaggle account status
+# 统一配置、域名与全平台体检
 colabllm tunnel-config
+colabllm doctor --provider all
 # 固定域名 / FRP 模式还需检查
-command -v cf
-cf --version
-cf auth whoami
-# FRP 模式还需检查
+command -v cf && cf auth whoami
 ssh -V
 colabllm frp-status
 ```
 
-认证文件保存在本机用户目录，运行时状态保存在用户目录 `~/.colabllm/services/`。执行脚本的本机需要持续在线且避免休眠：后台 runner 维持 `colab exec` 连接，断开可能导致 Colab 会话被回收。远端所需模型依赖、`cloudflared`/`frpc` 和认证 Caddy 由 Notebook 安装，不需要在本机重复安装。
+认证文件保存在本机用户目录，运行时状态保存在 `~/.colabllm/services/`（Colab）与 `~/.colabllm/kaggle/services/`（Kaggle）。执行脚本的本机需要持续在线且避免休眠：后台 runner 维持远端 WebSocket 保活连接，断开可能导致远端会话超时回收或无法及时释放 Kaggle 计费会话。远端所需模型依赖、`cloudflared`/`frpc` 和认证 Caddy 由 Notebook 安装，不需要在本机重复安装。
 
 ## Cloudflare Tunnel 配置
 
@@ -615,9 +661,53 @@ colabllm ollama down
 colabllm ollama down --delete-tunnel
 ```
 
+## Kaggle 运行时使用说明 (`colabllm kaggle`)
+
+Kaggle 运行时统一放在 `colabllm kaggle <short_name> <命令>` 子命令命名空间下，与 Colab 共享同一套全局域名（`tunnel-config` / `frp-config`）、本地 `MuxDaemon` 单进程 WebSocket 保活架构，以及 `colabllm web` / `colabllm doctor` 管理面板。详细设计见 [Kaggle 运行时架构设计](https://github.com/deluxebear/colabllm/blob/master/docs/designs/kaggle-runtime.md)，当前随包提供的 `web-probe` 用法见 [Kaggle 探针指南](https://github.com/deluxebear/colabllm/blob/master/docs/kaggle-web-probe.md)。
+
+### 1. 常用生命周期与内核重启
+
+以随包分发的纯 CPU 连通性与缓存探针 `web-probe`（不消耗 GPU/TPU 周配额）为例：
+
+```bash
+# 查看可用 Kaggle 运行时与本地预览执行计划
+colabllm kaggle services
+colabllm kaggle web-probe up --dry-run --quick-tunnel -i chk
+
+# 启动并暴露到公网（默认 Cloudflare 固定域名，自动生成 kaggle-web-probe.example.com；也支持 --quick-tunnel 或 --transport frp）
+colabllm kaggle web-probe up --quick-tunnel
+colabllm kaggle -a work web-probe up -i 2 --domain --auto-restart    # 指定 Kaggle 账户 work + 实例 2 + 守护重连
+colabllm kaggle web-probe up --auto-restart --max-restarts 0        # 仅断线重附，不自动重建新容器
+
+# 在不清除 /kaggle/working/.ct-cache 二进制缓存的前提下安全重启远端 Jupyter 内核
+colabllm kaggle web-probe restart
+
+# 查询状态、公网/凭据详情、实时日志与所有实例
+colabllm kaggle web-probe status --json
+colabllm kaggle web-probe info --json --show-secrets
+colabllm kaggle web-probe logs -f
+colabllm kaggle web-probe ps
+
+# 停止并释放远端 Kaggle 交互式会话（自动清除 runtime.env；--delete-tunnel 同步清理 DNS/FRP 路由）
+colabllm kaggle web-probe down
+colabllm kaggle web-probe down --delete-tunnel
+colabllm kaggle web-probe down --all
+```
+
+### 2. Kaggle 与 Colab 运行时的关键差异
+
+| 维度 | Google Colab (`colabllm <name>`) | Kaggle (`colabllm kaggle <short_name>`) |
+| --- | --- | --- |
+| **命令与全局标识** | `colabllm <name> <subcmd>`；Web/网关全局键 `<name>` | `colabllm kaggle <short_name> <subcmd>`；Web/网关全局键 `kaggle-<short_name>` |
+| **状态目录与会话长度** | `~/.colabllm/services/<session>/`（实例后缀最多 64 字符） | `~/.colabllm/kaggle/services/<session>/`（`<short_name[-inst]>` 总长 `<= 48` 字符） |
+| **固定域名与隧道隔离** | 隧道 `colab-<session>`；DNS 注释 `colabsvc`；域名 `<alias>.example.com` | 隧道 `kaggle-<session>`；DNS 注释 `kagglesvc`；自动前缀 `kaggle-<alias>.example.com`（与 Colab 共享主域名与 FRP 无冲突） |
+| **存储与凭据安全** | 自动免浏览器挂载 `/content/drive` | **不挂载 Google Drive**；容器内严格划分 `/kaggle/working/.ct-cache`（持久化二进制 + SHA-256 清单，支持 `restart` 缓存命中）与 `/tmp/ct-runtime`（`0700`/`0600` 易失密钥区），通过本机 `0600` `runtime.env` 经 WebSocket 注入 Kernel 内存，云端占位 Notebook 零明文留存 |
+| **配额门禁与防孤儿保护** | `colab exec` 断连后 VM 由平台自动回收；默认按 Colab 账户 CCU 运行 | Kaggle 交互式会话在宿主机断连后仍继续消耗每周配额，因此宿主机对非 CPU 会话前置要求周配额 `remaining_hours > 0.15`、统一启用 `--max-uptime 6h` 上限，且首次 `CT_READY` 前失败/`SIGINT`/`SIGTERM` 自动执行 `kaggle session stop`；`--auto-restart` 按 `live_state`（`running` / `unreachable` / `reclaimed`）四分支恢复 |
+| **控制台与网关接入** | 全部服务纳入 `colabllm web`；兼容模型接入 `colabllm gateway` | `colabllm web` 纳管 Kaggle 实例、周配额面板、`restart` 内核重启与 AI 演练场 `kaggle-web-probe` 探针面板（按需禁用无意义的 Drive 导入控件）；纯诊断服务 `web-probe` 保持 `gateway_enabled=False` |
+
 ## 多实例（多会话）并发支持（所有运行时通用）
 
-所有运行时脚本（`nemotron-transcribe.py`、`comfyui.py`、`qwen-flash.py`、`ollama.py`、`unsloth-studio.py` 以及 `templates/service.py`）均原生支持通过 **`-i <ID>` / `--instance <ID>`**（或环境变量 `CT_INSTANCE=<ID>`）创建和管理多个独立的 Colab GPU 会话与隧道：
+所有运行时脚本（`nemotron-transcribe.py`、`comfyui.py`、`qwen-flash.py`、`ollama.py`、`unsloth-studio.py`、`templates/service.py` 以及 Kaggle 运行时 `kaggle_services/*.py`）均原生支持通过 **`-i <ID>` / `--instance <ID>`**（或环境变量 `CT_INSTANCE=<ID>`）创建和管理多个独立的远端会话与隧道（Kaggle 组合会话名 `<short_name>-<ID>` 须 `<= 48` 字符）：
 
 | 实例参数 | Colab 会话名 (`-s`) | 状态目录 (`~/.colabllm/services/`) | 隧道名 (`--domain`) | 默认域名 (`--domain`) | 网盘共享目录 (`CT_DATA_DIR`) |
 | --- | --- | --- | --- | --- | --- |
@@ -633,9 +723,11 @@ colabllm qwen-flash up -i 2 --domain            # -> https://qwen-2.example.com
 colabllm ollama up -i 2 --domain                # -> https://ollama-2.example.com
 colabllm unsloth-studio up -i 2 --domain        # -> https://unsloth-studio-2.example.com
 colabllm nemotron-transcribe up -i 2 --domain   # -> https://transcribe-2.example.com
+colabllm kaggle web-probe up -i 2 -a work --domain # -> https://kaggle-web-probe-2.example.com（使用 work 账户）
 
 # 列出某个服务的所有实例状态、URL 与 API Token
 colabllm <name> ps
+colabllm kaggle <short_name> ps
 
 # 查看指定实例的详情 / 日志 / 状态
 colabllm <name> info --show-secrets -i 2
@@ -645,6 +737,7 @@ colabllm <name> status -i 2
 # 停止指定实例，或使用 --all 一键停止该服务的所有实例
 colabllm <name> down -i 2
 colabllm <name> down --all
+colabllm kaggle <short_name> down --all
 ```
 
 ## 新增一个大模型服务
@@ -660,6 +753,7 @@ colabllm <name> down --all
 4. 先运行 `colabllm <name> up --dry-run` 检查执行计划，再正式运行 `up`。
 5. 同一变更中更新 `docs/<name>.md`，运行 `python tools/sync_runtime_docs.py` 生成对应的技能参考文档，并更新 `skills/colabllm/SKILL.md` 的运行时索引，覆盖启动、调用、输入输出、认证和任务恢复。新增、删除运行时或修改命令行为都需要同步维护用户技能。
 6. 核对技能示例与实际 CLI 参数一致，构建分发包，并用 `tools/check_distribution.py` 验证安装、运行时发现和完整技能导出；新增文件类型时同步调整打包规则。运行时及其用户技能均可从安装包使用后，才算完成新增流程。
+7. 若新增 Kaggle 运行时，配对脚本与 Notebook 置于 `src/colabllm/kaggle_services/<short_name>.{py,ipynb}`，文档置于 `docs/kaggle-<short_name>.md`，并遵循 `runtime_core.KAGGLE_NAMESPACE` 与双区存储规范（详见[Kaggle 运行时架构设计](https://github.com/deluxebear/colabllm/blob/master/docs/designs/kaggle-runtime.md)）。
 
 详细规范与排错指南见 [`.agents/skills/colab-llm-service/SKILL.md`](https://github.com/deluxebear/colabllm/blob/master/.agents/skills/colab-llm-service/SKILL.md)。
 
