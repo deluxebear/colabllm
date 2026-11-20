@@ -65,6 +65,46 @@ BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 MAX_REFERENCE_IMAGES = 4
 DIM_ALIGNMENT = 32
 DRIVE_PREFIXES = ("drive://", "gdrive://", "MyDrive/", "/content/drive/")
+DEFAULT_VARIANT = "official"
+
+MODEL_VARIANTS: dict[str, dict[str, Any]] = {
+    "official": {
+        "label": "Official Qwen-Image-2.1 (BF16)",
+        "description": (
+            "Alibaba Qwen/Qwen-Image-2.1 official checkpoint "
+            "(40 steps, true_cfg_scale=1.0 / 4.0 with negative prompt, VAE tiling enabled)"
+        ),
+        "base_repo": "Qwen/Qwen-Image-2.1",
+        "alias": "qwen-image-2.1",
+        "transformer_repo": "",
+        "transformer_subfolder": "",
+        "local_dir_name": "Qwen-Image-2.1",
+        "vae_tiling": True,
+        "default_steps": 40,
+        "default_true_cfg_no_neg": 1.0,
+        "default_true_cfg_with_neg": 4.0,
+        "default_negative_prompt": "",
+        "lora_backend": "peft",
+    },
+    "uncensored": {
+        "label": "ChatR Labs Qwen-Image-2.1 Uncensored Omni (Step 90,000 BF16)",
+        "description": (
+            "ChatR Labs Omni rank-128 merged BF16 full transformer (step 90,000) on Qwen/Qwen-Image-2.1 base "
+            "(35 steps, true_cfg_scale=5.0 + single-space negative prompt, VAE tiling disabled)"
+        ),
+        "base_repo": "Qwen/Qwen-Image-2.1",
+        "alias": "qwen-image-2.1-uncensored",
+        "transformer_repo": "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+        "transformer_subfolder": "qwen-image-2.1-step90000-BF16",
+        "local_dir_name": "Qwen-Image-2.1-Uncensored-Omni-Step90000",
+        "vae_tiling": False,
+        "default_steps": 35,
+        "default_true_cfg_no_neg": 5.0,
+        "default_true_cfg_with_neg": 5.0,
+        "default_negative_prompt": " ",
+        "lora_backend": "peft",
+    },
+}
 
 MIME_BY_EXT = {
     ".png": "image/png",
@@ -77,6 +117,8 @@ MIME_BY_EXT = {
     ".tif": "image/tiff",
 }
 
+_DEFAULT_VSPEC = MODEL_VARIANTS[DEFAULT_VARIANT]
+
 SERVICE = Service(
     name="qwen-image",
     notebook="qwen-image.ipynb",
@@ -88,26 +130,33 @@ SERVICE = Service(
     default_hostname="qwen-image",
     ready_timeout=3600,
     env={
-        "CT_QWEN_IMAGE_MODEL": "Qwen/Qwen-Image-2.1",
-        "CT_QWEN_IMAGE_ALIAS": "qwen-image-2.1",
+        "CT_QWEN_IMAGE_VARIANT": DEFAULT_VARIANT,
+        "CT_QWEN_IMAGE_MODEL": str(_DEFAULT_VSPEC["base_repo"]),
+        "CT_QWEN_IMAGE_ALIAS": str(_DEFAULT_VSPEC["alias"]),
+        "CT_QWEN_IMAGE_TRANSFORMER_REPO": str(_DEFAULT_VSPEC["transformer_repo"]),
+        "CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER": str(_DEFAULT_VSPEC["transformer_subfolder"]),
         "CT_QWEN_IMAGE_QUANTIZATION": "none",
         "CT_QWEN_IMAGE_PREFIX_KV_DTYPE": "auto",
         "CT_QWEN_IMAGE_STEP_EXECUTION": "0",
-        "CT_QWEN_IMAGE_VAE_TILING": "1",
+        "CT_QWEN_IMAGE_VAE_TILING": "1" if _DEFAULT_VSPEC["vae_tiling"] else "0",
         "CT_QWEN_IMAGE_MAX_NUM_SEQS": "",
         "CT_QWEN_IMAGE_LORA_PATH": "",
         "CT_QWEN_IMAGE_LORA_SCALE": "1.0",
+        "CT_QWEN_IMAGE_LORA_BACKEND": str(_DEFAULT_VSPEC["lora_backend"]),
     },
 )
 
 UP_ENV_FLAGS = {
     "--model": "CT_QWEN_IMAGE_MODEL",
     "--alias": "CT_QWEN_IMAGE_ALIAS",
+    "--transformer-repo": "CT_QWEN_IMAGE_TRANSFORMER_REPO",
+    "--transformer-subfolder": "CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER",
     "--quantization": "CT_QWEN_IMAGE_QUANTIZATION",
     "--prefix-kv-dtype": "CT_QWEN_IMAGE_PREFIX_KV_DTYPE",
     "--max-num-seqs": "CT_QWEN_IMAGE_MAX_NUM_SEQS",
     "--lora-path": "CT_QWEN_IMAGE_LORA_PATH",
     "--lora-scale": "CT_QWEN_IMAGE_LORA_SCALE",
+    "--lora-backend": "CT_QWEN_IMAGE_LORA_BACKEND",
 }
 _BASE_ENV = dict(SERVICE.env)
 
@@ -373,17 +422,15 @@ def _build_lora_dict(args: argparse.Namespace) -> dict[str, Any] | None:
 def _apply_common_sampling(payload: dict[str, Any], args: argparse.Namespace) -> None:
     if args.seed is not None:
         payload["seed"] = int(args.seed)
-    steps = args.steps if args.steps is not None else 40
-    payload["num_inference_steps"] = int(steps)
+    if args.steps is not None:
+        payload["num_inference_steps"] = int(args.steps)
 
-    neg = (args.negative_prompt or "").strip()
-    if neg:
+    neg = args.negative_prompt
+    if neg is not None and len(neg) > 0:
         payload["negative_prompt"] = neg
 
     if args.true_cfg_scale is not None:
         payload["true_cfg_scale"] = float(args.true_cfg_scale)
-    else:
-        payload["true_cfg_scale"] = 4.0 if neg else 1.0
 
     if getattr(args, "rgba", False):
         payload["color_format"] = "RGBA"
@@ -586,6 +633,30 @@ def cmd_ls_drive(args: argparse.Namespace) -> None:
         print(f"  {item.get('rel_path', item.get('drive_path'))}  [{item.get('type', 'image')}, {item.get('size_mb', 0):.2f} MB]")
 
 
+def cmd_variants(args: argparse.Namespace) -> None:
+    payload = {
+        "default_variant": DEFAULT_VARIANT,
+        "variants": [
+            {"name": name, "default": name == DEFAULT_VARIANT, **spec}
+            for name, spec in MODEL_VARIANTS.items()
+        ],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    for name, spec in MODEL_VARIANTS.items():
+        marker = " (default)" if name == DEFAULT_VARIANT else ""
+        tf = f"{spec['transformer_repo']}/{spec['transformer_subfolder']}".strip("/") if spec["transformer_repo"] else "base"
+        neg = repr(spec["default_negative_prompt"]) if spec["default_negative_prompt"] else "none"
+        print(
+            f"{name}{marker}: {spec['label']}\n"
+            f"  base={spec['base_repo']}  transformer={tf}  alias={spec['alias']}\n"
+            f"  defaults: steps={spec['default_steps']}  cfg={spec['default_true_cfg_no_neg']}/{spec['default_true_cfg_with_neg']}  "
+            f"neg_prompt={neg}  vae_tiling={spec['vae_tiling']}\n"
+            f"  {spec['description']}"
+        )
+
+
 def cmd_models(args: argparse.Namespace) -> None:
     base_url, token = _get_endpoint(args.url, args.api_token)
     code_i, info_res, _ = _http_json(f"{base_url}/api/ct/info", token, timeout=30)
@@ -597,7 +668,13 @@ def cmd_models(args: argparse.Namespace) -> None:
         print(json.dumps(combined, indent=2, ensure_ascii=False))
         return
     print(f"Service:            {info_res.get('service', 'qwen-image')}")
+    if info_res.get("variant"):
+        lbl = info_res.get("variant_label")
+        v_str = f"{info_res['variant']} ({lbl})" if lbl else str(info_res["variant"])
+        print(f"Variant:            {v_str}")
     print(f"Model repo:         {info_res.get('model_repo')}")
+    if info_res.get("transformer_repo"):
+        print(f"Transformer:        {info_res.get('transformer_repo')}")
     print(f"Served names:       {', '.join(combined['models'] or info_res.get('served_models') or [])}")
     print(
         f"Engine config:      quant={info_res.get('quantization')} "
@@ -606,13 +683,19 @@ def cmd_models(args: argparse.Namespace) -> None:
         f"max_num_seqs={info_res.get('max_num_seqs')} "
         f"vae_tiling={info_res.get('vae_use_tiling')}"
     )
+    def_neg = info_res.get("default_negative_prompt")
+    neg_desc = f" default_neg_prompt={def_neg!r}" if def_neg else ""
     print(
         f"Default sampling:   steps={info_res.get('default_steps')} "
         f"true_cfg_scale={info_res.get('default_true_cfg_scale')} "
-        f"(with neg prompt: {info_res.get('default_true_cfg_scale_with_negative_prompt')}) "
+        f"(with neg prompt: {info_res.get('default_true_cfg_scale_with_negative_prompt')})"
+        f"{neg_desc} "
         f"rgba_vae={info_res.get('rgba_vae')} max_refs={info_res.get('max_reference_images')}"
     )
-    print(f"Preloaded LoRA:     {info_res.get('preloaded_lora') or 'none'}")
+    lora_line = info_res.get("preloaded_lora") or "none"
+    if info_res.get("lora_backend"):
+        lora_line += f" (backend={info_res['lora_backend']})"
+    print(f"Preloaded LoRA:     {lora_line}")
     print(f"Drive inputs dir:   {info_res.get('drive_inputs_dir')}")
     print(f"Drive outputs dir:  {info_res.get('drive_outputs_dir')}")
     print(f"Drive loras dir:    {info_res.get('drive_loras_dir')}")
@@ -635,14 +718,23 @@ def _add_generation_common_flags(p: argparse.ArgumentParser, *, is_edit: bool) -
     p.add_argument("--size", help=size_help)
     p.add_argument("--width", type=int, help="Output width in pixels (aligned to multiple of 32)")
     p.add_argument("--height", type=int, help="Output height in pixels (aligned to multiple of 32)")
-    p.add_argument("--steps", type=int, default=40, help="Sampling steps (Qwen-Image-2.1 default: 40)")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Sampling steps (defaults to active server variant: 40 for official, 35 for uncensored)",
+    )
     p.add_argument(
         "--true-cfg-scale", "--cfg-scale",
         dest="true_cfg_scale",
         type=float,
-        help="True CFG scale (default: 1.0 when --negative-prompt is empty, 4.0 when --negative-prompt is given)",
+        help="True CFG scale (defaults to active server variant: 1.0/4.0 for official, 5.0 for uncensored)",
     )
-    p.add_argument("--negative-prompt", default="", help="Negative prompt (engages True CFG when non-empty)")
+    p.add_argument(
+        "--negative-prompt",
+        default=None,
+        help="Negative prompt (defaults to active server variant; uncensored auto-injects ' ' for True CFG)",
+    )
     p.add_argument("--rgba", action="store_true", help="Preserve / generate 4-channel RGBA PNG transparency")
     p.add_argument("--color-format", choices=("RGBA", "RGB"), help="Output color channels: RGBA (4ch default) or RGB (3ch)")
     p.add_argument("--background", choices=("auto", "transparent", "opaque"), help="OpenAI Images background hint")
@@ -733,18 +825,40 @@ def _build_custom_parser(_parser: argparse.ArgumentParser, sub: Any) -> None:
     mp.add_argument("--json", action="store_true", help="Print raw JSON response")
     _add_endpoint_flags(mp)
 
+    vp = sub.add_parser("variants", help="List available Qwen-Image-2.1 model variants (--variant / --preset)")
+    vp.add_argument("--json", action="store_true", help="Print variants registry as JSON")
+
 
 def configure_cli(parser: argparse.ArgumentParser, commands: Any, up: argparse.ArgumentParser) -> None:
     _build_custom_parser(parser, commands)
+    variant_help = "Model variant preset (default: official). Choices: " + "; ".join(
+        f"{name}: {spec['description']}" for name, spec in MODEL_VARIANTS.items()
+    )
+    up.add_argument(
+        "--variant", "--preset",
+        dest="up_CT_QWEN_IMAGE_VARIANT",
+        choices=tuple(MODEL_VARIANTS),
+        help=variant_help,
+    )
     up.add_argument(
         "--model",
         dest="up_CT_QWEN_IMAGE_MODEL",
-        help="Hugging Face repo (default: Qwen/Qwen-Image-2.1)",
+        help="Override base Hugging Face repo (default comes from --variant, e.g. Qwen/Qwen-Image-2.1)",
     )
     up.add_argument(
         "--alias",
         dest="up_CT_QWEN_IMAGE_ALIAS",
-        help="Served model alias (default: qwen-image-2.1)",
+        help="Override served model alias (default comes from --variant)",
+    )
+    up.add_argument(
+        "--transformer-repo",
+        dest="up_CT_QWEN_IMAGE_TRANSFORMER_REPO",
+        help="Optional Hugging Face repo containing a drop-in Qwen-Image-2.1 transformer override",
+    )
+    up.add_argument(
+        "--transformer-subfolder",
+        dest="up_CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER",
+        help="Optional subfolder inside --transformer-repo (e.g. qwen-image-2.1-step90000-BF16)",
     )
     up.add_argument(
         "--quantization",
@@ -774,11 +888,18 @@ def configure_cli(parser: argparse.ArgumentParser, commands: Any, up: argparse.A
         type=int,
         help="Max concurrent sequences in the diffusion engine (default: 4 in request mode, 8 with --step-execution)",
     )
-    up.add_argument(
+    tiling_grp = up.add_mutually_exclusive_group()
+    tiling_grp.add_argument(
+        "--vae-tiling",
+        dest="up_vae_tiling",
+        action="store_true",
+        help="Force-enable --vae-use-tiling (recommended on 40 GB A100; default for official)",
+    )
+    tiling_grp.add_argument(
         "--no-vae-tiling",
         dest="up_no_vae_tiling",
         action="store_true",
-        help="Disable default --vae-use-tiling (512px tile / 384px stride adaptive OOM protection)",
+        help="Force-disable --vae-use-tiling (default for uncensored to avoid vertical colour streaks)",
     )
     up.add_argument(
         "--lora-path",
@@ -790,17 +911,37 @@ def configure_cli(parser: argparse.ArgumentParser, commands: Any, up: argparse.A
         dest="up_CT_QWEN_IMAGE_LORA_SCALE",
         help="Default scale for preloaded LoRA adapter (default: 1.0)",
     )
+    up.add_argument(
+        "--lora-backend",
+        dest="up_CT_QWEN_IMAGE_LORA_BACKEND",
+        choices=("peft", "distill"),
+        help="Preloaded LoRA backend: peft (default dynamic adapter dir) or distill (fuse single .safetensors at init)",
+    )
 
 
 def prepare_up(args: argparse.Namespace) -> None:
     SERVICE.env.clear()
     SERVICE.env.update(_BASE_ENV)
+    raw_variant = getattr(args, "up_CT_QWEN_IMAGE_VARIANT", None)
+    variant = (str(raw_variant).strip().lower() if raw_variant is not None else "") or DEFAULT_VARIANT
+    if variant not in MODEL_VARIANTS:
+        raise UsageError(f"Unknown --variant {variant!r}; expected one of: {', '.join(MODEL_VARIANTS)}")
+    vspec = MODEL_VARIANTS[variant]
+    SERVICE.env["CT_QWEN_IMAGE_VARIANT"] = variant
+    SERVICE.env["CT_QWEN_IMAGE_MODEL"] = str(vspec["base_repo"])
+    SERVICE.env["CT_QWEN_IMAGE_ALIAS"] = str(vspec["alias"])
+    SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_REPO"] = str(vspec["transformer_repo"])
+    SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER"] = str(vspec["transformer_subfolder"])
+    SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"] = "1" if vspec["vae_tiling"] else "0"
+    SERVICE.env["CT_QWEN_IMAGE_LORA_BACKEND"] = str(vspec["lora_backend"])
     for _flag, env_key in UP_ENV_FLAGS.items():
         val = getattr(args, "up_" + env_key, None)
         if val is not None:
             SERVICE.env[env_key] = str(val)
     if getattr(args, "up_step_execution", False):
         SERVICE.env["CT_QWEN_IMAGE_STEP_EXECUTION"] = "1"
+    if getattr(args, "up_vae_tiling", False):
+        SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"] = "1"
     if getattr(args, "up_no_vae_tiling", False):
         SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"] = "0"
 
@@ -820,6 +961,7 @@ if __name__ == "__main__":
                 "i2i": cmd_edit,
                 "ls-drive": cmd_ls_drive,
                 "models": cmd_models,
+                "variants": cmd_variants,
             },
         )
     )

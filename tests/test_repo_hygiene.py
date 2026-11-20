@@ -104,6 +104,18 @@ class RepoHygieneTest(unittest.TestCase):
         h3_image.prepare_up(types.SimpleNamespace())
         self.assertEqual(h3_image.SERVICE.env, h3_baseline)
 
+        qwen_img = load_service("qwen-image")
+        qi_baseline = dict(qwen_img.SERVICE.env)
+        qwen_img.prepare_up(types.SimpleNamespace(up_CT_QWEN_IMAGE_VARIANT="uncensored", up_vae_tiling=True))
+        self.assertEqual(qwen_img.SERVICE.env["CT_QWEN_IMAGE_VARIANT"], "uncensored")
+        self.assertEqual(
+            qwen_img.SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_REPO"],
+            "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+        )
+        self.assertEqual(qwen_img.SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"], "1")
+        qwen_img.prepare_up(types.SimpleNamespace())
+        self.assertEqual(qwen_img.SERVICE.env, qi_baseline)
+
         r2 = load_service("r2-migrate")
         r2_baseline = dict(r2.SERVICE.env)
         r2_hm = r2.SERVICE.high_mem

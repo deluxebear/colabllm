@@ -10,6 +10,34 @@
 
 `Qwen/Qwen-Image-2.1` 采用 **Apache-2.0** 开源协议，在 Hugging Face 上**公开免门控**（无需同意许可协议即可下载；可选配置 `HF_TOKEN` 仅用于提升 Hugging Face Hub 下载速率限额）。
 
+若启动时选择 `--variant uncensored`（ChatR Labs Step 90,000 合并版 BF16 权重），需注意该社区微调权重受上游 **Qwen Research License Agreement** 约束，仅限非商业研究与评估用途。
+
+## 模型变体选择（`--variant` / `--preset`）
+
+`qwen-image` 通过 `MODEL_VARIANTS` 注册表管理多个开箱即用的模型变体，启动时只需传入 `--variant`（或别名 `--preset`）即可切换完整模型权重及对应的最佳默认采样/解码参数；后续只需向 `MODEL_VARIANTS` 追加字典项即可继续扩展新模型：
+
+| 变体 (`--variant`) | 说明与权重来源 | 默认推理步数与 True CFG | VAE Tiling | 适用场景 |
+| --- | --- | --- | --- | --- |
+| **`official`**（默认） | `Qwen/Qwen-Image-2.1` 官方满血 BF16 权重 | `40` 步；`true_cfg_scale=1.0`（传入非空负向词时自动切至 `4.0`） | 开启（防 OOM） | 通用文生图、多图编辑与官方基准复现 |
+| **`uncensored`** | `chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized`（`qwen-image-2.1-step90000-BF16/` 合并版 297 张量 BF16 DiT，自动复刻于 `Qwen/Qwen-Image-2.1` 编码器与 RGBA VAE 上） | `35` 步；`true_cfg_scale=5.0`，未指定负向词时自动注入单空格 `" "` 激活 True CFG | **关闭**（防纵向色带；40 GB A100 可加 `--vae-tiling`） | 无内置审查的通用文生图与图生图编辑，兼容 `--quantization fp8-all` 与 `--step-execution` |
+
+```bash
+# 查看当前所有注册变体及其默认参数
+colabllm qwen-image variants
+colabllm qwen-image variants --json
+
+# 启动无审查 Step 90,000 BF16 完整版（默认 G4，推荐显存配置）
+colabllm qwen-image up --variant uncensored --domain
+
+# 在 40 GB A100 上运行 uncensored + 在线 FP8 + 显式开启 VAE 分块防 OOM
+colabllm qwen-image up --variant uncensored --gpu A100 --quantization fp8-all --vae-tiling --domain
+```
+
+> **采样默认参数（服务端自动按变体注入）**：
+> 1. `official` 变体自动注入 `40` 步与 `true_cfg_scale=1.0`（传入非空 `--negative-prompt` 时切至 `4.0`），对应 [vLLM-Omni 官方 Recipe](https://recipes.vllm.ai/Qwen/Qwen-Image-2.1)。
+> 2. `uncensored` 变体按 ChatR Labs 官方评测网格搜索推荐，自动注入 `35` 步、`true_cfg_scale=5.0` 及单空格负向提示词 `" "`（`QwenImage21Pipeline` 仅在 `negative_prompt` 非 `None` 时开启双路 True CFG）；若需显式自定义可随时通过 `--steps`、`--true-cfg-scale`、`--negative-prompt` 覆盖。
+> 3. 若需加载单文件 BF16/diffusers LoRA（如 v0.1 增量权重），除直接 `--variant uncensored` 外，也可配合 `--lora-backend distill --lora-path ...` 在初始化时融合。
+
 ## G4、H100、A100 硬件选型与启动调用详解
 
 模型磁盘权重共 **33.1 GB**（`Qwen3-VL-8B` 文本/视觉编码器 17.5 GB BF16 + `QwenImage21Transformer2DModel` 7.1B DiT 14.2 GB BF16 + 四通道 RGBA VAE 1.4 GB FP32），在开启默认 `--vae-use-tiling` 时 `1024x1024` 40 步 BF16 峰值显存约为 **34–40 GB**：
@@ -62,6 +90,7 @@ colabllm qwen-image up --domain --quantization fp8-text --prefix-kv-dtype fp8_v
 ### 状态与服务配置检查
 
 ```bash
+colabllm qwen-image variants
 colabllm qwen-image status --json
 colabllm qwen-image models
 colabllm qwen-image models --json
@@ -190,5 +219,5 @@ with open("pose-transfer.png", "wb") as f:
 
 ## 本地 SSD 权重与编译缓存归档
 
-- **本地 NVMe SSD 高速加载**：`Qwen/Qwen-Image-2.1`（约 33.1 GB）下载并缓存在 VM 本地 NVMe SSD（`/content/qwen-image/model/Qwen-Image-2.1`），禁用 Xet 临时块缓存膨胀并在下载后自动清理 `/root/.cache/huggingface`，确保 Colab 本地磁盘余量充裕。
+- **本地 NVMe SSD 高速加载**：`Qwen/Qwen-Image-2.1`（约 33.1 GB）下载并缓存在 VM 本地 NVMe SSD（`official` 位于 `/content/qwen-image/model/Qwen-Image-2.1`，`uncensored` 位于 `/content/qwen-image/model/Qwen-Image-2.1-Uncensored-Omni-Step90000` 并通过硬链接自动复用同 VM 上已下载的基座编码器与 VAE），仅按需拉取目标变体的 DiT 权重，禁用 Xet 临时块缓存膨胀并在下载后自动清理 `/root/.cache/huggingface`。
 - **跨步精确 Prefix KV Cache 与按架构编译缓存归档**：提示词与最多 4 张参考图编码仅在首个去噪步计算一次并在后续 39 步精确复用；FlashInfer、Triton 与 vLLM/TorchInductor 编译缓存在预热生图后按 GPU 架构（如 `sm120`、`sm90`、`sm80`）分别打包归档至 `MyDrive/colab-llm/qwen-image/cache-archives/`。

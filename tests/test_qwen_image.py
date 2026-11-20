@@ -53,6 +53,186 @@ class QwenImageNotebookAndMiddlewareTest(unittest.TestCase):
         self.assertIn('"--vae-use-tiling"', joined)
         self.assertIn('"--step-execution"', joined)
         self.assertIn('"--diffusion-quantization-config"', joined)
+        self.assertIn("resolve_variant_config", joined)
+        self.assertIn('"--lora-backend"', joined)
+
+    def test_variant_registry_and_checkpoint_staging(self):
+        svc = _load_service_module()
+        self.assertEqual(svc.MODEL_VARIANTS, mw.MODEL_VARIANTS)
+
+        off_cfg = mw.resolve_variant_config({})
+        self.assertEqual(off_cfg["variant"], "official")
+        self.assertEqual(off_cfg["base_repo"], "Qwen/Qwen-Image-2.1")
+        self.assertEqual(off_cfg["transformer_repo"], "")
+        self.assertTrue(off_cfg["vae_tiling"])
+        self.assertEqual(off_cfg["default_steps"], 40)
+        self.assertEqual(off_cfg["default_true_cfg_no_neg"], 1.0)
+        self.assertEqual(off_cfg["default_true_cfg_with_neg"], 4.0)
+        self.assertEqual(off_cfg["default_negative_prompt"], "")
+
+        unc_cfg = mw.resolve_variant_config({"CT_QWEN_IMAGE_VARIANT": "uncensored"})
+        self.assertEqual(unc_cfg["variant"], "uncensored")
+        self.assertEqual(unc_cfg["base_repo"], "Qwen/Qwen-Image-2.1")
+        self.assertEqual(unc_cfg["alias"], "qwen-image-2.1-uncensored")
+        self.assertEqual(unc_cfg["transformer_repo"], "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized")
+        self.assertEqual(unc_cfg["transformer_subfolder"], "qwen-image-2.1-step90000-BF16")
+        self.assertFalse(unc_cfg["vae_tiling"])
+        self.assertEqual(unc_cfg["default_steps"], 35)
+        self.assertEqual(unc_cfg["default_true_cfg_no_neg"], 5.0)
+        self.assertEqual(unc_cfg["default_true_cfg_with_neg"], 5.0)
+        self.assertEqual(unc_cfg["default_negative_prompt"], " ")
+
+        with self.assertRaises(ValueError):
+            mw.resolve_variant_config({"CT_QWEN_IMAGE_VARIANT": "nonexistent"})
+
+        def make_fake_downloader(calls_log: list[dict]):
+            def fake_snapshot_download(**kwargs):
+                calls_log.append(kwargs)
+                repo_id = kwargs["repo_id"]
+                local_dir = Path(kwargs["local_dir"])
+                allow = kwargs.get("allow_patterns") or []
+                ignore = kwargs.get("ignore_patterns") or []
+                if repo_id == "Qwen/Qwen-Image-2.1":
+                    (local_dir / "model_index.json").write_text('{"_class_name":"QwenImage21Pipeline"}', encoding="utf-8")
+                    (local_dir / "vae").mkdir(parents=True, exist_ok=True)
+                    (local_dir / "vae/diffusion_pytorch_model.safetensors").write_bytes(b"VAE")
+                    (local_dir / "text_encoder").mkdir(parents=True, exist_ok=True)
+                    (local_dir / "text_encoder/config.json").write_text("{}", encoding="utf-8")
+                    if "transformer/*" not in ignore:
+                        (local_dir / "transformer").mkdir(parents=True, exist_ok=True)
+                        (local_dir / "transformer/config.json").write_text('{"src":"official"}', encoding="utf-8")
+                        (local_dir / "transformer/diffusion_pytorch_model-00001-of-00002.safetensors").write_bytes(b"OFF")
+                elif repo_id == "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized":
+                    self.assertEqual(allow, ["qwen-image-2.1-step90000-BF16/*"])
+                    sub = local_dir / "qwen-image-2.1-step90000-BF16"
+                    sub.mkdir(parents=True, exist_ok=True)
+                    (sub / "config.json").write_text('{"src":"step90000"}', encoding="utf-8")
+                    (sub / "diffusion_pytorch_model.safetensors").write_bytes(b"UNCENSORED_90K")
+                return str(local_dir)
+
+            return fake_snapshot_download
+
+        # 1. Stage uncensored on an empty models_root: skips base transformer/* and fetches subfolder only
+        with tempfile.TemporaryDirectory() as tmp1:
+            root1 = Path(tmp1)
+            calls1: list[dict] = []
+            dl1 = make_fake_downloader(calls1)
+            out_dir1 = mw.stage_variant_checkpoint(unc_cfg, root1, dl1, cleanup_hf_cache=False)
+            self.assertEqual(len(calls1), 2)
+            self.assertIn("transformer/*", calls1[0]["ignore_patterns"])
+            self.assertEqual(calls1[1]["allow_patterns"], ["qwen-image-2.1-step90000-BF16/*"])
+            self.assertTrue(mw.is_checkpoint_ready(unc_cfg, root1))
+            self.assertEqual(
+                (out_dir1 / "transformer/diffusion_pytorch_model.safetensors").read_bytes(),
+                b"UNCENSORED_90K",
+            )
+            self.assertFalse(any(p.name.startswith(".tmp_tf_") for p in root1.iterdir()))
+
+        # 2. Stage official, then uncensored on same models_root: reuses base via hardlink without re-downloading base
+        with tempfile.TemporaryDirectory() as tmp2:
+            root2 = Path(tmp2)
+            calls2: list[dict] = []
+            dl2 = make_fake_downloader(calls2)
+            off_dir = mw.stage_variant_checkpoint(off_cfg, root2, dl2, cleanup_hf_cache=False)
+            self.assertEqual(len(calls2), 1)
+            self.assertNotIn("transformer/*", calls2[0]["ignore_patterns"])
+            self.assertTrue(mw.is_checkpoint_ready(off_cfg, root2))
+            # Re-running is a no-op
+            mw.stage_variant_checkpoint(off_cfg, root2, dl2, cleanup_hf_cache=False)
+            self.assertEqual(len(calls2), 1)
+
+            calls2.clear()
+            unc_dir = mw.stage_variant_checkpoint(unc_cfg, root2, dl2, cleanup_hf_cache=False)
+            self.assertEqual(len(calls2), 1)
+            self.assertEqual(calls2[0]["repo_id"], "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized")
+            self.assertTrue(mw.is_checkpoint_ready(unc_cfg, root2))
+            self.assertTrue((unc_dir / "vae/diffusion_pytorch_model.safetensors").is_file())
+            self.assertTrue((unc_dir / "text_encoder/config.json").is_file())
+            self.assertFalse((unc_dir / "transformer/diffusion_pytorch_model-00001-of-00002.safetensors").exists())
+            self.assertEqual((unc_dir / "transformer/diffusion_pytorch_model.safetensors").read_bytes(), b"UNCENSORED_90K")
+            self.assertEqual((off_dir / "transformer/config.json").read_text(encoding="utf-8"), '{"src":"official"}')
+
+    def test_uncensored_middleware_defaults_and_info(self):
+        async def invoke_get(app, path: str):
+            async def receive():
+                return {"type": "http.disconnect"}
+
+            out_status = 500
+            out_chunks: list[bytes] = []
+
+            async def send(msg):
+                nonlocal out_status
+                if msg["type"] == "http.response.start":
+                    out_status = msg["status"]
+                elif msg["type"] == "http.response.body":
+                    out_chunks.append(msg.get("body", b""))
+
+            scope = {
+                "type": "http",
+                "method": "GET",
+                "path": path,
+                "raw_path": path.encode("utf-8"),
+                "root_path": "",
+                "headers": [(b"authorization", b"Bearer unc-tok")],
+            }
+            await app(scope, receive, send)
+            return out_status, json.loads(b"".join(out_chunks).decode("utf-8"))
+
+        async def dummy_app(scope, receive, send):
+            raise AssertionError("should not reach upstream")
+
+        try:
+            with mock.patch.dict("os.environ", {"CT_QWEN_IMAGE_VARIANT": "uncensored", "CT_API_TOKEN": "unc-tok"}):
+                importlib.reload(mw)
+                self.assertEqual(mw.VARIANT, "uncensored")
+                self.assertFalse(mw.VAE_TILING)
+                self.assertEqual(mw.DEFAULT_STEPS, 35)
+                self.assertEqual(mw.DEFAULT_TRUE_CFG_NO_NEG, 5.0)
+                self.assertEqual(mw.DEFAULT_NEGATIVE_PROMPT, " ")
+
+                raw_t2i, _, _, _ = mw._prepare_generation_request(
+                    json.dumps({"model": "qwen-image-2.1-uncensored", "prompt": "portrait"}).encode("utf-8")
+                )
+                parsed_t2i = json.loads(raw_t2i)
+                self.assertEqual(parsed_t2i["model"], "Qwen/Qwen-Image-2.1")
+                self.assertEqual(parsed_t2i["num_inference_steps"], 35)
+                self.assertEqual(parsed_t2i["true_cfg_scale"], 5.0)
+                self.assertEqual(parsed_t2i["negative_prompt"], " ")
+
+                # Explicit warmup true_cfg_scale=1.0 must NOT inject negative_prompt=" "
+                raw_warm, _, _, _ = mw._prepare_generation_request(
+                    json.dumps({"prompt": "teapot", "num_inference_steps": 2, "true_cfg_scale": 1.0}).encode("utf-8")
+                )
+                parsed_warm = json.loads(raw_warm)
+                self.assertEqual(parsed_warm["num_inference_steps"], 2)
+                self.assertEqual(parsed_warm["true_cfg_scale"], 1.0)
+                self.assertNotIn("negative_prompt", parsed_warm)
+
+                # Multipart edit preserves whitespace-only negative_prompt=" "
+                mp_ct, mp_body = mw._encode_multipart_formdata(
+                    [("prompt", "edit me"), ("negative_prompt", " ")],
+                    [("image", "ref.png", "image/png", TINY_RGBA_PNG)],
+                )
+                target, new_ct, rewritten, _, _, _ = mw._prepare_edit_request(mp_ct, mp_body)
+                self.assertEqual(target, "/v1/images/edits")
+                parsed_mp = mw._parse_multipart_edit_body(new_ct, rewritten)
+                self.assertEqual(parsed_mp["num_inference_steps"], 35)
+                self.assertEqual(parsed_mp["true_cfg_scale"], 5.0)
+                self.assertEqual(parsed_mp["negative_prompt"], " ")
+
+                status, info = asyncio.run(invoke_get(mw.QwenImageMiddleware(dummy_app), "/api/ct/info"))
+                self.assertEqual(status, 200)
+                self.assertEqual(info["variant"], "uncensored")
+                self.assertFalse(info["vae_use_tiling"])
+                self.assertEqual(info["default_steps"], 35)
+                self.assertEqual(info["default_true_cfg_scale"], 5.0)
+                self.assertEqual(info["default_negative_prompt"], " ")
+                self.assertEqual(
+                    info["transformer_repo"],
+                    "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized/qwen-image-2.1-step90000-BF16",
+                )
+        finally:
+            importlib.reload(mw)
 
     def test_sampling_defaults_aliases_and_32px_alignment(self):
         # Empty env vars forwarded by SERVICE.env (e.g. CT_QWEN_IMAGE_MAX_NUM_SEQS='') must never fail module import
@@ -277,7 +457,10 @@ class QwenImageCliTest(unittest.TestCase):
                 elif self.path == "/api/ct/info":
                     self._send(200, {
                         "service": "qwen-image",
+                        "variant": "official",
+                        "variant_label": "Official Qwen-Image-2.1 (BF16)",
                         "model_repo": "Qwen/Qwen-Image-2.1",
+                        "transformer_repo": None,
                         "served_models": ["Qwen/Qwen-Image-2.1", "qwen-image-2.1"],
                         "quantization": "none",
                         "prefix_kv_cache_dtype": "auto",
@@ -287,6 +470,8 @@ class QwenImageCliTest(unittest.TestCase):
                         "default_steps": 40,
                         "default_true_cfg_scale": 1.0,
                         "default_true_cfg_scale_with_negative_prompt": 4.0,
+                        "default_negative_prompt": None,
+                        "lora_backend": "peft",
                         "rgba_vae": True,
                         "max_reference_images": 4,
                         "drive_inputs_dir": "/content/drive/MyDrive/colab-llm/qwen-image/inputs",
@@ -359,21 +544,48 @@ class QwenImageCliTest(unittest.TestCase):
 
         args1 = self._parse([
             "up", "--quantization", "fp8-all", "--prefix-kv-dtype", "fp8_v",
-            "--step-execution", "--max-num-seqs", "8", "--no-vae-tiling",
+            "--step-execution", "--max-num-seqs", "8", "--no-vae-tiling", "--lora-backend", "distill",
         ])
         self.svc.prepare_up(args1)
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VARIANT"], "official")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_QUANTIZATION"], "fp8-all")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_PREFIX_KV_DTYPE"], "fp8_v")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_STEP_EXECUTION"], "1")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_MAX_NUM_SEQS"], "8")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"], "0")
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_LORA_BACKEND"], "distill")
+
+        for flag in ("--variant", "--preset"):
+            args_unc = self._parse(["up", flag, "uncensored"])
+            self.svc.prepare_up(args_unc)
+            self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VARIANT"], "uncensored")
+            self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_MODEL"], "Qwen/Qwen-Image-2.1")
+            self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_ALIAS"], "qwen-image-2.1-uncensored")
+            self.assertEqual(
+                self.svc.SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_REPO"],
+                "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+            )
+            self.assertEqual(
+                self.svc.SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER"],
+                "qwen-image-2.1-step90000-BF16",
+            )
+            self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"], "0")
+
+        args_unc_tiled = self._parse(["up", "--variant", "uncensored", "--vae-tiling"])
+        self.svc.prepare_up(args_unc_tiled)
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VARIANT"], "uncensored")
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"], "1")
 
         args2 = self._parse(["up"])
         self.svc.prepare_up(args2)
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VARIANT"], "official")
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_REPO"], "")
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER"], "")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_QUANTIZATION"], "none")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_PREFIX_KV_DTYPE"], "auto")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_STEP_EXECUTION"], "0")
         self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_VAE_TILING"], "1")
+        self.assertEqual(self.svc.SERVICE.env["CT_QWEN_IMAGE_LORA_BACKEND"], "peft")
 
     def test_generate_and_edit_rgba_and_drive_io(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,19 +594,33 @@ class QwenImageCliTest(unittest.TestCase):
             local_ref.write_bytes(TINY_RGBA_PNG)
             local_out = tmp_path / "rgba_out.png"
 
-            # 1. T2I with negative_prompt automatically switches true_cfg_scale to 4.0
+            # 1. T2I omitting --steps / --true-cfg-scale defers defaults to active server variant;
+            #    explicit --negative-prompt is preserved verbatim (including single space " ")
             args_gen = self._parse([
                 "generate", "青瓷茶壶",
-                "--negative-prompt", "模糊",
+                "--negative-prompt", " ",
                 "--save-drive", "outputs/teapot.png",
                 "--url", self.base_url, "--api-token", "test-secret",
             ])
             self.svc.cmd_generate(args_gen)
             method, path, _, body = self.requests_log[-1]
             self.assertEqual((method, path), ("POST", "/v1/images/generations"))
-            self.assertEqual(body["num_inference_steps"], 40)
-            self.assertEqual(body["true_cfg_scale"], 4.0)
+            self.assertNotIn("num_inference_steps", body)
+            self.assertNotIn("true_cfg_scale", body)
+            self.assertEqual(body["negative_prompt"], " ")
             self.assertTrue(body["drive_only"])
+
+            # Explicit --steps and --true-cfg-scale override server defaults
+            args_gen_explicit = self._parse([
+                "generate", "青瓷茶壶",
+                "--steps", "35", "--true-cfg-scale", "5.0",
+                "--save-drive", "outputs/teapot2.png",
+                "--url", self.base_url, "--api-token", "test-secret",
+            ])
+            self.svc.cmd_generate(args_gen_explicit)
+            _, _, _, body_exp = self.requests_log[-1]
+            self.assertEqual(body_exp["num_inference_steps"], 35)
+            self.assertEqual(body_exp["true_cfg_scale"], 5.0)
 
             # 2. Multi-ref RGBA edit preserving exact <image1>, <image2> order + Drive & local output
             args_edit = self._parse([
@@ -410,7 +636,8 @@ class QwenImageCliTest(unittest.TestCase):
             method, path, _, body = self.requests_log[-1]
             self.assertEqual((method, path), ("POST", "/v1/images/edits"))
             self.assertEqual(body["size"], "auto")
-            self.assertEqual(body["true_cfg_scale"], 1.0)
+            self.assertNotIn("true_cfg_scale", body)
+            self.assertNotIn("num_inference_steps", body)
             self.assertEqual(body["color_format"], "RGBA")
             self.assertEqual(body["background"], "transparent")
             self.assertEqual(body["images"][0], "drive://inputs/person.jpg")
@@ -426,15 +653,19 @@ class QwenImageCliTest(unittest.TestCase):
             with self.assertRaises(UsageError):
                 self.svc.cmd_edit(args_bad)
 
-            # 4. ls-drive and models JSON output
+            # 4. ls-drive, models, and variants JSON output
             for argv, fn in (
                 (["ls-drive", "--json", "--url", self.base_url, "--api-token", "test-secret"], self.svc.cmd_ls_drive),
                 (["models", "--json", "--url", self.base_url, "--api-token", "test-secret"], self.svc.cmd_models),
+                (["variants", "--json"], self.svc.cmd_variants),
             ):
                 buf = io.StringIO()
                 with mock.patch("sys.stdout", buf):
                     fn(self._parse(argv))
-                json.loads(buf.getvalue())
+                parsed = json.loads(buf.getvalue())
+                if argv[0] == "variants":
+                    self.assertEqual(parsed["default_variant"], "official")
+                    self.assertEqual([v["name"] for v in parsed["variants"]], ["official", "uncensored"])
 
 
 if __name__ == "__main__":

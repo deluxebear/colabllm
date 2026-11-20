@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Callable, Mapping
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
 import glob as glob_mod
@@ -84,16 +85,309 @@ EXT_BY_MIME = {
 
 # Qwen-Image-2.1 supports 1-4 reference images (<image1> .. <image4>); a 5th is rejected with 400.
 MAX_REFERENCE_IMAGES = 4
-DEFAULT_STEPS = 40
-DEFAULT_TRUE_CFG_NO_NEG = 1.0
-DEFAULT_TRUE_CFG_WITH_NEG = 4.0
 DIM_ALIGNMENT = 32
+DEFAULT_VARIANT = "official"
+
+MODEL_VARIANTS: dict[str, dict[str, Any]] = {
+    "official": {
+        "label": "Official Qwen-Image-2.1 (BF16)",
+        "description": (
+            "Alibaba Qwen/Qwen-Image-2.1 official checkpoint "
+            "(40 steps, true_cfg_scale=1.0 / 4.0 with negative prompt, VAE tiling enabled)"
+        ),
+        "base_repo": "Qwen/Qwen-Image-2.1",
+        "alias": "qwen-image-2.1",
+        "transformer_repo": "",
+        "transformer_subfolder": "",
+        "local_dir_name": "Qwen-Image-2.1",
+        "vae_tiling": True,
+        "default_steps": 40,
+        "default_true_cfg_no_neg": 1.0,
+        "default_true_cfg_with_neg": 4.0,
+        "default_negative_prompt": "",
+        "lora_backend": "peft",
+    },
+    "uncensored": {
+        "label": "ChatR Labs Qwen-Image-2.1 Uncensored Omni (Step 90,000 BF16)",
+        "description": (
+            "ChatR Labs Omni rank-128 merged BF16 full transformer (step 90,000) on Qwen/Qwen-Image-2.1 base "
+            "(35 steps, true_cfg_scale=5.0 + single-space negative prompt, VAE tiling disabled)"
+        ),
+        "base_repo": "Qwen/Qwen-Image-2.1",
+        "alias": "qwen-image-2.1-uncensored",
+        "transformer_repo": "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+        "transformer_subfolder": "qwen-image-2.1-step90000-BF16",
+        "local_dir_name": "Qwen-Image-2.1-Uncensored-Omni-Step90000",
+        "vae_tiling": False,
+        "default_steps": 35,
+        "default_true_cfg_no_neg": 5.0,
+        "default_true_cfg_with_neg": 5.0,
+        "default_negative_prompt": " ",
+        "lora_backend": "peft",
+    },
+}
+
+
+def resolve_variant_config(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Resolve active variant settings from MODEL_VARIANTS and CT_QWEN_IMAGE_* env overrides."""
+    env = os.environ if environ is None else environ
+    raw_variant = str(env.get("CT_QWEN_IMAGE_VARIANT") or "").strip().lower()
+    variant = raw_variant or DEFAULT_VARIANT
+    if variant not in MODEL_VARIANTS:
+        raise ValueError(f"Unknown Qwen-Image variant {variant!r}; expected one of {tuple(MODEL_VARIANTS)}")
+
+    vspec = MODEL_VARIANTS[variant]
+    base_repo = str(env.get("CT_QWEN_IMAGE_MODEL") or "").strip() or str(vspec["base_repo"])
+    alias = str(env.get("CT_QWEN_IMAGE_ALIAS") or "").strip() or str(vspec["alias"])
+
+    if "CT_QWEN_IMAGE_TRANSFORMER_REPO" in env:
+        transformer_repo = str(env["CT_QWEN_IMAGE_TRANSFORMER_REPO"] or "").strip()
+    else:
+        transformer_repo = str(vspec["transformer_repo"])
+
+    if "CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER" in env:
+        transformer_subfolder = str(env["CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER"] or "").strip().strip("/")
+    else:
+        transformer_subfolder = str(vspec["transformer_subfolder"]).strip("/")
+
+    lora_backend = str(env.get("CT_QWEN_IMAGE_LORA_BACKEND") or "").strip().lower() or str(vspec["lora_backend"])
+
+    raw_tiling = str(env.get("CT_QWEN_IMAGE_VAE_TILING") or "").strip().lower()
+    if raw_tiling in ("", "auto"):
+        vae_tiling = bool(vspec["vae_tiling"])
+    else:
+        vae_tiling = raw_tiling not in ("0", "false", "no")
+
+    raw_steps = str(env.get("CT_QWEN_IMAGE_DEFAULT_STEPS") or "").strip()
+    default_steps = int(raw_steps) if raw_steps else int(vspec["default_steps"])
+
+    raw_cfg_no_neg = str(env.get("CT_QWEN_IMAGE_DEFAULT_TRUE_CFG_NO_NEG") or "").strip()
+    default_true_cfg_no_neg = float(raw_cfg_no_neg) if raw_cfg_no_neg else float(vspec["default_true_cfg_no_neg"])
+
+    raw_cfg_with_neg = str(env.get("CT_QWEN_IMAGE_DEFAULT_TRUE_CFG_WITH_NEG") or "").strip()
+    default_true_cfg_with_neg = float(raw_cfg_with_neg) if raw_cfg_with_neg else float(vspec["default_true_cfg_with_neg"])
+
+    if "CT_QWEN_IMAGE_DEFAULT_NEGATIVE_PROMPT" in env:
+        default_negative_prompt = str(env["CT_QWEN_IMAGE_DEFAULT_NEGATIVE_PROMPT"])
+    else:
+        default_negative_prompt = str(vspec["default_negative_prompt"])
+
+    if (
+        base_repo == vspec["base_repo"]
+        and transformer_repo == vspec["transformer_repo"]
+        and transformer_subfolder == str(vspec["transformer_subfolder"]).strip("/")
+    ):
+        local_dir_name = str(vspec["local_dir_name"])
+    elif not transformer_repo:
+        local_dir_name = base_repo.split("/")[-1]
+    else:
+        tf_hash = hashlib.sha256(f"{transformer_repo}/{transformer_subfolder}".encode("utf-8")).hexdigest()[:8]
+        local_dir_name = f"{base_repo.split('/')[-1]}--tf-{tf_hash}"
+
+    expected_stamp = f"{base_repo}|{transformer_repo}|{transformer_subfolder}"
+    return {
+        "variant": variant,
+        "label": str(vspec["label"]),
+        "description": str(vspec["description"]),
+        "base_repo": base_repo,
+        "alias": alias,
+        "transformer_repo": transformer_repo,
+        "transformer_subfolder": transformer_subfolder,
+        "local_dir_name": local_dir_name,
+        "expected_stamp": expected_stamp,
+        "vae_tiling": vae_tiling,
+        "default_steps": default_steps,
+        "default_true_cfg_no_neg": default_true_cfg_no_neg,
+        "default_true_cfg_with_neg": default_true_cfg_with_neg,
+        "default_negative_prompt": default_negative_prompt,
+        "lora_backend": lora_backend,
+    }
+
+
+def is_checkpoint_ready(cfg: Mapping[str, Any], models_root: Path | str) -> bool:
+    """Return True if the requested variant/transformer checkpoint is completely staged on SSD."""
+    model_dir = Path(models_root) / str(cfg["local_dir_name"])
+    ready_stamp = model_dir / ".ct_model_ready"
+    if not ready_stamp.is_file():
+        return False
+    try:
+        if ready_stamp.read_text(encoding="utf-8").strip() != str(cfg["expected_stamp"]):
+            return False
+    except OSError:
+        return False
+    tf_dir = model_dir / "transformer"
+    return (
+        (model_dir / "model_index.json").is_file()
+        and (model_dir / "vae" / "diffusion_pytorch_model.safetensors").is_file()
+        and (tf_dir / "config.json").is_file()
+        and any(tf_dir.glob("*.safetensors"))
+    )
+
+
+def _reuse_base_from_sibling(model_dir: Path, models_root: Path, base_repo: str) -> bool:
+    """Hardlink shared base components (text_encoder, vae, processor, scheduler) from a verified sibling."""
+    if not models_root.is_dir():
+        return False
+    for sib in sorted(models_root.iterdir()):
+        if not sib.is_dir() or sib == model_dir:
+            continue
+        stamp_p = sib / ".ct_model_ready"
+        if not stamp_p.is_file():
+            continue
+        try:
+            stamp_txt = stamp_p.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not stamp_txt.startswith(f"{base_repo}|"):
+            continue
+        if not (
+            (sib / "model_index.json").is_file()
+            and (sib / "vae" / "diffusion_pytorch_model.safetensors").is_file()
+            and (sib / "text_encoder" / "config.json").is_file()
+        ):
+            continue
+        for src_path in sib.rglob("*"):
+            rel = src_path.relative_to(sib)
+            if not rel.parts:
+                continue
+            if rel.parts[0] in ("transformer", ".cache") or rel.name == ".ct_model_ready":
+                continue
+            dst_path = model_dir / rel
+            if src_path.is_dir():
+                dst_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if not src_path.is_file():
+                continue
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            if dst_path.exists():
+                if dst_path.stat().st_size == src_path.stat().st_size:
+                    continue
+                dst_path.unlink()
+            try:
+                os.link(src_path, dst_path)
+            except OSError:
+                shutil.copy2(src_path, dst_path)
+        return True
+    return False
+
+
+def stage_variant_checkpoint(
+    cfg: Mapping[str, Any],
+    models_root: Path | str,
+    snapshot_download_fn: Callable[..., Any],
+    *,
+    token: str | None = None,
+    cleanup_hf_cache: bool = True,
+) -> Path:
+    """Download/stage base components and optional replacement transformer onto local SSD."""
+    root = Path(models_root)
+    root.mkdir(parents=True, exist_ok=True)
+    model_dir = root / str(cfg["local_dir_name"])
+    if is_checkpoint_ready(cfg, root):
+        return model_dir
+
+    model_dir.mkdir(parents=True, exist_ok=True)
+    ready_stamp = model_dir / ".ct_model_ready"
+    ready_stamp.unlink(missing_ok=True)
+
+    base_repo = str(cfg["base_repo"])
+    tf_repo = str(cfg.get("transformer_repo") or "").strip()
+    tf_subfolder = str(cfg.get("transformer_subfolder") or "").strip().strip("/")
+
+    if tf_repo:
+        reused = _reuse_base_from_sibling(model_dir, root, base_repo)
+        if not reused:
+            snapshot_download_fn(
+                repo_id=base_repo,
+                local_dir=str(model_dir),
+                token=token,
+                max_workers=4,
+                ignore_patterns=["*.md", ".gitattributes", "transformer/*", "transformer/**"],
+            )
+
+        tf_dir = model_dir / "transformer"
+        shutil.rmtree(tf_dir, ignore_errors=True)
+        tf_dir.mkdir(parents=True, exist_ok=True)
+
+        tmp_tf = root / f".tmp_tf_{os.getpid()}"
+        shutil.rmtree(tmp_tf, ignore_errors=True)
+        tmp_tf.mkdir(parents=True, exist_ok=True)
+        try:
+            allow_patterns = (
+                [f"{tf_subfolder}/*"]
+                if tf_subfolder
+                else ["config.json", "*.safetensors", "*.index.json", "transformer/*"]
+            )
+            snapshot_download_fn(
+                repo_id=tf_repo,
+                local_dir=str(tmp_tf),
+                token=token,
+                max_workers=4,
+                allow_patterns=allow_patterns,
+                ignore_patterns=["*.md", ".gitattributes"],
+            )
+            if tf_subfolder:
+                src_tf = tmp_tf / tf_subfolder
+            elif (tmp_tf / "transformer" / "config.json").is_file():
+                src_tf = tmp_tf / "transformer"
+            else:
+                src_tf = tmp_tf
+
+            if not (src_tf / "config.json").is_file() or not any(src_tf.glob("*.safetensors")):
+                raise RuntimeError(
+                    f"Custom transformer {tf_repo!r} (subfolder={tf_subfolder!r}) is missing "
+                    f"config.json or *.safetensors in {src_tf}"
+                )
+            for item in src_tf.iterdir():
+                if item.is_file() and (
+                    item.name == "config.json"
+                    or item.suffix == ".safetensors"
+                    or item.name.endswith(".index.json")
+                ):
+                    os.replace(item, tf_dir / item.name)
+        finally:
+            shutil.rmtree(tmp_tf, ignore_errors=True)
+    else:
+        snapshot_download_fn(
+            repo_id=base_repo,
+            local_dir=str(model_dir),
+            token=token,
+            max_workers=4,
+            ignore_patterns=["*.md", ".gitattributes"],
+        )
+
+    shutil.rmtree(model_dir / ".cache", ignore_errors=True)
+    if cleanup_hf_cache:
+        for cache_p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
+            shutil.rmtree(cache_p, ignore_errors=True)
+
+    ready_stamp.write_text(f"{cfg['expected_stamp']}\n", encoding="utf-8")
+    return model_dir
+
+
+_VARIANT_CFG = resolve_variant_config(os.environ)
 
 API_TOKEN = os.environ.get("CT_API_TOKEN", "")
 SERVICE_PORT = int((os.environ.get("CT_SERVICE_PORT") or "").strip() or "8091")
 
+VARIANT = str(_VARIANT_CFG["variant"])
+VARIANT_LABEL = str(_VARIANT_CFG["label"])
+MODEL_REPO = str(_VARIANT_CFG["base_repo"])
+MODEL_ALIAS = str(_VARIANT_CFG["alias"])
+TRANSFORMER_REPO = str(_VARIANT_CFG["transformer_repo"])
+TRANSFORMER_SUBFOLDER = str(_VARIANT_CFG["transformer_subfolder"])
+VAE_TILING = bool(_VARIANT_CFG["vae_tiling"])
+LORA_BACKEND = str(_VARIANT_CFG["lora_backend"])
+DEFAULT_STEPS = int(_VARIANT_CFG["default_steps"])
+DEFAULT_TRUE_CFG_NO_NEG = float(_VARIANT_CFG["default_true_cfg_no_neg"])
+DEFAULT_TRUE_CFG_WITH_NEG = float(_VARIANT_CFG["default_true_cfg_with_neg"])
+DEFAULT_NEGATIVE_PROMPT = str(_VARIANT_CFG["default_negative_prompt"])
+
 WORK_DIR = Path(os.environ.get("CT_QWEN_IMAGE_WORK_DIR", "/content/qwen-image"))
-MODEL_DIR = Path(os.environ.get("CT_QWEN_IMAGE_MODEL_DIR", str(WORK_DIR / "model" / "Qwen-Image-2.1")))
+MODEL_DIR = Path(
+    (os.environ.get("CT_QWEN_IMAGE_MODEL_DIR") or "").strip()
+    or str(WORK_DIR / "model" / _VARIANT_CFG["local_dir_name"])
+)
 LOCAL_LORA_DIR = Path(os.environ.get("CT_QWEN_IMAGE_LOCAL_LORA_DIR", str(WORK_DIR / "loras")))
 
 DATA_DIR = Path(os.environ.get("CT_DATA_DIR", "/content/drive/MyDrive/colab-llm/qwen-image"))
@@ -103,12 +397,9 @@ DRIVE_INPUTS_DIR = DATA_DIR / "inputs"
 DRIVE_OUTPUTS_DIR = DATA_DIR / "outputs"
 DRIVE_LORAS_DIR = DATA_DIR / "loras"
 
-MODEL_REPO = os.environ.get("CT_QWEN_IMAGE_MODEL", "Qwen/Qwen-Image-2.1")
-MODEL_ALIAS = os.environ.get("CT_QWEN_IMAGE_ALIAS", "qwen-image-2.1")
 QUANTIZATION = os.environ.get("CT_QWEN_IMAGE_QUANTIZATION", "none").strip().lower() or "none"
 PREFIX_KV_DTYPE = os.environ.get("CT_QWEN_IMAGE_PREFIX_KV_DTYPE", "auto").strip().lower() or "auto"
 STEP_EXECUTION = os.environ.get("CT_QWEN_IMAGE_STEP_EXECUTION", "0").strip() in ("1", "true", "True", "yes")
-VAE_TILING = os.environ.get("CT_QWEN_IMAGE_VAE_TILING", "1").strip() not in ("0", "false", "False", "no")
 _RAW_MAX_NUM_SEQS = (os.environ.get("CT_QWEN_IMAGE_MAX_NUM_SEQS") or "").strip()
 MAX_NUM_SEQS = int(_RAW_MAX_NUM_SEQS) if _RAW_MAX_NUM_SEQS else (8 if STEP_EXECUTION else 4)
 PRELOADED_LORA = os.environ.get("CT_QWEN_IMAGE_PRELOADED_LORA", "").strip()
@@ -557,6 +848,8 @@ def _normalize_served_model(payload: dict[str, Any]) -> None:
         "qwen-image",
         "qwen-image-2.1",
         "Qwen-Image-2.1",
+        "qwen-image-uncensored",
+        *(v["alias"] for v in MODEL_VARIANTS.values()),
         MODEL_REPO.split("/")[-1],
         # Seamless drop-in compatibility for OpenAI Images SDK / Studio apps (e.g. open-pose-costume)
         "gpt-image-1",
@@ -568,7 +861,7 @@ def _normalize_served_model(payload: dict[str, Any]) -> None:
 
 
 def _apply_qwen_sampling_defaults(payload: dict[str, Any]) -> str | None:
-    """Inject Qwen-Image-2.1's recommended 40-step / True CFG defaults and pop custom color_format."""
+    """Inject variant-specific sampling / True CFG defaults and pop custom color_format."""
     color_format_raw = payload.pop("color_format", None)
     color_format = str(color_format_raw).strip().upper() if color_format_raw else None
     if color_format and color_format not in ("RGB", "RGBA"):
@@ -587,18 +880,24 @@ def _apply_qwen_sampling_defaults(payload: dict[str, Any]) -> str | None:
     if payload.get("true_cfg_scale") is None and cfg_alias is not None:
         payload["true_cfg_scale"] = float(cfg_alias)
 
-    neg = payload.get("negative_prompt")
-    if isinstance(neg, str) and not neg.strip():
+    neg_raw = payload.get("negative_prompt")
+    if neg_raw is None or neg_raw == "":
         payload.pop("negative_prompt", None)
-        neg = None
+        has_explicit_neg = False
+    else:
+        payload["negative_prompt"] = str(neg_raw)
+        has_explicit_neg = True
 
     if payload.get("true_cfg_scale") is None:
-        if neg:
+        if has_explicit_neg:
             payload["true_cfg_scale"] = (
                 float(guidance_val) if guidance_val is not None else DEFAULT_TRUE_CFG_WITH_NEG
             )
         else:
             payload["true_cfg_scale"] = DEFAULT_TRUE_CFG_NO_NEG
+
+    if not has_explicit_neg and DEFAULT_NEGATIVE_PROMPT and float(payload["true_cfg_scale"]) > 1.0:
+        payload["negative_prompt"] = DEFAULT_NEGATIVE_PROMPT
 
     # Strip OpenAI SDK 'quality' if sent by generic clients so vLLM-Omni doesn't reject/warn
     payload.pop("quality", None)
@@ -818,7 +1117,12 @@ def _parse_multipart_edit_body(content_type: str, raw_body: bytes) -> dict[str, 
             mime = detect_image_mime(payload_bytes, filename or "upload.png")
             ordered_inputs.append(("bytes", (payload_bytes, filename or f"image.{EXT_BY_MIME.get(mime, 'png')}", mime)))
         else:
-            text_val = payload_bytes.decode("utf-8", errors="replace").strip()
+            raw_text = payload_bytes.decode("utf-8", errors="replace")
+            text_val = (
+                raw_text
+                if (clean_name == "negative_prompt" and raw_text and not raw_text.strip())
+                else raw_text.strip()
+            )
             if clean_name in ("image", "images", "url", "drive_image", "drive_images"):
                 if text_val:
                     ordered_inputs.append(("spec", text_val))
@@ -1180,7 +1484,12 @@ class QwenImageMiddleware:
             served = list(dict.fromkeys([MODEL_REPO, MODEL_ALIAS, "qwen-image", "qwen-image-2.1"]))
             resp = JSONResponse({
                 "service": "qwen-image",
+                "variant": VARIANT,
+                "variant_label": VARIANT_LABEL,
                 "model_repo": MODEL_REPO,
+                "transformer_repo": (
+                    f"{TRANSFORMER_REPO}/{TRANSFORMER_SUBFOLDER}".strip("/") if TRANSFORMER_REPO else None
+                ),
                 "served_models": served,
                 "quantization": QUANTIZATION,
                 "prefix_kv_cache_dtype": PREFIX_KV_DTYPE,
@@ -1190,6 +1499,8 @@ class QwenImageMiddleware:
                 "default_steps": DEFAULT_STEPS,
                 "default_true_cfg_scale": DEFAULT_TRUE_CFG_NO_NEG,
                 "default_true_cfg_scale_with_negative_prompt": DEFAULT_TRUE_CFG_WITH_NEG,
+                "default_negative_prompt": DEFAULT_NEGATIVE_PROMPT or None,
+                "lora_backend": LORA_BACKEND,
                 "default_size": "1024x1024",
                 "dimension_alignment": DIM_ALIGNMENT,
                 "rgba_vae": True,

@@ -4220,12 +4220,9 @@ QWEN_IMAGE_SETUP = (
     "from concurrent.futures import ThreadPoolExecutor\n"
     "from pathlib import Path\n\n"
     "QI_SETUP_OK = False\n"
-    "MODEL_REPO = os.environ.get('CT_QWEN_IMAGE_MODEL', 'Qwen/Qwen-Image-2.1').strip() or 'Qwen/Qwen-Image-2.1'\n"
-    "MODEL_ALIAS = os.environ.get('CT_QWEN_IMAGE_ALIAS', 'qwen-image-2.1').strip() or 'qwen-image-2.1'\n"
     "QUANTIZATION = os.environ.get('CT_QWEN_IMAGE_QUANTIZATION', 'none').strip().lower() or 'none'\n"
     "PREFIX_KV_DTYPE = os.environ.get('CT_QWEN_IMAGE_PREFIX_KV_DTYPE', 'auto').strip().lower() or 'auto'\n"
     "STEP_EXECUTION = os.environ.get('CT_QWEN_IMAGE_STEP_EXECUTION', '0').strip() in ('1', 'true', 'True', 'yes')\n"
-    "VAE_TILING = os.environ.get('CT_QWEN_IMAGE_VAE_TILING', '1').strip() not in ('0', 'false', 'False', 'no')\n"
     "_raw_mns = os.environ.get('CT_QWEN_IMAGE_MAX_NUM_SEQS', '').strip()\n"
     "MAX_NUM_SEQS = int(_raw_mns) if _raw_mns else (8 if STEP_EXECUTION else 4)\n"
     "LORA_PATH_SPEC = os.environ.get('CT_QWEN_IMAGE_LORA_PATH', '').strip()\n"
@@ -4235,7 +4232,6 @@ QWEN_IMAGE_SETUP = (
     "QI_WORK = Path('/content/qwen-image')\n"
     "VENV_DIR = QI_WORK / 'venv'\n"
     "MODELS_ROOT = QI_WORK / 'model'\n"
-    "MODEL_DIR = MODELS_ROOT / MODEL_REPO.split('/')[-1]\n"
     "LOCAL_LORA_DIR = QI_WORK / 'loras'\n"
     "DRIVE_INPUTS_DIR = Path(DATA_DIR) / 'inputs'\n"
     "DRIVE_OUTPUTS_DIR = Path(DATA_DIR) / 'outputs'\n"
@@ -4255,9 +4251,24 @@ QWEN_IMAGE_SETUP = (
     "def qilog(msg):\n"
     "    print(time.strftime('[%F %T] [qwen-image] ') + msg, flush=True)\n\n"
     + embed_source("QI_WORK", "colab_cache.py", "templates/colab_cache.py")
-    + r"""if str(QI_WORK) not in sys.path:
+    + embed_source("QI_WORK", "colab_asgi_common.py", "templates/colab_asgi_common.py")
+    + embed_source("QI_WORK", "ct_qwen_image_middleware.py", "templates/qwen_image_middleware.py")
+    + r"""import importlib
+if str(QI_WORK) not in sys.path:
     sys.path.insert(0, str(QI_WORK))
 from colab_cache import restore_cache, save_cache
+import ct_qwen_image_middleware as _qi_mw
+importlib.reload(_qi_mw)
+
+_V_CFG = _qi_mw.resolve_variant_config(os.environ)
+VARIANT = _V_CFG['variant']
+MODEL_REPO = _V_CFG['base_repo']
+MODEL_ALIAS = _V_CFG['alias']
+TRANSFORMER_REPO = _V_CFG['transformer_repo']
+TRANSFORMER_SUBFOLDER = _V_CFG['transformer_subfolder']
+VAE_TILING = _V_CFG['vae_tiling']
+LORA_BACKEND = _V_CFG['lora_backend']
+MODEL_DIR = MODELS_ROOT / _V_CFG['local_dir_name']
 
 try:
     _gpu_arch = subprocess.check_output(
@@ -4288,9 +4299,11 @@ def run_logged(cmd, log_path, env=None, cwd=None, check=True):
         raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:4])}\n{tail}")
     return res
 
+_tf_desc = f"{TRANSFORMER_REPO}/{TRANSFORMER_SUBFOLDER}".strip("/") if TRANSFORMER_REPO else "base"
 qilog(
     f"GPU detected: {ct_gpu_stat('name,memory.total,compute_cap')} | "
-    f"repo={MODEL_REPO} quant={QUANTIZATION} step_exec={STEP_EXECUTION} max_seqs={MAX_NUM_SEQS}"
+    f"variant={VARIANT} repo={MODEL_REPO} transformer={_tf_desc} "
+    f"vae_tiling={VAE_TILING} quant={QUANTIZATION} step_exec={STEP_EXECUTION} max_seqs={MAX_NUM_SEQS}"
 )
 
 if not shutil.which("uv"):
@@ -4329,46 +4342,35 @@ def _cleanup_hf_temp():
 
 def prepare_model():
     dl_log = QI_WORK / "model-download.log"
-    ready_stamp = MODEL_DIR / ".ct_model_ready"
-    if (
-        ready_stamp.is_file()
-        and (MODEL_DIR / "model_index.json").is_file()
-        and (MODEL_DIR / "vae" / "diffusion_pytorch_model.safetensors").is_file()
-    ):
+    if _qi_mw.is_checkpoint_ready(_V_CFG, MODELS_ROOT):
         qilog(f"Reusing staged local SSD checkpoint at {MODEL_DIR}")
         return MODEL_DIR
 
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub", "hf_xet"], check=True)
     _cleanup_hf_temp()
     free_gb = shutil.disk_usage("/content").free / 1e9
-    qilog(f"Staging {MODEL_REPO} (~33.1 GB) onto local SSD (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
+    _tf_hint = f" + {TRANSFORMER_REPO}/{TRANSFORMER_SUBFOLDER}".rstrip("/") if TRANSFORMER_REPO else ""
+    qilog(f"Staging {VARIANT} ({MODEL_REPO}{_tf_hint}) onto local SSD (free SSD: {free_gb:.1f} GB; log: {dl_log})...")
     dl_env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
     dl_env.pop("HF_XET_HIGH_PERFORMANCE", None)
 
     dl_script = r'''
-import os, shutil, sys
+import os, sys
 from pathlib import Path
 from huggingface_hub import snapshot_download
 
-model_repo, model_dir_s = sys.argv[1:3]
-model_dir = Path(model_dir_s)
+work_dir, models_root = sys.argv[1:3]
+sys.path.insert(0, work_dir)
+import ct_qwen_image_middleware as mw
+
+cfg = mw.resolve_variant_config(os.environ)
 token = os.environ.get("HF_TOKEN") or None
-model_dir.mkdir(parents=True, exist_ok=True)
-print(f"[dl] Downloading {model_repo} -> {model_dir}", flush=True)
-snapshot_download(
-    repo_id=model_repo,
-    local_dir=str(model_dir),
-    token=token,
-    max_workers=4,
-    ignore_patterns=["*.md", ".gitattributes"],
-)
-for p in ("/root/.cache/huggingface/xet", "/root/.cache/huggingface/hub"):
-    shutil.rmtree(p, ignore_errors=True)
-shutil.rmtree(model_dir / ".cache", ignore_errors=True)
-(model_dir / ".ct_model_ready").write_text(f"{model_repo}\n", encoding="utf-8")
+print(f"[dl] Staging {cfg['variant']} ({cfg['base_repo']}) -> {Path(models_root) / cfg['local_dir_name']}", flush=True)
+out_dir = mw.stage_variant_checkpoint(cfg, Path(models_root), snapshot_download, token=token)
+print(f"[dl] Staged {cfg['variant']} checkpoint at {out_dir}", flush=True)
 '''
     try:
-        run_logged([sys.executable, "-c", dl_script, MODEL_REPO, str(MODEL_DIR)], dl_log, env=dl_env)
+        run_logged([sys.executable, "-c", dl_script, str(QI_WORK), str(MODELS_ROOT)], dl_log, env=dl_env)
     finally:
         _cleanup_hf_temp()
     qilog(f"Checkpoint staged on local SSD (free SSD: {shutil.disk_usage('/content').free / 1e9:.1f} GB)")
@@ -4398,9 +4400,11 @@ QWEN_IMAGE_SERVICE = (
     "# @title 2. Service -- start vLLM-Omni Qwen-Image-2.1 server on loopback\n"
     "if not globals().get('QI_SETUP_OK'):\n"
     "    raise RuntimeError('Qwen-Image-2.1 setup cell failed before completing model staging; check setup traceback above.')\n"
-    + embed_source("QI_WORK", "colab_asgi_common.py", "templates/colab_asgi_common.py")
-    + embed_source("QI_WORK", "ct_qwen_image_middleware.py", "templates/qwen_image_middleware.py")
-    + r"""import ct_qwen_image_middleware as _qi_mw
+    + r"""import importlib
+if str(QI_WORK) not in sys.path:
+    sys.path.insert(0, str(QI_WORK))
+import ct_qwen_image_middleware as _qi_mw
+importlib.reload(_qi_mw)
 
 PRELOADED_LORA_LOCAL = ""
 if LORA_PATH_SPEC:
@@ -4432,13 +4436,17 @@ VLLM_ENV = {
     "CT_QWEN_IMAGE_WORK_DIR": str(QI_WORK),
     "CT_QWEN_IMAGE_MODEL_DIR": str(MODEL_DIR),
     "CT_QWEN_IMAGE_LOCAL_LORA_DIR": str(LOCAL_LORA_DIR),
+    "CT_QWEN_IMAGE_VARIANT": VARIANT,
     "CT_QWEN_IMAGE_MODEL": MODEL_REPO,
     "CT_QWEN_IMAGE_ALIAS": MODEL_ALIAS,
+    "CT_QWEN_IMAGE_TRANSFORMER_REPO": TRANSFORMER_REPO,
+    "CT_QWEN_IMAGE_TRANSFORMER_SUBFOLDER": TRANSFORMER_SUBFOLDER,
     "CT_QWEN_IMAGE_QUANTIZATION": QUANTIZATION,
     "CT_QWEN_IMAGE_PREFIX_KV_DTYPE": PREFIX_KV_DTYPE,
     "CT_QWEN_IMAGE_STEP_EXECUTION": "1" if STEP_EXECUTION else "0",
     "CT_QWEN_IMAGE_VAE_TILING": "1" if VAE_TILING else "0",
     "CT_QWEN_IMAGE_MAX_NUM_SEQS": str(MAX_NUM_SEQS),
+    "CT_QWEN_IMAGE_LORA_BACKEND": LORA_BACKEND,
     "CT_QWEN_IMAGE_PRELOADED_LORA": PRELOADED_LORA_LOCAL,
 }
 if _gpu_arch.startswith("12.") and QUANTIZATION != "none":
@@ -4487,6 +4495,8 @@ if PREFIX_KV_DTYPE in ("fp8_v", "fp8"):
 
 if PRELOADED_LORA_LOCAL:
     SERVER_ARGS.extend(["--lora-path", PRELOADED_LORA_LOCAL, "--lora-scale", str(LORA_SCALE)])
+    if LORA_BACKEND and LORA_BACKEND != "peft":
+        SERVER_ARGS.extend(["--lora-backend", LORA_BACKEND])
 
 # Reclaim GPU VRAM from any leftover workers of an earlier notebook execution on the same VM
 subprocess.run(["pkill", "-f", f"{VENV_DIR}/bin/"], check=False)
@@ -4505,7 +4515,7 @@ def start_service():
     time.sleep(1)
     qilog(
         f"Starting vLLM-Omni Qwen-Image-2.1 server on 127.0.0.1:{SERVICE_PORT} "
-        f"(model={MODEL_REPO}, quant={QUANTIZATION}, step_exec={STEP_EXECUTION})"
+        f"(variant={VARIANT}, model={MODEL_REPO}, quant={QUANTIZATION}, step_exec={STEP_EXECUTION})"
     )
     return ct_spawn("service", SERVER_ARGS, env=VLLM_ENV, cwd=str(QI_WORK))
 
