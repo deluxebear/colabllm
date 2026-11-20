@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [1.2.4] - 2026-11-20
+
+### 修复
+
+- **消除 `r2-migrate` 并发文件/目录前缀冲突竞态**：在 `DriveDirCache` 中增加路径级活跃写入追踪与条件变量同步，使 `ensure_dir_locked` 在重定向同名冲突文件至 `<dir>/__r2_object__` 前等待在途写入完成；同时在 `write_file_direct` 中增加已知目录前置重定向、写入后 `S_ISDIR` 校验与多轮 `ENOENT`/`EISDIR` 冲突重试，彻底修复高并发小文件迁移在 macOS/Linux 上偶发 `[Errno 21] Is a directory` 的竞态失败，并同步重新生成 `r2-migrate.ipynb`。
+
 ## [1.2.3] - 2026-11-20
 
 ### 新增
