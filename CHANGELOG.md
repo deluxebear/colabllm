@@ -4,6 +4,24 @@
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-11-20
+
+### 新增
+
+- **Firecrawl Local v2 CPU 运行时（`firecrawl-local`）**：新增零 GPU Colab CPU 运行时，在本地 NVMe SSD 编译 `firecrawl-local` Rust 二进制并按源码提交 SHA、架构与 glibc 版本缓存至 Google Drive（二次启动约 1 秒恢复）；以非特权 `firecrawl` 用户运行服务并隔离无头 Chrome 原生沙箱，在 Caddy Basic/Bearer 鉴权后暴露完整的 Firecrawl v2 HTTP API（`/v2/scrape`、`/v2/map`、`/v2/crawl`、`/v2/batch/scrape`、`/health`）与对应 CLI 子命令，同时完成 `colabllm web` API 档案、网关目录注册及文档/用户技能同步。
+- **`qwen-image` 模型变体注册表（`MODEL_VARIANTS`）与 `uncensored` 变体**：新增 `colabllm qwen-image variants` 与 `up --variant/--preset`（默认 `official`，内置 `uncensored` ChatR Labs Step 90,000 BF16 权重及自动匹配默认步数、True CFG、VAE Tiling 与 `--lora-backend` 策略），支持按注册表持续扩展新变体。
+
+### 修复
+
+- **修复 Colab `--auto-restart` 健康探针路径与 `busy` Kernel 死锁循环**：
+  - 为 `Service` 新增可选 `health_path` 字段（并在 `firecrawl-local` 上设为 `/health`），统一 `up`、`status` 与 `--auto-restart` 的健康探测路径，避免根路径 `/` 返回 404 的 API 服务在瞬断重连时被误判为未就绪。
+  - 原生 WebSocket 执行器（`colab_ws.py`）在 `initially_ready=True` 重连时改为只读 `iopub` 监听模式（`native-ws-watch`），不再向存活 Kernel 排队发送多余 `execute_request`，并在健康重连及 `up` 复用存活实例时跳过冗余 `colab dfs mount`（避免持续泄漏空闲 Kernel）；在服务确实不健康需要重跑 Notebook 时，若远端 Kernel 仍处于 `busy`，自动先执行 `interrupt`/`restart` 解除排队死锁，避免无限触发 `CT_READY` 超时。
+  - 完善无包体 `POST` 请求的 `Content-Length: 0` 头部、WebSocket `IncompleteReadError` 报错提示及 `MuxDaemon` 服务字段兼容过滤。
+
+### 文档
+
+- 补充 `README.md` 中的 Kaggle 运行时安装与使用说明，新增 `docs/firecrawl-local.md` 并更新 `docs/qwen-image.md` 及随包分发的用户技能参考。
+
 ## [1.2.2] - 2026-11-18
 
 ### 新增与变更
