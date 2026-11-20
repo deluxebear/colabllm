@@ -183,7 +183,11 @@ def _http_json_once(
     payload: dict[str, Any] | None = None,
     timeout: float = 20.0,
 ) -> Any:
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    data = (
+        json.dumps(payload).encode("utf-8")
+        if payload is not None
+        else (b"" if method.upper() == "POST" else None)
+    )
     req = urllib.request.Request(url, data=data, headers=_colab_headers(token), method=method)
     try:
         with safe_urlopen(req, timeout=timeout) as resp:
@@ -204,14 +208,15 @@ def _http_json_once(
         raise ColabWsError(f"Colab HTTP 返回了无效 JSON: {err}") from err
 
 
-def ensure_kernel_sync(
+def _ensure_kernel_with_state_sync(
     session_name: str,
     account: str | None = None,
     *,
     env: dict[str, str] | None = None,
     timeout: float = 20.0,
-) -> tuple[str, str, str, str]:
-    """Verify or create a remote Jupyter kernel, returning `(url, token, kernel_id, session_id)`."""
+    prefer_busy: bool = False,
+) -> tuple[str, str, str, str, str | None]:
+    """Verify or create a remote Jupyter kernel, returning `(url, token, kernel_id, session_id, execution_state)`."""
     rec = load_colab_session_record(session_name, account=account, env=env)
     if rec is None:
         raise ColabSessionLostError(f"[colab] Session '{session_name}' not found.")
@@ -227,6 +232,7 @@ def ensure_kernel_sync(
         else f"{uuid.uuid4().hex[:8]}-{uuid.uuid4().hex[:24]}"
     )
 
+    execution_state: str | None = None
     last_err: Exception | None = None
     for attempt in range(3):
         try:
@@ -240,16 +246,27 @@ def ensure_kernel_sync(
                     )
                     if not isinstance(info, dict) or not info.get("id"):
                         kernel_id = None
+                    else:
+                        execution_state = info.get("execution_state")
                 except ColabSessionLostError:
                     kernel_id = None
 
             if not kernel_id:
                 listed = _http_json_once("GET", f"{base_url}/api/kernels", token=token, timeout=timeout)
                 if isinstance(listed, list):
+                    fallback_item = None
+                    chosen_item = None
                     for item in listed:
                         if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
-                            kernel_id = item["id"].strip()
-                            break
+                            if fallback_item is None:
+                                fallback_item = item
+                            if prefer_busy and item.get("execution_state") == "busy":
+                                chosen_item = item
+                                break
+                    picked = chosen_item or fallback_item
+                    if picked is not None:
+                        kernel_id = picked["id"].strip()
+                        execution_state = picked.get("execution_state")
                 if not kernel_id:
                     created = _http_json_once(
                         "POST",
@@ -260,6 +277,7 @@ def ensure_kernel_sync(
                     )
                     if isinstance(created, dict) and isinstance(created.get("id"), str) and created["id"].strip():
                         kernel_id = created["id"].strip()
+                        execution_state = created.get("execution_state")
             break
         except (ColabAuthExpiredError, ColabSessionLostError):
             raise
@@ -277,7 +295,69 @@ def ensure_kernel_sync(
         raise ColabWsError("无法从 Colab 运行时获取或创建 Kernel ID")
 
     update_session_kernel_ids(session_name, account, kernel_id, session_id, env=env)
+    return base_url, token, kernel_id, session_id, execution_state
+
+
+def ensure_kernel_sync(
+    session_name: str,
+    account: str | None = None,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 20.0,
+) -> tuple[str, str, str, str]:
+    """Verify or create a remote Jupyter kernel, returning `(url, token, kernel_id, session_id)`."""
+    base_url, token, kernel_id, session_id, _ = _ensure_kernel_with_state_sync(
+        session_name, account=account, env=env, timeout=timeout
+    )
     return base_url, token, kernel_id, session_id
+
+
+def reset_busy_kernel_sync(
+    base_url: str,
+    token: str,
+    kernel_id: str,
+    *,
+    timeout: float = 20.0,
+    interrupt_wait: float = 5.0,
+    restart_wait: float = 15.0,
+) -> str:
+    """Interrupt or restart a busy kernel before re-executing; returns 'interrupted', 'restarted', or 'busy'."""
+    quoted = urllib.parse.quote(kernel_id, safe="")
+    kernel_url = f"{base_url.rstrip('/')}/api/kernels/{quoted}"
+
+    def _poll_idle(wait_sec: float, interval: float) -> bool:
+        deadline = time.monotonic() + max(0.0, wait_sec)
+        while True:
+            try:
+                info = _http_json_once("GET", kernel_url, token=token, timeout=min(10.0, timeout))
+                if isinstance(info, dict) and info.get("execution_state") == "idle":
+                    return True
+            except (ColabAuthExpiredError, ColabSessionLostError):
+                raise
+            except ColabWsError:
+                pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(interval, max(0.01, deadline - time.monotonic())))
+
+    for action, wait_sec, interval, label in (
+        ("interrupt", interrupt_wait, 0.25, "interrupted"),
+        ("restart", restart_wait, 0.35, "restarted"),
+    ):
+        try:
+            _http_json_once(
+                "POST",
+                f"{kernel_url}/{action}",
+                token=token,
+                timeout=min(20.0 if action == "restart" else 15.0, timeout),
+            )
+        except (ColabAuthExpiredError, ColabSessionLostError):
+            raise
+        except ColabWsError:
+            continue
+        if _poll_idle(wait_sec, interval):
+            return label
+    return "busy"
 
 
 def _mask_bytes(data: bytes, mask: bytes) -> bytes:
@@ -420,20 +500,26 @@ class AsyncWebSocket:
         await self._send_frame(0xA, data[:125])
 
     async def _read_single_frame(self) -> tuple[bool, int, bytes]:
-        head = await self.reader.readexactly(2)
-        b0, b1 = head[0], head[1]
-        fin = bool(b0 & 0x80)
-        opcode = b0 & 0x0F
-        masked = bool(b1 & 0x80)
-        length = b1 & 0x7F
-        if length == 126:
-            length = int.from_bytes(await self.reader.readexactly(2), "big")
-        elif length == 127:
-            length = int.from_bytes(await self.reader.readexactly(8), "big")
-        if length > _MAX_WS_MESSAGE_BYTES:
-            raise ColabWsError(f"WebSocket 帧过大 ({length} bytes)")
-        mask_key = await self.reader.readexactly(4) if masked else b""
-        payload = await self.reader.readexactly(length) if length else b""
+        try:
+            head = await self.reader.readexactly(2)
+            b0, b1 = head[0], head[1]
+            fin = bool(b0 & 0x80)
+            opcode = b0 & 0x0F
+            masked = bool(b1 & 0x80)
+            length = b1 & 0x7F
+            if length == 126:
+                length = int.from_bytes(await self.reader.readexactly(2), "big")
+            elif length == 127:
+                length = int.from_bytes(await self.reader.readexactly(8), "big")
+            if length > _MAX_WS_MESSAGE_BYTES:
+                raise ColabWsError(f"WebSocket 帧过大 ({length} bytes)")
+            mask_key = await self.reader.readexactly(4) if masked else b""
+            payload = await self.reader.readexactly(length) if length else b""
+        except asyncio.IncompleteReadError as err:
+            self.closed = True
+            raise EOFError(
+                f"WebSocket connection closed unexpectedly ({len(err.partial)}/{err.expected} bytes)"
+            ) from err
         if masked and payload:
             payload = _mask_bytes(payload, mask_key)
         self.last_rx_mono = time.monotonic()
@@ -569,6 +655,170 @@ def _format_iopub_output(msg: dict[str, Any]) -> bytes:
     return b""
 
 
+async def _poll_ws_keepalive(
+    ws: AsyncWebSocket,
+    *,
+    svc: Any,
+    state_box: dict[str, Any],
+    output_sink: Callable[[bytes], None],
+    deadline: float | None,
+    auto_restart: bool,
+    idle_check_seconds: float,
+    fast_probe_seconds: float,
+    probe_fn: Callable[[Any, dict[str, Any], float], Awaitable[str]],
+    check_remote_fn: Callable[[], Awaitable[str]],
+    ping_interval: float,
+    pong_timeout: float,
+    next_ping_at: float,
+) -> tuple[bool, float, float]:
+    """Run one ping + fast-probe + idle-check tick and return `(reclaimed, next_ping_at, wait_sec)`."""
+    now = time.monotonic()
+    st = state_box["st"]
+    if deadline is not None and not st.get("ready") and now >= deadline:
+        raise _ReadyDeadlineExceeded("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
+
+    if (now - ws.last_rx_mono) > pong_timeout:
+        raise ColabWsError("Connection was lost.")
+
+    if now >= next_ping_at:
+        await ws.send_ping()
+        next_ping_at = now + ping_interval
+
+    if auto_restart and st.get("ready"):
+        need_remote_check = False
+        if idle_check_seconds > 0 and now >= state_box["next_idle_probe_at"]:
+            need_remote_check = True
+            state_box["next_idle_probe_at"] = now + min(idle_check_seconds, 60.0)
+        if fast_probe_seconds > 0 and st.get("url") and now >= state_box["next_fast_probe_at"]:
+            probe_to = min(5.0, max(0.5, fast_probe_seconds))
+            code_str = await probe_fn(svc, st, probe_to)
+            now_after = time.monotonic()
+            state_box["next_fast_probe_at"] = now_after + fast_probe_seconds
+            if code_str.isdigit() and 200 <= int(code_str) < 500:
+                state_box["next_status_allowed_at"] = 0.0
+            elif now_after >= state_box["next_status_allowed_at"]:
+                need_remote_check = True
+        if need_remote_check:
+            if await check_remote_fn() == "missing":
+                msg = (
+                    f"[colabsvc] [auto-restart] 远端会话 '{svc.name}' 已不存在"
+                    "（连接半开或边缘探针检出停机），正在立即断开并恢复\n"
+                ).encode("utf-8")
+                output_sink(msg)
+                return True, next_ping_at, 0.0
+            cooldown = min(idle_check_seconds, 60.0) if idle_check_seconds > 0 else 60.0
+            state_box["next_status_allowed_at"] = time.monotonic() + cooldown
+
+    now2 = time.monotonic()
+    wakeups = [
+        max(0.05, next_ping_at - now2),
+        max(0.05, (ws.last_rx_mono + pong_timeout) - now2),
+    ]
+    if deadline is not None and not st.get("ready"):
+        wakeups.append(max(0.0, deadline - now2))
+    if auto_restart and st.get("ready"):
+        if idle_check_seconds > 0:
+            wakeups.append(max(0.0, state_box["next_idle_probe_at"] - now2))
+        if fast_probe_seconds > 0 and st.get("url"):
+            wakeups.append(max(0.0, state_box["next_fast_probe_at"] - now2))
+    return False, next_ping_at, max(0.05, min(wakeups))
+
+
+async def _apply_iopub_output(
+    state: Any,
+    state_box: dict[str, Any],
+    protocol: NotebookProtocol,
+    output_sink: Callable[[bytes], None],
+    msg: dict[str, Any],
+) -> None:
+    chunk = _format_iopub_output(msg)
+    if not chunk:
+        return
+    output_sink(chunk)
+    curr_st = state_box["st"]
+    updates = {k: v for k, v in protocol.feed(chunk).items() if curr_st.get(k) != v}
+    if updates:
+        curr_st = await asyncio.to_thread(state.save, **updates)
+        state_box["st"] = curr_st
+        if curr_st.get("ready"):
+            state_box["reached_ready"] = True
+
+
+async def _watch_ws_iopub(
+    ws: AsyncWebSocket,
+    *,
+    svc: Any,
+    state: Any,
+    protocol: NotebookProtocol,
+    output_sink: Callable[[bytes], None],
+    auto_restart: bool,
+    idle_check_seconds: float,
+    fast_probe_seconds: float,
+    probe_fn: Callable[[Any, dict[str, Any], float], Awaitable[str]],
+    check_remote_fn: Callable[[], Awaitable[str]],
+    ping_interval: float,
+    pong_timeout: float,
+    state_box: dict[str, Any],
+) -> bool:
+    """Attach a read-only iopub stream monitor while multiplexing ping and health probes."""
+    recv_task: asyncio.Task[tuple[int, bytes]] | None = None
+    next_ping_at = time.monotonic() + ping_interval
+    try:
+        while True:
+            reclaimed, next_ping_at, wait_sec = await _poll_ws_keepalive(
+                ws,
+                svc=svc,
+                state_box=state_box,
+                output_sink=output_sink,
+                deadline=None,
+                auto_restart=auto_restart,
+                idle_check_seconds=idle_check_seconds,
+                fast_probe_seconds=fast_probe_seconds,
+                probe_fn=probe_fn,
+                check_remote_fn=check_remote_fn,
+                ping_interval=ping_interval,
+                pong_timeout=pong_timeout,
+                next_ping_at=next_ping_at,
+            )
+            if reclaimed:
+                return True
+
+            if recv_task is None:
+                recv_task = asyncio.create_task(ws.recv_message())
+            done, _ = await asyncio.wait({recv_task}, timeout=wait_sec)
+            if not done:
+                continue
+
+            opcode, payload = recv_task.result()
+            recv_task = None
+            msg = decode_jupyter_ws_frame(opcode, payload)
+            now_rx = time.monotonic()
+            state_box["next_idle_probe_at"] = now_rx + idle_check_seconds
+            state_box["next_fast_probe_at"] = now_rx + fast_probe_seconds
+
+            channel = msg.get("channel") or "iopub"
+            if channel != "iopub":
+                continue
+            header = msg.get("header") or {}
+            msg_type = msg.get("msg_type") or header.get("msg_type") or ""
+            content = msg.get("content") or {}
+
+            if msg_type == "status":
+                exec_state = content.get("execution_state")
+                if exec_state in ("dead", "restarting"):
+                    err_line = f"RuntimeError: Kernel {exec_state} before the code finished.\n".encode("utf-8")
+                    output_sink(err_line)
+                    protocol.feed(err_line)
+                    raise ColabWsError(f"Kernel {exec_state} before the code finished.")
+            elif msg_type in ("stream", "error", "display_data", "execute_result"):
+                await _apply_iopub_output(state, state_box, protocol, output_sink, msg)
+    finally:
+        if recv_task is not None and not recv_task.done():
+            recv_task.cancel()
+            with contextlib.suppress(BaseException):
+                await recv_task
+
+
 async def _run_execute_cell(
     ws: AsyncWebSocket,
     *,
@@ -612,52 +862,23 @@ async def _run_execute_cell(
     next_ping_at = time.monotonic() + ping_interval
     try:
         while True:
-            now = time.monotonic()
-            if deadline is not None and not st.get("ready"):
-                if now >= deadline:
-                    raise _ReadyDeadlineExceeded("等待 CT_READY 超时，前台连接已停止；可用 status 检查远端会话")
-
-            if (now - ws.last_rx_mono) > pong_timeout:
-                raise ColabWsError("Connection was lost.")
-
-            if now >= next_ping_at:
-                await ws.send_ping()
-                next_ping_at = now + ping_interval
-
-            if auto_restart and st.get("ready"):
-                need_remote_check = False
-                if idle_check_seconds > 0 and now >= state_box["next_idle_probe_at"]:
-                    need_remote_check = True
-                    state_box["next_idle_probe_at"] = now + min(idle_check_seconds, 60.0)
-                if fast_probe_seconds > 0 and st.get("url") and now >= state_box["next_fast_probe_at"]:
-                    probe_to = min(5.0, max(0.5, fast_probe_seconds))
-                    code_str = await probe_fn(svc, st, probe_to)
-                    now_after = time.monotonic()
-                    state_box["next_fast_probe_at"] = now_after + fast_probe_seconds
-                    if code_str.isdigit() and 200 <= int(code_str) < 500:
-                        state_box["next_status_allowed_at"] = 0.0
-                    elif now_after >= state_box["next_status_allowed_at"]:
-                        need_remote_check = True
-                if need_remote_check:
-                    if await check_remote_fn() == "missing":
-                        msg = (
-                            f"[colabsvc] [auto-restart] 远端会话 '{svc.name}' 已不存在"
-                            "（连接半开或边缘探针检出停机），正在立即断开并恢复\n"
-                        ).encode("utf-8")
-                        output_sink(msg)
-                        return False, True, None
-                    cooldown = min(idle_check_seconds, 60.0) if idle_check_seconds > 0 else 60.0
-                    state_box["next_status_allowed_at"] = time.monotonic() + cooldown
-
-            wakeups = [max(0.05, next_ping_at - time.monotonic()), max(0.05, (ws.last_rx_mono + pong_timeout) - time.monotonic())]
-            if deadline is not None and not st.get("ready"):
-                wakeups.append(max(0.0, deadline - time.monotonic()))
-            if auto_restart and st.get("ready"):
-                if idle_check_seconds > 0:
-                    wakeups.append(max(0.0, state_box["next_idle_probe_at"] - time.monotonic()))
-                if fast_probe_seconds > 0 and st.get("url"):
-                    wakeups.append(max(0.0, state_box["next_fast_probe_at"] - time.monotonic()))
-            wait_sec = max(0.05, min(wakeups))
+            reclaimed, next_ping_at, wait_sec = await _poll_ws_keepalive(
+                ws,
+                svc=svc,
+                state_box=state_box,
+                output_sink=output_sink,
+                deadline=deadline,
+                auto_restart=auto_restart,
+                idle_check_seconds=idle_check_seconds,
+                fast_probe_seconds=fast_probe_seconds,
+                probe_fn=probe_fn,
+                check_remote_fn=check_remote_fn,
+                ping_interval=ping_interval,
+                pong_timeout=pong_timeout,
+                next_ping_at=next_ping_at,
+            )
+            if reclaimed:
+                return False, True, None
 
             if recv_task is None:
                 recv_task = asyncio.create_task(ws.recv_message())
@@ -693,15 +914,7 @@ async def _run_execute_cell(
                     reply_status = (shell_reply.get("content") or {}).get("status")
                     return reply_status not in ("error", "abort"), False, reply_status
             elif channel == "iopub" and (parent_id == msg_id or (initially_ready and msg_type == "stream")):
-                chunk = _format_iopub_output(msg)
-                if chunk:
-                    output_sink(chunk)
-                    updates = {k: v for k, v in protocol.feed(chunk).items() if st.get(k) != v}
-                    if updates:
-                        st = await asyncio.to_thread(state.save, **updates)
-                        state_box["st"] = st
-                        if st.get("ready"):
-                            state_box["reached_ready"] = True
+                await _apply_iopub_output(state, state_box, protocol, output_sink, msg)
                 if parent_id == msg_id and msg_type == "status" and content.get("execution_state") == "idle":
                     iopub_idle = True
                     if shell_reply is not None:
@@ -758,24 +971,50 @@ async def run_single_ws_session(
         if is_token_near_expiry(rec):
             await refresh_token_fn()
 
+        env_src = env or os.environ
         try:
-            req_timeout = float((env or os.environ).get("REQUEST_TIMEOUT") or 60)
+            req_timeout = float(env_src.get("REQUEST_TIMEOUT") or 60)
         except ValueError:
             req_timeout = 60.0
+        try:
+            interrupt_wait = float(env_src.get("COLABLLM_KERNEL_INTERRUPT_WAIT") or 5.0)
+        except ValueError:
+            interrupt_wait = 5.0
+        try:
+            restart_wait = float(env_src.get("COLABLLM_KERNEL_RESTART_WAIT") or 15.0)
+        except ValueError:
+            restart_wait = 15.0
 
         for auth_attempt in range(2):
             try:
-                base_url, token, kernel_id, session_id = await asyncio.to_thread(
-                    ensure_kernel_sync,
+                base_url, token, kernel_id, session_id, kernel_state = await asyncio.to_thread(
+                    _ensure_kernel_with_state_sync,
                     svc.name,
                     svc.account,
                     env=env,
                     timeout=req_timeout,
+                    prefer_busy=True,
                 )
+                if not initially_ready and kernel_state == "busy":
+                    warn_line = (
+                        "[colabsvc] 远端 Kernel 仍处于 busy 状态（旧保活循环未退出），"
+                        "正在中断/重置 Kernel 以重新执行 Notebook\n"
+                    ).encode("utf-8")
+                    output_sink(warn_line)
+                    await asyncio.to_thread(
+                        reset_busy_kernel_sync,
+                        base_url,
+                        token,
+                        kernel_id,
+                        timeout=req_timeout,
+                        interrupt_wait=interrupt_wait,
+                        restart_wait=restart_wait,
+                    )
+                ws_sid = str(uuid.uuid4()) if initially_ready else session_id
                 ws_base = re.sub(r"^http", "ws", base_url.rstrip("/"), count=1)
                 qs = urllib.parse.urlencode(
                     {
-                        "session_id": session_id,
+                        "session_id": ws_sid,
                         "token": token,
                         "colab-runtime-proxy-token": token,
                     }
@@ -802,6 +1041,41 @@ async def run_single_ws_session(
                 return 1, reached_ready, False, str(err)
 
         assert ws is not None
+        if initially_ready:
+            st = await asyncio.to_thread(state.save, exec_pid=None, exec_identity=f"native-ws-watch:{conn_seq}")
+            now0 = time.monotonic()
+            state_box.update(
+                {
+                    "st": st,
+                    "reached_ready": True,
+                    "next_idle_probe_at": now0 + idle_check_seconds,
+                    "next_fast_probe_at": now0 + fast_probe_seconds,
+                    "next_status_allowed_at": 0.0,
+                }
+            )
+            reclaimed = await _watch_ws_iopub(
+                ws,
+                svc=svc,
+                state=state,
+                protocol=protocol,
+                output_sink=output_sink,
+                auto_restart=auto_restart,
+                idle_check_seconds=idle_check_seconds,
+                fast_probe_seconds=fast_probe_seconds,
+                probe_fn=probe_fn,
+                check_remote_fn=check_remote_fn,
+                ping_interval=ping_interval,
+                pong_timeout=pong_timeout,
+                state_box=state_box,
+            )
+            final_updates = protocol.feed(b"", final=True)
+            if final_updates:
+                st = await asyncio.to_thread(state.save, **final_updates)
+                state_box["st"] = st
+            if reclaimed:
+                return 1, True, True, None
+            return 0, True, False, None
+
         st = await asyncio.to_thread(state.save, exec_pid=None, exec_identity=f"native-ws:{conn_seq}")
         state_box["st"] = st
 

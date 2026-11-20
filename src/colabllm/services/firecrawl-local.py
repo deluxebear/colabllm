@@ -56,6 +56,7 @@ SERVICE = Service(
     high_mem=False,
     default_hostname="firecrawl",
     ready_timeout=1800,
+    health_path="/health",
     env={
         "CT_FIRECRAWL_REF": "main",
         "CT_FIRECRAWL_LTO": "thin",

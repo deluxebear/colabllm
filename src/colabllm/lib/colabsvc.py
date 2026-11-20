@@ -92,6 +92,7 @@ class Service:
     auth_user: str = "admin"
     env: dict = dataclasses.field(default_factory=dict)   # extra env for the notebook
     ready_timeout: int = 3600       # seconds `up` waits for CT_READY
+    health_path: str = ""           # optional HTTP health probe path (defaults to "/" or "/v1/models")
     base_name: str = ""             # base service name before --instance suffix
     base_default_hostname: str | None = None
     instance: str | None = None     # optional instance id (-i / --instance)
@@ -547,11 +548,12 @@ def _probe_service_endpoint(
     url = (url_override or st.get("url") or "").strip()
     if not url:
         return "missing-url"
+    custom_path = (svc.health_path or "").strip()
     if svc.auth == "caddy":
-        return probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")), timeout=timeout)
+        return probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")), path=custom_path, timeout=timeout)
     if svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
-        return probe(url.rstrip("/") + "/v1/models", bearer=st["api_token"], timeout=timeout)
-    return probe(url, timeout=timeout)
+        return probe(url, bearer=st["api_token"], path=custom_path or "/v1/models", timeout=timeout)
+    return probe(url, path=custom_path, timeout=timeout)
 
 
 def _run_single_exec(
@@ -732,6 +734,16 @@ def _provision_session_for_restart(
                 )
                 return "failed"
             if remote == "alive":
+                candidate_url = previous_url or st.get("url")
+                if candidate_url:
+                    code = _probe_service_endpoint(svc, st, url_override=candidate_url)
+                    if code.isdigit() and 200 <= int(code) < 400:
+                        state.save(url=candidate_url, ready=True)
+                        log(
+                            f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活且服务探针正常 "
+                            f"(HTTP {code})，保持 ready=True 并继续附着保活"
+                        )
+                        return "reattached_ready"
                 log(f"[auto-restart] 远端会话 '{target_svc.name}' 仍存活（本地连接闪断），正在恢复挂载与保活连接")
                 remount_ok = True
                 if mount_drive:
@@ -754,13 +766,20 @@ def _provision_session_for_restart(
                         warn(f"[auto-restart] 原会话挂载恢复失败 ({err})，转为清理并重建会话")
                         remount_ok = False
                 if remount_ok:
-                    candidate_url = previous_url or st.get("url")
                     if candidate_url:
                         code = _probe_service_endpoint(svc, st, url_override=candidate_url)
                         if code.isdigit() and 200 <= int(code) < 400:
                             state.save(url=candidate_url, ready=True)
                             log(f"[auto-restart] 远端服务探针正常 (HTTP {code})，保持 ready=True 并继续附着保活")
                             return "reattached_ready"
+                    if st.get("exec_backend") != "native" and previous_url:
+                        run(
+                            ["colab", "restart-kernel", "-s", target_svc.name],
+                            capture=True,
+                            check=False,
+                            quiet_capture_on_error=True,
+                            env=target_env,
+                        )
                     return "ready"
             log(f"[auto-restart] 远端会话 '{target_svc.name}' 已停机，正在清理残留记录并重新申请实例")
             run(["colab", "stop", "-s", target_svc.name], capture=True, check=False, env=target_env)
@@ -1404,10 +1423,6 @@ def _start_up(svc: Service, script: Path, a):
     # 2. session + 3. Drive
     previous_url = st.get("url")
     reused_session = ensure_session(svc) is True
-    if not a.no_drive:
-        drv_note = f" (drive {svc.drive_account})" if svc.drive_account and svc.drive_account != svc.account else ""
-        log(f"colab dfs mount{drv_note}")
-        run(["colab", "dfs", "mount", "-s", svc.name], env=colab_runtime_env_for(svc))
     initial_url = None
     initial_ready = False
     if reused_session and not a.new_credentials:
@@ -1418,6 +1433,10 @@ def _start_up(svc: Service, script: Path, a):
                 log(f"远端服务已在运行 (HTTP {code})，直接复用现有实例并接管保活")
                 initial_url = candidate_url
                 initial_ready = True
+    if not a.no_drive and not initial_ready:
+        drv_note = f" (drive {svc.drive_account})" if svc.drive_account and svc.drive_account != svc.account else ""
+        log(f"colab dfs mount{drv_note}")
+        run(["colab", "dfs", "mount", "-s", svc.name], env=colab_runtime_env_for(svc))
     req_backend = getattr(a, "exec_backend", None) or os.environ.get("COLABLLM_EXEC_BACKEND") or "auto"
     use_native = (req_backend == "native") or (
         req_backend == "auto" and has_native_colab_session(svc.name, svc.account)
@@ -1553,13 +1572,7 @@ def show_info(svc: Service, do_probe=False, reveal=False, output_json=False, rem
                 lines.append(f"{key}: {st[key]}")
     healthy = ready
     if do_probe and st.get("url"):
-        url = st["url"]
-        if svc.auth == "caddy":
-            result = probe(url, (st.get("auth_user", ""), st.get("auth_pass", "")))
-        elif svc.auth == "builtin" and st.get("api_token") and not st.get("login_user"):
-            result = probe(url.rstrip('/') + '/v1/models', bearer=st["api_token"])
-        else:
-            result = probe(url)
+        result = _probe_service_endpoint(svc, st)
         data["http_status"] = result
         lines.append(f"probe   : {result}")
         healthy = bool(ready and result.isdigit() and 200 <= int(result) < 400)

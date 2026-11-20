@@ -270,12 +270,14 @@ class MuxDaemon:
         if provider == "kaggle":
             import kagglesvc
 
-            svc = kagglesvc.KaggleService(**svc_data)
+            allowed = {f.name for f in dataclasses.fields(kagglesvc.KaggleService)}
+            svc = kagglesvc.KaggleService(**{k: v for k, v in svc_data.items() if k in allowed})
             state = kagglesvc._state_for(svc)
         else:
             import colabsvc
 
-            svc = colabsvc.Service(**svc_data)
+            allowed = {f.name for f in dataclasses.fields(colabsvc.Service)}
+            svc = colabsvc.Service(**{k: v for k, v in svc_data.items() if k in allowed})
             state = colabsvc.State(svc)
 
         skey = _mux_session_key(provider, svc.name)

@@ -93,6 +93,10 @@ class _MockColabRuntimeServer:
         self.active_ws_sockets: list[socket.socket] = []
         self._lock = threading.Lock()
         self.kernels_by_token: dict[str, str] = {}
+        self.kernel_states: dict[str, str] = {}
+        self.interrupt_calls: list[str] = []
+        self.restart_calls: list[str] = []
+        self.ws_execute_requests = 0
         self.executed_codes: list[str] = []
         srv_ref = self
 
@@ -134,8 +138,9 @@ class _MockColabRuntimeServer:
                 if parsed.path == "/api/kernels":
                     with srv_ref._lock:
                         kid = srv_ref.kernels_by_token.get(tok)
+                        state = "busy" if (srv_ref.root / "kernel-busy").exists() else srv_ref.kernel_states.get(kid or "", "idle")
                     if kid:
-                        self._send_json(200, [{"id": kid, "name": "python3", "execution_state": "idle"}])
+                        self._send_json(200, [{"id": kid, "name": "python3", "execution_state": state}])
                     else:
                         self._send_json(200, [])
                     return
@@ -143,8 +148,9 @@ class _MockColabRuntimeServer:
                     req_id = urllib.parse.unquote(parsed.path[len("/api/kernels/") :])
                     with srv_ref._lock:
                         known = set(srv_ref.kernels_by_token.values())
+                        state = "busy" if (srv_ref.root / "kernel-busy").exists() else srv_ref.kernel_states.get(req_id, "idle")
                     if req_id in known:
-                        self._send_json(200, {"id": req_id, "name": "python3", "execution_state": "idle"})
+                        self._send_json(200, {"id": req_id, "name": "python3", "execution_state": state})
                     else:
                         self._send_json(404, {"error": "kernel not found"})
                     return
@@ -162,7 +168,33 @@ class _MockColabRuntimeServer:
                     kid = f"kern-{len(srv_ref.kernels_by_token) + 1}"
                     with srv_ref._lock:
                         srv_ref.kernels_by_token[tok] = kid
+                        srv_ref.kernel_states[kid] = "idle"
                     self._send_json(201, {"id": kid, "name": "python3", "execution_state": "idle"})
+                    return
+                if parsed.path.startswith("/api/kernels/") and parsed.path.endswith("/interrupt"):
+                    req_id = urllib.parse.unquote(parsed.path[len("/api/kernels/") : -len("/interrupt")])
+                    with srv_ref._lock:
+                        known = set(srv_ref.kernels_by_token.values())
+                        srv_ref.interrupt_calls.append(req_id)
+                        if not (srv_ref.root / "ignore-interrupt").exists():
+                            (srv_ref.root / "kernel-busy").unlink(missing_ok=True)
+                            srv_ref.kernel_states[req_id] = "idle"
+                    if req_id in known:
+                        self._send_json(200, {})
+                    else:
+                        self._send_json(404, {"error": "kernel not found"})
+                    return
+                if parsed.path.startswith("/api/kernels/") and parsed.path.endswith("/restart"):
+                    req_id = urllib.parse.unquote(parsed.path[len("/api/kernels/") : -len("/restart")])
+                    with srv_ref._lock:
+                        known = set(srv_ref.kernels_by_token.values())
+                        srv_ref.restart_calls.append(req_id)
+                        (srv_ref.root / "kernel-busy").unlink(missing_ok=True)
+                        srv_ref.kernel_states[req_id] = "idle"
+                    if req_id in known:
+                        self._send_json(200, {"id": req_id, "name": "python3", "execution_state": "idle"})
+                    else:
+                        self._send_json(404, {"error": "kernel not found"})
                     return
                 self._send_json(404, {"error": "not found"})
 
@@ -217,6 +249,10 @@ class _MockColabRuntimeServer:
                         with contextlib.suppress(OSError):
                             _emit_iopub("", "stream", {"name": "stdout", "text": "[mock-kernel] heartbeat\n"})
 
+                if reattach_mode and not heartbeat_started.is_set():
+                    heartbeat_started.set()
+                    threading.Thread(target=_heartbeat_loop, daemon=True).start()
+
                 try:
                     while True:
                         frame = _ws_unmask_frame(sock)
@@ -234,8 +270,11 @@ class _MockColabRuntimeServer:
                         req = json.loads(payload.decode("utf-8"))
                         msg_id = (req.get("header") or {}).get("msg_id") or ""
                         code = (req.get("content") or {}).get("code") or ""
+                        if (req.get("header") or {}).get("msg_type") == "execute_request":
+                            with srv_ref._lock:
+                                srv_ref.ws_execute_requests += 1
 
-                        if reattach_mode:
+                        if reattach_mode or (srv_ref.root / "kernel-busy").exists():
                             # Simulate busy Cell 5 blocking further shell replies while streaming heartbeats.
                             if not heartbeat_started.is_set():
                                 heartbeat_started.set()
@@ -359,6 +398,18 @@ class ColabWsMuxTest(unittest.TestCase):
                 return
 
             def do_GET(self):
+                if (root_dir / "root-404-health-200").exists():
+                    if self.path == "/":
+                        self.send_response(404)
+                        self.end_headers()
+                        self.wfile.write(b"not found")
+                        return
+                    if self.path == "/health":
+                        code = 502 if (root_dir / "http-502").exists() else 200
+                        self.send_response(code)
+                        self.end_headers()
+                        self.wfile.write(b'{"status":"ok"}' if code == 200 else b"bad gateway")
+                        return
                 code = 502 if (root_dir / "http-502").exists() else 200
                 self.send_response(code)
                 self.end_headers()
@@ -819,6 +870,140 @@ sys.exit(0)
         self.assertIn("CT_READY", log_post)
         self.assertIn("RuntimeError: boom", log_post)
         self.assertEqual(self.cli("ollama", "-i", "err5", "down").returncode, 0)
+
+    def test_health_path_reattaches_readonly_without_remount_or_ct_ready_timeout(self):
+        self.env["COLABLLM_FAST_PROBE_SECONDS"] = "0.08"
+        self.env["COLABLLM_IDLE_CHECK_SECONDS"] = "300"
+        (self.root / "root-404-health-200").touch()
+        up = self.cli(
+            "firecrawl-local",
+            "-i",
+            "fc",
+            "up",
+            "--quick-tunnel",
+            "--auto-restart",
+            "--restart-delay",
+            "0.05",
+            "--ready-timeout",
+            "0.35",
+            "--detach",
+        )
+        self.assertEqual(up.returncode, 0, up.stderr)
+
+        sp = self.profile_dir / "services" / "firecrawl-local-fc" / "state.json"
+        deadline = time.monotonic() + 8.0
+        initial = {}
+        while time.monotonic() < deadline:
+            if sp.is_file():
+                initial = json.loads(sp.read_text(encoding="utf-8"))
+                if initial.get("ready") and initial.get("url") == self.health_url:
+                    break
+            time.sleep(0.03)
+        self.assertTrue(initial.get("ready"), initial)
+
+        status_res = self.cli("firecrawl-local", "-i", "fc", "status", "--json")
+        self.assertEqual(status_res.returncode, 0, status_res.stderr)
+        status_payload = json.loads(status_res.stdout)
+        self.assertTrue(status_payload["ready"], status_payload)
+        self.assertEqual(status_payload["http_status"], "200")
+
+        mount_calls_before = [c for c in self.colab_calls() if c[:2] == ["dfs", "mount"]]
+        with self.mock_ws._lock:
+            ws_exec_before = self.mock_ws.ws_execute_requests
+
+        (self.root / "reattach-busy-kernel").touch()
+        (self.root / "kernel-busy").touch()
+        self.mock_ws.drop_all_ws()
+
+        deadline = time.monotonic() + 8.0
+        reattached = {}
+        while time.monotonic() < deadline:
+            reattached = json.loads(sp.read_text(encoding="utf-8"))
+            if (
+                int(reattached.get("restart_count") or 0) >= 1
+                and reattached.get("ready")
+                and str(reattached.get("exec_identity") or "").startswith("native-ws-watch:")
+            ):
+                break
+            time.sleep(0.03)
+        self.assertGreaterEqual(int(reattached.get("restart_count") or 0), 1, reattached)
+        self.assertTrue(reattached.get("ready"), reattached)
+        self.assertTrue(str(reattached.get("exec_identity") or "").startswith("native-ws-watch:"), reattached)
+
+        # Stay connected past ready_timeout (0.35s) -> must NOT hit CT_READY timeout or increment restarts.
+        time.sleep(0.45)
+        after = json.loads(sp.read_text(encoding="utf-8"))
+        self.assertEqual(after.get("restart_count"), reattached.get("restart_count"), after)
+        self.assertTrue(after.get("ready"), after)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 1)
+        mount_calls_after = [c for c in self.colab_calls() if c[:2] == ["dfs", "mount"]]
+        self.assertEqual(len(mount_calls_after), len(mount_calls_before), mount_calls_after)
+        with self.mock_ws._lock:
+            self.assertEqual(self.mock_ws.ws_execute_requests, ws_exec_before)
+
+        run_log = (self.profile_dir / "services" / "firecrawl-local-fc" / "run.log").read_text(encoding="utf-8")
+        self.assertIn("auto-restart #1", run_log)
+        after_banner = run_log.split("auto-restart #1", 1)[1]
+        self.assertIn("[mock-kernel] heartbeat", after_banner)
+        self.assertEqual(self.cli("firecrawl-local", "-i", "fc", "down").returncode, 0)
+
+    def test_unhealthy_live_vm_interrupts_or_restarts_busy_kernel_before_reexec(self):
+        self.env["COLABLLM_FAST_PROBE_SECONDS"] = "0.08"
+        self.env["COLABLLM_IDLE_CHECK_SECONDS"] = "300"
+        self.env["COLABLLM_KERNEL_INTERRUPT_WAIT"] = "0.15"
+        self.env["COLABLLM_KERNEL_RESTART_WAIT"] = "1.0"
+        up = self.cli(
+            "ollama",
+            "-i",
+            "rst",
+            "up",
+            "--quick-tunnel",
+            "--no-drive",
+            "--auto-restart",
+            "--restart-delay",
+            "0.05",
+            "--ready-timeout",
+            "5",
+        )
+        self.assertEqual(up.returncode, 0, up.stderr)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 1)
+
+        (self.root / "kernel-busy").touch()
+        (self.root / "ignore-interrupt").touch()
+        (self.root / "http-502").touch()
+        self.mock_ws.drop_all_ws()
+
+        def _clear_502_after_restart():
+            dl = time.monotonic() + 8.0
+            while time.monotonic() < dl:
+                with self.mock_ws._lock:
+                    restarted = bool(self.mock_ws.restart_calls)
+                if restarted:
+                    (self.root / "http-502").unlink(missing_ok=True)
+                    return
+                time.sleep(0.02)
+
+        t = threading.Thread(target=_clear_502_after_restart, daemon=True)
+        t.start()
+        sp = self.profile_dir / "services" / "ollama-rst" / "state.json"
+        deadline = time.monotonic() + 10.0
+        recovered = {}
+        while time.monotonic() < deadline:
+            recovered = json.loads(sp.read_text(encoding="utf-8"))
+            if int(recovered.get("restart_count") or 0) >= 1 and recovered.get("ready"):
+                break
+            time.sleep(0.03)
+        t.join(timeout=2.0)
+
+        with self.mock_ws._lock:
+            interrupts = list(self.mock_ws.interrupt_calls)
+            restarts = list(self.mock_ws.restart_calls)
+        self.assertGreaterEqual(len(interrupts), 1)
+        self.assertGreaterEqual(len(restarts), 1)
+        self.assertGreaterEqual(int(recovered.get("restart_count") or 0), 1, recovered)
+        self.assertTrue(recovered.get("ready"), recovered)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ["new"]]), 1)
+        self.assertEqual(self.cli("ollama", "-i", "rst", "down").returncode, 0)
 
 
 if __name__ == "__main__":

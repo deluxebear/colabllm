@@ -1,18 +1,23 @@
 """Unit tests for Firecrawl Local setup/cache helper and service CLI."""
 from __future__ import annotations
 
+import base64
 import contextlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 from pathlib import Path
 import runpy
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "templates"))
+sys.path.insert(0, str(ROOT / "src" / "colabllm" / "lib"))
+import colabsvc  # noqa: E402
 import firecrawl_local_setup as fc_setup  # noqa: E402
 
 
@@ -183,6 +188,42 @@ class TestFirecrawlLocalCLI(unittest.TestCase):
         self.assertEqual(req["url"], "https://fc.example.com/v2/map")
         self.assertEqual(req["body"], {"url": "https://example.com", "limit": 25, "search": "docs"})
         self.assertEqual(out.strip(), "https://example.com/docs")
+
+    def test_service_probes_health_path_even_when_root_returns_404(self):
+        mod = runpy.run_path(str(ROOT / "src" / "colabllm" / "services" / "firecrawl-local.py"))
+        svc = mod["SERVICE"]
+        self.assertEqual(svc.health_path, "/health")
+
+        expected_auth = "Basic " + base64.b64encode(b"admin:secret-pass").decode("ascii")
+        seen_paths: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_GET(self):
+                seen_paths.append(self.path)
+                if self.headers.get("Authorization") != expected_auth:
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                code = 200 if self.path == "/health" else 404
+                self.send_response(code)
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}' if code == 200 else b"Not Found")
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        self.addCleanup(srv.server_close)
+
+        st = {
+            "url": f"http://127.0.0.1:{srv.server_port}",
+            "auth_user": "admin",
+            "auth_pass": "secret-pass",
+        }
+        self.assertEqual(colabsvc._probe_service_endpoint(svc, st), "200")
+        self.assertEqual(seen_paths, ["/health"])
 
 
 if __name__ == "__main__":
