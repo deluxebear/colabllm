@@ -115,7 +115,7 @@ LIFECYCLE_SUBCOMMANDS = {
     "_exec",
 }
 
-_SENSITIVE_FLAGS = {"--hf-token", "--api-token", "--token", "--secret-access-key"}
+_SENSITIVE_FLAGS = {"--hf-token", "--api-token", "--token", "--secret-access-key", "--firecrawl-api-key"}
 _SKIP_RE = re.compile(r"^[0-9]+(,[0-9]+)*$")
 _GPU_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 

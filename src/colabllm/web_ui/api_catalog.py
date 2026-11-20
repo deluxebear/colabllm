@@ -728,6 +728,47 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             {"label": "Drive 根目录 (/api/drive-list)", "method": "POST", "path": "api/drive-list", "body": {"path": ""}},
         ],
     },
+    "firecrawl-local": {
+        "primary_surface": "inspector",
+        "surfaces": ["inspector"],
+        "openai_compatible": False,
+        "default_model": "firecrawl-local",
+        "api_style": "firecrawl-v2",
+        "health_path": "health",
+        "models_path": "",
+        "features": {
+            "scrape": True,
+            "map": True,
+            "crawl": True,
+            "batch_scrape": True,
+            "js_rendering": True,
+        },
+        "suggestions": [
+            "抓取单个网页并转换为干净 Markdown (POST /v2/scrape)",
+            "发现站点 URL 列表 (POST /v2/map) 或异步整站爬取 (POST /v2/crawl)",
+        ],
+        "endpoint_presets": [
+            {"label": "健康检查 (/health)", "method": "GET", "path": "health"},
+            {
+                "label": "抓取单页 (/v2/scrape)",
+                "method": "POST",
+                "path": "v2/scrape",
+                "body": {"url": "https://example.com", "formats": ["markdown"]},
+            },
+            {
+                "label": "站点地图发现 (/v2/map)",
+                "method": "POST",
+                "path": "v2/map",
+                "body": {"url": "https://example.com", "limit": 50},
+            },
+            {
+                "label": "启动异步爬取 (/v2/crawl)",
+                "method": "POST",
+                "path": "v2/crawl",
+                "body": {"url": "https://example.com", "limit": 10},
+            },
+        ],
+    },
     "unsloth-studio": {
         "primary_surface": "specialized",
         "surfaces": ["specialized", "inspector"],

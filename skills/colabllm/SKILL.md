@@ -55,6 +55,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | Workflow models, queue and image/video UI | `comfyui` | [ComfyUI](references/comfyui.md) |
 | Training, inference and export UI | `unsloth-studio` | [Unsloth Studio](references/unsloth-studio.md) |
 | Resumable multi-bucket Cloudflare R2 -> Google Drive migration (CPU + Web UI) | `r2-migrate` | [R2 -> Drive Migration](references/r2-migrate.md) |
+| Firecrawl Local v2 scraping, crawling, mapping & JS rendering (CPU + Drive binary cache) | `firecrawl-local` | [Firecrawl Local](references/firecrawl-local.md) |
 | Kaggle pure-CPU HTTP connectivity & `/kaggle/working/.ct-cache` probe (`colabllm kaggle web-probe`) | `kaggle-web-probe` | [Kaggle Web Probe](references/kaggle-web-probe.md) |
 
 Read the selected runtime reference before constructing its task commands. The [common operations

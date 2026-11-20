@@ -127,10 +127,30 @@ class RepoHygieneTest(unittest.TestCase):
         self.assertEqual(r2.SERVICE.env, r2_baseline)
         self.assertEqual(r2.SERVICE.high_mem, r2_hm)
 
+        fc = load_service("firecrawl-local")
+        fc_baseline = dict(fc.SERVICE.env)
+        fc_hm = fc.SERVICE.high_mem
+        fc.prepare_up(types.SimpleNamespace(
+            up_high_mem=True,
+            up_CT_FIRECRAWL_BROWSER="never",
+            up_CT_FIRECRAWL_CLOUD="search",
+            up_rebuild=True,
+            up_scroll=True,
+        ))
+        self.assertTrue(fc.SERVICE.high_mem)
+        self.assertEqual(fc.SERVICE.env["CT_FIRECRAWL_BROWSER"], "never")
+        self.assertEqual(fc.SERVICE.env["CT_FIRECRAWL_CLOUD"], "search")
+        self.assertEqual(fc.SERVICE.env["CT_FIRECRAWL_REBUILD"], "1")
+        self.assertEqual(fc.SERVICE.env["CT_FIRECRAWL_SCROLL"], "1")
+        fc.prepare_up(types.SimpleNamespace())
+        self.assertEqual(fc.SERVICE.env, fc_baseline)
+        self.assertEqual(fc.SERVICE.high_mem, fc_hm)
+
     def test_service_default_hostnames_are_short_aliases(self):
         for name in (
             "qwen-flash", "deepseek-coder", "nemotron-transcribe",
-            "indextts", "qwen3-tts", "drama3", "tangoflux", "minimax-h3-image", "r2-migrate",
+            "indextts", "qwen3-tts", "drama3", "tangoflux", "minimax-h3-image",
+            "r2-migrate", "firecrawl-local",
         ):
             alias = load_service(name).SERVICE.default_hostname
             self.assertTrue(alias and "." not in alias, (name, alias))

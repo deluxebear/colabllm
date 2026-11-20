@@ -6411,6 +6411,159 @@ ct_watchdog(
 )
 '''
 
+
+# --------------------------------------------------------------------------- firecrawl-local (Colab CPU + Drive binary cache)
+FIRECRAWL_LOCAL_CFG = dict(
+    name="firecrawl-local",
+    service_port=3002,
+    auth="caddy",
+    public_port=18080,
+    health_path="/health",
+    ready_timeout=1800,
+)
+FIRECRAWL_LOCAL_SETUP = (
+    "# @title 1. Setup -- restore/compile Firecrawl Local binary (Drive-cached) & stage Chrome sandbox\n"
+    "import sys\n"
+    "from pathlib import Path\n\n"
+    "FC_WORK = Path(os.environ.get('CT_FIRECRAWL_WORK_DIR', '/content/firecrawl-local'))\n"
+    "FC_WORK.mkdir(parents=True, exist_ok=True)\n"
+    + embed_source("FC_WORK", "firecrawl_local_setup.py", "templates/firecrawl_local_setup.py")
+    + "\n"
+    "if str(FC_WORK) not in sys.path:\n"
+    "    sys.path.insert(0, str(FC_WORK))\n"
+    "import firecrawl_local_setup as _fc_setup\n\n"
+    "def _fc_setup_log(msg):\n"
+    "    print(f\"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [firecrawl-setup] {msg}\", flush=True)\n\n"
+    "FC_REF = os.environ.get('CT_FIRECRAWL_REF', 'main').strip() or 'main'\n"
+    "FC_REBUILD = os.environ.get('CT_FIRECRAWL_REBUILD', '0').strip() in ('1', 'true', 'yes')\n"
+    "FC_LTO = os.environ.get('CT_FIRECRAWL_LTO', 'thin').strip() or 'thin'\n"
+    "FC_BROWSER = os.environ.get('CT_FIRECRAWL_BROWSER', 'auto').strip().lower() or 'auto'\n"
+    "FC_CLOUD = os.environ.get('CT_FIRECRAWL_CLOUD', 'off').strip().lower() or 'off'\n\n"
+    "FC_BIN_INFO = _fc_setup.ensure_binary(\n"
+    "    FC_WORK, Path(DATA_DIR), ref=FC_REF, rebuild=FC_REBUILD, lto=FC_LTO, log=_fc_setup_log\n"
+    ")\n"
+    "FC_USER_INFO = _fc_setup.ensure_nonroot_user('firecrawl', FC_WORK)\n"
+    "FC_CHROME_PATH = _fc_setup.ensure_chrome(FC_BROWSER, log=_fc_setup_log)\n"
+    "FC_BIN = FC_BIN_INFO['binary']\n"
+    "print(\n"
+    "    f\"firecrawl-local ready: {FC_BIN_INFO['version']} (source={FC_BIN_INFO['source']}, \"\n"
+    "    f\"cache_key={FC_BIN_INFO['cache_key']}, browser={FC_BROWSER}, chrome={FC_CHROME_PATH or 'none'}, \"\n"
+    "    f\"cloud={FC_CLOUD}, cpus={os.cpu_count()}, free_ssd={shutil.disk_usage('/content').free / 1e9:.1f}GB)\",\n"
+    "    flush=True,\n"
+    ")\n"
+)
+
+FIRECRAWL_LOCAL_SERVICE = r'''# @title 2. Service -- start loopback Firecrawl Local v2 API as unprivileged `firecrawl` user
+if "FC_BIN" not in globals():
+    raise RuntimeError("firecrawl-local setup cell did not run; run Cell 1 first.")
+
+subprocess.run(["pkill", "-f", str(FC_BIN)], check=False)
+
+def start_service():
+    fc_env = {
+        "HOME": FC_USER_INFO["home"],
+        "TMPDIR": FC_USER_INFO["tmp"],
+        "FIRECRAWL_LOCAL_HOME": FC_USER_INFO["home"],
+        "FIRECRAWL_LOCAL_BROWSER": FC_BROWSER,
+        "FIRECRAWL_CLOUD": FC_CLOUD,
+    }
+    if FC_CHROME_PATH:
+        fc_env["FIRECRAWL_CHROME_PATH"] = FC_CHROME_PATH
+    ua = os.environ.get("CT_FIRECRAWL_USER_AGENT", "").strip()
+    if ua:
+        fc_env["FIRECRAWL_LOCAL_USER_AGENT"] = ua
+    if os.environ.get("CT_FIRECRAWL_SCROLL", "0").strip() in ("1", "true", "yes"):
+        fc_env["FIRECRAWL_LOCAL_SCROLL"] = "1"
+    fc_key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if fc_key:
+        fc_env["FIRECRAWL_API_KEY"] = fc_key
+    whitelist = ",".join(sorted(fc_env.keys()))
+    cmd = [
+        "runuser",
+        "-w", whitelist,
+        "-u", FC_USER_INFO["user"],
+        "--",
+        str(FC_BIN),
+        "serve",
+        "--host", "127.0.0.1",
+        "--port", str(SERVICE_PORT),
+    ]
+    return ct_spawn("service", cmd, cwd=FC_USER_INFO["home"], env=fc_env)
+
+PROCS["service"] = (start_service(), start_service)
+ct_wait_http(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=60, ok=lambda c: c == 200)
+print(f"firecrawl-local API listening on 127.0.0.1:{SERVICE_PORT} (user={FC_USER_INFO['user']})", flush=True)
+'''
+
+FIRECRAWL_LOCAL_CADDY = render_caddy_cell(rewrite_host=True, extra_proxy_lines="header_up -Origin")
+
+FIRECRAWL_LOCAL_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- verify public Caddy Basic/Bearer auth before CT_READY
+def _fc_log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [firecrawl-local] {msg}", flush=True)
+
+def _fc_public_probe():
+    req = urllib.request.Request(
+        PUBLIC_URL + "/health",
+        headers={"Authorization": f"Bearer {API_TOKEN}", "User-Agent": "Mozilla/5.0"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") != "ok":
+            raise RuntimeError(f"Public /health returned unexpected payload: {data}")
+        return resp.status
+
+def _fc_verify_auth():
+    req_unauth = urllib.request.Request(PUBLIC_URL + "/health", headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        urllib.request.urlopen(req_unauth, timeout=15)
+        raise RuntimeError("Unauthenticated public GET /health unexpectedly succeeded!")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 without credentials, got {err.code}")
+        if err.headers.get("Set-Cookie"):
+            raise RuntimeError("Public 401 leaked Set-Cookie")
+    req_bad = urllib.request.Request(
+        PUBLIC_URL + "/health",
+        headers={"Authorization": "Bearer invalid-token", "User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        urllib.request.urlopen(req_bad, timeout=15)
+        raise RuntimeError("Invalid Bearer token unexpectedly succeeded!")
+    except urllib.error.HTTPError as err:
+        if err.code != 401:
+            raise RuntimeError(f"Expected HTTP 401 for bad Bearer token, got {err.code}")
+
+ct_public_gate(PUBLIC_URL, _fc_public_probe, _fc_verify_auth, _fc_log, timeout=180, interval=8)
+if not CREDS_FROM_ENV:
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def _fc_local_health():
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=10) as resp:
+        return resp.status == 200 and json.loads(resp.read().decode("utf-8")).get("status") == "ok"
+
+def _fc_heartbeat(uptime_s):
+    with urllib.request.urlopen(f"http://127.0.0.1:{SERVICE_PORT}/health", timeout=10) as resp:
+        info = json.loads(resp.read().decode("utf-8"))
+    _fc_log(
+        f"heartbeat | up={uptime_s}s | version={info.get('version', '?')} | "
+        f"browser={FC_BROWSER} | cloud={FC_CLOUD} | "
+        f"free_ssd={shutil.disk_usage('/content').free / 1e9:.1f}GB"
+    )
+
+ct_watchdog(
+    _fc_local_health,
+    start_service,
+    _fc_log,
+    service_key="service",
+    log_name="service",
+    grace=60,
+    heartbeat=_fc_heartbeat,
+)
+'''
+
 def kaggle_notebook(title, intro, cfg, *, install_cell, service_cell, proxy_cell, tunnel_cell, watchdog_cell):
     cells = [
         md(f"# {title}\n\n{intro}\n\nRun via `colabllm kaggle <short_name> up`."),
@@ -6684,6 +6837,16 @@ if __name__ == "__main__":
                    "`free-only` / `unlimited` + CDN cache bypass).",
                    R2_MIGRATE_CFG, R2_MIGRATE_SETUP, R2_MIGRATE_SERVICE,
                    keepalive=R2_MIGRATE_KEEPALIVE, accelerator=None))
+    write(ROOT / "src/colabllm/services/firecrawl-local.ipynb",
+          notebook("Firecrawl Local (CPU · Rust v2 API + Native-Sandbox Chrome + Drive Binary Cache)",
+                   "Serves `firecrawl-local` (Firecrawl v2 HTTP API: `/v2/scrape`, `/v2/map`, `/v2/crawl`, "
+                   "`/v2/batch/scrape`, `/health`) on a zero-GPU Colab CPU runtime (`gpu=None`, optional "
+                   "`--high-mem`) behind Caddy Basic Auth + Bearer token auth. Compiles the single Rust binary "
+                   "once on local SSD and caches it to Google Drive (`$CT_DATA_DIR/bin/`) for instant reuse on "
+                   "subsequent sessions, running the server as an unprivileged `firecrawl` user with native-sandbox "
+                   "headless Chrome for JavaScript rendering.",
+                   FIRECRAWL_LOCAL_CFG, FIRECRAWL_LOCAL_SETUP, FIRECRAWL_LOCAL_SERVICE,
+                   keepalive=FIRECRAWL_LOCAL_KEEPALIVE, auth_cell=FIRECRAWL_LOCAL_CADDY, accelerator=None))
     write(ROOT / "src/colabllm/kaggle_services/web-probe.ipynb",
           kaggle_notebook(
               "Kaggle Web Probe (CPU · Cache & Isolation Diagnostic)",
