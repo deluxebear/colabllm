@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import tarfile
 import threading
@@ -401,6 +402,8 @@ class DriveDirCache:
         self.max_entries = max(1000, int(max_entries))
         self.max_dir_entries = max(256, int(max_dir_entries))
         self.lock = threading.Lock()
+        self._write_cond = threading.Condition(self.lock)
+        self._active_writes: dict[str, int] = {}
         self._known: OrderedDict[str, None] = OrderedDict()
         # rel_dir -> {entry_name: -1 (dir) | None (file, size unknown) | int >= 0 (file size)}
         self._dir_entries: OrderedDict[str, dict[str, int | None]] = OrderedDict()
@@ -463,6 +466,8 @@ class DriveDirCache:
             built.append(seg)
             cur_rel = "/".join(built)
             cur = cur / seg
+            while self._active_writes.get(cur_rel, 0) > 0:
+                self._write_cond.wait()
             if cur_rel in self._known:
                 parent_rel = cur_rel
                 continue
@@ -585,11 +590,23 @@ class DriveDirCache:
     ) -> str:
         """Write file directly to DriveFS without holding `self.lock` across FUSE I/O."""
         actual_rel = rel_path.strip("/")
-        for attempt in range(2):
-            parent_rel, _, name = actual_rel.rpartition("/")
+        for attempt in range(4):
             with self.lock:
-                self.ensure_dir_locked(parent_rel, on_relocate=on_relocate)
-            dest = self.dest_root / actual_rel
+                while True:
+                    parent_rel, _, name = actual_rel.rpartition("/")
+                    self.ensure_dir_locked(parent_rel, on_relocate=on_relocate)
+                    cached_parent = self._dir_entries.get(parent_rel)
+                    known_dir = actual_rel in self._known or (
+                        cached_parent is not None and cached_parent.get(name) == -1
+                    )
+                    if known_dir and not actual_rel.endswith("/__r2_object__"):
+                        actual_rel = f"{actual_rel}/__r2_object__"
+                        continue
+                    break
+                tracked_rel = actual_rel
+                self._active_writes[tracked_rel] = self._active_writes.get(tracked_rel, 0) + 1
+
+            dest = self.dest_root / tracked_rel
             try:
                 with dest.open("wb") as dst_f:
                     if expected_size > 0 and src_path is not None:
@@ -599,28 +616,33 @@ class DriveDirCache:
                         dst_f.flush()
                         with contextlib.suppress(OSError):
                             os.fsync(dst_f.fileno())
-                actual_size = dest.stat().st_size
+                st_res = dest.stat()
+                if stat.S_ISDIR(st_res.st_mode):
+                    raise IsADirectoryError(errno.EISDIR, "Directory created concurrently", str(dest))
+                actual_size = st_res.st_size
                 if actual_size != int(expected_size):
                     with contextlib.suppress(OSError):
                         dest.unlink(missing_ok=True)
                     raise OSError(f"Drive verify failed for {dest}: expected {expected_size}B, got {actual_size}B")
                 with self.lock:
                     self._record_entry_locked(parent_rel, name, int(expected_size))
-                return actual_rel
+                return tracked_rel
             except (IsADirectoryError, FileExistsError):
-                if attempt == 0 and dest.is_dir():
-                    actual_rel = f"{actual_rel}/__r2_object__"
+                if not tracked_rel.endswith("/__r2_object__") and dest.is_dir():
+                    actual_rel = f"{tracked_rel}/__r2_object__"
                     with self.lock:
-                        self._remember_locked(rel_path.strip("/"))
+                        self._remember_locked(tracked_rel)
+                        self._record_entry_locked(parent_rel, name, -1)
                     continue
                 raise
             except OSError as exc:
-                if attempt == 0 and dest.is_dir():
-                    actual_rel = f"{actual_rel}/__r2_object__"
+                if not tracked_rel.endswith("/__r2_object__") and dest.is_dir():
+                    actual_rel = f"{tracked_rel}/__r2_object__"
                     with self.lock:
-                        self._remember_locked(rel_path.strip("/"))
+                        self._remember_locked(tracked_rel)
+                        self._record_entry_locked(parent_rel, name, -1)
                     continue
-                if attempt == 0 and exc.errno in (2, 20):  # ENOENT / ENOTDIR (stale dir cache or collision)
+                if attempt < 3 and exc.errno in (errno.ENOENT, errno.ENOTDIR):
                     with self.lock:
                         self._invalidate_locked(parent_rel)
                     continue
@@ -628,6 +650,14 @@ class DriveDirCache:
                     if dest.is_file():
                         dest.unlink(missing_ok=True)
                 raise
+            finally:
+                with self.lock:
+                    rem = self._active_writes.get(tracked_rel, 1) - 1
+                    if rem <= 0:
+                        self._active_writes.pop(tracked_rel, None)
+                    else:
+                        self._active_writes[tracked_rel] = rem
+                    self._write_cond.notify_all()
         raise OSError(f"Drive write failed for {rel_path}")
 
 

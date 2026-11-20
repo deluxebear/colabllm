@@ -31,7 +31,7 @@ for _p in (ROOT / "src" / "colabllm" / "lib", ROOT / "templates"):
 import colabsvc  # noqa: E402
 from r2_migrate_app import create_server  # noqa: E402
 import r2_migrate_engine  # noqa: E402
-from r2_migrate_engine import MigrationManager  # noqa: E402
+from r2_migrate_engine import DriveDirCache, MigrationManager  # noqa: E402
 from r2_s3 import R2Client, R2Credentials, R2Error, R2UsageLedger, map_object_to_drive_relpath  # noqa: E402
 
 
@@ -1009,6 +1009,52 @@ class R2MigrationTest(unittest.TestCase):
             self.assertTrue(any("single DELETE" in m for m in logs2), logs2)
         finally:
             c2.close()
+
+    def test_concurrent_file_and_descendant_dir_collision_stress(self) -> None:
+        dest_root = self.drive_mount / "collision-stress"
+        spool_dir = self.work_dir / "spool-collision"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        cache = DriveDirCache(dest_root)
+
+        specs = [
+            ("a/b", b"B" * 96),
+            ("a/b/c.txt", b"C" * 64),
+            ("a/b/sub/deep.txt", b"D" * 128),
+            ("a/b/c.txt/nested.txt", b"N" * 32),
+        ]
+        src_files: dict[str, Path] = {}
+        for idx, (suffix, payload) in enumerate(specs):
+            src = spool_dir / f"src_{idx}.bin"
+            src.write_bytes(payload)
+            src_files[suffix] = src
+
+        errors: list[tuple[int, str, BaseException]] = []
+        for r in range(40):
+            barrier = threading.Barrier(len(specs))
+
+            def _worker(suffix: str, payload: bytes, round_idx: int = r, b: threading.Barrier = barrier) -> None:
+                rel = f"col_{round_idx}/{suffix}"
+                src = src_files[suffix]
+                try:
+                    b.wait(timeout=5.0)
+                    cache.write_file_direct(rel, src, len(payload))
+                except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                    errors.append((round_idx, rel, exc))
+
+            threads = [threading.Thread(target=_worker, args=(suffix, payload)) for suffix, payload in specs]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=10.0)
+                self.assertFalse(th.is_alive())
+
+        self.assertEqual(errors, [], f"Concurrent collision errors: {errors}")
+        for r in range(40):
+            base = dest_root / f"col_{r}"
+            self.assertEqual((base / "a" / "b" / "__r2_object__").read_bytes(), b"B" * 96)
+            self.assertEqual((base / "a" / "b" / "c.txt" / "__r2_object__").read_bytes(), b"C" * 64)
+            self.assertEqual((base / "a" / "b" / "sub" / "deep.txt").read_bytes(), b"D" * 128)
+            self.assertEqual((base / "a" / "b" / "c.txt" / "nested.txt").read_bytes(), b"N" * 32)
 
 
 if __name__ == "__main__":
