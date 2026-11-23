@@ -1728,7 +1728,10 @@ sys.exit(2)
         self.assertEqual(overview['frp']['server_port'], 7000)
         self.assertEqual(overview['frp']['ssh'], 'root@frp.example.com')
 
-        self.assertNotRegex(index_html, r'(?i)(src|href)=["\']https?://')
+        # The project homepage is an outbound navigation link, not a loaded resource.
+        project_link = 'href="https://github.com/deluxebear/colabllm"'
+        self.assertIn(project_link, index_html)
+        self.assertNotRegex(index_html.replace(project_link, ''), r'(?i)(src|href)=["\']https?://')
         self.assertNotRegex(styles_css, r'(?i)(@import|url\()\s*["\']?https?://')
         self.assertNotRegex(copilot_css, r'(?i)(@import|url\()\s*["\']?https?://')
         self.assertRegex(

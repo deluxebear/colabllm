@@ -394,6 +394,25 @@ body {
   border-block-start: 1px solid var(--border);
 }
 
+.github-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.github-link .app-version {
+  font-family: var(--font-mono);
+}
+
+.github-link:hover,
+.github-link:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
 .status-line {
   display: flex;
   align-items: center;
