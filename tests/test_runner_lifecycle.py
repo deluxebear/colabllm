@@ -48,6 +48,20 @@ if cmd == 'status':
         print("[ollama-test] gpu-t4-s-fake | Hardware: T4 | Status: BUSY", flush=True)
     sys.exit(0)
 if cmd == 'new':
+    if (root / 'fail-new-412').exists():
+        (root / 'fail-new-412').unlink()
+        print('[colab] Allocation refused (precondition failed).', file=sys.stderr)
+        sys.exit(1)
+    f503 = root / 'fail-new-503-count'
+    if f503.exists():
+        remaining = int(f503.read_text().strip() or '0')
+        if remaining > 0:
+            f503.write_text(str(remaining - 1))
+            print("╭─── Traceback (most recent call last) ───╮", file=sys.stderr)
+            print("│ /fake/colab_cli/client.py:238           │", file=sys.stderr)
+            print("╰─────────────────────────────────────────╯", file=sys.stderr)
+            print("ColabRequestError: Failed to issue request POST https://colab.research.google.com/tun/m/assign?nbh=abc&variant=GPU&accelerator=A100: Service Unavailable", file=sys.stderr)
+            sys.exit(1)
     if (root / 'fail-new-once').exists():
         (root / 'fail-new-once').unlink()
         print('GPU capacity temporarily unavailable', file=sys.stderr)
@@ -214,7 +228,7 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
         (self.root / 'session-missing').touch()
         (self.root / 'fail-new-once').touch()
         start = self.cli(
-            'up', '--quick-tunnel', '--gpu', 'L4', '--auto-restart', '--restart-delay', '.05', '--detach'
+            'up', '--quick-tunnel', '--gpu', 'L4', '--auto-restart', '--restart-delay', '.05', '--assign-retries', '0', '--detach'
         )
         # Note: initial `up` consumes `fail-new-once`? Keep `fail-new-once` only for the restart cycle:
         self.assertNotEqual(start.returncode, 0)
@@ -222,7 +236,7 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
         (self.root / 'colab-calls.jsonl').unlink(missing_ok=True)
         (self.root / 'crash-once-after-ready').touch()
         start = self.cli(
-            'up', '--quick-tunnel', '--gpu', 'L4', '--auto-restart', '--restart-delay', '.05', '--detach'
+            'up', '--quick-tunnel', '--gpu', 'L4', '--auto-restart', '--restart-delay', '.05', '--assign-retries', '0', '--detach'
         )
         self.assertEqual(start.returncode, 0, start.stderr)
         (self.root / 'session-missing').touch()
@@ -353,6 +367,38 @@ if cmd == 'stop' and (root / 'fail-stop').exists():
         self.assertEqual(len([c for c in calls if c[:1] == ['new']]), 1, calls)
         self.assertEqual(len([c for c in calls if c[:1] == ['stop']]), 0, calls)
         self.assertEqual(self.cli('down').returncode, 0)
+
+    def test_initial_up_retries_transient_503_and_fails_fast_on_412(self):
+        (self.root / 'fail-new-503-count').write_text('2')
+        ok = self.cli(
+            'up', '--quick-tunnel', '--no-drive', '--assign-retries', '3', '--assign-retry-delay', '0.01', '--detach'
+        )
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.wait_ready()
+        new_calls = [c for c in self.colab_calls() if c[:1] == ['new']]
+        self.assertEqual(len(new_calls), 3)
+        self.assertIn('Service Unavailable', ok.stderr)
+        self.assertIn('重试（第 2/4 次）', ok.stderr)
+        self.assertEqual(self.cli('down').returncode, 0)
+
+        (self.root / 'colab-calls.jsonl').unlink(missing_ok=True)
+        (self.root / 'fail-new-503-count').write_text('5')
+        exhausted = self.cli(
+            'up', '--quick-tunnel', '--no-drive', '--assign-retries', '2', '--assign-retry-delay', '0.01', '--detach'
+        )
+        self.assertNotEqual(exhausted.returncode, 0)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ['new']]), 3)
+        self.assertIn('Service Unavailable', exhausted.stderr)
+
+        (self.root / 'fail-new-503-count').unlink(missing_ok=True)
+        (self.root / 'colab-calls.jsonl').unlink(missing_ok=True)
+        (self.root / 'fail-new-412').touch()
+        refused = self.cli(
+            'up', '--quick-tunnel', '--no-drive', '--assign-retries', '3', '--assign-retry-delay', '0.01', '--detach'
+        )
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(len([c for c in self.colab_calls() if c[:1] == ['new']]), 1)
+        self.assertIn('Allocation refused', refused.stderr)
 
 
 if __name__ == '__main__':

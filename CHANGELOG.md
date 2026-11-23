@@ -6,6 +6,7 @@
 
 ### 改进
 
+- **Colab VM 申请临时不可用自动重试**：`colabsvc.ensure_session`（`up`）遇到 `503 Service Unavailable`、`502`/`504`/`429`/`500`、读超时或网络抖动时默认自动重试最多 5 次（基础间隔 `10s`，逐步退避至 `30s`，可通过 `--assign-retries` / `--assign-retry-delay` 或 `COLABLLM_ASSIGN_RETRIES` / `COLABLLM_ASSIGN_RETRY_DELAY` 调整），重试前先复查会话是否已就绪以避免重复建机；遇到 `412`/`400`/`401`/`403` 等确定性失败则立即报错退出。
 - **简化 `--allow-remote` 绑定与通配监听地址展示**：`colabllm web` 与 `colabllm gateway` 指定 `--allow-remote` 且未填 `--host` 时自动绑定 `0.0.0.0`，不再要求重复传 `--host 0.0.0.0`（指定具体非回环 `--host` 时仍须显式带 `--allow-remote`）；通配绑定 `0.0.0.0` / `::` 时保留实际 `host`/`listen` 字段并在启动与 `--status` 输出中分别展示检测到的局域网访问地址与本机回环地址，同时确保后台模式下的非回环监听安全警告正常打印。
 
 ### 新增

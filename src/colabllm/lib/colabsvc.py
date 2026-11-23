@@ -50,7 +50,7 @@ import urllib.request
 from pathlib import Path
 
 from paths import private_dir, user_home
-from cli_support import CliError, UsageError, command_timeout, positive_seconds, diagnostic, safe_urlopen
+from cli_support import CliError, UsageError, command_timeout, nonnegative_seconds, positive_seconds, diagnostic, safe_urlopen
 from colab_accounts import (
     account_sessions_path,
     colab_subprocess_env,
@@ -320,7 +320,11 @@ def run(
         msg = f"命令执行失败 ({res.returncode}): {' '.join(cmd[:4])}"
         if reason:
             msg = f"{msg} — {reason}"
-        raise CliError(msg, res.returncode if res.returncode > 0 else 1)
+        err = CliError(msg, res.returncode if res.returncode > 0 else 1)
+        if capture:
+            err.stdout = res.stdout or ""
+            err.stderr = res.stderr or ""
+        raise err
     return res
 
 
@@ -460,6 +464,9 @@ DEFAULT_FAST_PROBE_SECONDS = 10.0
 DEFAULT_FAST_PROBE_TIMEOUT = 5.0
 DEFAULT_IDLE_CHECK_SECONDS = 300.0
 DEFAULT_SILENT_RECHECK_SECONDS = 60.0
+DEFAULT_ASSIGN_RETRIES = 5
+DEFAULT_ASSIGN_RETRY_DELAY = 10.0
+MAX_ASSIGN_RETRY_BACKOFF = 30.0
 DEFAULT_MAX_STARTUP_RETRIES = 3
 DEFAULT_COLAB_REQUEST_TIMEOUT = 60
 DEFAULT_PREFLIGHT_RETRIES = 2
@@ -1249,19 +1256,81 @@ def exec_runner(svc: Service, nb_path: Path) -> int:
 
 
 # --------------------------------------------------------------------------- commands
-def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
+_NON_RETRYABLE_ASSIGN_RE = re.compile(
+    r"precondition failed|allocation refused|toomanyassignmentserror|"
+    r"backend rejected accelerator|bad request|unauthorized|forbidden|"
+    r"not authenticated|invalid_grant|unknown accelerator|invalid value",
+    re.IGNORECASE,
+)
+_RETRYABLE_ASSIGN_RE = re.compile(
+    r"service unavailable|\b503\b|bad gateway|\b502\b|gateway time-?out|\b504\b|"
+    r"too many requests|\b429\b|internal server error|\b500\b|"
+    r"temporarily unavailable|readtimeout|read timed out|connecttimeout|"
+    r"timed out|connectionerror|connection reset|connection aborted|"
+    r"remotedisconnected|nameresolutionerror|temporary failure in name resolution|"
+    r"sslerror|eof occurred in violation of protocol",
+    re.IGNORECASE,
+)
+
+
+def _is_retryable_assign_error(text: str) -> bool:
+    if not text:
+        return False
+    if _NON_RETRYABLE_ASSIGN_RE.search(text):
+        return False
+    return bool(_RETRYABLE_ASSIGN_RE.search(text))
+
+
+def _assign_retry_settings(retries: int | None = None, retry_delay: float | None = None) -> tuple[int, float]:
+    if retries is None:
+        raw_retries = os.environ.get("COLABLLM_ASSIGN_RETRIES")
+        if raw_retries is not None and raw_retries.strip():
+            try:
+                retries = nonnegative_int(raw_retries.strip())
+            except (ValueError, argparse.ArgumentTypeError) as err:
+                raise UsageError(f"COLABLLM_ASSIGN_RETRIES 无效: {err}") from None
+        else:
+            retries = DEFAULT_ASSIGN_RETRIES
+    if retry_delay is None:
+        raw_delay = os.environ.get("COLABLLM_ASSIGN_RETRY_DELAY")
+        if raw_delay is not None and raw_delay.strip():
+            try:
+                retry_delay = nonnegative_seconds(raw_delay.strip())
+            except ValueError as err:
+                raise UsageError(f"COLABLLM_ASSIGN_RETRY_DELAY 无效: {err}") from None
+        else:
+            retry_delay = DEFAULT_ASSIGN_RETRY_DELAY
+    return int(retries), float(retry_delay)
+
+
+def _assign_backoff_delay(base_delay: float, failed_attempt: int) -> float:
+    if base_delay <= 0:
+        return 0.0
+    return min(MAX_ASSIGN_RETRY_BACKOFF, base_delay * (1.5 ** max(0, failed_attempt - 1)))
+
+
+def ensure_session(
+    svc: Service,
+    *,
+    force_new: bool = False,
+    assign_retries: int | None = None,
+    assign_retry_delay: float | None = None,
+) -> bool:
     env = colab_env_for(svc)
-    if not force_new:
+
+    def _has_recorded_session() -> bool:
         try:
             sessions = json.loads(account_sessions_path(svc.account).read_text(encoding="utf-8"))
         except Exception:
             sessions = {}
-        if svc.name in sessions:
-            if check_remote_session(svc) != "missing":
-                log(f"reusing Colab session '{svc.name}'")
-                return True
-            log(f"stale Colab session '{svc.name}' was reclaimed remotely; recreating")
-            run(["colab", "stop", "-s", svc.name], capture=True, check=False, env=env)
+        return svc.name in sessions
+
+    if not force_new and _has_recorded_session():
+        if check_remote_session(svc) != "missing":
+            log(f"reusing Colab session '{svc.name}'")
+            return True
+        log(f"stale Colab session '{svc.name}' was reclaimed remotely; recreating")
+        run(["colab", "stop", "-s", svc.name], capture=True, check=False, env=env)
     args = ["colab", "new", "-s", svc.name]
     if svc.tpu:
         args += ["--tpu", svc.tpu]
@@ -1269,8 +1338,47 @@ def ensure_session(svc: Service, *, force_new: bool = False) -> bool:
         args += ["--gpu", svc.gpu]
     if svc.high_mem:
         args += ["--high-mem"]
-    log(" ".join(args))
-    run(args, env=env)
+    retries, base_delay = _assign_retry_settings(assign_retries, assign_retry_delay)
+    if retries > 0:
+        assign_env = dict(env if env is not None else os.environ)
+        assign_env.setdefault("COLAB_CLI_ASSIGN_RETRIES", "1")
+        assign_env.setdefault("COLAB_CLI_RETRY_BACKOFF", "5")
+    else:
+        assign_env = env
+    for attempt in range(1, retries + 2):
+        if attempt > 1 and not force_new and _has_recorded_session():
+            if check_remote_session(svc) != "missing":
+                log(f"reusing Colab session '{svc.name}'")
+                return True
+            run(["colab", "stop", "-s", svc.name], capture=True, check=False, env=env)
+        log(" ".join(args) if attempt == 1 else f"{' '.join(args)} (第 {attempt}/{retries + 1} 次尝试)")
+        try:
+            res = run(args, capture=True, quiet_capture_on_error=True, env=assign_env)
+            stdout_text = getattr(res, "stdout", None)
+            if isinstance(stdout_text, str):
+                for line in stdout_text.splitlines():
+                    if line.strip():
+                        diagnostic(line)
+            return False
+        except (CliError, subprocess.TimeoutExpired) as err:
+            if isinstance(err, subprocess.TimeoutExpired):
+                retryable = True
+                reason = f"命令超时 ({err.timeout}s)"
+            else:
+                combined = "\n".join(
+                    part for part in (str(err), getattr(err, "stderr", "") or "", getattr(err, "stdout", "") or "")
+                    if part
+                )
+                retryable = _is_retryable_assign_error(combined)
+                reason = str(err)
+            if not retryable or attempt > retries:
+                if isinstance(err, subprocess.TimeoutExpired):
+                    raise CliError(f"申请 Colab VM 超时 ({err.timeout}s): {' '.join(args)}", 124) from None
+                raise
+            delay = _assign_backoff_delay(base_delay, attempt)
+            warn(f"申请 Colab VM 暂时失败（{reason}），{delay:g}s 后重试（第 {attempt + 1}/{retries + 1} 次）")
+            if delay > 0:
+                time.sleep(delay)
     return False
 
 
@@ -1422,7 +1530,11 @@ def _start_up(svc: Service, script: Path, a):
     _write_private_notebook(nb_path, built, env)
     # 2. session + 3. Drive
     previous_url = st.get("url")
-    reused_session = ensure_session(svc) is True
+    reused_session = ensure_session(
+        svc,
+        assign_retries=getattr(a, "assign_retries", None),
+        assign_retry_delay=getattr(a, "assign_retry_delay", None),
+    ) is True
     initial_url = None
     initial_ready = False
     if reused_session and not a.new_credentials:
@@ -1719,6 +1831,10 @@ def build_parser(svc: Service, configure=None):
     u.add_argument("--max-restarts", type=nonnegative_int, default=0, metavar="N",
                    help="最大自动重启次数，0 表示就绪后不限次数（默认: 0）")
     u.add_argument("--ready-timeout", type=positive_seconds, help="seconds to wait for readiness (default: service-specific)")
+    u.add_argument("--assign-retries", type=nonnegative_int, default=None, metavar="N",
+                   help="申请 Colab VM 遇临时不可用(503/超时/网络波动)时的最大重试次数（默认: 5，或 COLABLLM_ASSIGN_RETRIES；0 不重试）")
+    u.add_argument("--assign-retry-delay", type=nonnegative_seconds, default=None, metavar="SECONDS",
+                   help="申请 Colab VM 重试基础等待秒数，逐步退避至 30s（默认: 10，或 COLABLLM_ASSIGN_RETRY_DELAY）")
     u.add_argument("--exec-backend", choices=("auto", "native", "cli"), default="auto",
                    help="保活执行后端：auto 优先使用原生轻量 WebSocket 多路复用，无会话令牌时回退 colab exec（默认: auto）")
     u.add_argument("--no-mux", action="store_true",

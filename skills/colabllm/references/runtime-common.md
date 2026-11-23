@@ -44,6 +44,7 @@ colabllm tunnel-config
 - `up` 等到完整的 `CT_READY` 协议行；`up --detach` 仅提交后台启动，需要继续检查 `status --json`。
 - `up --auto-restart` 开启守护模式（可配合 `--restart-delay SECONDS`、`--idle-check SECONDS` 与 `--max-restarts N`）：Colab 与 Kaggle 后台实例均默认由单进程共享 `MuxDaemon` 托管（`--exec-backend auto` 优先使用原生纯标准库 Jupyter WebSocket，稳态零常驻外部 CLI 子进程；`--no-mux` 独立运行，`--exec-backend cli` 回退外部 CLI 子进程）。当保活连接断开、轻量公网边缘探针检出网关异常或 `--idle-check`（默认 `300s`）巡检超时时，若远端容器/VM 仍存活且 HTTP 健康则以只读 WebSocket `iopub`（或 `kaggle session logs -f`）重附不计重启次数；若已被回收则清理残留记录并重建恢复，固定域名与 `api_token` 保持不变；手动 `down` 时正常退出不重拉（单实例 `down`/`restart` 通过 `mux` RPC 停止对应协程而不影响同进程内其他平台实例）。
 - `up --ready-timeout SECONDS` 限制就绪等待。默认后台模式超时保留 runner；前台 `--foreground` 超时断开连接。
+- `up --assign-retries N`（默认 `5`，环境变量 `COLABLLM_ASSIGN_RETRIES`，`0` 关闭）与 `--assign-retry-delay SECONDS`（默认 `10`，环境变量 `COLABLLM_ASSIGN_RETRY_DELAY`，退避上限 `30s`）用于在申请 Colab VM 遇到 `503 Service Unavailable`、网络抖动或请求超时等临时故障时自动重试；遇到配额不足/拒绝分配（`412`/`400`）或未认证（`401`/`403`）会立即失败，不作无效等待。
 - `--command-timeout SECONDS` 或 `COLABLLM_COMMAND_TIMEOUT` 限制外部控制命令；长驻保活连接不受该通用上限影响。
 - `status --json` 返回运行、就绪、URL 和探测信息；`running: true` 只代表本地 runner 活着，不能替代模型就绪检查。
 - `logs -n 100` 查看近期日志，`logs -f` 跟随输出；日志可能含第三方程序打印的敏感信息，分享前应脱敏。

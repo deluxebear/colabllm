@@ -207,6 +207,78 @@ class LifecycleSafetyTest(unittest.TestCase):
         with patch.object(svc, "run", return_value=missing_res):
             self.assertEqual(svc.inspect_remote_session(self.service), ("missing", None))
 
+    def test_assign_retry_classification(self):
+        for transient in (
+            "ColabRequestError: Failed to issue request POST https://colab.research.google.com/tun/m/assign: Service Unavailable",
+            "HTTP 502 Bad Gateway",
+            "HTTP 504 Gateway Timeout",
+            "429 Too Many Requests",
+            "500 Internal Server Error",
+            "ReadTimeout: Read timed out",
+            "ConnectionError: NameResolutionError",
+            "GPU capacity temporarily unavailable",
+        ):
+            self.assertTrue(svc._is_retryable_assign_error(transient), transient)
+
+        for permanent in (
+            "[colab] Allocation refused (precondition failed).",
+            "TooManyAssignmentsError",
+            "[colab] Backend rejected accelerator 'A100'.",
+            "401 Unauthorized",
+            "403 Forbidden",
+            "400 Bad Request",
+            "some unknown error",
+            "",
+        ):
+            self.assertFalse(svc._is_retryable_assign_error(permanent), permanent)
+
+    def test_ensure_session_retries_transient_errors_and_reuses_recorded_session(self):
+        fake_home = self.root / 'home'
+        cfg_dir = fake_home / '.config/colab-cli'
+        cfg_dir.mkdir(parents=True)
+
+        err_503 = CliError("命令执行失败 (1): colab new -s test — Service Unavailable", 1)
+        ok_res = subprocess.CompletedProcess(["colab", "new"], 0, "[colab] Creating session 'test'...\n", "")
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', side_effect=[err_503, ok_res]) as mock_run, \
+             patch.object(svc.time, 'sleep') as mock_sleep:
+            self.assertFalse(svc.ensure_session(self.service, assign_retries=2, assign_retry_delay=0.5))
+        self.assertEqual(mock_run.call_count, 2)
+        mock_sleep.assert_called_once_with(0.5)
+        self.assertEqual(mock_run.call_args.kwargs['env']['COLAB_CLI_ASSIGN_RETRIES'], '1')
+        self.assertEqual(mock_run.call_args.kwargs['env']['COLAB_CLI_RETRY_BACKOFF'], '5')
+
+        # Respect explicit COLAB_CLI_ASSIGN_RETRIES / COLAB_CLI_RETRY_BACKOFF overrides.
+        with patch.dict(os.environ, {'COLAB_CLI_ASSIGN_RETRIES': '0', 'COLAB_CLI_RETRY_BACKOFF': '2'}), \
+             patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', return_value=ok_res) as mock_run_env:
+            svc.ensure_session(self.service, assign_retries=1, assign_retry_delay=0.0)
+        self.assertEqual(mock_run_env.call_args.kwargs['env']['COLAB_CLI_ASSIGN_RETRIES'], '0')
+        self.assertEqual(mock_run_env.call_args.kwargs['env']['COLAB_CLI_RETRY_BACKOFF'], '2')
+
+        # Non-retryable 412 fails fast without retrying or sleeping.
+        err_412 = CliError("命令执行失败 (1): colab new -s test — [colab] Allocation refused (precondition failed).", 1)
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', side_effect=err_412) as mock_run_412, \
+             patch.object(svc.time, 'sleep') as mock_sleep_412:
+            with self.assertRaises(CliError):
+                svc.ensure_session(self.service, assign_retries=3, assign_retry_delay=1.0)
+        self.assertEqual(mock_run_412.call_count, 1)
+        mock_sleep_412.assert_not_called()
+
+        # Timeout on first attempt where session actually materialized before retry -> reuse without calling `new` again.
+        def timeout_then_recorded(*args, **kwargs):
+            (cfg_dir / 'sessions.json').write_text(json.dumps({'test': {'id': 'late-sess'}}))
+            raise subprocess.TimeoutExpired(args[0], 300)
+
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', side_effect=timeout_then_recorded) as mock_run_to, \
+             patch.object(svc, 'check_remote_session', return_value='alive'), \
+             patch.object(svc.time, 'sleep') as mock_sleep_to:
+            self.assertTrue(svc.ensure_session(self.service, assign_retries=2, assign_retry_delay=0.25))
+        self.assertEqual(mock_run_to.call_count, 1)
+        mock_sleep_to.assert_called_once_with(0.25)
+
 
 if __name__ == '__main__':
     unittest.main()
