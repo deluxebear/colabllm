@@ -258,7 +258,7 @@ class IntrospectionTest(unittest.TestCase):
             self.assertIsInstance(schema['subcommands'], list)
         self.assertTrue(introspect.get_service_schema('qwen-flash')['subcommands'])
         self.assertTrue(introspect.get_service_schema('flux-klein')['subcommands'])
-        for web_svc in ('qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'unsloth-studio', 'r2-migrate'):
+        for web_svc in ('qwen-flash', 'deepseek-coder', 'deepseek-qwen-9b', 'unsloth-studio', 'r2-migrate', 'oxr'):
             self.assertTrue(catalog[web_svc]['has_web_ui'], f'{web_svc} should expose has_web_ui')
         self.assertIsNone(catalog['r2-migrate']['gpu'])
         self.assertFalse(catalog['ollama']['has_web_ui'])
@@ -283,7 +283,7 @@ class IntrospectionTest(unittest.TestCase):
         ):
             self.assertTrue(catalog[oai_svc]['openai_compatible'], f'{oai_svc} should be openai_compatible')
 
-        for native_svc in ('comfyui', 'unlimited-ocr', 'unsloth-studio', 'r2-migrate'):
+        for native_svc in ('comfyui', 'unlimited-ocr', 'oxr', 'unsloth-studio', 'r2-migrate'):
             self.assertFalse(catalog[native_svc]['openai_compatible'], f'{native_svc} should be native API')
             self.assertEqual(catalog[native_svc]['api_profile']['primary_surface'], 'specialized')
 

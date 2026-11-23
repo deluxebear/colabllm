@@ -235,6 +235,7 @@ GATEWAY_RUNTIME_SPECS: dict[str, RuntimeGatewaySpec] = {
     "longcat-video": RuntimeGatewaySpec(),
     "longcat-avatar": RuntimeGatewaySpec(),
     "unlimited-ocr": RuntimeGatewaySpec(),
+    "oxr": RuntimeGatewaySpec(),
     "r2-migrate": RuntimeGatewaySpec(),
     "firecrawl-local": RuntimeGatewaySpec(),
     "unsloth-studio": RuntimeGatewaySpec(),

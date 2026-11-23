@@ -39,7 +39,7 @@ class CliRegressionTest(unittest.TestCase):
         self.assertEqual(result.exception.code, 0)
 
     def test_public_help_lists_business_commands(self):
-        expected = {'qwen3-tts': 'tts', 'indextts': 'tts', 'unlimited-ocr': 'ocr',
+        expected = {'qwen3-tts': 'tts', 'indextts': 'tts', 'unlimited-ocr': 'ocr', 'oxr': 'parse',
                     'longcat-avatar': 'generate', 'openjutsu': 'swap', 'comfyui': 'pull-workflow',
                     'nemotron-transcribe': 'transcribe'}
         with tempfile.TemporaryDirectory() as home:

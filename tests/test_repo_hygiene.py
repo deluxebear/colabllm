@@ -127,6 +127,14 @@ class RepoHygieneTest(unittest.TestCase):
         self.assertEqual(r2.SERVICE.env, r2_baseline)
         self.assertEqual(r2.SERVICE.high_mem, r2_hm)
 
+        oxr = load_service("oxr")
+        oxr_baseline = dict(oxr.SERVICE.env)
+        oxr.prepare_up(types.SimpleNamespace(up_CT_OXR_MAX_NUM_SEQS="8", up_CT_OXR_GPU_MEM_UTIL="0.6"))
+        self.assertEqual(oxr.SERVICE.env["CT_OXR_MAX_NUM_SEQS"], "8")
+        self.assertEqual(oxr.SERVICE.env["CT_OXR_GPU_MEM_UTIL"], "0.6")
+        oxr.prepare_up(types.SimpleNamespace())
+        self.assertEqual(oxr.SERVICE.env, oxr_baseline)
+
         fc = load_service("firecrawl-local")
         fc_baseline = dict(fc.SERVICE.env)
         fc_hm = fc.SERVICE.high_mem
@@ -150,7 +158,7 @@ class RepoHygieneTest(unittest.TestCase):
         for name in (
             "qwen-flash", "deepseek-coder", "nemotron-transcribe",
             "indextts", "qwen3-tts", "drama3", "tangoflux", "minimax-h3-image",
-            "r2-migrate", "firecrawl-local",
+            "r2-migrate", "firecrawl-local", "oxr",
         ):
             alias = load_service(name).SERVICE.default_hostname
             self.assertTrue(alias and "." not in alias, (name, alias))

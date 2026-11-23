@@ -17,7 +17,7 @@ python3 -m unittest tests/test_notebooks_sync.py
 | Shared transport | `templates/tunnel_client.py` | pasted as cell 4 |
 | Compiler cache archives | `templates/colab_cache.py` | written to `<work>/colab_cache.py` and imported |
 | ASGI security / Drive helpers | `templates/colab_asgi_common.py` | written next to each middleware |
-| Service middlewares / workers | `templates/nemotron_middleware.py`, `indextts_middleware.py`, `qwen3_tts_middleware.py`, `qwen3_tts_aux_worker.py`, `drama3_middleware.py`, `tangoflux_service.py`, `flux_klein_middleware.py`, `qwen_image_middleware.py`, `minimax_h3_image_middleware.py` | written to the service work dir |
+| Service middlewares / workers | `templates/nemotron_middleware.py`, `indextts_middleware.py`, `qwen3_tts_middleware.py`, `qwen3_tts_aux_worker.py`, `drama3_middleware.py`, `tangoflux_service.py`, `flux_klein_middleware.py`, `qwen_image_middleware.py`, `minimax_h3_image_middleware.py`, `oxr_auth_app.py` | written to the service work dir |
 | Service Web UI & job apps | `templates/unlimited_ocr_app.py`, `longcat_video_app.py`, `longcat_avatar_app.py`, `r2_migrate_app.py`, `r2_migrate_engine.py` | written to the service work dir (`GET /` + `/api/*`) |
 | ComfyUI helper, custom node, browser JS | `templates/comfyui_workflow_helper.py`, `comfyui_workflow_downloader.py`, `comfyui_ssd_downloader.js` | written under `/content/ComfyUI` |
 | Code shared with the local CLI | `src/colabllm/lib/` (e.g. `nemotron_audio.py`, `avatar_sampling.py`, `ocr_parameters.py`, `r2_s3.py`) | embedded the same way |

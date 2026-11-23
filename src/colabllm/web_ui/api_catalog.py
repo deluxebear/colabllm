@@ -589,6 +589,30 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             {"label": "提交 OCR 任务 (/api/jobs)", "method": "POST", "path": "api/jobs", "body": {"source": ""}},
         ],
     },
+    "oxr": {
+        "primary_surface": "specialized",
+        "surfaces": ["specialized", "inspector"],
+        "openai_compatible": False,
+        "default_model": "oxr",
+        "api_style": "somark-parse",
+        "health_path": "health",
+        "models_path": "",
+        "features": {
+            "web_ui": True,
+            "somark_compatible": True,
+            "multipart_upload": True,
+            "output_formats": ["markdown", "json"],
+        },
+        "suggestions": [
+            "打开 /demo 上传 PDF/图片，查看版面框、阅读顺序与 Markdown 预览",
+            "POST /v1/parse/sync（multipart file + output_formats）获取 Markdown/JSON",
+            "使用 SoMark SDK/CLI：--base-url <url>/v1 --api-key <api_token>",
+        ],
+        "endpoint_presets": [
+            {"label": "健康检查 (/health)", "method": "GET", "path": "health"},
+            {"label": "OpenAPI (/openapi.json)", "method": "GET", "path": "openapi.json"},
+        ],
+    },
     "longcat-avatar": {
         "primary_surface": "specialized",
         "surfaces": ["specialized", "inspector"],

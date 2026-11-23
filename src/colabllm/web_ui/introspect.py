@@ -32,7 +32,7 @@ _CATEGORIES: dict[str, set[str]] = {
     "image": {"minimax-h3-image", "flux-klein", "qwen-image"},
     "audio": {"qwen3-tts", "indextts", "drama3", "tangoflux", "nemotron-transcribe"},
     "video": {"comfyui", "openjutsu", "longcat-video", "longcat-avatar", "unsloth-studio"},
-    "ocr": {"unlimited-ocr"},
+    "ocr": {"unlimited-ocr", "oxr"},
 }
 
 CATEGORY_LABELS: dict[str, str] = {
@@ -51,6 +51,7 @@ WEB_UI_SERVICES = {
     "longcat-video",
     "unsloth-studio",
     "unlimited-ocr",
+    "oxr",
     "r2-migrate",
     "kaggle-web-probe",
     *LLAMA_SERVER_SERVICES,

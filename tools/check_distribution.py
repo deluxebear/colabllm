@@ -179,6 +179,7 @@ def check(artifact):
             'comfyui': ('pull-workflow', 'pull-model'),
             'openjutsu': ('check',),
             'unlimited-ocr': ('ocr', 'job', 'resume'),
+            'oxr': ('parse',),
             'longcat-avatar': ('generate', 'job', 'download'),
             'nemotron-transcribe': ('transcribe', 'download', 'ls-drive'),
             'flux-klein': ('generate', 'edit', 'upsample', 'ls-drive', 'models'),

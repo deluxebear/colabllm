@@ -1,7 +1,8 @@
 ---
 name: colabllm
 description: >-
-  Use installed colabllm runtimes on Google Colab for LLM inference, PDF/image OCR,
+  Use installed colabllm runtimes on Google Colab for LLM inference, PDF/image OCR and
+  SoMark-compatible document parsing (OXR),
   speech transcription, speech synthesis, voice cloning, sound-effect/audio generation,
   image generation, multi-reference image editing, avatar/video generation, ComfyUI,
   Unsloth Studio and Cloudflare R2 to Google Drive migration. Use when the user asks
@@ -41,6 +42,7 @@ such as Torch, CUDA and NumPy are unnecessary; computation occurs in Colab.
 | DeepSeek-V4-Pro Qwen3.5-9B reasoning / vision (256K on L4/T4) | `deepseek-qwen-9b` | [DeepSeek-Qwen-9B](references/deepseek-qwen-9b.md) |
 | Ollama models, OpenAI/Anthropic/native APIs & tuning | `ollama` | [Ollama](references/ollama.md) |
 | PDF/image files or directories to Markdown | `unlimited-ocr` | [Unlimited-OCR](references/unlimited-ocr.md) |
+| SoMark-compatible PDF/image parsing (Markdown/JSON, layout, `/demo`) | `oxr` | [SoMark OXR](references/oxr.md) |
 | Audio/video transcription, timestamps, subtitles | `nemotron-transcribe` | [Nemotron](references/nemotron-transcribe.md) |
 | Built-in speech, voice design and cloning | `qwen3-tts` | [Qwen3-TTS](references/qwen3-tts.md) |
 | Voice cloning, emotion and speed | `indextts` | [IndexTTS](references/indextts.md) |

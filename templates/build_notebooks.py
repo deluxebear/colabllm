@@ -534,6 +534,7 @@ __EXTRA_PROXY_LINES__            flush_interval -1
     handle @bearer {{
         {upstream}
     }}
+__EXTRA_HANDLES__
     @cookie header Cookie *ct_session={cookie_tok}*
     handle @cookie {{
         {upstream}
@@ -574,11 +575,17 @@ else:
 
 
 
-def render_caddy_cell(rewrite_host=True, extra_proxy_lines=""):
-    """Render the Caddy auth cell; extra_proxy_lines are inserted inside reverse_proxy {...}."""
+def render_caddy_cell(rewrite_host=True, extra_proxy_lines="", extra_handles=""):
+    """Render the Caddy auth cell.
+
+    extra_proxy_lines are inserted inside the shared authenticated reverse_proxy {...};
+    extra_handles (Caddyfile f-string text, braces doubled) are inserted after the Bearer
+    handle and before the cookie/Basic Auth handles.
+    """
     extra = "".join(f"            {line}\n" for line in extra_proxy_lines.splitlines() if line.strip())
+    handles = "".join(f"    {line}\n" if line.strip() else "\n" for line in extra_handles.strip("\n").splitlines())
     return CADDY_TEMPLATE.replace("__REWRITE_HOST__", "True" if rewrite_host else "False").replace(
-        "__EXTRA_PROXY_LINES__", extra)
+        "__EXTRA_PROXY_LINES__", extra).replace("__EXTRA_HANDLES__\n", handles)
 
 
 CADDY = render_caddy_cell()
@@ -3416,6 +3423,424 @@ UNLIMITED_OCR_KEEPALIVE = render_keepalive(UNLIMITED_OCR_CFG, before_ready="""fo
         save_cache(local, Path(DATA_DIR) / 'kernel-archives', OCR_CACHE_KEY)
     except (OSError, ValueError) as err:
         print(f'Cache archive save warning ({local.name}): {err}', flush=True)""")
+
+# --------------------------------------------------------------------------- oxr (A100 default, SoMark OXR-1.0: D-FINE + vLLM plugin + parse API behind Caddy)
+OXR_CFG = dict(name="oxr", service_port=8000, auth="caddy", public_port=18080,
+               health_path="/health", ready_timeout=3600)
+
+OXR_SETUP = r'''# @title 1. Setup -- OXR repo + three uv venvs (vLLM 0.25.1 / D-FINE / parse API) + OXR-1.0 weights on local SSD
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import hashlib
+
+OXR_REPO_URL = "https://github.com/SoMarkAI/OXR.git"
+OXR_COMMIT = os.environ.get("CT_OXR_COMMIT", "b2ee4ac12ed220bf7fefa74951babf0d3b05e766").strip()
+OXR_MODEL_REPO = "SoMarkAI/OXR-1.0"
+OXR_MODEL_REVISION = os.environ.get("CT_OXR_MODEL_REVISION", "c708407f9d2b4df658f2543d9132b62bb7221df4").strip()
+VLLM_PORT = int(os.environ.get("CT_OXR_VLLM_PORT", "8090"))     # Colab itself owns :8080
+DFINE_PORT = int(os.environ.get("CT_OXR_DFINE_PORT", "8091"))
+VLLM_URL = f"http://127.0.0.1:{VLLM_PORT}/v1"
+DFINE_URL = f"http://127.0.0.1:{DFINE_PORT}"
+
+OXR_WORK = Path("/content/oxr")
+OXR_REPO = OXR_WORK / "repo"
+OXR_MODEL = OXR_WORK / "model" / "OXR-1.0"
+OXR_RUN = OXR_WORK / "run"
+VLLM_VENV, DFINE_VENV, API_VENV = OXR_WORK / "vllm-venv", OXR_WORK / "dfine-venv", OXR_WORK / "api-venv"
+VLLM_PY, DFINE_PY, API_PY = (str(v / "bin" / "python") for v in (VLLM_VENV, DFINE_VENV, API_VENV))
+for _d in (OXR_WORK, OXR_MODEL, OXR_RUN, OXR_RUN / "outputs"):
+    _d.mkdir(parents=True, exist_ok=True)
+
+def olog(msg):
+    print(time.strftime("[%F %T] [oxr] ") + msg, flush=True)
+
+# BF16 GPU sizing: 1.3B BF16 weights are ~3.1 GB; vLLM and D-FINE share one GPU.
+_gpu_line = ct_gpu_stat("name,memory.total,compute_cap").splitlines()[0]
+if _gpu_line == "cpu/no-gpu":
+    raise RuntimeError("OXR needs an NVIDIA BF16 GPU (A100 / L4 / H100 / G4); got a CPU runtime")
+_gpu_name, _gpu_mem, _gpu_cc = (x.strip() for x in _gpu_line.split(","))
+GPU_TOTAL_GIB = float(_gpu_mem.split()[0]) / 1024
+if float(_gpu_cc) < 8.0:
+    raise RuntimeError(f"OXR needs BF16 (compute capability >= 8.0); {_gpu_name} is sm{_gpu_cc}")
+GPU_MEM_UTIL = float(os.environ.get("CT_OXR_GPU_MEM_UTIL") or "0.70")
+MAX_NUM_SEQS = int(os.environ.get("CT_OXR_MAX_NUM_SEQS") or (16 if GPU_TOTAL_GIB < 32 else 32 if GPU_TOTAL_GIB < 64 else 64))
+MAX_MODEL_LEN = int(os.environ.get("CT_OXR_MAX_MODEL_LEN") or "16384")
+OXR_CONCURRENCY = int(os.environ.get("CT_OXR_CONCURRENCY") or MAX_NUM_SEQS)
+if not 0.2 <= GPU_MEM_UTIL <= 0.9:
+    raise RuntimeError(f"CT_OXR_GPU_MEM_UTIL must be within 0.2-0.9, got {GPU_MEM_UTIL}")
+olog(f"GPU {_gpu_name} {GPU_TOTAL_GIB:.1f} GiB sm{_gpu_cc} | vLLM util={GPU_MEM_UTIL} "
+     f"max_num_seqs={MAX_NUM_SEQS} max_model_len={MAX_MODEL_LEN} api_concurrency={OXR_CONCURRENCY}")
+
+# Compiler caches on local SSD, archived to Drive per environment + GPU architecture.
+(OXR_WORK / "colab_cache.py").write_text(__OXR_CACHE_SOURCE__, encoding="utf-8")
+sys.path.insert(0, str(OXR_WORK))
+from colab_cache import restore_cache, save_cache
+CACHE_KEY = "oxr-vllm0.25.1-torch2.11-py312-sm" + _gpu_cc.replace(".", "")
+CACHE_ARCHIVES = Path(DATA_DIR) / "cache-archives"
+CACHE_DIRS = {name: OXR_WORK / name for name in ("vllm-cache", "triton-cache", "flashinfer-cache", "inductor-cache")}
+CACHE_ENV = {
+    "VLLM_CACHE_ROOT": str(CACHE_DIRS["vllm-cache"]),
+    "TRITON_CACHE_DIR": str(CACHE_DIRS["triton-cache"]),
+    "FLASHINFER_WORKSPACE_BASE": str(CACHE_DIRS["flashinfer-cache"]),
+    "TORCHINDUCTOR_CACHE_DIR": str(CACHE_DIRS["inductor-cache"]),
+}
+for _local in CACHE_DIRS.values():
+    try:
+        restore_cache(_local, Path(DATA_DIR) / _local.name, CACHE_ARCHIVES, CACHE_KEY, olog)
+    except (OSError, ValueError) as err:
+        olog(f"Cache restore warning ({_local.name}): {err}; continuing")
+
+if not shutil.which("uv"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "uv"], check=True)
+UV = shutil.which("uv") or "uv"
+
+def run_logged(cmd, log_path, env=None, cwd=None):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"\n$ {' '.join(str(x) for x in cmd)}\n")
+        f.flush()
+        res = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT, env=env, cwd=cwd, text=True)
+    if res.returncode != 0:
+        tail = "".join(open(log_path, errors="replace").readlines()[-45:])
+        raise RuntimeError(f"Command failed ({res.returncode}): {' '.join(str(x) for x in cmd[:5])}\n{tail}")
+
+def _venv_ready(venv, signature, probe):
+    marker = venv / ".ct_oxr_ready"
+    py = venv / "bin" / "python"
+    if marker.is_file() and marker.read_text() == signature and py.is_file():
+        return subprocess.run([str(py), "-c", probe], capture_output=True, timeout=300).returncode == 0
+    return False
+
+def prepare_repo():
+    log_path = OXR_WORK / "repo-setup.log"
+    head = subprocess.run(["git", "-C", str(OXR_REPO), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode == 0 and head.stdout.strip() == OXR_COMMIT:
+        olog(f"Reusing OXR source {OXR_COMMIT[:12]}")
+        return
+    if not (OXR_REPO / ".git").is_dir():
+        shutil.rmtree(OXR_REPO, ignore_errors=True)
+        run_logged(["git", "init", "-q", str(OXR_REPO)], log_path)
+        run_logged(["git", "-C", str(OXR_REPO), "remote", "add", "origin", OXR_REPO_URL], log_path)
+    run_logged(["git", "-C", str(OXR_REPO), "fetch", "-q", "--depth", "1", "origin", OXR_COMMIT], log_path)
+    run_logged(["git", "-C", str(OXR_REPO), "checkout", "-q", "--force", "--detach", "FETCH_HEAD"], log_path)
+    olog(f"OXR source ready at {OXR_COMMIT[:12]}")
+
+def prepare_vllm_env():
+    signature = "vllm==0.25.1 transformers==5.13.1 py3.12\n"
+    if _venv_ready(VLLM_VENV, signature, "import vllm, transformers"):
+        olog("Reusing vLLM 0.25.1 virtualenv")
+        return
+    log_path = OXR_WORK / "vllm-env.log"
+    olog(f"Installing vLLM 0.25.1 + Transformers 5.13.1 (torch 2.11 cu130; log: {log_path})")
+    run_logged([UV, "venv", "--python", "3.12", "--seed", "--clear", str(VLLM_VENV)], log_path)
+    run_logged([UV, "pip", "install", "--python", VLLM_PY, "vllm==0.25.1", "transformers==5.13.1"], log_path)
+    (VLLM_VENV / ".ct_oxr_ready").write_text(signature)
+    olog("vLLM environment ready")
+
+def prepare_dfine_env():
+    reqs = OXR_REPO / "services" / "layout_analyze" / "requirements.txt"
+    signature = "torch==2.11.0 torchvision==0.26.0\n" + reqs.read_text()
+    if _venv_ready(DFINE_VENV, signature, "import torch, cv2, fastapi, uvicorn"):
+        olog("Reusing D-FINE virtualenv")
+        return
+    log_path = OXR_WORK / "dfine-env.log"
+    olog(f"Installing D-FINE layout environment (log: {log_path})")
+    run_logged([UV, "venv", "--python", "3.12", "--clear", str(DFINE_VENV)], log_path)
+    run_logged([UV, "pip", "install", "--python", DFINE_PY, "torch==2.11.0", "torchvision==0.26.0",
+                "-r", str(reqs)], log_path)
+    (DFINE_VENV / ".ct_oxr_ready").write_text(signature)
+    olog("D-FINE environment ready")
+
+def prepare_api_env():
+    constraints = OXR_REPO / "docker" / "requirements.allinone.txt"
+    signature = OXR_COMMIT + "\n" + constraints.read_text()
+    if _venv_ready(API_VENV, signature, "import oxr.server.app, uvicorn"):
+        olog("Reusing OXR parse API virtualenv")
+        return
+    log_path = OXR_WORK / "api-env.log"
+    olog(f"Installing OXR parse API (log: {log_path})")
+    run_logged([UV, "venv", "--python", "3.12", "--clear", str(API_VENV)], log_path)
+    run_logged([UV, "pip", "install", "--python", API_PY, "-c", str(constraints), str(OXR_REPO)], log_path)
+    (API_VENV / ".ct_oxr_ready").write_text(signature)
+    olog("OXR parse API environment ready")
+
+OXR_REQUIRED = ("config.json", "model.safetensors", "tokenizer.json", "chat_template.jinja",
+                "plugins/vllm/pyproject.toml", "layout_analysis/last.pth", "layout_analysis/metadata.json")
+
+def _model_complete():
+    for rel in OXR_REQUIRED:
+        path = OXR_MODEL / rel
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        with path.open("rb") as handle:
+            if handle.read(64).startswith(b"version https://git-lfs"):
+                return False
+    return (OXR_MODEL / "model.safetensors").stat().st_size > 1_000_000_000
+
+def prepare_model():
+    marker = OXR_MODEL / ".ct_model_ready"
+    if marker.is_file() and marker.read_text().strip() == OXR_MODEL_REVISION and _model_complete():
+        olog(f"Reusing local SSD weights {OXR_MODEL}")
+        return
+    log_path = OXR_WORK / "model-download.log"
+    olog(f"Downloading {OXR_MODEL_REPO}@{OXR_MODEL_REVISION[:12]} -> {OXR_MODEL} (log: {log_path})")
+    env = {**os.environ, "HF_XET_CHUNK_CACHE_SIZE_BYTES": "0", "HF_HUB_ENABLE_HF_TRANSFER": "0"}
+    script = ("import sys; from huggingface_hub import snapshot_download; "
+              "snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3], max_workers=8, "
+              "ignore_patterns=['.eval_results/*'])")
+    try:
+        run_logged([UV, "run", "--no-project", "--python", "3.12", "--with", "huggingface_hub[hf_xet]>=0.34",
+                    "python", "-c", script, OXR_MODEL_REPO, OXR_MODEL_REVISION, str(OXR_MODEL)], log_path, env=env)
+    finally:
+        for p in ("/root/.cache/huggingface/xet", str(OXR_MODEL / ".cache")):
+            shutil.rmtree(p, ignore_errors=True)
+    if not _model_complete():
+        raise RuntimeError(f"OXR-1.0 download incomplete in {OXR_MODEL}")
+    marker.write_text(OXR_MODEL_REVISION + "\n")
+    olog("OXR-1.0 weights ready on local SSD")
+
+def install_plugin():
+    plugin_src = OXR_MODEL / "plugins" / "vllm"
+    digest = hashlib.sha256(b"".join(p.read_bytes() for p in sorted(plugin_src.rglob("*.py")))
+                            + (plugin_src / "pyproject.toml").read_bytes()).hexdigest()
+    marker = VLLM_VENV / ".ct_oxr_plugin"
+    if marker.is_file() and marker.read_text() == digest and subprocess.run(
+            [VLLM_PY, "-c", "import oxr_vllm"], capture_output=True, timeout=300).returncode == 0:
+        return
+    staged = OXR_WORK / "plugin-src"
+    shutil.rmtree(staged, ignore_errors=True)
+    shutil.copytree(plugin_src, staged, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.egg-info", "build", "dist"))
+    run_logged([UV, "pip", "install", "--python", VLLM_PY, "--no-deps", "--reinstall-package", "oxr-vllm-plugin",
+                str(staged)], OXR_WORK / "vllm-env.log")
+    marker.write_text(digest)
+    olog("OXR vLLM plugin installed")
+
+prepare_repo()
+with ThreadPoolExecutor(max_workers=4) as pool:
+    jobs = {name: pool.submit(fn) for name, fn in (("vllm", prepare_vllm_env), ("dfine", prepare_dfine_env),
+                                                   ("api", prepare_api_env), ("model", prepare_model))}
+    while not all(job.done() for job in jobs.values()):
+        for job in jobs.values():
+            if job.done() and job.exception():
+                raise job.exception()
+        olog("Setup heartbeat | " + " ".join(f"{n}={'done' if j.done() else 'running'}" for n, j in jobs.items())
+             + f" | free_ssd={shutil.disk_usage('/content').free / 1e9:.1f} GB")
+        time.sleep(30)
+    for job in jobs.values():
+        job.result()
+install_plugin()
+olog(f"Setup complete: repo={OXR_REPO} model={OXR_MODEL} data={DATA_DIR}")
+'''.replace("__OXR_CACHE_SOURCE__", repr((ROOT / "templates/colab_cache.py").read_text()))
+
+OXR_SERVICE = r'''# @title 2. Service -- D-FINE :8091 -> vLLM OXR :8090 -> SoMark-compatible parse API :8000 (all 127.0.0.1)
+import hashlib
+(OXR_WORK / "oxr_auth_app.py").write_text(__OXR_AUTH_APP_SOURCE__, encoding="utf-8")
+# Caddy adds this header on its authenticated branches; SoMark form-key requests arrive without it.
+OXR_PROXY_SECRET = hashlib.sha256(("ct-oxr-proxy-v1:" + API_TOKEN).encode()).hexdigest()
+
+def start_dfine():
+    return ct_spawn_marked("dfine", [DFINE_PY, "-m", "uvicorn", "dfine_la.api:app",
+                              "--app-dir", str(OXR_REPO / "services" / "layout_analyze"),
+                              "--host", "127.0.0.1", "--port", str(DFINE_PORT), "--workers", "1"],
+                    cwd=str(OXR_RUN), env={**CACHE_ENV,
+                        "MODEL_PATH": str(OXR_MODEL / "layout_analysis" / "last.pth"),
+                        "MODEL_METADATA_PATH": str(OXR_MODEL / "layout_analysis" / "metadata.json"),
+                        "DFINE_DEVICE": "cuda", "DFINE_CUDA_GRAPH": "1", "DFINE_PARALLEL_PREPROCESS": "1"})
+
+def start_vllm():
+    return ct_spawn_marked("vllm", [str(VLLM_VENV / "bin" / "vllm"), "serve", str(OXR_MODEL),
+                             "--served-model-name", "oxr", "--host", "127.0.0.1", "--port", str(VLLM_PORT),
+                             "--trust-remote-code", "--chat-template", str(OXR_MODEL / "chat_template.jinja"),
+                             "--dtype", "bfloat16", "--max-model-len", str(MAX_MODEL_LEN),
+                             "--gpu-memory-utilization", str(GPU_MEM_UTIL), "--max-num-seqs", str(MAX_NUM_SEQS),
+                             "--attention-config", '{"backend":"TRITON_ATTN"}'],
+                    cwd=str(OXR_RUN), env={**CACHE_ENV, "VLLM_PLUGINS": "oxr", "CUDA_HOME": "/usr/local/cuda",
+                                           # FlashInfer JIT (sampling kernels) needs the venv's ninja + nvcc.
+                                           "PATH": f"{VLLM_VENV / 'bin'}:/usr/local/cuda/bin:{os.environ.get('PATH', '')}"})
+
+def start_service():
+    return ct_spawn_marked("service", [API_PY, "-m", "uvicorn", "oxr_auth_app:app", "--app-dir", str(OXR_WORK),
+                                "--host", "127.0.0.1", "--port", str(SERVICE_PORT), "--workers", "1"],
+                    cwd=str(OXR_RUN), env={
+                        "CT_API_TOKEN": API_TOKEN, "CT_OXR_PROXY_SECRET": OXR_PROXY_SECRET,
+                        "OXR__LAYOUT_ANALYZE_MODEL__URL": DFINE_URL,
+                        "OXR__OXR_MODEL__URL": VLLM_URL, "OXR__OXR_MODEL__MODEL_NAME": "oxr",
+                        "OXR__OXR_MODEL__MAX_CONCURRENCY": str(OXR_CONCURRENCY),
+                        "OXR__PIPELINE__IMAGE_OUTPUT_DIR": str(OXR_RUN / "outputs")})
+
+def _dfine_healthy():
+    try:
+        with urllib.request.urlopen(DFINE_URL + "/health", timeout=10) as resp:
+            return json.loads(resp.read()).get("status") == "healthy"
+    except Exception:
+        return False
+
+# Reused VM/kernel: PROCS is reset by cell 0, so stop stale processes via their pid markers.
+for _name in ("service", "vllm", "dfine"):
+    ct_stop_marked_proc(_name, timeout=30)
+# D-FINE first so vLLM's memory profiling sees its CUDA graphs already resident.
+PROCS["dfine"] = (start_dfine(), start_dfine)
+_deadline = time.monotonic() + 900
+while not _dfine_healthy():
+    if PROCS["dfine"][0].poll() is not None:
+        raise RuntimeError("D-FINE exited during startup:\n" + ct_tail("dfine", 60))
+    if time.monotonic() > _deadline:
+        raise RuntimeError("D-FINE did not become healthy within 900s:\n" + ct_tail("dfine", 60))
+    time.sleep(3)
+olog(f"D-FINE healthy on {DFINE_URL} | GPU: {ct_gpu_stat()}")
+PROCS["vllm"] = (start_vllm(), start_vllm)
+PROCS["service"] = (start_service(), start_service)
+olog(f"vLLM (:{VLLM_PORT}) and parse API (:{SERVICE_PORT}) starting")
+'''.replace("__OXR_AUTH_APP_SOURCE__", repr((ROOT / "templates/oxr_auth_app.py").read_text()))
+
+OXR_CADDY = render_caddy_cell(
+    rewrite_host=True,
+    extra_proxy_lines="header_up X-CT-Proxy-Auth {OXR_PROXY_SECRET}",
+    extra_handles="""@ct_form_auth {{
+    method POST
+    path /v1/parse/sync /v1/parse/async /v1/parse/async_check
+}}
+handle @ct_form_auth {{
+    reverse_proxy 127.0.0.1:{SERVICE_PORT} {{
+        header_up Host {{upstream_hostport}}
+        header_up -Authorization
+        header_up -X-CT-Proxy-Auth
+        flush_interval -1
+    }}
+}}""",
+)
+
+OXR_KEEPALIVE = r'''# @title 5. Ready + keep-alive -- all three services healthy, real parse warmup, auth checks, then watchdog
+import urllib.parse, uuid
+LOCAL = f"http://127.0.0.1:{SERVICE_PORT}"
+CADDY_LOCAL = f"http://127.0.0.1:{PUBLIC_PORT}"
+UA = "Mozilla/5.0 (X11; Linux x86_64) colabllm-oxr"
+
+def oxr_http(url, *, method="GET", headers=None, body=None, timeout=30):
+    req = urllib.request.Request(url, data=body, method=method, headers={"User-Agent": UA, **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as err:
+        return err.code, err.read()
+
+def oxr_form(fields, files=()):
+    boundary = "----ctoxr" + uuid.uuid4().hex
+    parts = []
+    for key, value in fields:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode())
+    for key, name, ctype, data in files:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"; filename="{name}"\r\n'
+                     f'Content-Type: {ctype}\r\n\r\n'.encode() + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+
+def oxr_vllm_ready():
+    try:
+        code, raw = oxr_http(VLLM_URL + "/models", timeout=10)
+        return code == 200 and any(m.get("id") == "oxr" for m in json.loads(raw).get("data") or ())
+    except Exception:
+        return False
+
+def oxr_stack_health(base=LOCAL, headers=None):
+    code, raw = oxr_http(base + "/health", headers=headers, timeout=15)
+    return code, (json.loads(raw) if raw[:1] == b"{" else {})
+
+deadline = time.monotonic() + 2400
+last_notice = 0
+while True:
+    for _name in ("dfine", "vllm", "service"):
+        if PROCS[_name][0].poll() is not None:
+            raise RuntimeError(f"{_name} exited during startup:\n" + ct_tail(_name, 80))
+    try:
+        code, info = oxr_stack_health()
+        if code == 200 and info.get("ok"):
+            break
+    except Exception:
+        info = {}
+    if time.monotonic() > deadline:
+        raise RuntimeError("OXR stack not ready within 2400s:\n" + ct_tail("vllm", 60) + ct_tail("service", 30))
+    if time.monotonic() - last_notice >= 30:
+        last_line = (ct_tail("vllm", 3).strip().splitlines() or ["starting..."])[-1]
+        olog(f"Waiting for OXR stack {info or ''} | GPU: {ct_gpu_stat()} | vllm: {last_line[:110]}")
+        last_notice = time.monotonic()
+    time.sleep(5)
+olog(f"All services healthy (D-FINE, vLLM, parse API) | GPU: {ct_gpu_stat()}")
+
+# Real end-to-end warmup through the form-key path (layout -> recognition -> markdown).
+_warm_png = OXR_RUN / "warmup.png"
+subprocess.run([API_PY, "-c", (
+    "import sys, cv2, numpy as np\n"
+    "img = np.full((520, 1300, 3), 255, np.uint8)\n"
+    "cv2.putText(img, 'OXR Warmup Report', (60, 110), cv2.FONT_HERSHEY_DUPLEX, 2.0, (0, 0, 0), 3)\n"
+    "for i, line in enumerate(['Colab deployment readiness check.', 'Layout analysis, recognition and reading order.',"
+    " 'Total: 42 documents parsed successfully.']):\n"
+    "    cv2.putText(img, line, (60, 220 + 90 * i), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 0), 2)\n"
+    "cv2.imwrite(sys.argv[1], img)\n"), str(_warm_png)], check=True, timeout=120)
+_body, _hdrs = oxr_form([("api_key", API_TOKEN), ("output_formats", "markdown"), ("output_formats", "json")],
+                        [("file", "warmup.png", "image/png", _warm_png.read_bytes())])
+_t0 = time.monotonic()
+code, raw = oxr_http(LOCAL + "/v1/parse/sync", method="POST", headers=_hdrs, body=_body, timeout=600)
+try:
+    _warm = json.loads(raw)
+except ValueError:
+    _warm = {}
+if code != 200 or _warm.get("code") != 0:
+    raise RuntimeError(f"OXR warmup parse failed: HTTP {code} {raw[:400]!r}\n" + ct_tail("service", 40))
+_md = ((_warm.get("data") or {}).get("result") or {}).get("outputs", {}).get("markdown", "")
+olog(f"Warmup parse OK in {time.monotonic() - _t0:.1f}s ({len(_md)} markdown chars): {_md[:120]!r}")
+if not _md.strip():
+    olog("Warmup warning: markdown is empty; check vllm/dfine logs")
+
+for _local in CACHE_DIRS.values():
+    try:
+        save_cache(_local, CACHE_ARCHIVES, CACHE_KEY, olog)
+    except (OSError, ValueError) as err:
+        olog(f"Cache archive save warning ({_local.name}): {err}")
+
+def oxr_verify_auth(base):
+    """No credentials / wrong Bearer / wrong form api_key -> 401; Bearer and form api_key -> accepted."""
+    code, _ = oxr_http(base + "/health")
+    if code != 401:
+        raise RuntimeError(f"Unauthenticated GET {base}/health returned {code}, expected 401")
+    code, _ = oxr_http(base + "/health", headers={"Authorization": "Bearer invalid-token-probe"})
+    if code != 401:
+        raise RuntimeError(f"Invalid Bearer on {base}/health returned {code}, expected 401")
+    code, _ = oxr_stack_health(base, {"Authorization": f"Bearer {API_TOKEN}"})
+    if code != 200:
+        raise RuntimeError(f"Bearer GET {base}/health returned {code}, expected 200")
+    probe = urllib.parse.urlencode({"task_id": "ct-auth-probe", "api_key": "invalid-key-probe"}).encode()
+    form = {"Content-Type": "application/x-www-form-urlencoded"}
+    code, _ = oxr_http(base + "/v1/parse/async_check", method="POST", headers=form, body=probe)
+    if code != 401:
+        raise RuntimeError(f"Invalid form api_key on {base}/v1/parse/async_check returned {code}, expected 401")
+    probe = urllib.parse.urlencode({"task_id": "ct-auth-probe", "api_key": API_TOKEN}).encode()
+    code, _ = oxr_http(base + "/v1/parse/async_check", method="POST", headers=form, body=probe)
+    if code != 200:
+        raise RuntimeError(f"Valid form api_key on {base}/v1/parse/async_check returned {code}, expected 200")
+
+if AUTH == "caddy":
+    oxr_verify_auth(CADDY_LOCAL)
+    olog("Local Caddy auth verified (Basic/Bearer/SoMark form api_key)")
+ct_public_gate(PUBLIC_URL, lambda: oxr_stack_health(PUBLIC_URL, {"Authorization": f"Bearer {API_TOKEN}"})[0],
+               lambda: oxr_verify_auth(PUBLIC_URL), olog, timeout=180, interval=8)
+olog(f"Public endpoint verified: {PUBLIC_URL}/demo")
+if AUTH == "caddy" and not CREDS_FROM_ENV:   # started from the Colab UI: show generated credentials
+    print(f"CT_CREDENTIALS user={AUTH_USER} pass={AUTH_PASS}")
+    print(f"API token: {API_TOKEN}")
+print(f"{SERVICE} is up: {PUBLIC_URL}")
+print("CT_READY", flush=True)
+
+def oxr_heartbeat(uptime):
+    try:
+        _, info = oxr_stack_health()
+    except Exception as err:
+        info = {"error": type(err).__name__}
+    olog(f"heartbeat | up={uptime}s | {info} | GPU: {ct_gpu_stat()}")
+
+ct_watchdog(oxr_vllm_ready, start_vllm, olog, service_key="vllm", log_name="vllm",
+            dead_markers=("EngineDeadError", "EngineCore encountered a fatal error"),
+            heartbeat=oxr_heartbeat, heartbeat_interval=240)
+'''
 
 # --------------------------------------------------------------------------- openjutsu (G4, ComfyUI + comfy-api-proxy + Next.js behind Caddy)
 OPENJUTSU_CFG = dict(name="openjutsu", service_port=3000, auth="caddy", public_port=18080,
@@ -6818,6 +7243,15 @@ if __name__ == "__main__":
                    "voice cloning, Voice-Design-then-Clone workflow, 10 languages, and Google Drive voice/output persistence.",
                    QWEN3_TTS_CFG, QWEN3_TTS_SETUP, QWEN3_TTS_SERVICE,
                    keepalive=QWEN3_TTS_KEEPALIVE))
+    write(ROOT / "src/colabllm/services/oxr.ipynb",
+          notebook("SoMark OXR-1.0 (A100 default · D-FINE Layout + vLLM OXR + SoMark-compatible Parse API)",
+                   "Serves SoMark OXR-1.0 (1.3B BF16 document parser) as three loopback services on one GPU: "
+                   "D-FINE layout analysis (`127.0.0.1:8091`), the OXR VLM via `vllm==0.25.1` + the out-of-tree "
+                   "plugin shipped with the weights (`127.0.0.1:8090`), and the SoMark-compatible parse API "
+                   "(`/v1/parse/sync`, `/v1/parse/async`, `/demo`, `/docs` on `127.0.0.1:8000`). Caddy enforces "
+                   "Basic Auth / Bearer token, and SoMark SDK/CLI `api_key` form fields are verified fail-closed. "
+                   "Weights and three uv virtualenvs live on local SSD; compiler caches persist to Google Drive.",
+                   OXR_CFG, OXR_SETUP, OXR_SERVICE, keepalive=OXR_KEEPALIVE, auth_cell=OXR_CADDY))
     write(ROOT / "src/colabllm/services/openjutsu.ipynb",
           notebook("Openjutsu (G4 / MiniMax H3 Motion Transfer, Video Edit, Face & Colour Fix, FLUX.3 Picture Prep)",
                    "Co-locates ComfyUI (`127.0.0.1:8188` + 13 custom node packs), patched `comfy-api-proxy` "
