@@ -8,6 +8,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
 import time
 from typing import Any, Callable
 
@@ -40,6 +41,104 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def is_wildcard_host(host: str) -> bool:
+    """Return True if host is an all-interfaces wildcard address (0.0.0.0 or ::)."""
+    return normalize_host(host) in ("0.0.0.0", "::")
+
+
+def format_host_port(host: str, port: int) -> str:
+    """Format host:port with brackets around IPv6 addresses."""
+    normalized = normalize_host(host)
+    if ":" in normalized:
+        return f"[{normalized}]:{port}"
+    return f"{normalized}:{port}"
+
+
+def resolve_bind_host(host: str | None, allow_remote: bool) -> str:
+    """Resolve effective bind address (defaulting --allow-remote without --host to 0.0.0.0)."""
+    if host is None:
+        return "0.0.0.0" if allow_remote else "127.0.0.1"
+    return normalize_host(host)
+
+
+def _probe_route_addresses(family: int, targets: tuple[tuple[str, int], ...]) -> list[str]:
+    found: list[str] = []
+    for target in targets:
+        try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+        except OSError:
+            continue
+        try:
+            sock.connect(target)
+            raw = sock.getsockname()[0].split("%", 1)[0]
+            addr = ipaddress.ip_address(raw)
+        except (OSError, ValueError):
+            continue
+        finally:
+            sock.close()
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        if addr.is_loopback or addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+            continue
+        text = str(addr)
+        if text not in found:
+            found.append(text)
+    return found
+
+
+def detect_remote_hosts(bind_host: str) -> list[str]:
+    """Best-effort detection of routable local IP(s) when bound to a wildcard address."""
+    normalized = normalize_host(bind_host)
+    if normalized not in ("0.0.0.0", "::"):
+        return []
+    v4_targets = (("10.255.255.255", 1), ("192.0.2.1", 80), ("100.64.0.1", 1))
+    if normalized == "0.0.0.0":
+        return _probe_route_addresses(socket.AF_INET, v4_targets)
+    v6_targets = (("2001:db8::1", 80), ("2606:4700:4700::1111", 80))
+    hosts = _probe_route_addresses(socket.AF_INET6, v6_targets)
+    for v4 in _probe_route_addresses(socket.AF_INET, v4_targets):
+        if v4 not in hosts:
+            hosts.append(v4)
+    return hosts
+
+
+def describe_daemon_endpoints(bind_host: str, port: int, *, suffix: str = "") -> dict[str, Any]:
+    """Compute listen address, primary URL, loopback URL, and detected remote URLs."""
+    normalized = normalize_host(bind_host)
+    listen = format_host_port(normalized, port)
+    if is_wildcard_host(normalized):
+        local_host = "127.0.0.1" if normalized == "0.0.0.0" else "::1"
+        local_base = f"http://{format_host_port(local_host, port)}"
+        remote_bases = [f"http://{format_host_port(h, port)}" for h in detect_remote_hosts(normalized)]
+        primary_base = remote_bases[0] if remote_bases else local_base
+        return {
+            "host": normalized,
+            "port": port,
+            "listen": listen,
+            "wildcard": True,
+            "base_url": primary_base,
+            "url": f"{primary_base}{suffix}",
+            "local_base_url": local_base,
+            "local_url": f"{local_base}{suffix}",
+            "remote_base_urls": remote_bases,
+            "remote_urls": [f"{b}{suffix}" for b in remote_bases],
+        }
+    base = f"http://{listen}"
+    remote = not is_loopback_host(normalized)
+    return {
+        "host": normalized,
+        "port": port,
+        "listen": listen,
+        "wildcard": False,
+        "base_url": base,
+        "url": f"{base}{suffix}",
+        "local_base_url": None if remote else base,
+        "local_url": None if remote else f"{base}{suffix}",
+        "remote_base_urls": [base] if remote else [],
+        "remote_urls": [f"{base}{suffix}"] if remote else [],
+    }
+
+
 def display_host(host: str) -> str:
     """Return a URL-safe host string (mapping wildcard addresses to loopback)."""
     normalized = normalize_host(host)
@@ -59,7 +158,7 @@ def validate_bind_args(host: str, port: int, allow_remote: bool, *, min_port: in
         raise UsageError(f"端口号必须在 {min_port}–65535 之间")
     normalized_host = normalize_host(host)
     if not is_loopback_host(normalized_host) and not allow_remote:
-        raise UsageError("默认仅允许绑定本机回环地址；若确需监听其他地址，请显式指定 --allow-remote")
+        raise UsageError("默认仅允许绑定本机回环地址；若确需监听所有网卡可直接指定 --allow-remote，或配合 --host <IP> --allow-remote 绑定指定地址")
     return normalized_host
 
 

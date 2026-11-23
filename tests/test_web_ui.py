@@ -65,6 +65,73 @@ class WebCliBindingTest(unittest.TestCase):
         with self.assertRaises(UsageError):
             colabllm_web.create_bound_server('0.0.0.0', 0, allow_remote=False)
 
+    def test_resolve_bind_host_and_wildcard_endpoints(self):
+        import local_daemon
+
+        self.assertEqual(local_daemon.resolve_bind_host(None, False), '127.0.0.1')
+        self.assertEqual(local_daemon.resolve_bind_host(None, True), '0.0.0.0')
+        self.assertEqual(local_daemon.resolve_bind_host('127.0.0.1', True), '127.0.0.1')
+        self.assertEqual(local_daemon.resolve_bind_host('[::1]', False), '::1')
+
+        with patch.object(local_daemon, 'detect_remote_hosts', return_value=['192.168.50.69']):
+            ep = local_daemon.describe_daemon_endpoints('0.0.0.0', 8765, suffix='/auth?token=tok')
+        self.assertEqual(ep['host'], '0.0.0.0')
+        self.assertEqual(ep['listen'], '0.0.0.0:8765')
+        self.assertEqual(ep['base_url'], 'http://192.168.50.69:8765')
+        self.assertEqual(ep['url'], 'http://192.168.50.69:8765/auth?token=tok')
+        self.assertEqual(ep['local_url'], 'http://127.0.0.1:8765/auth?token=tok')
+        self.assertEqual(ep['remote_urls'], ['http://192.168.50.69:8765/auth?token=tok'])
+
+        with patch.object(local_daemon, 'detect_remote_hosts', return_value=[]):
+            fallback = local_daemon.describe_daemon_endpoints('0.0.0.0', 8765, suffix='/auth?token=tok')
+        self.assertEqual(fallback['host'], '0.0.0.0')
+        self.assertEqual(fallback['listen'], '0.0.0.0:8765')
+        self.assertEqual(fallback['url'], 'http://127.0.0.1:8765/auth?token=tok')
+        self.assertEqual(fallback['local_url'], 'http://127.0.0.1:8765/auth?token=tok')
+        self.assertEqual(fallback['remote_urls'], [])
+
+    def test_allow_remote_defaults_to_wildcard_and_reports_listen_in_status(self):
+        cli = str(ROOT / 'colabllm')
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'colabllm_home'
+            env = {**os.environ, 'COLABLLM_HOME': str(home)}
+
+            rejected = subprocess.run(
+                [cli, 'web', '--detach', '--host', '0.0.0.0', '--port', '0', '--no-open'],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(rejected.returncode, 2)
+
+            started = subprocess.run(
+                [cli, 'web', '--detach', '--allow-remote', '--port', '0', '--no-open'],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertEqual(started.returncode, 0, started.stderr)
+            try:
+                self.assertIn('监听 0.0.0.0:', started.stdout)
+                self.assertIn('本机访问：http://127.0.0.1:', started.stdout)
+                self.assertIn('警告', started.stderr)
+
+                st_json = subprocess.run([cli, 'web', '--status', '--json'], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(st_json.returncode, 0, st_json.stderr)
+                payload = json.loads(st_json.stdout)
+                self.assertEqual(payload['host'], '0.0.0.0')
+                self.assertTrue(payload['listen'].startswith('0.0.0.0:'))
+                self.assertTrue(payload['local_auth_url'].startswith('http://127.0.0.1:'))
+
+                st_text = subprocess.run([cli, 'web', '--status'], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(st_text.returncode, 0, st_text.stderr)
+                self.assertIn(f"监听地址：{payload['listen']}", st_text.stdout)
+                self.assertIn('本机访问：http://127.0.0.1:', st_text.stdout)
+            finally:
+                subprocess.run([cli, 'web', '--stop'], env=env, text=True, capture_output=True, timeout=10)
+
     def test_port_fallback_and_strict_port(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(('127.0.0.1', 0))

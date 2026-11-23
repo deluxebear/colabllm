@@ -31,10 +31,12 @@ from local_daemon import (  # noqa: E402
     bind_http_server,
     cleanup_own_daemon_state,
     daemon_status,
-    display_host,
+    describe_daemon_endpoints,
     is_loopback_host,
+    is_wildcard_host,
     load_live_daemon_state,
     normalize_host,
+    resolve_bind_host,
     stop_daemon,
     validate_bind_args,
 )
@@ -84,9 +86,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gw.add_argument("-a", "--account", default=argparse.SUPPRESS, metavar="ACCOUNT", type=validate_account,
                     help="透传全局 Colab 账户参数（网关数据面不使用）")
-    gw.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    gw.add_argument("--host", default=None,
+                    help="监听地址（默认 127.0.0.1；指定 --allow-remote 且未填 --host 时默认 0.0.0.0）")
     gw.add_argument("-p", "--port", type=int, default=8787, help="监听端口（默认 8787，端口冲突直接报错）")
-    gw.add_argument("--allow-remote", action="store_true", help="允许绑定非本机回环地址")
+    gw.add_argument("--allow-remote", action="store_true",
+                    help="允许局域网/远程访问（未指定 --host 时自动监听 0.0.0.0）")
     gw.add_argument("--allow-host", action="append", default=[], metavar="HOST",
                     help="允许的 Host 请求头域名或 IP（可重复指定；支持多级通配 *.domain.tld）")
     gw.add_argument("--connect-timeout", type=positive_seconds, default=8.0, help="上游建连超时秒数（默认 8.0）")
@@ -254,14 +258,45 @@ def _query_live_status_snapshot(st: dict) -> dict | None:
     return None
 
 
+def _refresh_state_endpoints(st: dict) -> dict:
+    ep = describe_daemon_endpoints(str(st.get("host") or "127.0.0.1"), int(st["port"]))
+    return {
+        **st,
+        "host": ep["host"],
+        "listen": ep["listen"],
+        "base_url": ep["base_url"],
+        "local_url": ep["local_url"],
+        "remote_urls": ep["remote_urls"],
+    }
+
+
 def _public_daemon_payload(st: dict, snapshot: dict | None = None) -> dict:
+    refreshed = _refresh_state_endpoints(st)
     payload = {
         "running": True,
-        **{k: v for k, v in st.items() if k not in ("identity", "status_token")},
+        **{k: v for k, v in refreshed.items() if k not in ("identity", "status_token")},
     }
     if snapshot is not None:
         payload.update(snapshot)
     return payload
+
+
+def _print_endpoint_lines(st: dict, *, prefix: str | None = None) -> None:
+    if is_wildcard_host(str(st.get("host") or "127.0.0.1")):
+        if prefix:
+            print(f"{prefix}（监听 {st['listen']}）", flush=True)
+        else:
+            print(f"监听地址：{st['listen']}", flush=True)
+        for url in st.get("remote_urls") or ():
+            print(f"局域网地址：{url}", flush=True)
+        if not st.get("remote_urls"):
+            print("提示：未自动检测到局域网 IP；其他设备访问时请将地址中的 127.0.0.1 替换为本机局域网 IP。", flush=True)
+        print(f"本机地址：{st['local_url']}", flush=True)
+        return
+    if prefix:
+        print(f"{prefix}：{st['base_url']}", flush=True)
+    else:
+        print(f"监听地址：{st['base_url']}", flush=True)
 
 
 def _cmd_token(args: argparse.Namespace) -> int:
@@ -319,6 +354,7 @@ def _cmd_status(output_json: bool) -> int:
         else:
             print("ColabLLM 网关未运行。")
         return 0
+    st = _refresh_state_endpoints(st)
     snapshot = _query_live_status_snapshot(st)
     out = _public_daemon_payload(st, snapshot)
     if output_json:
@@ -326,7 +362,7 @@ def _cmd_status(output_json: bool) -> int:
         return 0
     run_mode = "前台模式" if st.get("mode") == "foreground" else "后台模式"
     print(f"ColabLLM 网关运行中 (pid {st['pid']}，{run_mode})")
-    print(f"监听地址：{st['base_url']}")
+    _print_endpoint_lines(st)
     if st.get("allow_hosts"):
         print(f"Host 白名单：{', '.join(st['allow_hosts'])}")
     if snapshot is not None:
@@ -359,6 +395,7 @@ def _cmd_stop(output_json: bool) -> int:
 
 
 def _build_daemon_child_cmd(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> list[str]:
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
     cmd = [sys.executable, str(Path(__file__).resolve()), "--no-color"]
     if getattr(args, "command_timeout", None) is not None:
         cmd.extend(["--command-timeout", str(args.command_timeout)])
@@ -368,7 +405,7 @@ def _build_daemon_child_cmd(args: argparse.Namespace, allow_hosts: tuple[str, ..
         cmd.append("--quiet")
     cmd.extend([
         "gateway",
-        "--host", args.host,
+        "--host", bind_host,
         "--port", str(args.port),
         "--connect-timeout", str(args.connect_timeout),
         "--prefill-timeout", str(args.prefill_timeout),
@@ -387,7 +424,8 @@ def _build_daemon_child_cmd(args: argparse.Namespace, allow_hosts: tuple[str, ..
 
 
 def _start_detached(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> int:
-    validate_bind_args(args.host, args.port, args.allow_remote, min_port=0)
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
+    validate_bind_args(bind_host, args.port, args.allow_remote, min_port=0)
     gw_dir, state_path, log_path, lock_path = _daemon_paths()
     existing = load_live_daemon_state(state_path, unlink_stale=True)
     if existing is not None:
@@ -399,7 +437,7 @@ def _start_detached(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> i
     except TokenStoreFormatError as err:
         raise CliError(str(err)) from err
 
-    _print_startup_notices(actual_host=args.host, allow_remote=args.allow_remote, allow_hosts=allow_hosts)
+    _print_startup_notices(actual_host=bind_host, allow_remote=args.allow_remote, allow_hosts=allow_hosts)
     private_dir(gw_dir)
     state_path.unlink(missing_ok=True)
     startup_err_path = gw_dir / ".daemon_boot.log"
@@ -441,6 +479,7 @@ def _start_detached(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> i
     finally:
         startup_err_path.unlink(missing_ok=True)
 
+    st = _refresh_state_endpoints(st)
     initial_tok = initial["token"] if initial else None
     if args.json:
         out = {
@@ -448,13 +487,16 @@ def _start_detached(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> i
             "pid": st["pid"],
             "host": st["host"],
             "port": st["port"],
+            "listen": st["listen"],
             "base_url": st["base_url"],
+            "local_url": st["local_url"],
+            "remote_urls": st["remote_urls"],
             "log_file": st.get("log_file"),
             "initial_token": initial_tok,
         }
         print(json.dumps(out, ensure_ascii=False, indent=2))
     else:
-        print(f"ColabLLM 网关已在后台启动 (pid {st['pid']})：{st['base_url']}", flush=True)
+        _print_endpoint_lines(st, prefix=f"ColabLLM 网关已在后台启动 (pid {st['pid']})")
         if initial_tok:
             print(f"首次初始化默认客户端 Token (default): {initial_tok}", flush=True)
             print("注意：初始秘钥仅此一次显示且不写入日志，请妥善保存。", flush=True)
@@ -464,7 +506,8 @@ def _start_detached(args: argparse.Namespace, allow_hosts: tuple[str, ...]) -> i
 
 
 def _serve_single_instance(args: argparse.Namespace, allow_hosts: tuple[str, ...], *, is_daemon_child: bool) -> int:
-    validate_bind_args(args.host, args.port, args.allow_remote, min_port=0)
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
+    validate_bind_args(bind_host, args.port, args.allow_remote, min_port=0)
     gw_dir, state_path, log_path, lock_path = _daemon_paths()
     existing = load_live_daemon_state(state_path, unlink_stale=True)
     if existing is not None:
@@ -499,7 +542,7 @@ def _serve_single_instance(args: argparse.Namespace, allow_hosts: tuple[str, ...
             TokenStore(gw_dir).list_tokens()
 
         config = GatewayConfig(
-            host=normalize_host(args.host),
+            host=bind_host,
             port=args.port,
             allow_remote=bool(args.allow_remote),
             allow_hosts=allow_hosts,
@@ -512,37 +555,37 @@ def _serve_single_instance(args: argparse.Namespace, allow_hosts: tuple[str, ...
             state_root=user_home(),
         )
         server = bind_http_server(
-            args.host,
+            bind_host,
             args.port,
             server_factory=lambda addr: GatewayHTTPServer(addr, config=config),
             allow_remote=bool(args.allow_remote),
             strict_port=True,
             min_port=0,
         )
-        actual_host, actual_port = server.server_address[:2]
-        disp_host = display_host(actual_host)
-        base_url = f"http://{disp_host}:{actual_port}"
-
-        write_private(
-            state_path,
-            {
-                "pid": own_pid,
-                "identity": own_identity,
-                "mode": "background" if is_daemon_child else "foreground",
-                "host": disp_host,
-                "port": actual_port,
-                "base_url": base_url,
-                "allow_remote": bool(args.allow_remote),
-                "allow_hosts": list(allow_hosts),
-                "status_token": server.status_token,
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "log_file": str(log_path),
-            },
-        )
+        actual_host = normalize_host(str(server.server_address[0]))
+        actual_port = int(server.server_address[1])
+        ep = describe_daemon_endpoints(actual_host, actual_port)
+        st_payload = {
+            "pid": own_pid,
+            "identity": own_identity,
+            "mode": "background" if is_daemon_child else "foreground",
+            "host": ep["host"],
+            "port": actual_port,
+            "listen": ep["listen"],
+            "base_url": ep["base_url"],
+            "local_url": ep["local_url"],
+            "remote_urls": ep["remote_urls"],
+            "allow_remote": bool(args.allow_remote),
+            "allow_hosts": list(allow_hosts),
+            "status_token": server.status_token,
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "log_file": str(log_path),
+        }
+        write_private(state_path, st_payload)
 
         if not is_daemon_child:
             _print_startup_notices(actual_host=actual_host, allow_remote=bool(args.allow_remote), allow_hosts=allow_hosts)
-            print(f"ColabLLM 网关已启动：{base_url}", flush=True)
+            _print_endpoint_lines(st_payload, prefix="ColabLLM 网关已启动")
             if initial:
                 print(f"首次初始化默认客户端 Token (default): {initial['token']}", flush=True)
             print(f"审计日志：{log_path}", flush=True)

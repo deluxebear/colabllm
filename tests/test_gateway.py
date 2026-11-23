@@ -306,7 +306,7 @@ class GatewayCliAndAuthTests(GatewayTestMixin, unittest.TestCase):
             # --allow-remote 0.0.0.0 without --allow-host must warn on stderr
             env = self.make_env(home)
             up = subprocess.run(
-                [cli, "gateway", "--detach", "--host", "0.0.0.0", "--allow-remote", "--port", "0", "--json"],
+                [cli, "gateway", "--detach", "--allow-remote", "--port", "0", "--json"],
                 env=env,
                 text=True,
                 capture_output=True,
@@ -314,7 +314,19 @@ class GatewayCliAndAuthTests(GatewayTestMixin, unittest.TestCase):
             )
             self.assertEqual(up.returncode, 0, up.stderr)
             self.assertIn("警告", up.stderr)
-            subprocess.run([cli, "gateway", "--stop"], env=env, capture_output=True, timeout=15)
+            up_payload = json.loads(up.stdout)
+            self.assertEqual(up_payload["host"], "0.0.0.0")
+            self.assertTrue(up_payload["listen"].startswith("0.0.0.0:"))
+            self.assertTrue(up_payload["local_url"].startswith("http://127.0.0.1:"))
+            try:
+                st = subprocess.run([cli, "gateway", "--status", "--json"], env=env, text=True, capture_output=True, timeout=10)
+                self.assertEqual(st.returncode, 0, st.stderr)
+                st_payload = json.loads(st.stdout)
+                self.assertTrue(st_payload["running"])
+                self.assertEqual(st_payload["host"], "0.0.0.0")
+                self.assertEqual(st_payload["listen"], up_payload["listen"])
+            finally:
+                subprocess.run([cli, "gateway", "--stop"], env=env, capture_output=True, timeout=15)
 
             # In-process allow_hosts multi-label wildcard + Sec-Fetch-Site
             _, port, token = self.start_gateway(home, allow_hosts=("*.ts.net", "localhost"))

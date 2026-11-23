@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import webbrowser
 
 _PKG_DIR = Path(__file__).resolve().parent
@@ -25,14 +26,16 @@ for _path in (str(_LIB_DIR), str(_SRC_DIR)):
 from cli_support import CliError, UsageError, positive_seconds, run_cli, validate_account_syntax  # noqa: E402
 from colab_accounts import validate_account  # noqa: E402
 from local_daemon import (  # noqa: E402
-    _display_host,
     _normalize_host,
     _validate_bind_args,
     acquire_instance_lock as _acquire_lock_shared,
     bind_http_server,
     cleanup_own_daemon_state as _cleanup_own_daemon_state_shared,
+    describe_daemon_endpoints,
     is_loopback_host,
+    is_wildcard_host,
     load_live_daemon_state as _load_live_daemon_state_shared,
+    resolve_bind_host,
     stop_daemon as _stop_daemon_shared,
 )
 from paths import private_dir, user_home, write_private  # noqa: E402
@@ -53,14 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
     web = commands.add_parser('web', help='启动本地可视化 Web 控制台')
     web.add_argument('-a', '--account', default=argparse.SUPPRESS, metavar='ACCOUNT', type=validate_account,
                      help='默认使用的 Colab 账户名或邮箱')
-    web.add_argument('--host', default='127.0.0.1', help='监听地址（默认 127.0.0.1）')
+    web.add_argument('--host', default=None,
+                     help='监听地址（默认 127.0.0.1；指定 --allow-remote 且未填 --host 时默认 0.0.0.0）')
     web.add_argument('-p', '--port', type=int, default=8765, help='监听端口（默认 8765，0 表示随机空闲端口）')
     web.add_argument('--strict-port', action='store_true', help='端口占用时直接报错，不自动顺延')
     web.add_argument('--no-open', action='store_true', help='不自动打开浏览器')
     web.add_argument('--read-only', action='store_true',
                      help='只读模式：禁止启停实例、运行任务、修改配置或读取密钥')
     web.add_argument('--allow-remote', action='store_true',
-                     help='允许绑定非本机回环地址（仍强制启用会话与 CSRF 校验）')
+                     help='允许局域网/远程访问（未指定 --host 时自动监听 0.0.0.0；仍强制启用会话与 CSRF 校验）')
     mode = web.add_mutually_exclusive_group()
     mode.add_argument('-d', '--detach', action='store_true',
                       help='在后台守护运行 Web 控制台，启动后立即返回终端')
@@ -130,13 +134,50 @@ def _acquire_instance_lock(*, probe_only: bool = False):
     )
 
 
+def _refresh_state_endpoints(st: dict) -> dict:
+    parsed = urllib.parse.urlsplit(str(st.get('auth_url') or ''))
+    suffix = f'{parsed.path}?{parsed.query}' if parsed.query else parsed.path
+    ep = describe_daemon_endpoints(str(st.get('host') or '127.0.0.1'), int(st['port']), suffix=suffix)
+    return {
+        **st,
+        'host': ep['host'],
+        'listen': ep['listen'],
+        'base_url': ep['base_url'],
+        'auth_url': ep['url'],
+        'local_auth_url': ep['local_url'],
+        'remote_auth_urls': ep['remote_urls'],
+    }
+
+
 def _public_daemon_payload(st: dict) -> dict:
-    return {'running': True, **{k: v for k, v in st.items() if k != 'identity'}}
+    refreshed = _refresh_state_endpoints(st)
+    return {'running': True, **{k: v for k, v in refreshed.items() if k != 'identity'}}
 
 
-def _print_access_notices(*, auth_url: str, actual_host: str, actual_port: int, read_only: bool, prefix: str) -> None:
-    print(f'{prefix}：{auth_url}', flush=True)
-    if read_only:
+def _print_endpoint_lines(st: dict, *, prefix: str | None = None) -> None:
+    if is_wildcard_host(str(st.get('host') or '127.0.0.1')):
+        if prefix:
+            print(f"{prefix}（监听 {st['listen']}）", flush=True)
+        else:
+            print(f"监听地址：{st['listen']}", flush=True)
+        for url in st.get('remote_auth_urls') or ():
+            print(f'局域网访问：{url}', flush=True)
+        if not st.get('remote_auth_urls'):
+            print('提示：未自动检测到局域网 IP；其他设备访问时请将地址中的 127.0.0.1 替换为本机局域网 IP。', flush=True)
+        print(f"本机访问：{st['local_auth_url']}", flush=True)
+        return
+    if prefix:
+        print(f"{prefix}：{st['auth_url']}", flush=True)
+    else:
+        print(f"监听地址：{st['listen']}", flush=True)
+        print(f"访问地址：{st['auth_url']}", flush=True)
+
+
+def _print_access_notices(st: dict, *, prefix: str) -> None:
+    _print_endpoint_lines(st, prefix=prefix)
+    actual_host = str(st['host'])
+    actual_port = int(st['port'])
+    if st.get('read_only'):
         print('当前模式：只读观察 (--read-only)，所有启停、配置修改与密钥读取已禁用。', flush=True)
     if not is_loopback_host(actual_host):
         print('警告：当前监听非回环地址，请仅在受信任网络或 SSH 隧道中使用并妥善保管启动链接。', file=sys.stderr, flush=True)
@@ -179,13 +220,14 @@ def _cmd_status(output_json: bool) -> int:
         else:
             print('Web 控制台未运行。')
         return 0
+    st = _refresh_state_endpoints(st)
     if output_json:
         print(json.dumps(_public_daemon_payload(st), ensure_ascii=False, indent=2))
         return 0
     run_mode = '前台模式' if st.get('mode') == 'foreground' else '后台模式'
     perm_label = '只读观察 (--read-only)' if st.get('read_only') else '标准读写'
     print(f"Web 控制台运行中 (pid {st['pid']}，{run_mode})")
-    print(f"访问地址：{st['auth_url']}")
+    _print_endpoint_lines(st)
     print(f'模式：{perm_label}')
     if st.get('started'):
         print(f"启动时间：{st['started']}")
@@ -211,6 +253,7 @@ def _cmd_stop(output_json: bool) -> int:
 
 
 def _build_daemon_child_cmd(args: argparse.Namespace) -> list[str]:
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
     cmd = [sys.executable, str(Path(__file__).resolve()), '--no-color']
     if getattr(args, 'command_timeout', None) is not None:
         cmd.extend(['--command-timeout', str(args.command_timeout)])
@@ -218,7 +261,7 @@ def _build_daemon_child_cmd(args: argparse.Namespace) -> list[str]:
         cmd.append('--debug')
     if getattr(args, 'quiet', False):
         cmd.append('--quiet')
-    cmd.extend(['web', '--host', args.host, '--port', str(args.port), '--no-open'])
+    cmd.extend(['web', '--host', bind_host, '--port', str(args.port), '--no-open'])
     if getattr(args, 'account', None):
         cmd.extend(['--account', args.account])
     if args.strict_port:
@@ -231,7 +274,8 @@ def _build_daemon_child_cmd(args: argparse.Namespace) -> list[str]:
 
 
 def _start_detached(args: argparse.Namespace) -> int:
-    _validate_bind_args(args.host, args.port, args.allow_remote)
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
+    _validate_bind_args(bind_host, args.port, args.allow_remote)
     existing = _load_live_daemon_state()
     if existing is not None:
         raise _already_running_error(existing)
@@ -275,26 +319,22 @@ def _start_detached(args: argparse.Namespace) -> int:
             proc.terminate()
         raise CliError(f'等待后台 Web 控制台就绪超时；请查看日志 {log_path}')
 
+    st = _refresh_state_endpoints(st)
     if args.json:
         print(json.dumps(_public_daemon_payload(st), ensure_ascii=False, indent=2))
     else:
-        _print_access_notices(
-            auth_url=st['auth_url'],
-            actual_host=st['host'],
-            actual_port=int(st['port']),
-            read_only=bool(st.get('read_only')),
-            prefix=f"ColabLLM Web 控制台已在后台启动 (pid {st['pid']})",
-        )
+        _print_access_notices(st, prefix=f"ColabLLM Web 控制台已在后台启动 (pid {st['pid']})")
         print(f'日志文件：{log_path}', flush=True)
         print('查看状态：colabllm web --status  |  停止服务：colabllm web --stop', flush=True)
 
     if _should_auto_open(args.no_open):
-        webbrowser.open(st['auth_url'])
+        webbrowser.open(st.get('local_auth_url') or st['auth_url'])
     return 0
 
 
 def _serve_single_instance(args: argparse.Namespace, *, is_daemon_child: bool) -> int:
-    _validate_bind_args(args.host, args.port, args.allow_remote)
+    bind_host = resolve_bind_host(args.host, args.allow_remote)
+    _validate_bind_args(bind_host, args.port, args.allow_remote)
     existing = _load_live_daemon_state()
     if existing is not None:
         raise _already_running_error(existing)
@@ -312,51 +352,48 @@ def _serve_single_instance(args: argparse.Namespace, *, is_daemon_child: bool) -
             raise CliError('无法获取当前进程身份标识')
 
         server = create_bound_server(
-            args.host,
+            bind_host,
             args.port,
             strict_port=args.strict_port,
             read_only=args.read_only,
             default_account=getattr(args, 'account', None),
             allow_remote=args.allow_remote,
         )
-        actual_host, actual_port = server.server_address[:2]
-        disp_host = _display_host(actual_host)
-        base_url = f'http://{disp_host}:{actual_port}'
-        auth_url = f'{base_url}/auth?token={server.bootstrap_token}'
+        actual_host = _normalize_host(str(server.server_address[0]))
+        actual_port = int(server.server_address[1])
+        ep = describe_daemon_endpoints(actual_host, actual_port, suffix=f'/auth?token={server.bootstrap_token}')
 
         _, state_path, log_path, _ = _daemon_paths()
-        _write_private_json(state_path, {
+        st_payload = {
             'pid': own_pid,
             'identity': own_identity,
             'mode': 'background' if is_daemon_child else 'foreground',
-            'host': disp_host,
+            'host': ep['host'],
             'port': actual_port,
-            'base_url': base_url,
-            'auth_url': auth_url,
+            'listen': ep['listen'],
+            'base_url': ep['base_url'],
+            'auth_url': ep['url'],
+            'local_auth_url': ep['local_url'],
+            'remote_auth_urls': ep['remote_urls'],
             'read_only': bool(args.read_only),
             'allow_remote': bool(args.allow_remote),
             'account': getattr(args, 'account', None),
             'started': time.strftime('%Y-%m-%d %H:%M:%S'),
             'log_path': str(log_path) if is_daemon_child else None,
-        })
+        }
+        _write_private_json(state_path, st_payload)
 
         if is_daemon_child:
-            print(f'ColabLLM Web 控制台后台服务已就绪：{base_url} (pid {own_pid})', flush=True)
+            print(f"ColabLLM Web 控制台后台服务已就绪：{ep['listen']} (pid {own_pid})", flush=True)
         else:
-            _print_access_notices(
-                auth_url=auth_url,
-                actual_host=actual_host,
-                actual_port=actual_port,
-                read_only=bool(args.read_only),
-                prefix='ColabLLM Web 控制台已启动',
-            )
+            _print_access_notices(st_payload, prefix='ColabLLM Web 控制台已启动')
             print('按 Ctrl+C 退出 Web 控制台（已启动的后台保活服务不受影响）。', flush=True)
 
         serve_thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.25}, daemon=True)
         serve_thread.start()
 
         if not is_daemon_child and _should_auto_open(args.no_open):
-            timer = threading.Timer(0.15, webbrowser.open, args=(auth_url,))
+            timer = threading.Timer(0.15, webbrowser.open, args=(ep['local_url'] or ep['url'],))
             timer.daemon = True
             timer.start()
 
