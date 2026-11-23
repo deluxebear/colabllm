@@ -11,6 +11,7 @@
 
 ### 新增
 
+- **Unlimited-OCR 2 内置测试页面（`/demo`）**：新增零外部 CDN 依赖的 `templates/unlimited_ocr_demo.py` 并扩展 `templates/unlimited_ocr_app.py`，为 `unlimited-ocr` 提供与 `oxr` 风格一致的三栏交互测试 UI（`/` 302 跳转至 `/demo`，`colabllm web` 的 **打开 Web UI** 直达）：支持拖拽分块上传、DPI / 分组页数 / Token / `inference_params` 参数配置、逐页原图预览与可切换阅读顺序版面框、**预览 / 源码 / 版面** 视图（含安全清洗的 HTML 表格与裁剪图片）、Drive 历史任务列表与断点恢复及 Markdown / Raw 下载；所有 `/demo` 响应携带每次请求随机生成的 CSP `nonce`，结果附件接口强制 `nosniff` 并拦截 HTML/SVG 内联执行。
 - **SoMark OXR-1.0 文档解析运行时（`oxr`）**：默认 A100（BF16，≥ sm80），在同一 GPU 上以独立 uv 虚拟环境运行 D-FINE 版面分析（`127.0.0.1:8091`）、`vllm==0.25.1` + 权重自带 out-of-tree 插件的 OXR VLM（`127.0.0.1:8090`，按显存自动设定 `max-num-seqs`）与上游 SoMark 兼容解析 API（`/v1/parse/*`、`/demo`、`/docs`）；权重固定修订版下载到本地 SSD，编译缓存经 `colab_cache.py` 归档到 Drive；就绪前要求三进程健康、真实图片解析预热与本地/公网鉴权验证。Caddy 提供 Basic Auth/Bearer，并新增仅限 `POST /v1/parse/*` 的 SoMark 表单 `api_key` 校验分支（`templates/oxr_auth_app.py`，常数时间、失败即拒绝），使 SoMark SDK/CLI 可直接使用；新增 `colabllm oxr parse`、`/health` 汇总探针、`colabllm web` “打开 Web UI”（`/` → `/demo`）、网关目录禁用登记、`docs/oxr.md` 与用户技能参考。`render_caddy_cell` 新增 `extra_handles` 参数（默认不改变既有 Notebook）。
 
 ## [1.2.4] - 2026-11-20

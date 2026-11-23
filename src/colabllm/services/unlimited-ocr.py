@@ -13,7 +13,8 @@ Inputs: existing local paths are uploaded automatically; drive:// forces Drive.
 also downloads all results locally (available on ocr and job).
 Each PDF/image produces <output-dir>/<MyDrive-relative-source>/result.md,
 result.raw.txt, cropped figures and complete.json. Default: 10 pages per chunk;
-cross-page context/merging is preserved within each chunk. See docs/unlimited-ocr.md.
+cross-page context/merging is preserved within each chunk. Browser test UI: open <public-url>/demo
+(Basic Auth from `info --show-secrets`). See docs/unlimited-ocr.md.
 """
 import argparse
 import base64
@@ -33,7 +34,8 @@ from colabsvc import Service, State, main
 from ocr_parameters import add_inference_arguments, cli_parameters
 
 SERVICE = Service(name='unlimited-ocr', notebook='unlimited-ocr.ipynb', gpu='A100',
-                  service_port=8000, public_port=18080, auth='caddy', ready_timeout=5400)
+                  service_port=8000, public_port=18080, auth='caddy', ready_timeout=5400,
+                  health_path='/health')
 
 
 def request(path, args, payload=None):

@@ -16,6 +16,15 @@ colabllm unlimited-ocr ocr --help
 `ocr` 的别名为 `convert/run`。本机文件按块上传到 Drive 再在 GPU 处理；`-O` 将结果下载回本机。
 服务就绪要求模型加载及真实推理预热，域名可访问不等于 OCR 可用。
 
+## 浏览器测试页面（/demo）
+
+在 `colabllm web` 中点 **打开 Web UI**，或直接打开 `<公网地址>/demo`（根路径 `/` 会跳转到 `/demo`），
+使用 `info --show-secrets` 中的 Basic Auth 用户名/密码登录。
+
+- **拖拽上传与调参**：支持拖拽或点击上传 PDF / 图片，可直接在左侧表单配置 `DPI`、`pages_per_chunk`、`tokens_per_page`、`overwrite` 及可选 `inference_params` JSON，实时查看分块上传与 GPU 识别进度。
+- **左右对照与版面可视化**：左侧展示原始 PDF/图片逐页渲染图与可开关的阅读顺序版面框叠加，点击任意版面框可与右侧 **版面** 标签页双向定位。
+- **结果视图与历史任务**：右侧支持 **预览**（含安全渲染的跨页 HTML 表格与裁剪插图）、**源码**、**版面**（含 `result.raw.txt`）切换及 Markdown / Raw 下载；左侧可浏览 Drive 中的最近任务记录并一键对失败/中断任务发起断点恢复。
+
 ## 输入与输出目录
 
 ```bash

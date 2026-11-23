@@ -3408,6 +3408,7 @@ UNLIMITED_OCR_SETUP = ("OCR_CACHE_SOURCE = " + repr((ROOT / "templates/colab_cac
                        + (ROOT / "templates/unlimited_ocr_setup.py").read_text())
 UNLIMITED_OCR_SERVICE = ("# @title 2. Unlimited-OCR Drive job service\n"
     + "(OCR_WORK / 'ocr_parameters.py').write_text(" + repr((ROOT / "src/colabllm/lib/ocr_parameters.py").read_text()) + ", encoding='utf-8')\n"
+    + "(OCR_WORK / 'unlimited_ocr_demo.py').write_text(" + repr((ROOT / "templates/unlimited_ocr_demo.py").read_text()) + ", encoding='utf-8')\n"
     + "(OCR_WORK / 'unlimited_ocr_app.py').write_text(" + repr((ROOT / "templates/unlimited_ocr_app.py").read_text()) + ", encoding='utf-8')\n"
     + """def start_service():
     return ct_spawn("service", [OCR_PY, str(OCR_WORK / 'unlimited_ocr_app.py')], cwd=str(OCR_WORK),
@@ -7164,8 +7165,8 @@ if __name__ == "__main__":
                    FLUX_KLEIN_CFG, FLUX_KLEIN_SETUP, FLUX_KLEIN_SERVICE,
                    keepalive=FLUX_KLEIN_KEEPALIVE))
     write(ROOT / "src/colabllm/services/unlimited-ocr.ipynb",
-          notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR; official Transformers backend, "
-                   "local SSD model and kernels, persistent Drive results, Caddy auth and asynchronous CLI jobs.",
+          notebook("Unlimited-OCR 2 (A100)", "Drive-native PDF/image batch OCR with built-in /demo browser test UI; "
+                   "official Transformers backend, local SSD model and kernels, persistent Drive results, Caddy auth and asynchronous CLI jobs.",
                    UNLIMITED_OCR_CFG, UNLIMITED_OCR_SETUP, UNLIMITED_OCR_SERVICE,
                    keepalive=UNLIMITED_OCR_KEEPALIVE))
     write(ROOT / "src/colabllm/services/longcat-avatar.ipynb",

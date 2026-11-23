@@ -1,13 +1,18 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+import urllib.error
+import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src/colabllm/lib'))
+sys.path.insert(0, str(ROOT / 'templates'))
 spec = importlib.util.spec_from_file_location('unlimited_ocr_app', ROOT / 'templates/unlimited_ocr_app.py')
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
@@ -324,6 +329,175 @@ class CheckpointResumeTest(unittest.TestCase):
                 calls.clear()
                 engine.convert(source, destination, opts, lambda *args: None)
                 self.assertEqual(len(calls), 3)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class DemoPageAndHttpApiTest(unittest.TestCase):
+    def _http(self, url, *, method='GET', body=None, headers=None):
+        opener = urllib.request.build_opener(NoRedirect)
+        req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+        try:
+            with opener.open(req, timeout=5) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as err:
+            return err.code, dict(err.headers), err.read()
+
+    def test_parse_raw_blocks_multipage_and_bare_blocks(self):
+        raw = (
+            '<PAGE><BLOCK>title<LEVEL1>[-5,20,500,1200]<FORK>第一章\n'
+            '<BLOCK>text[10,150,900,400]<FORK>第一段内容\n'
+            '<PAGE><BLOCK>table[20,40,980,600]<FORK><table><tr><td>A</td></tr></table>\n'
+            'figure[50,620,400,880]<FORK>'
+        )
+        blocks = app.parse_raw_blocks(raw)
+        self.assertEqual(len(blocks), 4)
+        self.assertEqual([b['page'] for b in blocks], [1, 1, 2, 2])
+        self.assertEqual([b['index'] for b in blocks], [1, 2, 3, 4])
+        self.assertEqual(blocks[0]['label'], 'title')
+        self.assertEqual(blocks[0]['level'], 1)
+        self.assertEqual(blocks[0]['bbox'], [0, 20, 500, 1000])
+        self.assertEqual(blocks[0]['content'], '第一章')
+        self.assertEqual(blocks[2]['label'], 'table')
+        self.assertIn('<table>', blocks[2]['content'])
+        self.assertEqual(blocks[3]['label'], 'figure')
+        self.assertEqual(blocks[3]['bbox'], [50, 620, 400, 880])
+        self.assertEqual(app.parse_raw_blocks(''), [])
+
+    def test_demo_page_csp_hygiene_and_end_to_end_preview_apis(self):
+        import base64
+        import hashlib
+        from types import SimpleNamespace
+
+        demo_src = (ROOT / 'templates/unlimited_ocr_demo.py').read_text(encoding='utf-8')
+        self.assertNotRegex(demo_src.replace('http://www.w3.org/2000/svg', ''), r'(?i)https?://')
+        self.assertNotIn('innerHTML', app.HTML_TEMPLATE if hasattr(app, 'HTML_TEMPLATE') else demo_src)
+        self.assertIn('<meta name="color-scheme" content="light dark">', demo_src)
+        self.assertIn('focusgroup="tablist nomemory"', demo_src)
+        self.assertIn(':user-invalid', demo_src)
+        self.assertIn('"setHTML" in Element.prototype', demo_src)
+        self.assertIn('["colspan", "rowspan"]', demo_src)
+        self.assertNotIn('Document.parseHTML', demo_src)
+
+        class DemoEngine:
+            def convert(self, source, destination, opts, progress):
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / 'chunk-0001').mkdir(exist_ok=True)
+                (destination / 'chunk-0001' / 'page1_10_20_100_200.jpg').write_bytes(b'\xff\xd8\xff\xe0jpeg')
+                (destination / 'evil.html').write_bytes(b'<script>alert(1)</script>')
+                (destination / 'result.raw.txt').write_text(
+                    '<PAGE><BLOCK>title<LEVEL1>[10,20,500,100]<FORK>测试标题\n'
+                    '<BLOCK>table[20,120,900,450]<FORK><table><tr><td>单元格</td></tr></table>',
+                    encoding='utf-8',
+                )
+                (destination / 'result.md').write_text(
+                    '# 测试标题\n\n<table><tr><td>单元格</td></tr></table>\n\n![](chunk-0001/page1_10_20_100_200.jpg)\n',
+                    encoding='utf-8',
+                )
+                progress(2, 2)
+                return {'pages': 2, 'tokens': 42, 'chunks': 1}
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            with patch.object(app, 'DRIVE', root), patch.object(app, 'DATA', root / 'svc'):
+                jobs = app.Jobs(DemoEngine(), root / 'svc')
+                srv = app.make_server(jobs, '127.0.0.1', 0)
+                t = threading.Thread(target=srv.serve_forever, daemon=True)
+                t.start()
+                try:
+                    base = f'http://127.0.0.1:{srv.server_address[1]}'
+                    code, hdrs, _ = self._http(base + '/')
+                    self.assertEqual(code, 302)
+                    self.assertEqual(hdrs.get('Location'), '/demo')
+
+                    c1, h1, body1 = self._http(base + '/demo')
+                    c2, h2, body2 = self._http(base + '/demo')
+                    self.assertEqual((c1, c2), (200, 200))
+                    self.assertIn('text/html', h1.get('Content-Type', ''))
+                    self.assertEqual(h1.get('X-Content-Type-Options'), 'nosniff')
+                    m1 = re.search(r"script-src 'nonce-([^']+)'", h1.get('Content-Security-Policy', ''))
+                    m2 = re.search(r"script-src 'nonce-([^']+)'", h2.get('Content-Security-Policy', ''))
+                    self.assertIsNotNone(m1)
+                    self.assertNotEqual(m1.group(1), m2.group(1))
+                    html_text = body1.decode('utf-8')
+                    self.assertIn(f'nonce="{m1.group(1)}"', html_text)
+                    self.assertNotIn('__NONCE__', html_text)
+
+                    hc, _, hbody = self._http(base + '/health')
+                    self.assertEqual((hc, json.loads(hbody)['model']), (200, 'baidu/Unlimited-OCR-2'))
+
+                    pdf_bytes = b'%PDF-1.7 fake'
+                    up_body = json.dumps({
+                        'sha256': hashlib.sha256(pdf_bytes).hexdigest(),
+                        'name': 'demo.pdf',
+                        'offset': 0,
+                        'data': base64.b64encode(pdf_bytes).decode(),
+                        'final': True,
+                    }).encode()
+                    uc, _, ubody = self._http(
+                        base + '/api/upload', method='POST', body=up_body,
+                        headers={'Content-Type': 'application/json'},
+                    )
+                    self.assertEqual(uc, 200)
+                    uploaded_path = json.loads(ubody)['path']
+
+                    sub_body = json.dumps({
+                        'inputs': [uploaded_path],
+                        'relative_outputs': {uploaded_path: 'demo/demo.pdf'},
+                    }).encode()
+                    sc, _, sbody = self._http(
+                        base + '/api/jobs', method='POST', body=sub_body,
+                        headers={'Content-Type': 'application/json'},
+                    )
+                    self.assertEqual(sc, 202)
+                    job_id = json.loads(sbody)['id']
+                    jobs.queue.join()
+
+                    lc, _, lbody = self._http(base + '/api/jobs')
+                    self.assertEqual(lc, 200)
+                    listed = json.loads(lbody)['jobs']
+                    self.assertEqual(listed[0]['id'], job_id)
+                    self.assertEqual(listed[0]['files'][0]['filename'], 'demo.pdf')
+
+                    fake_page = SimpleNamespace(get_pixmap=lambda dpi, alpha: SimpleNamespace(tobytes=lambda fmt: b'\x89PNG\r\n\x1a\nfake'))
+                    class FakePdf:
+                        def __enter__(self): return self
+                        def __exit__(self, *a): return False
+                        def __len__(self): return 2
+                        def __getitem__(self, idx): return fake_page
+
+                    with patch.dict(sys.modules, {'fitz': SimpleNamespace(open=lambda p: FakePdf())}):
+                        pc, _, pbody = self._http(base + f'/api/jobs/{job_id}/files/0/preview')
+                        self.assertEqual(pc, 200)
+                        preview = json.loads(pbody)
+                        self.assertEqual(preview['page_count'], 2)
+                        self.assertTrue(preview['source_available'])
+                        self.assertEqual(len(preview['blocks']), 2)
+                        self.assertIn('# 测试标题', preview['markdown'])
+                        self.assertIn('chunk-0001/page1_10_20_100_200.jpg', preview['assets'])
+
+                        imgc, imgh, imgb = self._http(base + f'/api/jobs/{job_id}/files/0/pages/1')
+                        self.assertEqual(imgc, 200)
+                        self.assertEqual(imgh.get('Content-Type'), 'image/png')
+                        self.assertTrue(imgb.startswith(b'\x89PNG'))
+
+                    ac, ah, ab = self._http(base + f'/api/jobs/{job_id}/files/0/asset/chunk-0001/page1_10_20_100_200.jpg')
+                    self.assertEqual((ac, ah.get('Content-Type'), ab), (200, 'image/jpeg', b'\xff\xd8\xff\xe0jpeg'))
+
+                    ec, eh, _ = self._http(base + f'/api/jobs/{job_id}/files/0/asset/evil.html')
+                    self.assertEqual(ec, 200)
+                    self.assertEqual(eh.get('Content-Type'), 'application/octet-stream')
+                    self.assertIn('attachment', eh.get('Content-Disposition', ''))
+
+                    for bad in ('../../outside', '.checkpoints/000000.json'):
+                        bc, _, _ = self._http(base + f'/api/jobs/{job_id}/files/0/asset/{bad}')
+                        self.assertEqual(bc, 400)
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
 
 
 if __name__ == '__main__':

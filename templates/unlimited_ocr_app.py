@@ -3,18 +3,25 @@ from __future__ import annotations
 
 import hashlib
 import base64
+import io
 import json
 import os
 import queue
 import re
+import secrets
+import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ocr_parameters import validate_parameters, inference_kwargs
+from unlimited_ocr_demo import make_csp, parse_raw_blocks, render_demo_html
 
 EXTENSIONS = {'.pdf', '.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 DRIVE = Path(os.environ.get('CT_DRIVE_ROOT', '/content/drive/MyDrive')).resolve()
@@ -299,6 +306,44 @@ class Jobs:
         with self.lock:
             return json.loads((self.root / (job_id + '.json')).read_text())
 
+    def list_jobs(self, limit: int = 30) -> list[dict]:
+        items = []
+        with self.lock:
+            for path in self.root.glob('*.json'):
+                try:
+                    record = json.loads(path.read_text(encoding='utf-8'))
+                    if not isinstance(record, dict) or not re.fullmatch(r'[0-9a-f]{32}', str(record.get('id') or '')):
+                        continue
+                except (OSError, ValueError, TypeError):
+                    continue
+                files = []
+                for idx, item in enumerate(record.get('files') or ()):
+                    src = str(item.get('source') or '')
+                    files.append({
+                        'index': idx,
+                        'filename': Path(src).name if src else (item.get('relative_output') or f'file-{idx + 1}'),
+                        'relative_output': item.get('relative_output'),
+                        'status': item.get('status'),
+                        'pages_done': item.get('pages_done'),
+                        'pages_total': item.get('pages_total'),
+                        'pages': item.get('pages'),
+                        'tokens': item.get('tokens'),
+                        'chunks': item.get('chunks'),
+                        'error': item.get('error'),
+                    })
+                items.append({
+                    'id': record['id'],
+                    'status': record.get('status'),
+                    'created': record.get('created'),
+                    'finished': record.get('finished'),
+                    'options': record.get('options') or {},
+                    'overwrite': bool(record.get('overwrite', False)),
+                    'error': record.get('error'),
+                    'files': files,
+                })
+        items.sort(key=lambda rec: float(rec.get('created') or 0), reverse=True)
+        return items[:max(1, int(limit))]
+
     def save(self, record):
         with self.lock:
             atomic_json(self.root / (record['id'] + '.json'), record)
@@ -427,28 +472,215 @@ def result_files(jobs, job_id, index, name=None, offset=0):
                 complete=offset + len(chunk) >= target.stat().st_size)
 
 
-def serve():
-    engine = Engine()
-    jobs = Jobs(engine)
+_INLINE_MIME = {
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.webp': 'image/webp',
+    '.gif': 'image/gif',
+    '.md': 'text/markdown; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+}
 
+
+def _job_file(jobs, job_id: str, index: int) -> tuple[dict, dict]:
+    if index < 0:
+        raise IndexError('file index out of range')
+    record = jobs.get(job_id)
+    files = record.get('files') or []
+    if index >= len(files):
+        raise IndexError('file index out of range')
+    return record, files[index]
+
+
+def _count_source_pages(source: Path) -> int | None:
+    if not source.is_file():
+        return None
+    if source.suffix.lower() == '.pdf':
+        try:
+            import fitz
+            with fitz.open(source) as pdf:
+                return len(pdf)
+        except Exception:
+            return None
+    try:
+        from PIL import Image
+        with Image.open(source) as img:
+            return getattr(img, 'n_frames', 1)
+    except Exception:
+        return None
+
+
+def render_source_page_png(jobs, job_id: str, index: int, page: int, dpi: int = 144) -> bytes:
+    if page < 1:
+        raise ValueError('页码必须 >= 1')
+    dpi = max(72, min(200, int(dpi)))
+    _, item = _job_file(jobs, job_id, index)
+    source = drive_path(item['source'])
+    if not source.is_file():
+        raise FileNotFoundError('原始文件不存在')
+    if source.suffix.lower() == '.pdf':
+        import fitz
+        with fitz.open(source) as pdf:
+            if page > len(pdf):
+                raise ValueError('页码超出范围')
+            return pdf[page - 1].get_pixmap(dpi=dpi, alpha=False).tobytes('png')
+    from PIL import Image
+    buf = io.BytesIO()
+    with Image.open(source) as img:
+        total = getattr(img, 'n_frames', 1)
+        if page > total:
+            raise ValueError('页码超出范围')
+        if total > 1:
+            img.seek(page - 1)
+        img.convert('RGB').save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def file_preview(jobs, job_id: str, index: int) -> dict:
+    _, item = _job_file(jobs, job_id, index)
+    source_spec = item.get('source') or ''
+    source = None
+    source_available = False
+    if source_spec:
+        try:
+            source = drive_path(source_spec)
+            source_available = source.is_file()
+        except ValueError:
+            source_available = False
+    markdown = ''
+    raw = ''
+    assets: list[str] = []
+    if item.get('status') in ('completed', 'skipped') and item.get('output'):
+        try:
+            out_root = drive_path(item['output'])
+            if out_root.is_dir():
+                md_path = (out_root / 'result.md').resolve()
+                raw_path = (out_root / 'result.raw.txt').resolve()
+                if md_path.is_file() and md_path.is_relative_to(out_root):
+                    markdown = md_path.read_text(encoding='utf-8', errors='replace')
+                if raw_path.is_file() and raw_path.is_relative_to(out_root):
+                    raw = raw_path.read_text(encoding='utf-8', errors='replace')
+                assets = [
+                    str(p.relative_to(out_root))
+                    for p in sorted(out_root.rglob('*'))
+                    if p.is_file() and '.checkpoints' not in p.relative_to(out_root).parts
+                    and p.resolve().is_relative_to(out_root)
+                ]
+        except (OSError, ValueError):
+            pass
+    blocks = parse_raw_blocks(raw)
+    page_count = _count_source_pages(source) if (source is not None and source_available) else None
+    if page_count is None:
+        candidates = [item.get('pages'), item.get('pages_total'), max((b['page'] for b in blocks), default=0)]
+        page_count = max(int(v or 0) for v in candidates)
+    return {
+        'job_id': job_id,
+        'index': index,
+        'filename': Path(source_spec).name if source_spec else (item.get('relative_output') or f'file-{index + 1}'),
+        'relative_output': item.get('relative_output'),
+        'status': item.get('status'),
+        'pages_done': item.get('pages_done'),
+        'pages_total': item.get('pages_total'),
+        'page_count': page_count,
+        'source_available': source_available,
+        'markdown': markdown,
+        'raw': raw,
+        'blocks': blocks,
+        'assets': assets,
+        'pages': item.get('pages'),
+        'tokens': item.get('tokens'),
+        'chunks': item.get('chunks'),
+        'error': item.get('error'),
+    }
+
+
+def read_result_asset(jobs, job_id: str, index: int, rel_path: str) -> tuple[bytes, str, bool]:
+    _, item = _job_file(jobs, job_id, index)
+    if item.get('status') not in ('completed', 'skipped') or not item.get('output'):
+        raise ValueError('文件尚未完成转换')
+    clean = urllib.parse.unquote(rel_path).lstrip('/')
+    rel = Path(clean)
+    if not clean or rel.is_absolute() or '..' in rel.parts or '.checkpoints' in rel.parts:
+        raise ValueError('非法结果文件路径')
+    root = drive_path(item['output'])
+    target = (root / rel).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise FileNotFoundError('结果文件不存在')
+    mime = _INLINE_MIME.get(target.suffix.lower())
+    if mime is None:
+        return target.read_bytes(), 'application/octet-stream', True
+    return target.read_bytes(), mime, False
+
+
+def make_server(jobs, host: str = '127.0.0.1', port: int = 8000) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def send_bytes(self, code: int, content_type: str, data: bytes, *, headers: dict | None = None):
+            self.send_response(code)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(data)
+
         def send_json(self, code, value):
             raw = json.dumps(value, ensure_ascii=False).encode()
-            self.send_response(code)
-            self.send_header('Content-Type', 'application/json; charset=utf-8')
-            self.send_header('Content-Length', str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
+            self.send_bytes(code, 'application/json; charset=utf-8', raw)
+
+        def do_HEAD(self):
+            self.do_GET()
 
         def do_GET(self):
             try:
-                if self.path in ('/', '/health'):
+                parsed = urllib.parse.urlsplit(self.path)
+                path = parsed.path
+                query = urllib.parse.parse_qs(parsed.query)
+                if path == '/':
+                    self.send_response(302)
+                    self.send_header('Location', '/demo')
+                    self.send_header('Content-Length', '0')
+                    self.send_header('Cache-Control', 'no-store')
+                    self.end_headers()
+                    return
+                if path == '/demo':
+                    nonce = secrets.token_urlsafe(16)
+                    return self.send_bytes(200, 'text/html; charset=utf-8', render_demo_html(nonce), headers={
+                        'Content-Security-Policy': make_csp(nonce),
+                        'Cache-Control': 'no-store',
+                    })
+                if path == '/health':
                     return self.send_json(200, dict(status='ready', model='baidu/Unlimited-OCR-2'))
-                if self.path.startswith('/api/jobs/'):
-                    return self.send_json(200, jobs.get(self.path.removeprefix('/api/jobs/')))
+                if path == '/api/jobs':
+                    return self.send_json(200, dict(jobs=jobs.list_jobs()))
+                m = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/files/([0-9]+)/preview', path)
+                if m:
+                    return self.send_json(200, file_preview(jobs, m.group(1), int(m.group(2))))
+                m = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/files/([0-9]+)/pages/([0-9]+)', path)
+                if m:
+                    dpi = int((query.get('dpi') or ['144'])[0])
+                    png = render_source_page_png(jobs, m.group(1), int(m.group(2)), int(m.group(3)), dpi=dpi)
+                    return self.send_bytes(200, 'image/png', png, headers={'Cache-Control': 'private, max-age=300'})
+                m = re.fullmatch(r'/api/jobs/([0-9a-f]{32})/files/([0-9]+)/asset/(.+)', path)
+                if m:
+                    data, mime, force_dl = read_result_asset(jobs, m.group(1), int(m.group(2)), m.group(3))
+                    hdrs = {'Cache-Control': 'private, max-age=300'}
+                    if force_dl or (query.get('download') or [''])[0] in ('1', 'true'):
+                        fname = Path(urllib.parse.unquote(m.group(3))).name.replace('"', '_')
+                        hdrs['Content-Disposition'] = f'attachment; filename="{fname}"'
+                    return self.send_bytes(200, mime, data, headers=hdrs)
+                if path.startswith('/api/jobs/'):
+                    return self.send_json(200, jobs.get(path.removeprefix('/api/jobs/')))
                 self.send_json(404, dict(error='not found'))
-            except FileNotFoundError:
-                self.send_json(404, dict(error='job not found'))
+            except (FileNotFoundError, IndexError):
+                self.send_json(404, dict(error='not found'))
             except ValueError as error:
                 self.send_json(400, dict(error=str(error)))
 
@@ -476,7 +708,13 @@ def serve():
             except (ValueError, TypeError, OSError, KeyError, IndexError) as error:
                 self.send_json(400, dict(error=str(error)))
 
-    ThreadingHTTPServer(('127.0.0.1', int(os.environ.get('CT_SERVICE_PORT', '8000'))), Handler).serve_forever()
+    return ThreadingHTTPServer((host, port), Handler)
+
+
+def serve():
+    engine = Engine()
+    jobs = Jobs(engine)
+    make_server(jobs, '127.0.0.1', int(os.environ.get('CT_SERVICE_PORT', '8000'))).serve_forever()
 
 
 if __name__ == '__main__':

@@ -579,12 +579,13 @@ RUNTIME_API_PROFILES: dict[str, dict[str, Any]] = {
             "web_ui": True,
         },
         "suggestions": [
-            "查看 /health 状态并浏览 Drive 上的 PDF 与扫描件目录",
-            "分片上传本地 PDF/图片并发起 PaddleOCR-VL 识别任务",
-            "查询历史任务状态、断点续传并导出 Markdown/JSON 结果",
+            "打开 /demo 浏览器测试页上传 PDF/图片，对比版面框、阅读顺序与 Markdown/表格结果",
+            "浏览 Drive 上的历史识别任务并一键查看或断点恢复",
+            "分片上传本地 PDF/图片并发起异步识别或导出 Markdown/JSON 结果",
         ],
         "endpoint_presets": [
             {"label": "健康检查 (/health)", "method": "GET", "path": "health"},
+            {"label": "历史任务列表 (/api/jobs)", "method": "GET", "path": "api/jobs"},
             {"label": "列出 Drive 目录 (/api/drive-list)", "method": "POST", "path": "api/drive-list", "body": {"path": ""}},
             {"label": "提交 OCR 任务 (/api/jobs)", "method": "POST", "path": "api/jobs", "body": {"source": ""}},
         ],
