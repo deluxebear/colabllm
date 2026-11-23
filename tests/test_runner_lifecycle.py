@@ -58,6 +58,7 @@ if cmd == 'new':
         if remaining > 0:
             f503.write_text(str(remaining - 1))
             print("╭─── Traceback (most recent call last) ───╮", file=sys.stderr)
+            print("│   170 │   except TooManyAssignmentsError: │", file=sys.stderr)
             print("│ /fake/colab_cli/client.py:238           │", file=sys.stderr)
             print("╰─────────────────────────────────────────╯", file=sys.stderr)
             print("ColabRequestError: Failed to issue request POST https://colab.research.google.com/tun/m/assign?nbh=abc&variant=GPU&accelerator=A100: Service Unavailable", file=sys.stderr)

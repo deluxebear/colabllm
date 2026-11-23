@@ -279,6 +279,45 @@ class LifecycleSafetyTest(unittest.TestCase):
         self.assertEqual(mock_run_to.call_count, 1)
         mock_sleep_to.assert_called_once_with(0.25)
 
+    def test_ensure_session_ignores_rich_traceback_source_context(self):
+        fake_home = self.root / 'home'
+        (fake_home / '.config/colab-cli').mkdir(parents=True)
+        ok_res = subprocess.CompletedProcess(["colab", "new"], 0, "[colab] Creating session 'test'...\n", "")
+
+        err_503 = CliError("命令执行失败 (1): colab new -s test — Service Unavailable", 1)
+        err_503.stdout = ""
+        err_503.stderr = (
+            "╭─── Traceback (most recent call last) ───╮\n"
+            "│   170 │   except TooManyAssignmentsError: │\n"
+            "╰─────────────────────────────────────────╯\n"
+            "ColabRequestError: Failed to issue request POST "
+            "https://colab.research.google.com/tun/m/assign?nbh=abc&accelerator=A100: Service Unavailable\n"
+        )
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', side_effect=[err_503, ok_res]) as mock_run, \
+             patch.object(svc.time, 'sleep') as mock_sleep:
+            self.assertFalse(svc.ensure_session(self.service, assign_retries=2, assign_retry_delay=0.2))
+        self.assertEqual(mock_run.call_count, 2)
+        mock_sleep.assert_called_once_with(0.2)
+
+        err_401 = CliError("命令执行失败 (1): colab new -s test — Unauthorized", 1)
+        err_401.stdout = ""
+        err_401.stderr = (
+            "╭─── Traceback (most recent call last) ───╮\n"
+            "│   300 │   e, requests.exceptions.ReadTimeout │\n"
+            "│   301 │   ) or status in (502, 503, 504)     │\n"
+            "╰──────────────────────────────────────────────╯\n"
+            "ColabRequestError: Failed to issue request POST "
+            "https://colab.research.google.com/tun/m/assign?nbh=abc: Unauthorized\n"
+        )
+        with patch.object(svc.Path, 'home', return_value=fake_home), \
+             patch.object(svc, 'run', side_effect=err_401) as mock_run_401, \
+             patch.object(svc.time, 'sleep') as mock_sleep_401:
+            with self.assertRaises(CliError):
+                svc.ensure_session(self.service, assign_retries=3, assign_retry_delay=0.2)
+        self.assertEqual(mock_run_401.call_count, 1)
+        mock_sleep_401.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

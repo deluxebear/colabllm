@@ -259,9 +259,12 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def _extract_failure_reason(
-    stdout: str | None, stderr: str | None, *, max_len: int = 420
+    stdout: str | None, stderr: str | None, *, max_len: int | None = 420
 ) -> str | None:
     """Extract a concise single-line root cause from captured CLI stderr/stdout (including Rich tracebacks)."""
+    def _cap(text: str) -> str:
+        return text if max_len is None or len(text) <= max_len else text[: max_len - 3] + "..."
+
     for raw in (stderr, stdout):
         if not raw:
             continue
@@ -274,8 +277,7 @@ def _extract_failure_reason(
         if last_box_end >= 0:
             after = [ln for ln in lines[last_box_end + 1 :] if ln]
             if after:
-                joined = " ".join(after)
-                return joined if len(joined) <= max_len else joined[: max_len - 3] + "..."
+                return _cap(" ".join(after))
         tagged_idx = next(
             (
                 i
@@ -290,11 +292,10 @@ def _extract_failure_reason(
                 ln for ln in lines[tagged_idx:] if ln and not ln.startswith(("╭", "│", "╰"))
             )
             if joined:
-                return joined if len(joined) <= max_len else joined[: max_len - 3] + "..."
+                return _cap(joined)
         non_box = [ln for ln in lines if ln and not ln.startswith(("╭", "│", "╰"))]
         if non_box:
-            tail = non_box[-1]
-            return tail if len(tail) <= max_len else tail[: max_len - 3] + "..."
+            return _cap(non_box[-1])
     return None
 
 
@@ -1365,11 +1366,10 @@ def ensure_session(
                 retryable = True
                 reason = f"命令超时 ({err.timeout}s)"
             else:
-                combined = "\n".join(
-                    part for part in (str(err), getattr(err, "stderr", "") or "", getattr(err, "stdout", "") or "")
-                    if part
+                extracted = _extract_failure_reason(
+                    getattr(err, "stdout", None), getattr(err, "stderr", None), max_len=None
                 )
-                retryable = _is_retryable_assign_error(combined)
+                retryable = _is_retryable_assign_error(extracted or str(err))
                 reason = str(err)
             if not retryable or attempt > retries:
                 if isinstance(err, subprocess.TimeoutExpired):
